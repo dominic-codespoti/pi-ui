@@ -1,0 +1,219 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── Night theme: widen base-100/base-200 contrast gap ───────────────────── */
+/*
+ * DaisyUI night defaults: --b1 ≈ 20.8% L, --b2 ≈ 19.3% L — almost identical.
+ * We lift b1 (main chat area) and drop b2/b3 (sidebars) so panels stand out.
+ * Values are OKLCH: lightness% chroma hue
+ */
+[data-theme=night] {
+  --b1: 25% 0.036 265.754874;    /* was 20.77% — main background, noticeably lighter */
+  --b2: 17.5% 0.034 265.754874;  /* was 19.31% — sidebars, pulled darker */
+  --b3: 14%   0.030 265.754874;  /* was 17.86% — deepest accent areas */
+}
+
+/* ── Remove 300 ms tap delay on all interactive elements ─────────────────── */
+button, a, input, textarea, select, [role="button"] {
+  touch-action: manipulation;
+}
+
+/* ── Prose — assistant markdown output ────────────────────────────────────── */
+.prose {
+  line-height: 1.7;
+  overflow-wrap: break-word;
+  word-break: break-words;
+}
+
+.prose p {
+  margin-bottom: 0.75em;
+}
+.prose p:last-child {
+  margin-bottom: 0;
+}
+
+.prose h1, .prose h2, .prose h3, .prose h4 {
+  font-weight: 700;
+  margin-top: 1.2em;
+  margin-bottom: 0.4em;
+  color: oklch(var(--bc) / 0.95);
+}
+.prose h1 { font-size: 1.15em; }
+.prose h2 { font-size: 1.08em; }
+.prose h3, .prose h4 { font-size: 1em; }
+
+.prose ul, .prose ol {
+  margin: 0.4em 0 0.75em 1.4em;
+}
+.prose ul { list-style-type: disc; }
+.prose ol { list-style-type: decimal; }
+.prose li { margin-bottom: 0.3em; }
+
+.prose strong { font-weight: 600; color: oklch(var(--bc) / 0.92); }
+.prose em     { font-style: italic; color: oklch(var(--bc) / 0.75); }
+
+/* Inline code — subtle pill like ChatGPT */
+.prose code {
+  font-size: 0.85em;
+  background: oklch(var(--bc) / 0.09);
+  border: 1px solid oklch(var(--bc) / 0.09);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  color: oklch(var(--bc) / 0.88);
+}
+
+/* Inline code inside a code-block — reset */
+.prose .code-block code,
+.prose pre code {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 1em;
+  color: inherit;
+}
+
+/* Block quotes */
+.prose blockquote {
+  border-left: 3px solid oklch(var(--bc) / 0.18);
+  padding-left: 0.8em;
+  color: oklch(var(--bc) / 0.5);
+  margin: 0.6em 0;
+}
+
+/* Horizontal rule */
+.prose hr {
+  border: none;
+  border-top: 1px solid oklch(var(--bc) / 0.1);
+  margin: 0.75em 0;
+}
+
+/* Links */
+.prose a {
+  color: oklch(var(--p) / 0.8);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.prose a:hover { color: oklch(var(--p) / 1); }
+
+/* Tables */
+.prose table {
+  border-collapse: collapse;
+  font-size: 0.85em;
+  margin: 0.5em 0;
+  width: 100%;
+}
+.prose th, .prose td {
+  border: 1px solid oklch(var(--bc) / 0.1);
+  padding: 0.35em 0.65em;
+  text-align: left;
+}
+.prose th { color: oklch(var(--bc) / 0.6); font-weight: 600; }
+
+/* ── Code block — ChatGPT-style ───────────────────────────────────────────── */
+.code-block {
+  border-radius: 0.75rem;
+  overflow: hidden;
+  margin: 0.8em 0;
+  background: oklch(var(--bc) / 0.055);
+}
+
+.code-block-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.45rem 0.85rem;
+  background: oklch(var(--bc) / 0.075);
+}
+
+.code-block-lang {
+  font-size: 0.72rem;
+  font-family: ui-monospace, monospace;
+  color: oklch(var(--bc) / 0.5);
+  user-select: none;
+}
+
+.code-copy-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.75rem;
+  height: 1.75rem;
+  color: oklch(var(--bc) / 0.38);
+  cursor: pointer;
+  border-radius: 0.35rem;
+  transition: background 0.15s, color 0.15s;
+  background: transparent;
+  border: none;
+  padding: 0;
+}
+.code-copy-btn:hover {
+  color: oklch(var(--bc) / 0.8);
+  background: oklch(var(--bc) / 0.07);
+}
+
+.code-block-pre {
+  margin: 0;
+  padding: 0.9em 1em;
+  overflow-x: auto;
+  font-size: 0.8em;
+  line-height: 1.6;
+  background: transparent;
+}
+
+.code-block-pre code.hljs {
+  padding: 0;
+  background: transparent;
+  font-family: ui-monospace, 'Cascadia Code', 'Fira Code', monospace;
+}
+
+/* ── highlight.js syntax colour palette (neutral dark, works on night theme) */
+.hljs                  { color: oklch(var(--bc) / 0.78); }
+.hljs-keyword,
+.hljs-selector-tag     { color: #c792ea; }          /* purple — keywords */
+.hljs-built_in,
+.hljs-builtin-name     { color: #82aaff; }          /* blue — builtins */
+.hljs-type,
+.hljs-class .hljs-title { color: #ffcb6b; }         /* yellow — types/classes */
+.hljs-function .hljs-title,
+.hljs-title.function_  { color: #82aaff; }          /* blue — function names */
+.hljs-string           { color: #c3e88d; }          /* green — strings */
+.hljs-number,
+.hljs-literal          { color: #f78c6c; }          /* orange — numbers/true/false/null */
+.hljs-comment          { color: oklch(var(--bc) / 0.3); font-style: italic; }
+.hljs-attr,
+.hljs-attribute        { color: #ffcb6b; }          /* yellow — attributes */
+.hljs-variable,
+.hljs-template-variable{ color: #f07178; }          /* red — variables */
+.hljs-tag              { color: #f07178; }
+.hljs-name             { color: #f07178; }
+.hljs-operator,
+.hljs-punctuation      { color: oklch(var(--bc) / 0.5); }
+.hljs-params           { color: oklch(var(--bc) / 0.7); }
+.hljs-meta             { color: oklch(var(--bc) / 0.4); }
+.hljs-section,
+.hljs-selector-id      { color: #82aaff; font-weight: 600; }
+.hljs-symbol,
+.hljs-bullet           { color: #f78c6c; }
+.hljs-addition         { color: #c3e88d; background: rgba(195, 232, 141, 0.08); }
+.hljs-deletion         { color: #f07178; background: rgba(240, 113, 120, 0.08); }
+.hljs-emphasis         { font-style: italic; }
+.hljs-strong           { font-weight: bold; }
+.hljs-link             { color: #80cbc4; text-decoration: underline; }
+
+/* ── Typing / waiting indicator ──────────────────────────────────────────── */
+@keyframes typing-dot {
+  0%, 60%, 100% { opacity: 0.2; transform: translateY(0); }
+  30%           { opacity: 0.8; transform: translateY(-3px); }
+}
+
+.typing-dot {
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background-color: oklch(var(--bc) / 0.4);
+  animation: typing-dot 1.2s ease-in-out infinite;
+}
+.typing-dot:nth-child(2) { animation-delay: 0.2s; }
+.typing-dot:nth-child(3) { animation-delay: 0.4s; }
