@@ -380,6 +380,7 @@ const server = Bun.serve<WSData>({
         return;
       }
 
+      try {
       switch (msg.type) {
         case 'prompt': {
           const imageContent = msg.images?.length
@@ -732,6 +733,9 @@ const server = Bun.serve<WSData>({
           }
           break;
         }
+      } // end switch
+      } catch (err) {
+        console.error('[pi-ui] WS message handler error:', err);
       }
     },
 
