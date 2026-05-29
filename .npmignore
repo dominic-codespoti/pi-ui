@@ -1,0 +1,3 @@
+# Don't ship test files to npm consumers
+**/*.test.ts
+**/*.spec.ts

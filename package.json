@@ -19,10 +19,13 @@
   "bin": {
     "pi-ui": "./bin/pi-ui.ts"
   },
-    "files": [
+  "files": [
     "bin/",
     "build/",
-    "src/lib/",
+    "src/lib/auth/password.ts",
+    "src/lib/auth/rate-limiter.ts",
+    "src/lib/markdown.ts",
+    "src/lib/ws/protocol.ts",
     "server.ts",
     "server.bundle.js"
   ],
