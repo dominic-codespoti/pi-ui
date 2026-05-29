@@ -366,11 +366,10 @@ async function setActiveSession(newSession: AgentSession) {
 // ── 5. Start server ───────────────────────────────────────────────────────────
 
 const PORT = parseInt(Bun.env.PORT ?? '3000');
-const WS_TOPIC = 'pi';
 
-type WSData = { connectedAt: number };
-
-const server = Bun.serve<WSData>({
+let server: ReturnType<typeof Bun.serve>;
+try {
+  server = Bun.serve<WSData>({
   port: PORT,
 
   async fetch(req, server) {
@@ -792,6 +791,15 @@ const server = Bun.serve<WSData>({
     perMessageDeflate: true,
   },
 });
+} catch (err: any) {
+  if (err?.code === 'EADDRINUSE') {
+    console.error(`[pifrontier] Port ${PORT} is already in use.`);
+    console.error(`[pifrontier] Use a different port: pi-ui --port ${PORT + 1}`);
+  } else {
+    console.error('[pifrontier] Failed to start server:', err?.message ?? err);
+  }
+  process.exit(1);
+}
 
 // ── 6. Wire up broadcast ──────────────────────────────────────────────────────
 // Session subscription is set up inside ensureSession() on first WS connection.
