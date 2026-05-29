@@ -1,5 +1,5 @@
 {
-  "name": "pifrontier",
+  "name": "@thed24/pi-ui",
   "version": "0.1.0",
   "description": "Web UI for the pi coding agent — runs in your browser, served from a Raspberry Pi or any Bun-capable machine.",
   "type": "module",
@@ -17,7 +17,7 @@
     "bun": ">=1.0.0"
   },
   "bin": {
-    "pifrontier": "./bin/pifrontier"
+    "pi-ui": "./bin/pifrontier"
   },
   "files": [
     "bin/",

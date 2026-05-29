@@ -1,9 +1,9 @@
 #!/usr/bin/env bun
 /**
- * pifrontier CLI entry point
+ * pi-ui CLI entry point
  *
  * Usage:
- *   pifrontier [options]
+ *   pi-ui [options]
  *
  * Options:
  *   -p, --password <password>  Password to protect the UI (or set PI_PASSWORD env var)
@@ -43,18 +43,18 @@ const { values } = parseArgs({
 // ── Help / version ────────────────────────────────────────────────────────────
 
 if (values.version) {
-  console.log(`pifrontier v${pkg.version}`);
+  console.log(`pi-ui v${pkg.version}`);
   process.exit(0);
 }
 
 if (values.help) {
   console.log(`
-pifrontier v${pkg.version}
+pi-ui v${pkg.version}
 
   Web UI for the pi coding agent.
 
 Usage:
-  pifrontier [options]
+  pi-ui [options]
 
 Options:
   -p, --password <password>  Password to protect the UI
@@ -68,9 +68,9 @@ Options:
   -V, --version              Print version and exit
 
 Examples:
-  pifrontier --password secret
-  PI_PASSWORD=secret pifrontier --port 8080 --open
-  pifrontier -p secret -P 8080 --cwd /path/to/project
+  pi-ui --password secret
+  PI_PASSWORD=secret pi-ui --port 8080 --open
+  pi-ui -p secret -P 8080 --cwd /path/to/project
 `);
   process.exit(0);
 }

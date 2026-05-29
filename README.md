@@ -1,4 +1,4 @@
-# pifrontier
+# pi-ui
 
 Web UI for the [pi coding agent](https://github.com/earendil-works/pi) — a polished,
 low-footprint PWA that runs in your browser and connects to a `pi` session over WebSocket.
@@ -34,13 +34,13 @@ Designed to run on a Raspberry Pi, but works on any machine with Bun.
 ### Global (recommended for Raspberry Pi / servers)
 
 ```bash
-bun add -g pifrontier
+bun add -g @thed24/pi-ui
 ```
 
 Then start it:
 
 ```bash
-pifrontier --password your-secret
+pi-ui --password your-secret
 ```
 
 Open `http://<your-pi-ip>:3000` in your browser.
@@ -50,7 +50,7 @@ Open `http://<your-pi-ip>:3000` in your browser.
 ### Run without installing (npx / bunx)
 
 ```bash
-bunx pifrontier --password your-secret
+bunx @thed24/pi-ui --password your-secret
 ```
 
 ---
@@ -59,7 +59,7 @@ bunx pifrontier --password your-secret
 
 ```bash
 git clone https://github.com/dominic-codespoti/pi-ui
-cd pifrontier
+cd pi-ui
 bun install
 bun run build
 bun run start --password your-secret
@@ -70,7 +70,7 @@ bun run start --password your-secret
 ## Usage
 
 ```
-pifrontier [options]
+pi-ui [options]
 
 Options:
   -p, --password <password>  Password to protect the UI
@@ -88,16 +88,16 @@ Options:
 
 ```bash
 # Minimal
-pifrontier -p secret
+pi-ui -p secret
 
 # Custom port, open browser
-pifrontier -p secret -P 8080 --open
+pi-ui -p secret -P 8080 --open
 
 # Point pi at a specific project directory
-pifrontier -p secret --cwd /path/to/my-project
+pi-ui -p secret --cwd /path/to/my-project
 
 # Password from environment variable
-PI_PASSWORD=secret PORT=4000 pifrontier
+PI_PASSWORD=secret PORT=4000 pi-ui
 ```
 
 ---
@@ -119,12 +119,12 @@ CLI flags take precedence over environment variables when both are set.
 ### One-shot start
 
 ```bash
-PI_PASSWORD=secret pifrontier --port 3000
+PI_PASSWORD=secret pi-ui --port 3000
 ```
 
 ### Persistent service (systemd)
 
-Create `/etc/systemd/system/pifrontier.service`:
+Create `/etc/systemd/system/pi-ui.service`:
 
 ```ini
 [Unit]
@@ -137,7 +137,7 @@ User=pi
 WorkingDirectory=/home/pi
 Environment=PI_PASSWORD=your-secret-here
 Environment=PORT=3000
-ExecStart=/home/pi/.bun/bin/pifrontier
+ExecStart=/home/pi/.bun/bin/pi-ui
 Restart=on-failure
 RestartSec=5
 
@@ -148,8 +148,8 @@ WantedBy=multi-user.target
 Enable and start:
 
 ```bash
-sudo systemctl enable pifrontier
-sudo systemctl start pifrontier
+sudo systemctl enable pi-ui
+sudo systemctl start pi-ui
 ```
 
 ---
