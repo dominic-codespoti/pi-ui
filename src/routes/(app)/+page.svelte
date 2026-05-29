@@ -195,7 +195,7 @@
   function stopSessionResize() {
     if (!sessionResizing) return;
     sessionResizing = false;
-    try { localStorage.setItem('pi-ui:session-w', String(sessionPanelWidth)); } catch { /* quota */ }
+    try { localStorage.setItem('pifrontier:session-w', String(sessionPanelWidth)); } catch { /* quota */ }
   }
 
   function startRightResize(e: PointerEvent) {
@@ -210,7 +210,7 @@
   function stopRightResize() {
     if (!rightResizing) return;
     rightResizing = false;
-    try { localStorage.setItem('pi-ui:right-w', String(rightPanelWidth)); } catch { /* quota */ }
+    try { localStorage.setItem('pifrontier:right-w', String(rightPanelWidth)); } catch { /* quota */ }
   }
 
   // ── Core state ───────────────────────────────────────────────────────────────
@@ -1615,9 +1615,9 @@
     _mq.addEventListener('change', _mqHandler);
     // Restore persisted sidebar widths
     try {
-      const sw = parseInt(localStorage.getItem('pi-ui:session-w') ?? '');
+      const sw = parseInt(localStorage.getItem('pifrontier:session-w') ?? '');
       if (!isNaN(sw)) sessionPanelWidth = Math.max(PANEL_MIN_W, Math.min(PANEL_MAX_W, sw));
-      const rw = parseInt(localStorage.getItem('pi-ui:right-w') ?? '');
+      const rw = parseInt(localStorage.getItem('pifrontier:right-w') ?? '');
       if (!isNaN(rw)) rightPanelWidth = Math.max(PANEL_MIN_W, Math.min(PANEL_MAX_W, rw));
     } catch { /* localStorage unavailable */ }
   });

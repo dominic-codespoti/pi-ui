@@ -1,5 +1,5 @@
 {
-  "name": "pi-ui",
+  "name": "pifrontier",
   "version": "0.1.0",
   "description": "Web UI for the pi coding agent — runs in your browser, served from a Raspberry Pi or any Bun-capable machine.",
   "type": "module",
@@ -17,7 +17,7 @@
     "bun": ">=1.0.0"
   },
   "bin": {
-    "pi-ui": "./bin/pi-ui"
+    "pifrontier": "./bin/pifrontier"
   },
   "files": [
     "bin/",
@@ -37,7 +37,7 @@
     "check:server": "tsc --noEmit --project tsconfig.server.json",
     "lint": "eslint .",
     "format": "prettier --write .",
-    "start": "bun --smol run bin/pi-ui.ts",
+    "start": "bun --smol run bin/pifrontier.ts",
     "build:server": "bun build ./server.ts --target bun --outfile ./server.bundle.js --minify --external './build/handler.js' --external '@earendil-works/pi-coding-agent' --external '@earendil-works/pi-ai' --external 'bcryptjs' --external 'jose'",
     "test": "bun test src/lib/auth --timeout 15000",
     "prepublishOnly": "bun run build && bun run build:server"

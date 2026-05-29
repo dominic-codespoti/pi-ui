@@ -39,13 +39,13 @@ async function getSvelteHandler(): Promise<SvelteHandler> {
 
 const PI_PASSWORD = Bun.env.PI_PASSWORD;
 if (!PI_PASSWORD) {
-  console.error('[pi-ui] Error: PI_PASSWORD environment variable is required.');
-  console.error('[pi-ui] Usage: PI_PASSWORD=your-password bun run start');
+  console.error('[pifrontier] Error: PI_PASSWORD environment variable is required.');
+  console.error('[pifrontier] Usage: PI_PASSWORD=your-password bun run start');
   process.exit(1);
 }
 
 await initPassword(PI_PASSWORD);
-console.log('[pi-ui] Password initialised.');
+console.log('[pifrontier] Password initialised.');
 
 // ── 2. Helpers ────────────────────────────────────────────────────────────────
 
@@ -296,10 +296,10 @@ const uiContext: ExtensionUIContext = {
 let _sdk: typeof PiSDKNS | null = null;
 async function getSDK(): Promise<typeof PiSDKNS> {
   if (!_sdk) {
-    console.log('[pi-ui] Loading pi SDK (first connection)…');
+    console.log('[pifrontier] Loading pi SDK (first connection)…');
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     _sdk = await import('@earendil-works/pi-coding-agent') as any;
-    console.log('[pi-ui] Pi SDK loaded.');
+    console.log('[pifrontier] Pi SDK loaded.');
   }
   return _sdk!;
 }
@@ -315,13 +315,13 @@ let unsubscribePi: (() => void) | null = null;
 async function ensureSession(): Promise<AgentSession> {
   if (session) return session;
   const sdk = await getSDK();
-  console.log(`[pi-ui] Starting pi session in ${cwd} …`);
+  console.log(`[pifrontier] Starting pi session in ${cwd} …`);
   const sm = sdk.SessionManager.continueRecent(cwd);
   const result = await sdk.createAgentSession({ cwd, sessionManager: sm });
   session = result.session;
-  console.log(`[pi-ui] Pi session ready: ${session.sessionId}`);
+  console.log(`[pifrontier] Pi session ready: ${session.sessionId}`);
   await session.bindExtensions({ uiContext });
-  console.log('[pi-ui] Extension UI context bound.');
+  console.log('[pifrontier] Extension UI context bound.');
   unsubscribePi = session.subscribe((event) => {
     broadcast(event);
   });
@@ -454,14 +454,14 @@ const server = Bun.serve<WSData>({
         case 'set_model': {
           const model = session!.modelRegistry.find(msg.provider, msg.modelId);
           if (!model) {
-            console.warn(`[pi-ui] set_model: model not found: ${msg.provider}/${msg.modelId}`);
+            console.warn(`[pifrontier] set_model: model not found: ${msg.provider}/${msg.modelId}`);
             break;
           }
           try {
             await session!.setModel(model);
             broadcast({ type: 'model_changed', model: serializeModel(model) });
           } catch (err) {
-            console.error('[pi-ui] set_model error:', err);
+            console.error('[pifrontier] set_model error:', err);
           }
           break;
         }
@@ -472,7 +472,7 @@ const server = Bun.serve<WSData>({
             const sessions = list.slice(0, 30).map(serializeSession);
             ws.send(JSON.stringify({ type: 'sessions_list', sessions }));
           } catch (err) {
-            console.error('[pi-ui] list_sessions error:', err);
+            console.error('[pifrontier] list_sessions error:', err);
             ws.send(JSON.stringify({ type: 'sessions_list', sessions: [] }));
           }
           break;
@@ -489,7 +489,7 @@ const server = Bun.serve<WSData>({
             });
             await setActiveSession(newSession);
           } catch (err) {
-            console.error('[pi-ui] new_session error:', err);
+            console.error('[pifrontier] new_session error:', err);
           }
           break;
         }
@@ -504,7 +504,7 @@ const server = Bun.serve<WSData>({
             });
             await setActiveSession(newSession);
           } catch (err) {
-            console.error('[pi-ui] switch_session error:', err);
+            console.error('[pifrontier] switch_session error:', err);
           }
           break;
         }
@@ -532,7 +532,7 @@ const server = Bun.serve<WSData>({
               availableModels: session!.modelRegistry.getAvailable().map(serializeModel),
             });
           } catch (err) {
-            console.error('[pi-ui] set_provider_key error:', err);
+            console.error('[pifrontier] set_provider_key error:', err);
             ws.send(JSON.stringify({ type: 'providers_error', message: String(err) }));
           }
           break;
@@ -548,7 +548,7 @@ const server = Bun.serve<WSData>({
               availableModels: session!.modelRegistry.getAvailable().map(serializeModel),
             });
           } catch (err) {
-            console.error('[pi-ui] remove_provider_key error:', err);
+            console.error('[pifrontier] remove_provider_key error:', err);
             ws.send(JSON.stringify({ type: 'providers_error', message: String(err) }));
           }
           break;
@@ -566,7 +566,7 @@ const server = Bun.serve<WSData>({
             const list = await _sdk!.SessionManager.list(cwd);
             ws.send(JSON.stringify({ type: 'sessions_list', sessions: list.slice(0, 30).map(serializeSession) }));
           } catch (err) {
-            console.error('[pi-ui] rename_session error:', err);
+            console.error('[pifrontier] rename_session error:', err);
             ws.send(JSON.stringify({ type: 'sessions_error', message: String(err) }));
           }
           break;
@@ -582,7 +582,7 @@ const server = Bun.serve<WSData>({
               sm.appendSessionInfo(msg.name);
             }
           } catch (err) {
-            console.error('[pi-ui] rename_current_session error:', err);
+            console.error('[pifrontier] rename_current_session error:', err);
           }
           break;
         }
@@ -600,7 +600,7 @@ const server = Bun.serve<WSData>({
             const updated = await _sdk!.SessionManager.list(cwd);
             ws.send(JSON.stringify({ type: 'sessions_list', sessions: updated.slice(0, 30).map(serializeSession) }));
           } catch (err) {
-            console.error('[pi-ui] delete_session error:', err);
+            console.error('[pifrontier] delete_session error:', err);
             ws.send(JSON.stringify({ type: 'sessions_error', message: String(err) }));
           }
           break;
@@ -611,7 +611,7 @@ const server = Bun.serve<WSData>({
             const all = await _sdk!.SessionManager.listAll();
             ws.send(JSON.stringify({ type: 'all_sessions_list', sessions: all.map(serializeSession) }));
           } catch (err) {
-            console.error('[pi-ui] get_all_sessions error:', err);
+            console.error('[pifrontier] get_all_sessions error:', err);
             ws.send(JSON.stringify({ type: 'all_sessions_list', sessions: [] }));
           }
           break;
@@ -637,14 +637,14 @@ const server = Bun.serve<WSData>({
             }
             ws.send(JSON.stringify({ type: 'dir_completions', prefix, entries }));
           } catch (err) {
-            console.error('[pi-ui] dir_complete error:', err);
+            console.error('[pifrontier] dir_complete error:', err);
           }
           break;
         }
 
         case 'compact': {
           session!.compact().catch((err) => {
-            console.error('[pi-ui] compact error:', err);
+            console.error('[pifrontier] compact error:', err);
           });
           break;
         }
@@ -664,7 +664,7 @@ const server = Bun.serve<WSData>({
             const entries = session!.getUserMessagesForForking();
             ws.send(JSON.stringify({ type: 'fork_points', entries }));
           } catch (err) {
-            console.error('[pi-ui] get_fork_points error:', err);
+            console.error('[pifrontier] get_fork_points error:', err);
             ws.send(JSON.stringify({ type: 'fork_points', entries: [] }));
           }
           break;
@@ -684,7 +684,7 @@ const server = Bun.serve<WSData>({
               activeToolNames: activeNames,
             }));
           } catch (err) {
-            console.error('[pi-ui] get_tools error:', err);
+            console.error('[pifrontier] get_tools error:', err);
           }
           break;
         }
@@ -693,7 +693,7 @@ const server = Bun.serve<WSData>({
           try {
             session!.setActiveToolsByName(msg.toolNames as string[]);
           } catch (err) {
-            console.error('[pi-ui] set_active_tools error:', err);
+            console.error('[pifrontier] set_active_tools error:', err);
           }
           break;
         }
@@ -723,7 +723,7 @@ const server = Bun.serve<WSData>({
             }));
             ws.send(JSON.stringify({ type: 'resources_list', skills: skillSummaries, prompts: promptSummaries }));
           } catch (err) {
-            console.error('[pi-ui] get_resources error:', err);
+            console.error('[pifrontier] get_resources error:', err);
             ws.send(JSON.stringify({ type: 'resources_list', skills: [], prompts: [] }));
           }
           break;
@@ -752,7 +752,7 @@ const server = Bun.serve<WSData>({
             const skillName = nameMatch ? nameMatch[1].trim() : safeFileName.replace(/\.md$/, '');
             ws.send(JSON.stringify({ type: 'skill_install_result', success: true, name: skillName }));
           } catch (err) {
-            console.error('[pi-ui] install_skill error:', err);
+            console.error('[pifrontier] install_skill error:', err);
             ws.send(JSON.stringify({ type: 'skill_install_result', success: false, error: String(err) }));
           }
           break;
@@ -773,14 +773,14 @@ const server = Bun.serve<WSData>({
             });
             await setActiveSession(forkedSession);
           } catch (err) {
-            console.error('[pi-ui] fork_session error:', err);
+            console.error('[pifrontier] fork_session error:', err);
             ws.send(JSON.stringify({ type: 'sessions_error', message: String(err) }));
           }
           break;
         }
       } // end switch
       } catch (err) {
-        console.error('[pi-ui] WS message handler error:', err);
+        console.error('[pifrontier] WS message handler error:', err);
       }
     },
 
@@ -798,4 +798,4 @@ const server = Bun.serve<WSData>({
 
 broadcast = (payload) => server.publish(WS_TOPIC, JSON.stringify(payload));
 
-console.log(`[pi-ui] Listening on http://localhost:${PORT}`);
+console.log(`[pifrontier] Listening on http://localhost:${PORT}`);

@@ -3,6 +3,7 @@ build/
 .svelte-kit/
 dist/
 server.bundle.js
+*.tgz
 
 .env
 .env.*
