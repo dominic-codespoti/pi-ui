@@ -36,6 +36,7 @@
     "format": "prettier --write .",
     "start": "bun --smol run bin/pi-ui.ts",
     "build:server": "bun build ./server.ts --target bun --outfile ./server.bundle.js --minify --external './build/handler.js' --external '@earendil-works/pi-coding-agent' --external '@earendil-works/pi-ai' --external 'bcryptjs' --external 'jose'",
+    "test": "bun test src/lib/auth --timeout 15000",
     "prepublishOnly": "bun run build && bun run build:server"
   },
   "dependencies": {
