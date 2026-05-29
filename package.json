@@ -17,7 +17,7 @@
     "bun": ">=1.0.0"
   },
   "bin": {
-    "pi-ui": "./bin/pi-ui.ts"
+    "pi-ui": "./bin/pi-ui"
   },
   "files": [
     "bin/",
