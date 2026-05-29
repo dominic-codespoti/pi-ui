@@ -1,2 +1,3 @@
 #!/bin/sh
-exec bun "$(dirname "$0")/pifrontier.ts" "$@"
+SELF=$(readlink -f "$0")
+exec bun "$(dirname "$SELF")/pifrontier.ts" "$@"
