@@ -13,7 +13,6 @@
  * Build first: bun run build
  */
 
-import handler_default from './build/handler.js';
 import { createAgentSession, SessionManager, DefaultResourceLoader, getAgentDir } from '@earendil-works/pi-coding-agent';
 import type { AgentSession, ExtensionUIContext } from '@earendil-works/pi-coding-agent';
 import type { Model } from '@earendil-works/pi-ai';
@@ -22,8 +21,19 @@ import { join, resolve, basename, extname } from 'node:path';
 import { initPassword, isValidSessionCookie } from './src/lib/auth/password.ts';
 import type { ClientMessage, ModelInfo, ProviderInfo, SessionSummary, SkillSummary, PromptSummary } from './src/lib/ws/protocol.ts';
 
-// svelte-adapter-bun exports a factory; call it with true to serve static assets.
-const { httpserver: svelteHandler } = handler_default(true);
+// Lazy-load the SvelteKit handler — avoids pulling the ~30 MB SK bundle into
+// memory at process start before any HTTP request arrives.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type SvelteHandler = (req: Request, server: Bun.Server<any>) => Response | Promise<Response>;
+let _svelteHandler: SvelteHandler | null = null;
+async function getSvelteHandler(): Promise<SvelteHandler> {
+  if (!_svelteHandler) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const mod = await import('./build/handler.js') as any;
+    _svelteHandler = mod.default(true).httpserver as SvelteHandler;
+  }
+  return _svelteHandler;
+}
 
 // ── 1. Validate environment ───────────────────────────────────────────────────
 
@@ -347,7 +357,7 @@ const server = Bun.serve<WSData>({
       return new Response('WebSocket upgrade failed', { status: 400 });
     }
 
-    return svelteHandler(req, server);
+    return (await getSvelteHandler())(req, server);
   },
 
   websocket: {

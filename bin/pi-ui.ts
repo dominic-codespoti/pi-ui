@@ -119,7 +119,13 @@ if (values.cwd) process.env.PI_CWD = resolve(values.cwd);
 
 // ── Start server ──────────────────────────────────────────────────────────────
 
-const serverPath = new URL('../server.ts', import.meta.url);
+// Prefer the pre-built bundle (present in npm-installed packages) over the raw
+// TypeScript source (used during development / after `bun run build:server`).
+const bundlePath = new URL('../server.bundle.js', import.meta.url);
+const serverPath = (await Bun.file(bundlePath).exists())
+  ? bundlePath
+  : new URL('../server.ts', import.meta.url);
+
 await import(serverPath.href);
 
 // ── Open browser (optional) ───────────────────────────────────────────────────

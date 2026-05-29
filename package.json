@@ -19,11 +19,12 @@
   "bin": {
     "pi-ui": "./bin/pi-ui.ts"
   },
-  "files": [
+    "files": [
     "bin/",
     "build/",
     "src/lib/",
-    "server.ts"
+    "server.ts",
+    "server.bundle.js"
   ],
   "scripts": {
     "dev": "vite dev",
@@ -34,7 +35,8 @@
     "lint": "eslint .",
     "format": "prettier --write .",
     "start": "bun --smol run bin/pi-ui.ts",
-    "prepublishOnly": "bun run build"
+    "build:server": "bun build ./server.ts --target bun --outfile ./server.bundle.js --minify --external './build/handler.js' --external '@earendil-works/pi-coding-agent' --external '@earendil-works/pi-ai' --external 'bcryptjs' --external 'jose'",
+    "prepublishOnly": "bun run build && bun run build:server"
   },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "^0.75.5",
