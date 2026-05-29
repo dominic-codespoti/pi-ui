@@ -33,7 +33,7 @@
     "check:server": "tsc --noEmit --project tsconfig.server.json",
     "lint": "eslint .",
     "format": "prettier --write .",
-    "start": "bun run bin/pi-ui.ts",
+    "start": "bun --smol run bin/pi-ui.ts",
     "prepublishOnly": "bun run build"
   },
   "dependencies": {
