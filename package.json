@@ -1,6 +1,6 @@
 {
   "name": "@thed24/pi-ui",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Web UI for the pi coding agent — runs in your browser, served from a Raspberry Pi or any Bun-capable machine.",
   "type": "module",
   "license": "MIT",

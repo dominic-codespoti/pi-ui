@@ -80,31 +80,23 @@ Examples:
 let password = values.password ?? process.env.PI_PASSWORD;
 
 if (!password) {
-  // Prompt interactively when attached to a TTY
-  if (process.stdin.isTTY) {
-    process.stdout.write('Password: ');
-    // Read one line from stdin with echo off
-    const { execSync } = await import('child_process');
-    try {
-      // stty -echo / +echo works on Linux & macOS
-      execSync('stty -echo', { stdio: ['inherit', 'inherit', 'inherit'] });
-      const chunks: Uint8Array[] = [];
-      for await (const chunk of process.stdin) {
-        chunks.push(chunk as Uint8Array);
-        if ((chunk as Buffer).includes('\n'.charCodeAt(0))) break;
-      }
-      execSync('stty echo', { stdio: ['inherit', 'inherit', 'inherit'] });
+  // Prompt interactively — works in any TTY, no stty required.
+  // terminal:false suppresses echo (ideal for passwords) and is
+  // natively supported by Bun's readline implementation.
+  const { createInterface } = await import('readline');
+  const rl = createInterface({ input: process.stdin, terminal: false });
+
+  process.stdout.write('Password: ');
+  password = await new Promise<string>((resolve) => {
+    rl.once('line', (line) => {
       process.stdout.write('\n');
-      password = Buffer.concat(chunks).toString().trimEnd();
-    } catch {
-      // stty not available (e.g. CI) — fall through to error below
-      execSync('stty echo', { stdio: ['inherit', 'inherit', 'inherit'] });
-    }
-  }
+      rl.close();
+      resolve(line.trim());
+    });
+  });
 
   if (!password) {
-    console.error('Error: password is required.');
-    console.error('  Use --password <password>, or set the PI_PASSWORD environment variable.');
+    console.error('Error: password cannot be empty.');
     process.exit(1);
   }
 }
