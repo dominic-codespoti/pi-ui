@@ -3,7 +3,7 @@
  *
  * Responsibilities:
  *  1. Validate PI_PASSWORD env var and initialise the bcrypt hash
- *  2. Start the pi coding-agent session (singleton for the process lifetime)
+ *  2. Start the pi coding-agent session lazily on first WebSocket connection
  *  3. Bridge pi SDK events → all connected WebSocket clients via pub/sub
  *  4. Handle WebSocket upgrades at /ws (auth-gated)
  *  5. Handle session switching and model changes
@@ -13,11 +13,11 @@
  * Build first: bun run build
  */
 
-import { createAgentSession, SessionManager, DefaultResourceLoader, getAgentDir } from '@earendil-works/pi-coding-agent';
+import type * as PiSDKNS from '@earendil-works/pi-coding-agent';
 import type { AgentSession, ExtensionUIContext } from '@earendil-works/pi-coding-agent';
 import type { Model } from '@earendil-works/pi-ai';
 import { rm, mkdir, writeFile } from 'node:fs/promises';
-import { join, resolve, basename, extname } from 'node:path';
+import { join, resolve, basename } from 'node:path';
 import { initPassword, isValidSessionCookie } from './src/lib/auth/password.ts';
 import type { ClientMessage, ModelInfo, ProviderInfo, SessionSummary, SkillSummary, PromptSummary } from './src/lib/ws/protocol.ts';
 
@@ -64,7 +64,7 @@ function serializeModel(model: Model<any> | undefined | null): ModelInfo | null 
 }
 
 function getProviders(): ProviderInfo[] {
-  const allModels = session.modelRegistry.getAll();
+  const allModels = session!.modelRegistry.getAll();
   const providerCount = new Map<string, number>();
   for (const m of allModels) {
     providerCount.set(m.provider, (providerCount.get(m.provider) ?? 0) + 1);
@@ -72,10 +72,10 @@ function getProviders(): ProviderInfo[] {
 
   const providers: ProviderInfo[] = [];
   for (const [providerId, modelCount] of providerCount) {
-    const status = session.modelRegistry.getProviderAuthStatus(providerId);
+    const status = session!.modelRegistry.getProviderAuthStatus(providerId);
     providers.push({
       id: providerId,
-      name: session.modelRegistry.getProviderDisplayName(providerId),
+      name: session!.modelRegistry.getProviderDisplayName(providerId),
       configured: status.configured,
       source: status.source,
       modelCount,
@@ -118,14 +118,15 @@ function resolveGitHubRawUrl(url: string): string {
   return url;
 }
 
-function serializeSession(s: Awaited<ReturnType<typeof SessionManager.list>>[number]): SessionSummary {
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function serializeSession(s: Record<string, any>): SessionSummary {
   return {
     id: s.id,
     path: s.path,
     cwd: s.cwd,
     name: s.name,
-    created: s.created.getTime(),
-    modified: s.modified.getTime(),
+    created: s.created instanceof Date ? s.created.getTime() : s.created,
+    modified: s.modified instanceof Date ? s.modified.getTime() : s.modified,
     messageCount: s.messageCount,
     firstMessage: s.firstMessage,
   };
@@ -286,18 +287,46 @@ const uiContext: ExtensionUIContext = {
   },
 };
 
-// ── 4. Pi session — mutable singleton ────────────────────────────────────────
+// ── 4. Pi SDK — lazy-loaded singleton ────────────────────────────────────────
+//
+// The SDK static import alone costs ~136 MB of RSS. By deferring the dynamic
+// import until the first WebSocket connection, idle memory stays at ~32 MB
+// (bare Bun + auth). First connection may wait ~10 s during SDK + session init.
 
-console.log(`[pi-ui] Starting pi session in ${cwd} …`);
+let _sdk: typeof PiSDKNS | null = null;
+async function getSDK(): Promise<typeof PiSDKNS> {
+  if (!_sdk) {
+    console.log('[pi-ui] Loading pi SDK (first connection)…');
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    _sdk = await import('@earendil-works/pi-coding-agent') as any;
+    console.log('[pi-ui] Pi SDK loaded.');
+  }
+  return _sdk!;
+}
 
-// Resume the most recent session for this cwd (creates new one if none exists).
-const sm = SessionManager.continueRecent(cwd);
-let session: AgentSession = (await createAgentSession({ cwd, sessionManager: sm })).session;
+// Mutable session singleton — null until ensureSession() is first called.
+let session: AgentSession | null = null;
 let unsubscribePi: (() => void) | null = null;
-console.log(`[pi-ui] Pi session ready: ${session.sessionId}`);
 
-await session.bindExtensions({ uiContext });
-console.log('[pi-ui] Extension UI context bound.');
+/**
+ * Initialise (or return) the pi session. Loads the SDK and creates a session
+ * on demand. Safe to call concurrently — subsequent calls return immediately.
+ */
+async function ensureSession(): Promise<AgentSession> {
+  if (session) return session;
+  const sdk = await getSDK();
+  console.log(`[pi-ui] Starting pi session in ${cwd} …`);
+  const sm = sdk.SessionManager.continueRecent(cwd);
+  const result = await sdk.createAgentSession({ cwd, sessionManager: sm });
+  session = result.session;
+  console.log(`[pi-ui] Pi session ready: ${session.sessionId}`);
+  await session.bindExtensions({ uiContext });
+  console.log('[pi-ui] Extension UI context bound.');
+  unsubscribePi = session.subscribe((event) => {
+    broadcast(event);
+  });
+  return session;
+}
 
 /**
  * Switch the active session, rebind extensions, resubscribe, and broadcast state.
@@ -361,23 +390,26 @@ const server = Bun.serve<WSData>({
   },
 
   websocket: {
-    open(ws) {
+    async open(ws) {
       ws.subscribe(WS_TOPIC);
+
+      // Load SDK + session on first connection; subsequent calls return instantly.
+      const sess = await ensureSession();
 
       ws.send(
         JSON.stringify({
           type: 'connected',
-          sessionId: session.sessionId,
-          isStreaming: session.isStreaming,
-          thinkingLevel: session.thinkingLevel,
-          model: serializeModel(session.model),
-          availableModels: session.modelRegistry.getAvailable().map(serializeModel),
-          messages: session.messages,
+          sessionId: sess.sessionId,
+          isStreaming: sess.isStreaming,
+          thinkingLevel: sess.thinkingLevel,
+          model: serializeModel(sess.model),
+          availableModels: sess.modelRegistry.getAvailable().map(serializeModel),
+          messages: sess.messages,
           cwd,
-          sessionName: session.sessionManager.getSessionName(),
-          isCompacting: session.isCompacting,
-          autoCompactionEnabled: session.autoCompactionEnabled,
-          autoRetryEnabled: session.autoRetryEnabled,
+          sessionName: sess.sessionManager.getSessionName(),
+          isCompacting: sess.isCompacting,
+          autoCompactionEnabled: sess.autoCompactionEnabled,
+          autoRetryEnabled: sess.autoRetryEnabled,
         })
       );
     },
@@ -390,40 +422,43 @@ const server = Bun.serve<WSData>({
         return;
       }
 
+      // Ensure SDK + session are loaded before dispatching any command.
+      await ensureSession();
+
       try {
       switch (msg.type) {
         case 'prompt': {
           const imageContent = msg.images?.length
             ? msg.images.map((img) => ({ type: 'image' as const, data: img.data, mimeType: img.mimeType }))
             : undefined;
-          await session.prompt(msg.message, imageContent ? { images: imageContent } : undefined);
+          await session!.prompt(msg.message, imageContent ? { images: imageContent } : undefined);
           break;
         }
 
         case 'steer':
-          await session.steer(msg.message);
+          await session!.steer(msg.message);
           break;
 
         case 'follow_up':
-          await session.followUp(msg.message);
+          await session!.followUp(msg.message);
           break;
 
         case 'abort':
-          await session.abort();
+          await session!.abort();
           break;
 
         case 'set_thinking_level':
-          session.setThinkingLevel(msg.level as Parameters<typeof session.setThinkingLevel>[0]);
+          session!.setThinkingLevel(msg.level as Parameters<AgentSession['setThinkingLevel']>[0]);
           break;
 
         case 'set_model': {
-          const model = session.modelRegistry.find(msg.provider, msg.modelId);
+          const model = session!.modelRegistry.find(msg.provider, msg.modelId);
           if (!model) {
             console.warn(`[pi-ui] set_model: model not found: ${msg.provider}/${msg.modelId}`);
             break;
           }
           try {
-            await session.setModel(model);
+            await session!.setModel(model);
             broadcast({ type: 'model_changed', model: serializeModel(model) });
           } catch (err) {
             console.error('[pi-ui] set_model error:', err);
@@ -433,7 +468,7 @@ const server = Bun.serve<WSData>({
 
         case 'list_sessions': {
           try {
-            const list = await SessionManager.list(cwd);
+            const list = await _sdk!.SessionManager.list(cwd);
             const sessions = list.slice(0, 30).map(serializeSession);
             ws.send(JSON.stringify({ type: 'sessions_list', sessions }));
           } catch (err) {
@@ -446,11 +481,11 @@ const server = Bun.serve<WSData>({
         case 'new_session': {
           try {
             const targetCwd = (msg as { type: 'new_session'; targetCwd?: string }).targetCwd ?? cwd;
-            const sm = SessionManager.create(targetCwd);
-            const { session: newSession } = await createAgentSession({
+            const sm = _sdk!.SessionManager.create(targetCwd);
+            const { session: newSession } = await _sdk!.createAgentSession({
               cwd: targetCwd,
               sessionManager: sm,
-              modelRegistry: session.modelRegistry,
+              modelRegistry: session!.modelRegistry,
             });
             await setActiveSession(newSession);
           } catch (err) {
@@ -461,11 +496,11 @@ const server = Bun.serve<WSData>({
 
         case 'switch_session': {
           try {
-            const sm = SessionManager.open(msg.path);
-            const { session: newSession } = await createAgentSession({
+            const sm = _sdk!.SessionManager.open(msg.path);
+            const { session: newSession } = await _sdk!.createAgentSession({
               cwd: sm.getCwd() || cwd,
               sessionManager: sm,
-              modelRegistry: session.modelRegistry,
+              modelRegistry: session!.modelRegistry,
             });
             await setActiveSession(newSession);
           } catch (err) {
@@ -489,12 +524,12 @@ const server = Bun.serve<WSData>({
 
         case 'set_provider_key': {
           try {
-            session.modelRegistry.authStorage.set(msg.provider, { type: 'api_key', key: msg.key });
-            session.modelRegistry.refresh();
+            session!.modelRegistry.authStorage.set(msg.provider, { type: 'api_key', key: msg.key });
+            session!.modelRegistry.refresh();
             ws.send(JSON.stringify({ type: 'providers_list', providers: getProviders() }));
             broadcast({
               type: 'available_models_changed',
-              availableModels: session.modelRegistry.getAvailable().map(serializeModel),
+              availableModels: session!.modelRegistry.getAvailable().map(serializeModel),
             });
           } catch (err) {
             console.error('[pi-ui] set_provider_key error:', err);
@@ -505,12 +540,12 @@ const server = Bun.serve<WSData>({
 
         case 'remove_provider_key': {
           try {
-            session.modelRegistry.authStorage.remove(msg.provider);
-            session.modelRegistry.refresh();
+            session!.modelRegistry.authStorage.remove(msg.provider);
+            session!.modelRegistry.refresh();
             ws.send(JSON.stringify({ type: 'providers_list', providers: getProviders() }));
             broadcast({
               type: 'available_models_changed',
-              availableModels: session.modelRegistry.getAvailable().map(serializeModel),
+              availableModels: session!.modelRegistry.getAvailable().map(serializeModel),
             });
           } catch (err) {
             console.error('[pi-ui] remove_provider_key error:', err);
@@ -521,14 +556,14 @@ const server = Bun.serve<WSData>({
 
         case 'rename_session': {
           try {
-            const sm = SessionManager.open(msg.path);
+            const sm = _sdk!.SessionManager.open(msg.path);
             sm.appendSessionInfo(msg.name);
             // If renaming the active session, also fire the SDK event so all
             // connected browsers see the name change via session_info_changed.
-            if (msg.path === session.sessionFile) {
-              session.setSessionName(msg.name);
+            if (msg.path === session!.sessionFile) {
+              session!.setSessionName(msg.name);
             }
-            const list = await SessionManager.list(cwd);
+            const list = await _sdk!.SessionManager.list(cwd);
             ws.send(JSON.stringify({ type: 'sessions_list', sessions: list.slice(0, 30).map(serializeSession) }));
           } catch (err) {
             console.error('[pi-ui] rename_session error:', err);
@@ -540,10 +575,10 @@ const server = Bun.serve<WSData>({
         case 'rename_current_session': {
           try {
             // Set the name on the live session (emits session_info_changed to all browsers)
-            session.setSessionName(msg.name);
+            session!.setSessionName(msg.name);
             // Also persist it to the session file if available
-            if (session.sessionFile) {
-              const sm = SessionManager.open(session.sessionFile);
+            if (session!.sessionFile) {
+              const sm = _sdk!.SessionManager.open(session!.sessionFile);
               sm.appendSessionInfo(msg.name);
             }
           } catch (err) {
@@ -555,14 +590,14 @@ const server = Bun.serve<WSData>({
         case 'delete_session': {
           try {
             // Guard against deleting the active session
-            const list = await SessionManager.list(cwd);
+            const list = await _sdk!.SessionManager.list(cwd);
             const target = list.find((s) => s.path === msg.path);
-            if (target && target.id === session.sessionId) {
+            if (target && target.id === session!.sessionId) {
               ws.send(JSON.stringify({ type: 'sessions_error', message: 'Cannot delete the active session.' }));
               break;
             }
             await rm(msg.path);
-            const updated = await SessionManager.list(cwd);
+            const updated = await _sdk!.SessionManager.list(cwd);
             ws.send(JSON.stringify({ type: 'sessions_list', sessions: updated.slice(0, 30).map(serializeSession) }));
           } catch (err) {
             console.error('[pi-ui] delete_session error:', err);
@@ -573,7 +608,7 @@ const server = Bun.serve<WSData>({
 
         case 'get_all_sessions': {
           try {
-            const all = await SessionManager.listAll();
+            const all = await _sdk!.SessionManager.listAll();
             ws.send(JSON.stringify({ type: 'all_sessions_list', sessions: all.map(serializeSession) }));
           } catch (err) {
             console.error('[pi-ui] get_all_sessions error:', err);
@@ -608,25 +643,25 @@ const server = Bun.serve<WSData>({
         }
 
         case 'compact': {
-          session.compact().catch((err) => {
+          session!.compact().catch((err) => {
             console.error('[pi-ui] compact error:', err);
           });
           break;
         }
 
         case 'set_auto_compaction': {
-          session.setAutoCompactionEnabled(msg.enabled);
+          session!.setAutoCompactionEnabled(msg.enabled);
           break;
         }
 
         case 'set_auto_retry': {
-          session.setAutoRetryEnabled(msg.enabled);
+          session!.setAutoRetryEnabled(msg.enabled);
           break;
         }
 
         case 'get_fork_points': {
           try {
-            const entries = session.getUserMessagesForForking();
+            const entries = session!.getUserMessagesForForking();
             ws.send(JSON.stringify({ type: 'fork_points', entries }));
           } catch (err) {
             console.error('[pi-ui] get_fork_points error:', err);
@@ -637,8 +672,8 @@ const server = Bun.serve<WSData>({
 
         case 'get_tools': {
           try {
-            const allTools = session.getAllTools();
-            const activeNames = session.getActiveToolNames();
+            const allTools = session!.getAllTools();
+            const activeNames = session!.getActiveToolNames();
             ws.send(JSON.stringify({
               type: 'tools_list',
               tools: allTools.map((t) => ({
@@ -656,7 +691,7 @@ const server = Bun.serve<WSData>({
 
         case 'set_active_tools': {
           try {
-            session.setActiveToolsByName(msg.toolNames as string[]);
+            session!.setActiveToolsByName(msg.toolNames as string[]);
           } catch (err) {
             console.error('[pi-ui] set_active_tools error:', err);
           }
@@ -665,9 +700,9 @@ const server = Bun.serve<WSData>({
 
         case 'get_resources': {
           try {
-            const sessionCwd = session.sessionManager.getCwd() || cwd;
-            const agentDir = getAgentDir();
-            const loader = new DefaultResourceLoader({ cwd: sessionCwd, agentDir });
+            const sessionCwd = session!.sessionManager.getCwd() || cwd;
+            const agentDir = _sdk!.getAgentDir();
+            const loader = new _sdk!.DefaultResourceLoader({ cwd: sessionCwd, agentDir });
             await loader.reload();
             const { skills } = loader.getSkills();
             const { prompts } = loader.getPrompts();
@@ -705,9 +740,9 @@ const server = Bun.serve<WSData>({
             const content = await res.text();
             const fileName = basename(rawUrl.split('?')[0]);
             const safeFileName = fileName.endsWith('.md') ? fileName : `${fileName}.md`;
-            const sessionCwd = session.sessionManager.getCwd() || cwd;
+            const sessionCwd = session!.sessionManager.getCwd() || cwd;
             const destDir = (msg.scope as string) === 'user'
-              ? join(getAgentDir(), 'skills')
+              ? join(_sdk!.getAgentDir(), 'skills')
               : resolve(sessionCwd, PI_CONFIG_DIR, 'skills');
             await mkdir(destDir, { recursive: true });
             const destPath = join(destDir, safeFileName);
@@ -725,16 +760,16 @@ const server = Bun.serve<WSData>({
 
         case 'fork_session': {
           try {
-            const newPath = session.sessionManager.createBranchedSession(msg.entryId);
+            const newPath = session!.sessionManager.createBranchedSession(msg.entryId);
             if (!newPath) {
               ws.send(JSON.stringify({ type: 'sessions_error', message: 'Fork failed: session is not persisted.' }));
               break;
             }
-            const forkedSm = SessionManager.open(newPath);
-            const { session: forkedSession } = await createAgentSession({
+            const forkedSm = _sdk!.SessionManager.open(newPath);
+            const { session: forkedSession } = await _sdk!.createAgentSession({
               cwd: forkedSm.getCwd() || cwd,
               sessionManager: forkedSm,
-              modelRegistry: session.modelRegistry,
+              modelRegistry: session!.modelRegistry,
             });
             await setActiveSession(forkedSession);
           } catch (err) {
@@ -758,12 +793,9 @@ const server = Bun.serve<WSData>({
   },
 });
 
-// ── 6. Wire up broadcast and initial subscription ─────────────────────────────
+// ── 6. Wire up broadcast ──────────────────────────────────────────────────────
+// Session subscription is set up inside ensureSession() on first WS connection.
 
 broadcast = (payload) => server.publish(WS_TOPIC, JSON.stringify(payload));
-
-unsubscribePi = session.subscribe((event) => {
-  broadcast(event);
-});
 
 console.log(`[pi-ui] Listening on http://localhost:${PORT}`);
