@@ -103,6 +103,7 @@ export interface ConnectedMessage {
  *   { type: "tools_list",              tools: Array<{ name: string; description: string; isBuiltin: boolean }>, activeToolNames: string[] }
  *   { type: "resources_list",          skills: SkillSummary[], prompts: PromptSummary[] }
  *   { type: "skill_install_result",    success: boolean; name?: string; error?: string }
+ *   { type: "server_restarting" }
  *
  * SDK events the browser must handle:
  *   { type: "agent_start" }
@@ -176,4 +177,6 @@ export type ClientMessage =
    * write it to either the project or user skills directory.
    * Server replies with skill_install_result.
    */
-  | { type: 'install_skill'; url: string; scope: 'project' | 'user' };
+  | { type: 'install_skill'; url: string; scope: 'project' | 'user' }
+  /** Restart the server process in-place (re-exec with same args + env). */
+  | { type: 'restart_server' };

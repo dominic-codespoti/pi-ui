@@ -249,6 +249,8 @@
   );
   let isStreaming = $state(false);
   let wsState = $state<'connecting' | 'open' | 'closed'>('connecting');
+  /** True from server_restarting until the WS successfully reconnects. */
+  let isRestarting = $state(false);
   let sessionId = $state<string | null>(null);
   let thinkingLevel = $state('off');
   let model = $state<ModelInfo | null>(null);
@@ -521,6 +523,7 @@
 
     ws.onopen = () => {
       wsState = 'open';
+      isRestarting = false;
       if (reconnectTimer) clearTimeout(reconnectTimer);
     };
 
@@ -997,6 +1000,11 @@
 
       case 'dir_completions': {
         dirCompletions = ((msg as { type: string; entries: string[] }).entries) ?? [];
+        break;
+      }
+
+      case 'server_restarting': {
+        isRestarting = true;
         break;
       }
     }
@@ -1573,6 +1581,10 @@
   function toggleAutoRetry() {
     autoRetryEnabled = !autoRetryEnabled; // optimistic
     send({ type: 'set_auto_retry', enabled: autoRetryEnabled });
+  }
+
+  function restartServer() {
+    send({ type: 'restart_server' });
   }
 
   function toggleTool(toolName: string) {
@@ -2899,6 +2911,17 @@
             <span class="absolute top-0.5 w-4 h-4 bg-white rounded-full shadow-sm transition-all {autoRetryEnabled ? 'left-[1.125rem]' : 'left-0.5'}"></span>
           </button>
         </div>
+        <p class="text-xs text-base-content/40 uppercase tracking-wider pt-1">server</p>
+        <div class="flex items-center gap-3">
+          <span class="flex-1 text-sm text-base-content/55">restart server</span>
+          <button
+            onclick={restartServer}
+            class="px-3 py-1 text-xs rounded-lg transition-colors {wsState === 'open' ? 'text-error/70 hover:text-error hover:bg-error/10' : 'text-base-content/25 cursor-default'}"
+            tabindex={showModelPicker ? 0 : -1}
+            disabled={wsState !== 'open'}
+            aria-label="Restart server"
+          >restart</button>
+        </div>
       </div>
 
     </div>
@@ -2916,6 +2939,14 @@
   </div>
 
 </div>
+
+<!-- ── Restarting overlay ───────────────────────────────────────────────────── -->
+{#if isRestarting}
+  <div class="fixed inset-0 z-50 flex flex-col items-center justify-center bg-base-100/90 backdrop-blur-sm gap-3">
+    <p class="font-mono text-base-content/70 text-sm">restarting server…</p>
+    <p class="font-mono text-base-content/35 text-xs">reconnecting automatically</p>
+  </div>
+{/if}
 
 <!-- ── Toast notifications ─────────────────────────────────────────────────── -->
 {#if toasts.length > 0}

@@ -777,6 +777,21 @@ try {
           }
           break;
         }
+
+        case 'restart_server': {
+          console.log('[pifrontier] Restart requested — broadcasting and re-execing…');
+          broadcast({ type: 'server_restarting' });
+          // Give clients ~400 ms to receive the broadcast before the WS closes.
+          setTimeout(() => {
+            Bun.spawn([process.execPath, ...process.argv.slice(1)], {
+              env: process.env as Record<string, string>,
+              detached: true,
+              stdio: ['inherit', 'inherit', 'inherit'],
+            });
+            process.exit(0);
+          }, 400);
+          break;
+        }
       } // end switch
       } catch (err) {
         console.error('[pifrontier] WS message handler error:', err);
