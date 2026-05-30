@@ -1584,6 +1584,7 @@
   }
 
   function restartServer() {
+    if (!confirm('Restart the server? The page will reconnect automatically in a few seconds.')) return;
     send({ type: 'restart_server' });
   }
 
