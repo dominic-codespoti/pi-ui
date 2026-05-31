@@ -367,6 +367,14 @@ async function setActiveSession(newSession: AgentSession) {
 
 const PORT = parseInt(Bun.env.PORT ?? '3000');
 
+/** Bun pub/sub topic shared by all connected WebSocket clients. */
+const WS_TOPIC = 'pi';
+
+/** Per-connection WebSocket data. */
+interface WSData {
+  connectedAt: number;
+}
+
 let server: ReturnType<typeof Bun.serve>;
 try {
   server = Bun.serve<WSData>({
