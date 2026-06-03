@@ -1,3 +1,4 @@
 #!/bin/sh
-SELF=$(readlink -f "$0")
-exec bun "$(dirname "$SELF")/pifrontier.ts" "$@"
+# POSIX-compatible — works on macOS (BSD readlink) and Linux (GNU readlink).
+SELF_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+exec bun "$SELF_DIR/pifrontier.ts" "$@"

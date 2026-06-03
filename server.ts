@@ -61,7 +61,14 @@ console.log('[pifrontier] Password initialised.');
 
 // ── 2. Helpers ────────────────────────────────────────────────────────────────
 
+import { existsSync } from 'node:fs';
+
 const cwd = Bun.env.PI_CWD ?? process.cwd();
+if (!existsSync(cwd)) {
+  console.error(`[pifrontier] Error: working directory does not exist: ${cwd}`);
+  console.error('[pifrontier] Set PI_CWD to a valid directory or run from the target project.');
+  process.exit(1);
+}
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function serializeModel(model: Model<any> | undefined | null): ModelInfo | null {
@@ -361,25 +368,32 @@ async function getSDK(): Promise<typeof PiSDKNS> {
 // Mutable session singleton — null until ensureSession() is first called.
 let session: AgentSession | null = null;
 let unsubscribePi: (() => void) | null = null;
+// Promise lock — prevents concurrent first-connection races from creating duplicate sessions.
+let _sessionInitPromise: Promise<AgentSession> | null = null;
 
 /**
  * Initialise (or return) the pi session. Loads the SDK and creates a session
- * on demand. Safe to call concurrently — subsequent calls return immediately.
+ * on demand. Concurrent calls share the same initialisation promise.
  */
 async function ensureSession(): Promise<AgentSession> {
   if (session) return session;
-  const sdk = await getSDK();
-  console.log(`[pifrontier] Starting pi session in ${cwd} …`);
-  const sm = sdk.SessionManager.continueRecent(cwd);
-  const result = await sdk.createAgentSession({ cwd, sessionManager: sm });
-  session = result.session;
-  console.log(`[pifrontier] Pi session ready: ${session.sessionId}`);
-  await session.bindExtensions({ uiContext });
-  console.log('[pifrontier] Extension UI context bound.');
-  unsubscribePi = session.subscribe((event) => {
-    broadcast(event);
-  });
-  return session;
+  if (!_sessionInitPromise) {
+    _sessionInitPromise = (async () => {
+      const sdk = await getSDK();
+      console.log(`[pifrontier] Starting pi session in ${cwd} …`);
+      const sm = sdk.SessionManager.continueRecent(cwd);
+      const result = await sdk.createAgentSession({ cwd, sessionManager: sm });
+      session = result.session;
+      console.log(`[pifrontier] Pi session ready: ${session.sessionId}`);
+      await session.bindExtensions({ uiContext });
+      console.log('[pifrontier] Extension UI context bound.');
+      unsubscribePi = session.subscribe((event) => {
+        broadcast(event);
+      });
+      return session;
+    })();
+  }
+  return _sessionInitPromise;
 }
 
 /**
@@ -555,19 +569,34 @@ try {
       try {
       switch (msg.type) {
         case 'prompt': {
-          const imageContent = msg.images?.length
-            ? msg.images.map((img) => ({ type: 'image' as const, data: img.data, mimeType: img.mimeType }))
-            : undefined;
-          await session!.prompt(msg.message, imageContent ? { images: imageContent } : undefined);
+          try {
+            const imageContent = msg.images?.length
+              ? msg.images.map((img) => ({ type: 'image' as const, data: img.data, mimeType: img.mimeType }))
+              : undefined;
+            await session!.prompt(msg.message, imageContent ? { images: imageContent } : undefined);
+          } catch (err) {
+            console.error('[pifrontier] prompt error:', err);
+            ws.send(JSON.stringify({ type: 'agent_error', error: String(err) }));
+          }
           break;
         }
 
         case 'steer':
-          await session!.steer(msg.message);
+          try {
+            await session!.steer(msg.message);
+          } catch (err) {
+            console.error('[pifrontier] steer error:', err);
+            ws.send(JSON.stringify({ type: 'agent_error', error: String(err) }));
+          }
           break;
 
         case 'follow_up':
-          await session!.followUp(msg.message);
+          try {
+            await session!.followUp(msg.message);
+          } catch (err) {
+            console.error('[pifrontier] followUp error:', err);
+            ws.send(JSON.stringify({ type: 'agent_error', error: String(err) }));
+          }
           break;
 
         case 'abort':

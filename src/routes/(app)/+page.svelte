@@ -827,8 +827,8 @@
     ws.onmessage = ({ data }: MessageEvent<string>) => {
       try {
         handleServer(JSON.parse(data) as ServerMessage);
-      } catch {
-        // ignore malformed frames
+      } catch (e) {
+        console.warn('[pi-ui] Failed to parse WS message:', e);
       }
     };
 
@@ -1018,6 +1018,15 @@
           // autoSpeak is off but conversation mode is on: restart STT directly after response
           toggleSTT();
         }
+        break;
+      }
+
+      case 'agent_error': {
+        // Server-side error during prompt/steer/followUp — unfreeze the UI.
+        isStreaming = false;
+        sealStreaming();
+        const errMsg = (msg as { error?: string }).error ?? 'Unknown error';
+        addToast(`Agent error: ${errMsg}`, 'error');
         break;
       }
 
@@ -2730,7 +2739,17 @@
       class="flex-1 overflow-y-auto scroll-container-mobile pb-4 bg-base-100 rounded-none sm:rounded-xl"
       style="overflow-anchor: none; overscroll-behavior: contain;"
     >
-      {#if messages.length === 0 && wsState === 'open'}
+      {#if messages.length === 0 && wsState === 'connecting'}
+        <div class="min-h-full flex flex-col items-center justify-center gap-3 select-none pointer-events-none">
+          <span class="text-8xl font-light text-base-content/[0.08] animate-pulse">π</span>
+          <p class="text-sm text-base-content/30">connecting…</p>
+        </div>
+      {:else if messages.length === 0 && wsState === 'open' && !sessionId}
+        <div class="min-h-full flex flex-col items-center justify-center gap-3 select-none pointer-events-none">
+          <span class="text-8xl font-light text-base-content/[0.08] animate-pulse">π</span>
+          <p class="text-sm text-base-content/30">loading session…</p>
+        </div>
+      {:else if messages.length === 0 && wsState === 'open'}
         <div class="min-h-full flex flex-col items-center justify-center gap-3 select-none pointer-events-none">
           <span class="text-8xl font-light text-base-content/[0.08]">π</span>
           <p class="text-sm text-base-content/30">start a conversation</p>
