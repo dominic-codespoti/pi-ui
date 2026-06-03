@@ -32,12 +32,8 @@ export default [
   },
   {
     rules: {
-      // New in eslint-plugin-svelte 3 — disable for pre-existing code patterns
-      'svelte/prefer-svelte-reactivity': 'off',
-      'svelte/prefer-writable-derived': 'off',
-      'svelte/require-each-key': 'off',
+      // New in eslint-plugin-svelte 3 — keep no-at-html-tags off (intentional @html for syntax highlighting)
       'svelte/no-at-html-tags': 'off',
-      'svelte/no-navigation-without-resolve': 'off',
     },
   },
 ];

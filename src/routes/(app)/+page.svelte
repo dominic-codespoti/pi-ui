@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy, tick } from 'svelte';
+  import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 
   import type { ServerMessage, ClientMessage, ModelInfo, ProviderInfo, SessionSummary, SkillSummary, PromptSummary } from '$lib/ws/protocol';
   import { renderMarkdown, highlightCode } from '$lib/markdown';
@@ -605,7 +606,7 @@
 
   /** allSessions grouped by cwd, sorted by most-recently-modified first. */
   const projects = $derived.by<ProjectGroup[]>(() => {
-    const map = new Map<string, SessionSummary[]>();
+    const map = new SvelteMap<string, SessionSummary[]>();
     for (const s of allSessions) {
       const key = s.cwd ?? '';
       if (!map.has(key)) map.set(key, []);
@@ -716,7 +717,7 @@
   // ── Derived ──────────────────────────────────────────────────────────────────
 
   const modelsByProvider = $derived.by(() => {
-    const map = new Map<string, ModelInfo[]>();
+    const map = new SvelteMap<string, ModelInfo[]>();
     for (const m of availableModels) {
       if (!map.has(m.provider)) map.set(m.provider, []);
       map.get(m.provider)!.push(m);
@@ -864,7 +865,7 @@
     availableModels = payload.availableModels ?? [];
     // Build a map of toolCallId → { name, input } from assistant content blocks
     // so replayed toolResult messages can show their input args.
-    const toolInputMap = new Map<string, { name: string; input: Record<string, unknown> }>();
+    const toolInputMap = new SvelteMap<string, { name: string; input: Record<string, unknown> }>();
     for (const m of payload.messages ?? []) {
       const raw = m as Record<string, unknown>;
       if (raw.role === 'assistant' && Array.isArray(raw.content)) {
@@ -997,7 +998,7 @@
         isStreaming = false;
         sealStreaming();
         if (sessionId) {
-          const next = new Set(uncheckedSessions);
+          const next = new SvelteSet(uncheckedSessions);
           next.add(sessionId);
           uncheckedSessions = next;
         }
@@ -1465,7 +1466,7 @@
     // Clear unchecked for the session we're switching to
     const s = allSessions.find((s) => s.path === path);
     if (s && uncheckedSessions.has(s.id)) {
-      const next = new Set(uncheckedSessions);
+      const next = new SvelteSet(uncheckedSessions);
       next.delete(s.id);
       uncheckedSessions = next;
     }
@@ -1502,14 +1503,14 @@
   }
 
   function toggleDir(cwd: string) {
-    const next = new Set(collapsedDirs);
+    const next = new SvelteSet(collapsedDirs);
     if (next.has(cwd)) next.delete(cwd);
     else next.add(cwd);
     collapsedDirs = next;
   }
 
   function toggleSessionGroup(cwd: string) {
-    const next = new Set(expandedSessionGroups);
+    const next = new SvelteSet(expandedSessionGroups);
     if (next.has(cwd)) next.delete(cwd);
     else next.add(cwd);
     expandedSessionGroups = next;
@@ -2424,7 +2425,7 @@
           </div>
         {:else}
           <div class="flex flex-col pt-1 gap-2">
-            {#each filteredTree as p}
+            {#each filteredTree as p (p.cwd)}
               {@const isDirActive = p.cwd === cwd}
               {@const dirCollapsed = collapsedDirs.has(p.cwd)}
               <!-- Directory header — collapsible + new-session action -->
@@ -2463,7 +2464,7 @@
                 <!-- Sessions nested under this directory -->
                 {#if !dirCollapsed}
                   <div class="ml-3 pl-3 pt-1.5 pb-1.5 border-l border-base-content/8 space-y-1">
-                    {#each visibleSessions(p) as s}
+                    {#each visibleSessions(p) as s (s.id)}
                       {@const isActive = sessionId === s.id}
                       {@const isRenaming = renamingPath === s.path}
                       {@const hasUnchecked = uncheckedSessions.has(s.id)}
@@ -2588,7 +2589,7 @@
             />
             {#if dirCompletions.length > 0}
               <div class="mt-1.5 flex flex-col gap-0.5">
-                {#each dirCompletions as entry}
+                {#each dirCompletions as entry (entry)}
                   <button
                     onclick={() => { openFolderInput = entry; dirCompletions = []; }}
                     class="text-left text-xs text-base-content/60 hover:text-base-content/90 py-1 px-1 rounded hover:bg-base-content/8 transition-colors truncate"
@@ -2747,7 +2748,7 @@
                   <div class="bg-base-content/[0.10] rounded-none sm:rounded-lg sm:rounded-br-sm px-3 py-2 space-y-1">
                     {#if msg.images?.length}
                       <div class="flex gap-2 flex-wrap -mx-1">
-                        {#each msg.images as src}
+                        {#each msg.images as src (src)}
                           <img {src} alt="attachment" class="max-h-48 max-w-full rounded-lg object-contain" />
                         {/each}
                       </div>
@@ -2954,13 +2955,13 @@
       <div class="w-full max-w-3xl lg:max-w-5xl xl:max-w-6xl 2xl:max-w-7xl mx-auto px-3 md:px-6">
       {#if queuedSteering.length > 0 || queuedFollowUp.length > 0}
         <div class="flex flex-wrap gap-1.5 mb-2 px-1">
-          {#each queuedSteering as m}
+          {#each queuedSteering as m (m)}
             <span class="inline-flex items-center gap-1 text-xs text-base-content/40 bg-base-content/6 px-2 py-1 rounded-lg max-w-[16rem] truncate" title="Queued steer: {m}">
               <svg class="w-2.5 h-2.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
               <span class="truncate">{m}</span>
             </span>
           {/each}
-          {#each queuedFollowUp as m}
+          {#each queuedFollowUp as m (m)}
             <span class="inline-flex items-center gap-1 text-xs text-base-content/35 bg-base-content/5 px-2 py-1 rounded-lg max-w-[16rem] truncate" title="Queued follow-up: {m}">
               <svg class="w-2.5 h-2.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
               <span class="truncate">{m}</span>
@@ -2972,7 +2973,7 @@
       <!-- Extension widget panels -->
       {#if Object.keys(extensionWidgets).length > 0}
         <div class="mb-2 flex flex-col gap-1">
-          {#each Object.entries(extensionWidgets) as [_key, lines]}
+          {#each Object.entries(extensionWidgets) as [_key, lines] (_key)}
             <div class="bg-base-content/5 rounded-xl px-3 py-2 text-xs text-base-content/45 font-mono whitespace-pre-wrap leading-relaxed">{lines.join('\n')}</div>
           {/each}
         </div>
@@ -2983,7 +2984,7 @@
         {#if showSlashMenu && filteredSlashCommands.length > 0}
           <div class="absolute bottom-full left-0 right-0 mb-1 z-10">
             <div class="bg-base-200 border border-base-content/10 rounded-xl overflow-hidden shadow-lg max-h-60 overflow-y-auto" role="listbox" aria-label="Composer shortcuts">
-              {#each filteredSlashCommands as cmd, i}
+              {#each filteredSlashCommands as cmd, i (cmd.label ?? i)}
                 <button
                   onclick={() => selectSlashCommand(cmd)}
                   role="option"
@@ -3289,7 +3290,7 @@
         {#if model?.reasoning}          <div class="shrink-0 px-5 py-3.5 border-b border-base-content/8">
             <p class="text-[10px] text-base-content/35 uppercase tracking-[0.12em] mb-3 font-semibold">thinking</p>
             <div class="flex flex-wrap gap-1.5">
-              {#each ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'] as lvl}
+              {#each ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'] as lvl (lvl)}
                 <button
                   onclick={() => pickThinkingLevel(lvl)}
                   class="px-2.5 py-1 text-xs font-medium rounded-md border transition-all duration-150 {thinkingLevel === lvl ? 'border-primary/60 text-primary bg-primary/10 shadow-[0_0_10px_-2px_var(--color-primary)/0.25]' : 'border-base-content/12 text-base-content/40 hover:border-base-content/30 hover:text-base-content/70 hover:bg-base-content/5'}"
@@ -3324,7 +3325,7 @@
                 <p class="text-xs text-base-content/20">no match</p>
               </div>
             {:else}
-              {#each filteredModelsByProvider as [provider, models]}
+              {#each filteredModelsByProvider as [provider, models] (provider)}
                 <div>
                   <div class="sticky top-0 z-10 bg-base-200 px-5 py-2 flex items-center gap-2 border-b border-base-content/6">
                     <span
@@ -3334,7 +3335,7 @@
                     >{provider[0].toUpperCase()}</span>
                     <span class="text-[10px] text-base-content/35 uppercase tracking-[0.1em] font-semibold">{provider}</span>
                   </div>
-                  {#each models as m}
+                  {#each models as m (m.id)}
                     {@const isActive = model?.id === m.id && model?.provider === m.provider}
                     <button
                       onclick={() => selectModel(m)}
@@ -3387,7 +3388,7 @@
                 <p class="text-xs text-base-content/20">no match</p>
               </div>
             {:else}
-              {#each filteredProviders as p}
+              {#each filteredProviders as p (p.id)}
                 {@const isCurrentProvider = model?.provider === p.id}
                 {@const label = sourceLabel(p.source)}
                 <div class="px-5 py-3 border-b border-base-content/6 transition-colors duration-150 {isCurrentProvider ? 'bg-primary/[0.04]' : 'hover:bg-base-content/[0.02]'}">
@@ -3462,7 +3463,7 @@
                 <span class="inline-flex items-center justify-center w-3.5 h-3.5 rounded-[3px] text-[8px] text-white font-bold leading-none select-none shrink-0 bg-base-content/30" aria-hidden="true">B</span>
                 <span class="text-[10px] text-base-content/35 uppercase tracking-[0.1em] font-semibold">built-in</span>
               </div>
-              {#each builtinTools as tool}
+              {#each builtinTools as tool (tool.name)}
                 {@const isActive = activeToolNames.includes(tool.name)}
                 <button
                   onclick={() => toggleTool(tool.name)}
@@ -3486,7 +3487,7 @@
                 <span class="inline-flex items-center justify-center w-3.5 h-3.5 rounded-[3px] text-[8px] text-white font-bold leading-none select-none shrink-0 bg-primary/70" aria-hidden="true">C</span>
                 <span class="text-[10px] text-base-content/35 uppercase tracking-[0.1em] font-semibold">custom</span>
               </div>
-              {#each customTools as tool}
+              {#each customTools as tool (tool.name)}
                 {@const isActive = activeToolNames.includes(tool.name)}
                 <button
                   onclick={() => toggleTool(tool.name)}
@@ -3576,7 +3577,7 @@
                   <span class="inline-flex items-center justify-center w-3.5 h-3.5 rounded-[3px] text-[8px] text-white font-bold leading-none select-none shrink-0 bg-primary/70" aria-hidden="true">P</span>
                   <span class="text-[10px] text-base-content/35 uppercase tracking-[0.1em] font-semibold">project skills</span>
                 </div>
-                {#each projectSkills as skill}{@render skillItem(skill)}{/each}
+                {#each projectSkills as skill (skill.name)}{@render skillItem(skill)}{/each}
               {/if}
 
               {#if userSkills.length > 0}
@@ -3584,7 +3585,7 @@
                   <span class="inline-flex items-center justify-center w-3.5 h-3.5 rounded-[3px] text-[8px] text-white font-bold leading-none select-none shrink-0 bg-accent/70" aria-hidden="true">U</span>
                   <span class="text-[10px] text-base-content/35 uppercase tracking-[0.1em] font-semibold">user skills</span>
                 </div>
-                {#each userSkills as skill}{@render skillItem(skill)}{/each}
+                {#each userSkills as skill (skill.name)}{@render skillItem(skill)}{/each}
               {/if}
 
               {#if builtinSkills.length > 0}
@@ -3593,7 +3594,7 @@
                   <span class="text-[10px] text-base-content/35 uppercase tracking-[0.1em] font-semibold">built-in skills</span>
                 </div>
                 <div class="opacity-70">
-                  {#each builtinSkills as skill}{@render skillItem(skill)}{/each}
+                  {#each builtinSkills as skill (skill.name)}{@render skillItem(skill)}{/each}
                 </div>
               {/if}
             {/if}
@@ -3608,7 +3609,7 @@
                   <span class="inline-flex items-center justify-center w-3.5 h-3.5 rounded-[3px] text-[8px] text-white font-bold leading-none select-none shrink-0 bg-primary/70" aria-hidden="true">P</span>
                   <span class="text-[10px] text-base-content/35 uppercase tracking-[0.1em] font-semibold">project prompts</span>
                 </div>
-                {#each projectPrompts as prompt}
+                {#each projectPrompts as prompt (prompt.name)}
                   <div class="px-5 py-2.5 flex items-start gap-3 transition-colors hover:bg-base-content/[0.03]">
                     <span class="min-w-0 flex-1">
                       <span class="flex items-center gap-2 mb-0.5">
@@ -3632,7 +3633,7 @@
                   <span class="inline-flex items-center justify-center w-3.5 h-3.5 rounded-[3px] text-[8px] text-white font-bold leading-none select-none shrink-0 bg-accent/70" aria-hidden="true">U</span>
                   <span class="text-[10px] text-base-content/35 uppercase tracking-[0.1em] font-semibold">user prompts</span>
                 </div>
-                {#each userPrompts as prompt}
+                {#each userPrompts as prompt (prompt.name)}
                   <div class="px-5 py-2.5 flex items-start gap-3 transition-colors hover:bg-base-content/[0.03]">
                     <span class="min-w-0 flex-1">
                       <span class="flex items-center gap-2 mb-0.5">
@@ -3657,7 +3658,7 @@
                   <span class="text-[10px] text-base-content/35 uppercase tracking-[0.1em] font-semibold">built-in prompts</span>
                 </div>
                 <div class="opacity-70">
-                  {#each builtinPrompts as prompt}
+                  {#each builtinPrompts as prompt (prompt.name)}
                     <div class="px-5 py-2.5 flex items-start gap-3 transition-colors hover:bg-base-content/[0.03]">
                       <span class="min-w-0 flex-1">
                         <span class="flex items-center gap-2 mb-0.5">
@@ -3726,7 +3727,7 @@
             <p class="text-xs text-base-content/35 mt-0.5">pi-ui preferences</p>
           </div>
           <nav class="flex-1 p-2 space-y-1">
-            {#each SETTINGS_SECTIONS as section}
+            {#each SETTINGS_SECTIONS as section (section.id)}
               <button
                 onclick={() => (settingsSection = section.id)}
                 class="w-full flex items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm transition-colors {settingsSection === section.id ? 'bg-base-content/10 text-base-content' : 'text-base-content/62 hover:text-base-content/85 hover:bg-base-content/[0.055]'}"
@@ -3748,7 +3749,7 @@
                 {SETTINGS_SECTIONS.find((s) => s.id === settingsSection)?.label ?? 'Settings'}
               </Select.Trigger>
               <Select.Content>
-                {#each SETTINGS_SECTIONS as section}
+                {#each SETTINGS_SECTIONS as section (section.id)}
                   <Select.Item value={section.id}>{section.label}</Select.Item>
                 {/each}
               </Select.Content>
@@ -3807,7 +3808,7 @@
                       <Select.Root type="single" value={selectedVoiceURI} onValueChange={(v: string) => { selectedVoiceURI = v; try { localStorage.setItem('pifrontier:voice-uri', v); } catch { /* localStorage unavailable */ } }}>
                         <Select.Trigger size="sm" class="w-56 text-xs" disabled={speechVoices.length === 0}>{selectedVoice()?.name ?? 'Default voice'}</Select.Trigger>
                         <Select.Content>
-                          {#each speechVoices as voice}
+                          {#each speechVoices as voice (voice.voiceURI)}
                             <Select.Item value={voice.voiceURI}>{voice.name} {voice.lang ? `(${voice.lang})` : ''}</Select.Item>
                           {/each}
                         </Select.Content>
@@ -3830,7 +3831,7 @@
               {:else if settingsSection === 'shortcuts'}
                 <Card.Root size="sm" class="py-0 overflow-hidden bg-base-100/60 border-base-content/10">
                   <div class="divide-y divide-base-content/8">
-                    {#each SHORTCUTS as shortcut}
+                    {#each SHORTCUTS as shortcut (shortcut.keys)}
                       <div class="flex items-center gap-4 px-4 py-3">
                         <kbd class="min-w-32 rounded-lg border border-base-content/12 bg-base-content/[0.055] px-2 py-1 text-xs text-base-content/60 font-mono">{shortcut.keys}</kbd>
                         <span class="text-sm text-base-content/70">{shortcut.action}</span>
@@ -3916,7 +3917,7 @@
       <input bind:this={modalFocusEl} type="text" bind:value={modalInput} placeholder={modal.placeholder ?? ''} class="w-full bg-transparent border-b border-border focus:border-foreground/60 outline-none py-2 text-sm placeholder-muted-foreground transition-colors" />
     {:else if modal?.method === 'select'}
       <div class="space-y-1 max-h-60 overflow-y-auto">
-        {#each modal.options as opt}
+        {#each modal.options as opt (opt)}
           <button class="w-full text-left px-3 py-2.5 rounded-lg text-sm text-muted-foreground hover:bg-accent hover:text-accent-foreground transition-colors" onclick={() => modalSelectOption(opt)}>{opt}</button>
         {/each}
       </div>
@@ -3952,7 +3953,7 @@
       <p class="text-sm text-muted-foreground py-4 text-center">No user messages found in this session.</p>
     {:else}
       <div class="space-y-1 max-h-64 overflow-y-auto">
-        {#each forkPoints as fp}
+        {#each forkPoints as fp (fp.entryId)}
           <button
             onclick={() => forkAt(fp.entryId)}
             class="w-full text-left px-3 py-2.5 rounded-lg text-sm text-muted-foreground hover:bg-accent hover:text-accent-foreground transition-colors leading-snug truncate"

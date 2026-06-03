@@ -1,6 +1,7 @@
 <script lang="ts">
   import { highlightCode } from '$lib/markdown';
   import { parseDiff } from '$lib/diff-parser';
+  import { SvelteSet } from 'svelte/reactivity';
 
   const { diff }: { diff: string } = $props();
 
@@ -9,17 +10,17 @@
   const totalDeletions = $derived(parsed.reduce((s, f) => s + f.deletions, 0));
 
   /** Set of expanded file paths (all expanded by default). */
-  let expandedFiles = $state<Set<string>>(new Set());
+  let expandedFiles = $state<Set<string>>(new SvelteSet());
   /** Copy feedback state. */
   let copied = $state(false);
 
   // Reset expanded state when diff changes
   $effect(() => {
-    expandedFiles = new Set(parsed.map((f) => f.newPath));
+    expandedFiles = new SvelteSet(parsed.map((f) => f.newPath));
   });
 
   function toggleFile(path: string) {
-    const next = new Set(expandedFiles);
+    const next = new SvelteSet(expandedFiles);
     if (next.has(path)) next.delete(path);
     else next.add(path);
     expandedFiles = next;
