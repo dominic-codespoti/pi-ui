@@ -1,4 +1,4 @@
-import { marked, type RendererObject } from 'marked';
+import { marked, type RendererObject, type TokenizerAndRendererExtension } from 'marked';
 import hljs from 'highlight.js/lib/core';
 
 // Register the languages most likely to appear in LLM output
@@ -92,9 +92,64 @@ const renderer: RendererObject = {
   },
 };
 
+// ── File path tokenizer ──────────────────────────────────────────────────────
+// Detects file paths in assistant text and renders them as clickable buttons.
+// Excludes URLs (http/https), code blocks, and markdown links.
+
+/** Pattern: relative/absolute file paths with optional :line or :line-range suffix */
+const FILE_PATH_RE = /(?<![:\w/])([./~]?[\w\-./]+\.[\w]{1,10})(?::(\d+)(?:-(\d+))?)?(?![:\w/])/g;
+
+/** Set of extensions to treat as file paths */
+const FILE_EXTS = new Set([
+  'ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs', 'mts', 'cts',
+  'py', 'pyi', 'pyx',
+  'rs', 'go', 'cs', 'java', 'kt', 'rb', 'php',
+  'sh', 'bash', 'zsh', 'fish',
+  'json', 'jsonl', 'json5',
+  'yaml', 'yml', 'toml', 'ini', 'cfg', 'conf',
+  'html', 'htm', 'xml', 'svg', 'vue', 'svelte',
+  'css', 'scss', 'less', 'styl',
+  'sql', 'graphql',
+  'md', 'mdx', 'txt', 'rst', 'log',
+  'env', 'gitignore', 'dockerignore',
+  'env.local', 'env.production',
+]);
+
+function isFilePath(raw: string): boolean {
+  const ext = raw.split('.').pop()?.toLowerCase() ?? '';
+  return FILE_EXTS.has(ext);
+}
+
+const fileLinkExtension: TokenizerAndRendererExtension = {
+  name: 'fileLink',
+  level: 'inline',
+  start(src) { return src.match(FILE_PATH_RE)?.index; },
+  tokenizer(src) {
+    FILE_PATH_RE.lastIndex = 0;
+    const match = FILE_PATH_RE.exec(src);
+    if (!match) return;
+    const raw = match[0];
+    const path = match[1];
+    if (!isFilePath(path)) return;
+    return {
+      type: 'fileLink',
+      raw,
+      path,
+      line: match[2] ? parseInt(match[2]) : undefined,
+      endLine: match[3] ? parseInt(match[3]) : undefined,
+    };
+  },
+  renderer(token) {
+    const t = token as unknown as { path: string; line?: number; endLine?: number };
+    const lineLabel = t.line ? `:${t.line}${t.endLine ? `-${t.endLine}` : ''}` : '';
+    return `<button class="file-link-btn" data-filepath="${escAttr(t.path)}" data-fileline="${t.line ?? ''}" type="button">${escAttr(t.path)}${lineLabel}</button>`;
+  },
+};
+
 marked.use({
   breaks: true,
   renderer,
+  extensions: [fileLinkExtension],
 });
 
 /**

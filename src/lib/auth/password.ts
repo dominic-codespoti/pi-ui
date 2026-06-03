@@ -17,8 +17,15 @@ export async function initPassword(plain: string): Promise<void> {
 }
 
 export async function verifyPassword(plain: string): Promise<boolean> {
-  const hash = (globalThis as Record<string, unknown>).__piHash as string | undefined;
-  if (!hash) return false;
+  let hash = (globalThis as Record<string, unknown>).__piHash as string | undefined;
+  if (!hash) {
+    // In dev mode (Vite process) initPassword() is never called explicitly.
+    // Auto-initialize from the env var so login works without a separate call.
+    const envPwd = process.env.PI_PASSWORD;
+    if (!envPwd) return false;
+    await initPassword(envPwd);
+    hash = (globalThis as Record<string, unknown>).__piHash as string;
+  }
   return bcrypt.compare(plain, hash);
 }
 

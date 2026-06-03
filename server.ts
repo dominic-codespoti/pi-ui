@@ -20,6 +20,18 @@ import { rm, mkdir, writeFile } from 'node:fs/promises';
 import { join, resolve, basename } from 'node:path';
 import { initPassword, isValidSessionCookie } from './src/lib/auth/password.ts';
 import type { ClientMessage, ModelInfo, ProviderInfo, SessionSummary, SkillSummary, PromptSummary } from './src/lib/ws/protocol.ts';
+import ownPkgJson from './package.json' with { type: 'json' };
+
+/** pi-ui version baked in at startup. */
+const UI_VERSION: string = (ownPkgJson as { version: string }).version;
+
+/** pi SDK version — resolved after lazy SDK load. */
+let PI_SDK_VERSION = 'unknown';
+
+// When DEV_WS_ONLY=true the server handles only /ws — HTTP is served by the
+// Vite dev server (localhost:VITE_PORT). This enables a dev workflow where
+// `vite dev` proxies /ws here while retaining full HMR for the frontend.
+const DEV_WS_ONLY = Bun.env.DEV_WS_ONLY === 'true';
 
 // Lazy-load the SvelteKit handler — avoids pulling the ~30 MB SK bundle into
 // memory at process start before any HTTP request arrives.
@@ -87,6 +99,35 @@ function getProviders(): ProviderInfo[] {
     if (a.configured !== b.configured) return a.configured ? -1 : 1;
     return a.name.localeCompare(b.name);
   });
+}
+
+function sendSlashResult(
+  ws: { send(data: string): void },
+  command: string,
+  message: string,
+  level: 'info' | 'warning' | 'error' = 'info'
+) {
+  ws.send(JSON.stringify({ type: 'slash_result', command, message, level }));
+}
+
+function formatTreeNode(node: { entry: { id: string; type: string; message?: unknown }; children: unknown[]; label?: string }, depth = 0): string[] {
+  const indent = '  '.repeat(depth);
+  const entry = node.entry;
+  let label = entry.type;
+  const msg = entry.message as { role?: string; content?: unknown } | undefined;
+  if (msg?.role) label = `${msg.role}`;
+  if (Array.isArray(msg?.content)) {
+    const text = msg.content.find((c) => typeof c === 'object' && c && 'text' in c) as { text?: string } | undefined;
+    if (text?.text) label += `: ${text.text.replace(/\s+/g, ' ').slice(0, 64)}`;
+  } else if (typeof msg?.content === 'string') {
+    label += `: ${msg.content.replace(/\s+/g, ' ').slice(0, 64)}`;
+  }
+  if (node.label) label += ` [${node.label}]`;
+  const lines = [`${indent}- ${label} (${entry.id.slice(0, 8)})`];
+  for (const child of node.children as Parameters<typeof formatTreeNode>[0][]) {
+    lines.push(...formatTreeNode(child, depth + 1));
+  }
+  return lines;
 }
 
 /** Pi config directory name — same as CONFIG_DIR_NAME in the SDK. */
@@ -300,6 +341,14 @@ async function getSDK(): Promise<typeof PiSDKNS> {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     _sdk = await import('@earendil-works/pi-coding-agent') as any;
     console.log('[pifrontier] Pi SDK loaded.');
+    // Resolve SDK version from its package.json (best-effort)
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const piPkg = await import('@earendil-works/pi-coding-agent/package.json', { with: { type: 'json' } }) as any;
+      PI_SDK_VERSION = piPkg.default?.version ?? piPkg.version ?? 'unknown';
+    } catch {
+      // Not critical — version display stays 'unknown'
+    }
   }
   return _sdk!;
 }
@@ -360,10 +409,72 @@ async function setActiveSession(newSession: AgentSession) {
     isCompacting: session.isCompacting,
     autoCompactionEnabled: session.autoCompactionEnabled,
     autoRetryEnabled: session.autoRetryEnabled,
+    piVersion: PI_SDK_VERSION,
+    uiVersion: UI_VERSION,
   });
 }
 
-// ── 5. Start server ───────────────────────────────────────────────────────────
+// ── 5. TTS summarisation helper ───────────────────────────────────────────────
+
+/**
+ * Spin up a temporary pi session, prompt it to summarise `content` into
+ * 1-2 spoken sentences, collect the streamed text, and send
+ * { type: 'tts_summary', text } back to the requesting WebSocket client.
+ *
+ * The session is immediately disposed on completion or error so it does not
+ * linger in memory. Tools are disabled to prevent any tool-use overhead.
+ */
+async function summarizeForTTS(content: string, ws: { send(data: string): void }): Promise<void> {
+  const sdk = await getSDK();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let sumSession: any = null;
+  try {
+    const sm = sdk.SessionManager.create(cwd);
+    const { session: s } = await sdk.createAgentSession({
+      cwd,
+      sessionManager: sm,
+      modelRegistry: session!.modelRegistry,
+    });
+    sumSession = s;
+
+    // Disable all tools — this is a pure text completion
+    sumSession.setActiveToolsByName([]);
+
+    let summary = '';
+    const done = new Promise<void>((resolve) => {
+      const unsub = sumSession!.subscribe((event: Record<string, unknown>) => {
+        if (event.type === 'message_update') {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const inner = (event as any).assistantMessageEvent as { type?: string; delta?: string } | undefined;
+          if (inner?.type === 'text_delta' && typeof inner.delta === 'string') {
+            summary += inner.delta;
+          }
+        } else if (event.type === 'agent_end') {
+          unsub();
+          resolve();
+        }
+      });
+    });
+
+    const prompt =
+      `Summarize the following AI assistant response in 1-2 short spoken sentences suitable for text-to-speech. ` +
+      `Skip all code snippets and technical specifics. Be natural and conversational.\n\nResponse:\n${content.slice(0, 3000)}`;
+
+    await sumSession.prompt(prompt);
+
+    // Await agent_end with a 30 s safety timeout
+    await Promise.race([done, new Promise<void>((r) => setTimeout(r, 30_000))]);
+
+    ws.send(JSON.stringify({ type: 'tts_summary', text: summary.trim() }));
+  } catch (err) {
+    console.error('[pifrontier] summarizeForTTS error:', err);
+    ws.send(JSON.stringify({ type: 'tts_summary', text: '' }));
+  } finally {
+    sumSession?.dispose();
+  }
+}
+
+// ── 6. Start server ───────────────────────────────────────────────────────────
 
 const PORT = parseInt(Bun.env.PORT ?? '3000');
 
@@ -393,7 +504,9 @@ try {
       return new Response('WebSocket upgrade failed', { status: 400 });
     }
 
-    return (await getSvelteHandler())(req, server);
+    return DEV_WS_ONLY
+      ? new Response('Use Vite dev server for HTTP in dev mode', { status: 404 })
+      : (await getSvelteHandler())(req, server);
   },
 
   websocket: {
@@ -417,6 +530,8 @@ try {
           isCompacting: sess.isCompacting,
           autoCompactionEnabled: sess.autoCompactionEnabled,
           autoRetryEnabled: sess.autoRetryEnabled,
+          piVersion: PI_SDK_VERSION,
+          uiVersion: UI_VERSION,
         })
       );
     },
@@ -649,6 +764,47 @@ try {
           break;
         }
 
+        case 'file_complete': {
+          try {
+            const query = ((msg as { type: 'file_complete'; query: string }).query ?? '').toLowerCase();
+            const { readdir } = await import('node:fs/promises');
+            const { join, relative } = await import('node:path');
+            const root = session!.sessionManager.getCwd() || cwd;
+            const skip = new Set(['.git', 'node_modules', '.svelte-kit', 'build', 'dist', '.cache']);
+            const entries: string[] = [];
+            const queue: Array<{ dir: string; depth: number }> = [{ dir: root, depth: 0 }];
+
+            while (queue.length > 0 && entries.length < 40) {
+              const item = queue.shift()!;
+              let dirents: Awaited<ReturnType<typeof readdir>>;
+              try {
+                dirents = await readdir(item.dir, { withFileTypes: true });
+              } catch {
+                continue;
+              }
+
+              for (const dirent of dirents) {
+                if (dirent.name.startsWith('.') && dirent.name !== '.env') continue;
+                if (skip.has(dirent.name)) continue;
+                const abs = join(item.dir, dirent.name);
+                const rel = relative(root, abs);
+                if (dirent.isFile() && (!query || rel.toLowerCase().includes(query))) {
+                  entries.push(rel);
+                  if (entries.length >= 40) break;
+                } else if (dirent.isDirectory() && item.depth < 3) {
+                  queue.push({ dir: abs, depth: item.depth + 1 });
+                }
+              }
+            }
+
+            ws.send(JSON.stringify({ type: 'file_completions', query, entries }));
+          } catch (err) {
+            console.error('[pifrontier] file_complete error:', err);
+            ws.send(JSON.stringify({ type: 'file_completions', query: '', entries: [] }));
+          }
+          break;
+        }
+
         case 'compact': {
           session!.compact().catch((err) => {
             console.error('[pifrontier] compact error:', err);
@@ -663,6 +819,120 @@ try {
 
         case 'set_auto_retry': {
           session!.setAutoRetryEnabled(msg.enabled);
+          break;
+        }
+
+        case 'run_builtin': {
+          const command = String((msg as { type: 'run_builtin'; command: string; args?: string }).command ?? '').toLowerCase();
+          const args = String((msg as { type: 'run_builtin'; command: string; args?: string }).args ?? '').trim();
+          try {
+            switch (command) {
+              case 'reload': {
+                await session!.reload();
+                sendSlashResult(ws, command, 'Reloaded extensions, skills, prompts, and tools.');
+                ws.send(JSON.stringify({
+                  type: 'tools_list',
+                  tools: session!.getAllTools().map((t) => ({
+                    name: t.name,
+                    description: t.description,
+                    isBuiltin: t.sourceInfo.origin === 'package',
+                  })),
+                  activeToolNames: session!.getActiveToolNames(),
+                }));
+                break;
+              }
+              case 'logout': {
+                const provider = args || session!.model?.provider;
+                if (!provider) {
+                  sendSlashResult(ws, command, 'No provider selected. Pass a provider name, e.g. /logout openai.', 'warning');
+                  break;
+                }
+                session!.modelRegistry.authStorage.remove(provider);
+                session!.modelRegistry.refresh();
+                ws.send(JSON.stringify({ type: 'providers_list', providers: getProviders() }));
+                broadcast({
+                  type: 'available_models_changed',
+                  availableModels: session!.modelRegistry.getAvailable().map(serializeModel),
+                });
+                sendSlashResult(ws, command, `Removed stored credentials for ${provider}.`);
+                break;
+              }
+              case 'clone': {
+                const leafId = session!.sessionManager.getLeafId();
+                if (!leafId) {
+                  sendSlashResult(ws, command, 'No session branch to clone yet.', 'warning');
+                  break;
+                }
+                const newPath = session!.sessionManager.createBranchedSession(leafId);
+                if (!newPath) {
+                  sendSlashResult(ws, command, 'Could not clone this in-memory session.', 'warning');
+                  break;
+                }
+                const clonedSm = _sdk!.SessionManager.open(newPath);
+                const { session: clonedSession } = await _sdk!.createAgentSession({
+                  cwd: clonedSm.getCwd() || cwd,
+                  sessionManager: clonedSm,
+                  modelRegistry: session!.modelRegistry,
+                });
+                await setActiveSession(clonedSession);
+                sendSlashResult(ws, command, `Cloned current branch to ${newPath}.`);
+                break;
+              }
+              case 'tree': {
+                const tree = session!.sessionManager.getTree();
+                const lines = tree.flatMap((node) => formatTreeNode(node as Parameters<typeof formatTreeNode>[0]));
+                sendSlashResult(ws, command, lines.length ? `Session tree:\n${lines.join('\n')}` : 'Session tree is empty.');
+                break;
+              }
+              case 'session': {
+                const stats = session!.getSessionStats();
+                const context = session!.getContextUsage();
+                const lines = [
+                  `Session: ${stats.sessionId}`,
+                  `File: ${stats.sessionFile ?? '(not persisted)'}`,
+                  `Messages: ${stats.totalMessages} (${stats.userMessages} user, ${stats.assistantMessages} assistant)`,
+                  `Tools: ${stats.toolCalls} calls, ${stats.toolResults} results`,
+                  `Tokens: ${stats.tokens.total.toLocaleString()} total (${stats.tokens.input.toLocaleString()} in, ${stats.tokens.output.toLocaleString()} out)`,
+                  `Cost: $${stats.cost.toFixed(4)}`,
+                  ...(context ? [`Context: ${context.tokens == null ? 'unknown' : context.tokens.toLocaleString()} / ${context.contextWindow.toLocaleString()} tokens${context.percent == null ? '' : ` (${context.percent}%)`}`] : []),
+                ];
+                sendSlashResult(ws, command, lines.join('\n'));
+                break;
+              }
+              case 'export': {
+                const format = args.toLowerCase().includes('json') ? 'jsonl' : 'html';
+                const out = format === 'jsonl' ? session!.exportToJsonl() : await session!.exportToHtml();
+                sendSlashResult(ws, command, `Exported current session to ${out}.`);
+                break;
+              }
+              case 'share': {
+                const out = await session!.exportToHtml();
+                sendSlashResult(ws, command, `Created a local share/export at ${out}. GitHub gist sharing is not configured in pi-ui.`);
+                break;
+              }
+              case 'changelog': {
+                const { readFile } = await import('node:fs/promises');
+                const text = await readFile(join(process.cwd(), 'node_modules/@earendil-works/pi-coding-agent/CHANGELOG.md'), 'utf8');
+                sendSlashResult(ws, command, text.split('\n').slice(0, 80).join('\n'));
+                break;
+              }
+              case 'name': {
+                if (!args) {
+                  sendSlashResult(ws, command, session!.sessionName ? `Session name: ${session!.sessionName}` : 'No session name set.');
+                  break;
+                }
+                session!.setSessionName(args);
+                sendSlashResult(ws, command, `Session renamed to ${args}.`);
+                break;
+              }
+              default:
+                sendSlashResult(ws, command, `Unsupported built-in command: /${command}`, 'warning');
+                break;
+            }
+          } catch (err) {
+            console.error(`[pifrontier] run_builtin ${command} error:`, err);
+            sendSlashResult(ws, command, String(err), 'error');
+          }
           break;
         }
 
@@ -782,6 +1052,37 @@ try {
           } catch (err) {
             console.error('[pifrontier] fork_session error:', err);
             ws.send(JSON.stringify({ type: 'sessions_error', message: String(err) }));
+          }
+          break;
+        }
+
+        case 'summarize_for_tts': {
+          // Fire-and-forget — response is sent asynchronously via ws.send inside summarizeForTTS
+          summarizeForTTS((msg as { type: 'summarize_for_tts'; content: string }).content, ws).catch(
+            (err) => console.error('[pifrontier] summarize_for_tts unhandled:', err)
+          );
+          break;
+        }
+
+        case 'read_file': {
+          try {
+            const filePath = (msg as { type: 'read_file'; path: string }).path;
+            // Security: resolve relative to cwd and ensure it doesn't escape
+            const resolved = resolve(cwd, filePath);
+            if (!resolved.startsWith(resolve(cwd))) {
+              ws.send(JSON.stringify({ type: 'file_content', path: filePath, content: '', error: 'Path escapes workspace root' }));
+              break;
+            }
+            const file = Bun.file(resolved);
+            if (await file.exists()) {
+              const content = await file.text();
+              ws.send(JSON.stringify({ type: 'file_content', path: filePath, content }));
+            } else {
+              ws.send(JSON.stringify({ type: 'file_content', path: filePath, content: '', error: 'File not found' }));
+            }
+          } catch (err) {
+            console.error('[pifrontier] read_file error:', err);
+            ws.send(JSON.stringify({ type: 'file_content', path: (msg as { type: 'read_file'; path: string }).path, content: '', error: String(err) }));
           }
           break;
         }

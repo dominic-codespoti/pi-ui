@@ -83,6 +83,10 @@ export interface ConnectedMessage {
   autoCompactionEnabled?: boolean;
   /** Whether auto-retry on transient errors is enabled. */
   autoRetryEnabled?: boolean;
+  /** pi SDK version (e.g. "0.75.5"). */
+  piVersion?: string;
+  /** pi-ui server version (e.g. "0.1.5"). */
+  uiVersion?: string;
 }
 
 /**
@@ -96,6 +100,7 @@ export interface ConnectedMessage {
  *   { type: "sessions_list",           sessions: SessionSummary[] }
  *   { type: "all_sessions_list",       sessions: SessionSummary[] }
  *   { type: "dir_completions",         prefix: string; entries: string[] }
+ *   { type: "file_completions",        query: string; entries: string[] }
  *   { type: "providers_list",          providers: ProviderInfo[] }
  *   { type: "available_models_changed", availableModels: ModelInfo[] }
  *   { type: "sessions_error",          message: string }
@@ -104,6 +109,9 @@ export interface ConnectedMessage {
  *   { type: "resources_list",          skills: SkillSummary[], prompts: PromptSummary[] }
  *   { type: "skill_install_result",    success: boolean; name?: string; error?: string }
  *   { type: "server_restarting" }
+ *   { type: "tts_summary",             text: string }
+ *   { type: "slash_result",            command: string, message: string, level?: "info" | "warning" | "error" }
+ *   { type: "file_content",            path: string, content: string, error?: string }
  *
  * SDK events the browser must handle:
  *   { type: "agent_start" }
@@ -142,6 +150,8 @@ export type ClientMessage =
   | { type: 'get_all_sessions' }
   /** Request filesystem directory entries for path autocomplete. Server replies with dir_completions. */
   | { type: 'dir_complete'; prefix: string }
+  /** Request lightweight workspace file matches for composer @ references. */
+  | { type: 'file_complete'; query: string }
   /** Response to a blocking extension_ui_request (select / confirm / input / editor). */
   | { type: 'extension_ui_response'; id: string; value?: string; confirmed?: boolean; cancelled?: true }
   /** Request list of all providers with auth status. */
@@ -179,4 +189,14 @@ export type ClientMessage =
    */
   | { type: 'install_skill'; url: string; scope: 'project' | 'user' }
   /** Restart the server process in-place (re-exec with same args + env). */
-  | { type: 'restart_server' };
+  | { type: 'restart_server' }
+  /**
+   * Request an LLM-generated TTS-friendly summary of a long assistant response.
+   * Server creates a temporary pi session, generates a 1-2 sentence summary, and
+   * replies with { type: 'tts_summary', text: string }.
+   */
+  /** Execute a built-in slash command in the server session context. */
+  | { type: 'run_builtin'; command: string; args?: string }
+  | { type: 'summarize_for_tts'; content: string }
+  /** Request file contents for the file viewer modal. */
+  | { type: 'read_file'; path: string };
