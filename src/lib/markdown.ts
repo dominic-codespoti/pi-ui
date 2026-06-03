@@ -45,6 +45,11 @@ function escAttr(s: string) {
   return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;');
 }
 
+/** Escape HTML special characters for safe insertion into element text. */
+function escHtml(s: string) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 /** Highlight code or fall back to plain-escaped text if language unknown. */
 function highlight(code: string, lang: string): string {
   if (lang && hljs.getLanguage(lang)) {
@@ -85,19 +90,31 @@ const renderer: RendererObject = {
         `<div class="code-block-header">` +
           `<span class="code-block-lang">${langLabel}</span>` +
           `<button class="code-copy-btn" type="button" aria-label="Copy code"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>` +
-        `</div>` +
-        `<pre class="code-block-pre"><code class="hljs">${highlighted}</code></pre>` +
+      `</div>` +
+      `<pre class="code-block-pre"><code class="hljs">${highlighted}</code></pre>` +
       `</div>`
     );
   },
+
+  // Inline code: exact file refs become links. Everything else stays code.
+  codespan({ text }: { text: string }) {
+    const raw = text.trim();
+    const match = raw.match(/^((?:\.{1,2}\/|~\/)?(?:[\w.+()-]+\/)+[\w.+()-]+\.[\w]{1,10})(?::(\d+)(?:-(\d+))?)?$/);
+    if (match && isFilePath(match[1])) {
+      const path = match[1];
+      const line = match[2] ? parseInt(match[2]) : undefined;
+      const endLine = match[3] ? parseInt(match[3]) : undefined;
+      return renderFileLink(path, line, endLine);
+    }
+    return `<code>${text}</code>`;
+  },
+
 };
 
-// ── File path tokenizer ──────────────────────────────────────────────────────
-// Detects file paths in assistant text and renders them as clickable buttons.
-// Excludes URLs (http/https), code blocks, and markdown links.
-
-/** Pattern: relative/absolute file paths with optional :line or :line-range suffix */
-const FILE_PATH_RE = /(?<![:\w/])([./~]?[\w\-./]+\.[\w]{1,10})(?::(\d+)(?:-(\d+))?)?(?![:\w/])/g;
+function renderFileLink(path: string, line?: number, endLine?: number): string {
+  const lineLabel = line ? `:${line}${endLine ? `-${endLine}` : ''}` : '';
+  return `<a class="file-link" href="#" data-filepath="${escAttr(path)}" data-fileline="${line ?? ''}" aria-label="Open file ${escAttr(path)}${lineLabel}">${escHtml(path)}${lineLabel}</a>`;
+}
 
 /** Set of extensions to treat as file paths */
 const FILE_EXTS = new Set([
@@ -120,6 +137,9 @@ function isFilePath(raw: string): boolean {
   return FILE_EXTS.has(ext);
 }
 
+/** Pattern: explicit file paths with at least one directory segment + optional line suffix. */
+const FILE_PATH_RE = /(?<![:\w/`])((?:\.{1,2}\/|~\/)?(?:[\w.+()-]+\/)+[\w.+()-]+\.[\w]{1,10})(?::(\d+)(?:-(\d+))?)?(?![:\w/`])/g;
+
 const fileLinkExtension: TokenizerAndRendererExtension = {
   name: 'fileLink',
   level: 'inline',
@@ -130,6 +150,7 @@ const fileLinkExtension: TokenizerAndRendererExtension = {
     if (!match) return;
     const raw = match[0];
     const path = match[1];
+    if (path.startsWith('/')) return;
     if (!isFilePath(path)) return;
     return {
       type: 'fileLink',
@@ -141,8 +162,7 @@ const fileLinkExtension: TokenizerAndRendererExtension = {
   },
   renderer(token) {
     const t = token as unknown as { path: string; line?: number; endLine?: number };
-    const lineLabel = t.line ? `:${t.line}${t.endLine ? `-${t.endLine}` : ''}` : '';
-    return `<button class="file-link-btn" data-filepath="${escAttr(t.path)}" data-fileline="${t.line ?? ''}" type="button">${escAttr(t.path)}${lineLabel}</button>`;
+    return renderFileLink(t.path, t.line, t.endLine);
   },
 };
 

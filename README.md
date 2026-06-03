@@ -15,8 +15,9 @@ Designed to run on a Raspberry Pi, but works on any machine with Bun.
 - **Skills & prompts browser** — browse and inject skills/prompts; install from GitHub URLs
 - **Tool control** — enable/disable individual tools per session
 - **Extension UI** — `select`, `confirm`, `input`, and `editor` dialogs forwarded to the browser
+- **Diffs & file links** — inline unified-diff viewer and clickable workspace file references
 - **Syntax highlighting** — tool output and code blocks highlighted via `highlight.js`
-- **PWA** — installable on iOS and Android; service worker with offline shell
+- **PWA** — installable on iOS and Android; minimal service worker with no offline cache
 - **Password-protected** — bcrypt + signed JWT cookie; no external auth service required
 - **Low footprint** — no SSR, no Workbox, single pi session per process, `perMessageDeflate`
 
@@ -154,6 +155,44 @@ sudo systemctl start pi-ui
 
 ---
 
+## Remote access
+
+Do not expose the raw `pi-ui` port directly to the public internet. If you need
+remote access, put it behind a private tunnel and keep `PI_PASSWORD` strong and
+unique.
+
+### Cloudflare Tunnel example
+
+Start `pi-ui` locally on the Pi:
+
+```bash
+PI_PASSWORD='use-a-long-random-password' pi-ui --port 3000
+```
+
+Then point a Cloudflare Tunnel at the local service:
+
+```bash
+cloudflared tunnel --url http://localhost:3000
+```
+
+For a named tunnel, your `cloudflared` config should route a hostname to the
+local HTTP service:
+
+```yaml
+tunnel: <tunnel-id>
+credentials-file: /home/pi/.cloudflared/<tunnel-id>.json
+
+ingress:
+  - hostname: pi-ui.example.com
+    service: http://localhost:3000
+  - service: http_status:404
+```
+
+Cloudflare terminates TLS before traffic reaches the Pi, so treat the tunnel as
+a secure transport layer, not as a replacement for the app password.
+
+---
+
 ## Development
 
 ```bash
@@ -161,6 +200,9 @@ bun install
 
 # UI hot-reload (no WebSocket — use for visual iteration only)
 bun run dev
+
+# Full local dev: Vite HMR plus Bun WebSocket server
+PI_PASSWORD=dev bun run dev:full
 
 # Build production assets
 bun run build
@@ -186,10 +228,9 @@ bun run format
 npm publish
 ```
 
-The `prepublishOnly` hook runs `bun run build` automatically, so the pre-built
-SvelteKit assets are included in the package. Consumers get a zero-build install —
-only runtime dependencies (`@earendil-works/pi-coding-agent`, `bcryptjs`, `jose`)
-are installed.
+The `prepublishOnly` hook runs `bun run build && bun run build:server`, so the
+pre-built SvelteKit assets and minified Bun server bundle are included in the
+package. Consumers get a zero-build install through the `pi-ui` CLI.
 
 ---
 
@@ -224,4 +265,3 @@ Issues and PRs welcome at [github.com/dominic-codespoti/pi-ui](https://github.co
 ## License
 
 MIT
-

@@ -1,3 +1,7 @@
 # Don't ship test files to npm consumers
 **/*.test.ts
 **/*.spec.ts
+
+# Source maps are useful locally but unnecessary in the published CLI package.
+build/**/*.map
+server.bundle.js.map

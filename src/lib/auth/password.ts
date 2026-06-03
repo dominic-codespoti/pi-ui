@@ -4,37 +4,24 @@ import { SignJWT, jwtVerify } from 'jose';
 export const COOKIE_NAME = 'pi-session';
 
 // ── JWT secret ────────────────────────────────────────────────────────────────
-// Derived from HMAC-SHA256(password, random_salt) so the signing key is
-// independent of the password itself. A leaked password alone cannot forge
-// tokens — the per-boot salt is also required.
+// Derived deterministically from the password so every process in a given
+// run can verify the same session tokens.
 
 const g = globalThis as Record<string, unknown>;
 
-/** Per-process random salt generated once at startup (32 bytes, hex). */
-function getOrCreateSalt(): string {
-  if (!g.__piJwtSalt) {
-    const buf = new Uint8Array(32);
-    crypto.getRandomValues(buf);
-    g.__piJwtSalt = Array.from(buf, (b) => b.toString(16).padStart(2, '0')).join('');
-  }
-  return g.__piJwtSalt as string;
-}
-
-/** Derive a 256-bit JWT signing key from the password + per-boot salt. */
+/** Derive a 256-bit JWT signing key from the password. */
 async function deriveSecret(): Promise<Uint8Array> {
   if (g.__piJwtSecret) return g.__piJwtSecret as Uint8Array;
   const password = process.env.PI_PASSWORD ?? 'dev-secret-replace-me-set-PI_PASSWORD';
-  const salt = getOrCreateSalt();
   const enc = new TextEncoder();
   const key = await crypto.subtle.importKey('raw', enc.encode(password), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-  const sig = await crypto.subtle.sign('HMAC', key, enc.encode(salt));
+  const sig = await crypto.subtle.sign('HMAC', key, enc.encode('pi-ui-session-v1'));
   g.__piJwtSecret = new Uint8Array(sig);
   return g.__piJwtSecret as Uint8Array;
 }
 
 // ── Token revocation ──────────────────────────────────────────────────────────
-// Lightweight in-memory token ID blacklist. Cleared on restart (acceptable —
-// the per-boot salt already invalidates all tokens from previous runs).
+// Lightweight in-memory token ID blacklist. Cleared on restart.
 
 function revokedSet(): Set<string> {
   if (!g.__piRevokedJtis) g.__piRevokedJtis = new Set<string>();

@@ -4,6 +4,15 @@ build/
 dist/
 server.bundle.js
 *.tgz
+coverage/
+*.tsbuildinfo
+
+# Local tool/runtime artifacts
+/.opencode/
+/.playwright-mcp/
+
+# Temporary visual QA screenshots
+/sidebar-*.jpeg
 
 .env
 .env.*

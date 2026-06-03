@@ -85,7 +85,7 @@ export interface ConnectedMessage {
   autoRetryEnabled?: boolean;
   /** pi SDK version (e.g. "0.75.5"). */
   piVersion?: string;
-  /** pi-ui server version (e.g. "0.1.5"). */
+  /** pi-ui server version (e.g. "0.1.6"). */
   uiVersion?: string;
 }
 
@@ -108,6 +108,7 @@ export interface ConnectedMessage {
  *   { type: "tools_list",              tools: Array<{ name: string; description: string; isBuiltin: boolean }>, activeToolNames: string[] }
  *   { type: "resources_list",          skills: SkillSummary[], prompts: PromptSummary[] }
  *   { type: "skill_install_result",    success: boolean; name?: string; error?: string }
+ *   { type: "restart_nonce",           nonce: string }
  *   { type: "server_restarting" }
  *   { type: "tts_summary",             text: string }
  *   { type: "slash_result",            command: string, message: string, level?: "info" | "warning" | "error" }
@@ -188,8 +189,10 @@ export type ClientMessage =
    * Server replies with skill_install_result.
    */
   | { type: 'install_skill'; url: string; scope: 'project' | 'user' }
+  /** Request a single-use nonce before restarting the server. */
+  | { type: 'request_restart' }
   /** Restart the server process in-place (re-exec with same args + env). */
-  | { type: 'restart_server' }
+  | { type: 'restart_server'; nonce?: string }
   /**
    * Request an LLM-generated TTS-friendly summary of a long assistant response.
    * Server creates a temporary pi session, generates a 1-2 sentence summary, and

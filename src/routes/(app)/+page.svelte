@@ -522,7 +522,6 @@
   /** STT: true while SpeechRecognition is active. */
   let isRecording = $state(false);
   /** STT: active SpeechRecognition instance (not reactive — plain ref). */
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let speechRec: { stop(): void } | null = null;
   /** STT: true when the user manually stopped recording (so onend does NOT auto-submit). */
   let sttManualStop = false;
@@ -662,11 +661,6 @@
   let skillInstalling = $state(false);
   let skillInstallFeedback = $state<{ success: boolean; message: string } | null>(null);
 
-  /** Whether the footer session name is in inline-edit mode */
-  let isEditingSessionName = $state(false);
-  /** Draft value for inline session name edit */
-  let sessionNameDraft = $state('');
-
   /** Which tab is active inside the model picker panel */
   let modelTab = $state<'models' | 'providers'>('models');
   let providers = $state<ProviderInfo[]>([]);
@@ -755,6 +749,7 @@
 
   let scrollEl = $state<HTMLElement | undefined>(undefined);
   let inputEl = $state<HTMLTextAreaElement | undefined>(undefined);
+  let renameInputEl = $state<HTMLInputElement | undefined>(undefined);
   let ws: WebSocket | null = null;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let sendHoldTimer: ReturnType<typeof setTimeout> | null = null;
@@ -771,6 +766,14 @@
       send({ type: 'list_sessions' });
       send({ type: 'get_all_sessions' });
     }
+  });
+
+  $effect(() => {
+    if (!renamingPath) return;
+    tick().then(() => {
+      renameInputEl?.focus();
+      renameInputEl?.select();
+    });
   });
 
   // ── Request dir completions as user types open-folder path ───────────────────
@@ -1208,7 +1211,7 @@
           }
 
           case 'setTitle':
-            document.title = (msg.title as string | undefined) ?? 'pi';
+            document.title = (msg.title as string | undefined) ?? 'pi UI';
             break;
 
           case 'set_editor_text':
@@ -1434,18 +1437,6 @@
     send({ type: 'extension_ui_response', id: modal.id, cancelled: true });
     modal = null;
     modalInput = '';
-  }
-
-  function modalKeydown(e: KeyboardEvent) {
-    if (e.key === 'Escape') {
-      e.preventDefault();
-      modalCancel();
-    }
-    if (e.key === 'Enter' && !e.shiftKey && modal?.method !== 'editor') {
-      e.preventDefault();
-      if (modal?.method === 'confirm') modalConfirm(true);
-      else if (modal?.method === 'input') modalSubmitValue();
-    }
   }
 
   /** Handles Enter key inside the shadcn Dialog content (Escape is handled by onOpenChange). */
@@ -1840,18 +1831,6 @@
     }
   }
 
-  async function copyToolOutput(msg: UIMessage) {
-    const text = msg.content;
-    if (!text) return;
-    try {
-      await navigator.clipboard.writeText(text);
-      copiedId = msg.id;
-      setTimeout(() => { copiedId = null; }, 2000);
-    } catch {
-      // clipboard not available
-    }
-  }
-
   /** Delegated handler for copy buttons injected by the markdown renderer. */
   function handleCodeCopy(e: MouseEvent | KeyboardEvent) {
     if (e instanceof KeyboardEvent && e.key !== 'Enter' && e.key !== ' ') return;
@@ -1866,15 +1845,15 @@
     setTimeout(() => { btn.textContent = prev; }, 2000);
   }
 
-  /** Handle clicks on file-link buttons rendered by the markdown tokenizer. */
+  /** Handle clicks on file links rendered by the markdown renderer. */
   function handleFileLink(e: MouseEvent) {
     const target = e.target as HTMLElement;
-    const btn = target.closest('.file-link-btn') as HTMLElement | null;
-    if (!btn) return;
+    const link = target.closest('.file-link') as HTMLElement | null;
+    if (!link) return;
     e.preventDefault();
     e.stopPropagation();
-    const path = btn.dataset.filepath;
-    const lineStr = btn.dataset.fileline;
+    const path = link.dataset.filepath;
+    const lineStr = link.dataset.fileline;
     if (path) openFileViewer(path, lineStr ? parseInt(lineStr) : undefined);
   }
 
@@ -1893,7 +1872,6 @@
     // Escape — dismiss modal or close open panels
     if (e.key === 'Escape') {
       if (modal) return; // modal's own onkeydown handles this
-      if (isEditingSessionName) return; // input handles its own Escape
       if (showSessionPanel) { e.preventDefault(); showSessionPanel = false; return; }
       if (showRightPanel) { e.preventDefault(); showRightPanel = false; return; }
       if (showSettingsPanel) { e.preventDefault(); showSettingsPanel = false; return; }
@@ -2289,17 +2267,6 @@
     send({ type: 'set_active_tools', toolNames: activeToolNames });
   }
 
-  function startSessionNameEdit() {
-    sessionNameDraft = sessionName ?? '';
-    isEditingSessionName = true;
-  }
-
-  function commitSessionNameEdit() {
-    isEditingSessionName = false;
-    const name = sessionNameDraft.trim();
-    if (name) send({ type: 'rename_current_session', name });
-  }
-
   // ── Lifecycle ────────────────────────────────────────────────────────────────
 
   $effect(() => {
@@ -2355,7 +2322,7 @@
 </script>
 
 <svelte:head>
-  <title>pi</title>
+  <title>pi UI</title>
 </svelte:head>
 
 <svelte:window onkeydown={handleGlobalKeydown} />
@@ -2368,7 +2335,7 @@
 <Tooltip.Provider delayDuration={400}>
 <div
   role="application"
-  aria-label="pi chat"
+  aria-label="pi UI chat"
   class="flex flex-row w-dvw h-dvh text-base-content font-mono text-base select-none overflow-hidden"
   ontouchstart={handleTouchStart}
   ontouchend={handleTouchEnd}
@@ -2481,7 +2448,7 @@
                         {#if isRenaming}
                           <div class="px-3 py-2 flex items-center gap-2">
                             <input
-                              autofocus
+                              bind:this={renameInputEl}
                               type="text"
                               bind:value={renameDraft}
                               onkeydown={(e) => {
@@ -2773,13 +2740,12 @@
                       </div>
                     {/if}
                     {#if msg.content}
-                      <p
-                        class="whitespace-pre-wrap break-words leading-relaxed text-base-content/90 select-text {!isExpanded ? 'line-clamp-3' : ''}"
+                      <button
+                        type="button"
+                        class="block w-full appearance-none bg-transparent border-0 p-0 text-left whitespace-pre-wrap break-words leading-relaxed text-base-content/90 select-text {!isExpanded ? 'line-clamp-3' : ''}"
                         onclick={() => { expandedUserMsgs[msg.id] = !isExpanded; }}
-                        role="button"
-                        tabindex="0"
-                        onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); expandedUserMsgs[msg.id] = !isExpanded; } }}
-                      >{msg.content}</p>
+                        aria-expanded={isExpanded}
+                      >{msg.content}</button>
                       <button
                         onclick={() => { expandedUserMsgs[msg.id] = !isExpanded; }}
                         class="text-[10px] text-base-content/30 hover:text-base-content/55 transition-colors select-none"
@@ -2805,13 +2771,13 @@
                   {#if msg.thinking && msg.thinking.length > 0}
                     <div class="flex items-center gap-1.5 text-[10px] text-base-content/25 py-0.5">
                       <Brain class="w-3 h-3 shrink-0" style="color:var(--color-secondary);animation:pulse 1.5s ease-in-out infinite" />
-                      <span class="text-base-content/35">Thinking</span>
+                      <span class="text-base-content/35">{hiddenThinkingLabel}</span>
                       <span class="truncate">{msg.thinking.slice(0, 80)}{msg.thinking.length > 80 ? '…' : ''}</span>
                     </div>
                   {:else if !msg.content}
                     <div class="flex items-center gap-1.5 text-[10px] text-base-content/20 py-0.5">
                       <Loader class="w-3 h-3 animate-spin text-base-content/30" />
-                      <span>thinking…</span>
+                      <span>{hiddenThinkingLabel}...</span>
                     </div>
                   {/if}
                 {:else if msg.thinking}
@@ -2821,7 +2787,7 @@
                     aria-expanded={msg.thinkingExpanded}
                   >
                     <Brain class="w-3 h-3 shrink-0" style="color:var(--color-secondary)" />
-                    <span class="text-base-content/35">Thinking</span>
+                    <span class="text-base-content/35">{hiddenThinkingLabel}</span>
                     <span class="truncate">{msg.thinking.slice(0, 80)}{msg.thinking.length > 80 ? '…' : ''}</span>
                     {#if msg.endMs && msg.thinkingStartMs}
                       <span class="text-base-content/20 shrink-0">{fmtDuration(msg.endMs - msg.thinkingStartMs)}</span>
@@ -2839,7 +2805,7 @@
                 <div class="leading-relaxed select-text">
                   {#if !msg.content && msg.streaming}
                     {#if workingVisible && !(msg.thinking && msg.thinking.length > 0)}
-                      <span class="flex items-center gap-[3px] h-5" aria-label="Thinking">
+                      <span class="flex items-center gap-[3px] h-5" aria-label={hiddenThinkingLabel}>
                         <span class="typing-dot"></span>
                         <span class="typing-dot"></span>
                         <span class="typing-dot"></span>

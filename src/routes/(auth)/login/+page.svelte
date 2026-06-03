@@ -8,7 +8,7 @@
 </script>
 
 <svelte:head>
-  <title>pi — login</title>
+  <title>pi UI | Login</title>
 </svelte:head>
 
 <div class="flex min-h-dvh items-center justify-center bg-base-100 px-4">

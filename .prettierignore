@@ -1,0 +1,10 @@
+node_modules/
+build/
+.svelte-kit/
+dist/
+coverage/
+server.bundle.js
+*.tgz
+
+.opencode/
+.playwright-mcp/

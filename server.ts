@@ -196,8 +196,7 @@ let broadcast: (payload: unknown) => void = () => {};
 function createDialogPromise<T>(
   id: string,
   requestPayload: Record<string, unknown>,
-  parseResponse: (r: Record<string, unknown>) => T,
-  defaultValue: T
+  parseResponse: (r: Record<string, unknown>) => T
 ): Promise<T> {
   return new Promise<T>((resolve) => {
     pendingExtensionRequests.set(id, {
@@ -219,8 +218,7 @@ const uiContext: ExtensionUIContext = {
     return createDialogPromise<string | undefined>(
       id,
       { method: 'select', title, options },
-      (r) => ('cancelled' in r && r.cancelled ? undefined : 'value' in r ? (r.value as string) : undefined),
-      undefined
+      (r) => ('cancelled' in r && r.cancelled ? undefined : 'value' in r ? (r.value as string) : undefined)
     );
   },
 
@@ -229,8 +227,7 @@ const uiContext: ExtensionUIContext = {
     return createDialogPromise<boolean>(
       id,
       { method: 'confirm', title, message },
-      (r) => ('cancelled' in r && r.cancelled ? false : 'confirmed' in r ? Boolean(r.confirmed) : false),
-      false
+      (r) => ('cancelled' in r && r.cancelled ? false : 'confirmed' in r ? Boolean(r.confirmed) : false)
     );
   },
 
@@ -239,8 +236,7 @@ const uiContext: ExtensionUIContext = {
     return createDialogPromise<string | undefined>(
       id,
       { method: 'input', title, placeholder },
-      (r) => ('cancelled' in r && r.cancelled ? undefined : 'value' in r ? (r.value as string) : undefined),
-      undefined
+      (r) => ('cancelled' in r && r.cancelled ? undefined : 'value' in r ? (r.value as string) : undefined)
     );
   },
 
@@ -249,8 +245,7 @@ const uiContext: ExtensionUIContext = {
     return createDialogPromise<string | undefined>(
       id,
       { method: 'editor', title, prefill },
-      (r) => ('cancelled' in r && r.cancelled ? undefined : 'value' in r ? (r.value as string) : undefined),
-      undefined
+      (r) => ('cancelled' in r && r.cancelled ? undefined : 'value' in r ? (r.value as string) : undefined)
     );
   },
 
@@ -318,7 +313,6 @@ const uiContext: ExtensionUIContext = {
   },
 
   addAutocompleteProvider() {},
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   setEditorComponent() {},
   getEditorComponent() {
     return undefined;
@@ -355,8 +349,11 @@ async function getSDK(): Promise<typeof PiSDKNS> {
     console.log('[pifrontier] Pi SDK loaded.');
     // Resolve SDK version from its package.json (best-effort)
     try {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const piPkg = await import('@earendil-works/pi-coding-agent/package.json', { with: { type: 'json' } }) as any;
+      const piPkgSpecifier = '@earendil-works/pi-coding-agent/package.json';
+      const piPkg = await import(piPkgSpecifier, { with: { type: 'json' } }) as {
+        default?: { version?: string };
+        version?: string;
+      };
       PI_SDK_VERSION = piPkg.default?.version ?? piPkg.version ?? 'unknown';
     } catch {
       // Not critical — version display stays 'unknown'
@@ -845,9 +842,9 @@ try {
 
             while (queue.length > 0 && entries.length < 40) {
               const item = queue.shift()!;
-              let dirents: Awaited<ReturnType<typeof readdir>>;
+              let dirents: Array<{ name: string; isFile(): boolean; isDirectory(): boolean }>;
               try {
-                dirents = await readdir(item.dir, { withFileTypes: true });
+                dirents = await readdir(item.dir, { withFileTypes: true }) as typeof dirents;
               } catch {
                 continue;
               }
@@ -1216,12 +1213,13 @@ try {
     perMessageDeflate: true,
   },
 });
-} catch (err: any) {
-  if (err?.code === 'EADDRINUSE') {
+} catch (err: unknown) {
+  const error = err as { code?: string; message?: string };
+  if (error.code === 'EADDRINUSE') {
     console.error(`[pifrontier] Port ${PORT} is already in use.`);
     console.error(`[pifrontier] Use a different port: pi-ui --port ${PORT + 1}`);
   } else {
-    console.error('[pifrontier] Failed to start server:', err?.message ?? err);
+    console.error('[pifrontier] Failed to start server:', error.message ?? err);
   }
   process.exit(1);
 }

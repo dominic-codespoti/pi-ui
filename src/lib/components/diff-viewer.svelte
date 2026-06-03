@@ -10,20 +10,19 @@
   const totalDeletions = $derived(parsed.reduce((s, f) => s + f.deletions, 0));
 
   /** Set of expanded file paths (all expanded by default). */
-  let expandedFiles = $state<Set<string>>(new SvelteSet());
+  const expandedFiles = new SvelteSet<string>();
   /** Copy feedback state. */
   let copied = $state(false);
 
   // Reset expanded state when diff changes
   $effect(() => {
-    expandedFiles = new SvelteSet(parsed.map((f) => f.newPath));
+    expandedFiles.clear();
+    for (const file of parsed) expandedFiles.add(file.newPath);
   });
 
   function toggleFile(path: string) {
-    const next = new SvelteSet(expandedFiles);
-    if (next.has(path)) next.delete(path);
-    else next.add(path);
-    expandedFiles = next;
+    if (expandedFiles.has(path)) expandedFiles.delete(path);
+    else expandedFiles.add(path);
   }
 
   function detectLang(path: string): string {

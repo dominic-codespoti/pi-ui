@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, beforeEach } from 'bun:test';
+import { describe, it, expect, beforeAll } from 'bun:test';
 import {
   initPassword,
   verifyPassword,
@@ -64,9 +64,10 @@ describe('createSessionToken / verifySessionToken', () => {
 
   it('rejects an expired token', async () => {
     const { SignJWT } = await import('jose');
-    const secret = new TextEncoder().encode(
-      process.env.PI_PASSWORD ?? 'dev-secret-replace-me-set-PI_PASSWORD'
-    );
+    const password = process.env.PI_PASSWORD ?? 'dev-secret-replace-me-set-PI_PASSWORD';
+    const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+    const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode('pi-ui-session-v1'));
+    const secret = new Uint8Array(sig);
     // Set expiration 1 second in the past
     const expiredToken = await new SignJWT({ pi: 1 })
       .setProtectedHeader({ alg: 'HS256' })

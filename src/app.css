@@ -291,23 +291,21 @@ button, a, input, textarea, select, [role="button"] {
 .typing-dot:nth-child(2) { animation-delay: 0.2s; }
 .typing-dot:nth-child(3) { animation-delay: 0.4s; }
 
-/* ── File link buttons (rendered by markdown tokenizer) ───────────────────── */
-.file-link-btn {
-  display: inline;
-  font-family: ui-monospace, 'Cascadia Code', 'Fira Code', monospace;
-  font-size: 0.85em;
-  background: color-mix(in oklch, var(--color-info) 12%, transparent);
-  border: 1px solid color-mix(in oklch, var(--color-info) 20%, transparent);
-  border-radius: 4px;
-  padding: 0.1em 0.4em;
-  color: color-mix(in oklch, var(--color-info) 90%, transparent);
-  cursor: pointer;
-  transition: all 0.15s;
-}
-.file-link-btn:hover {
-  background: color-mix(in oklch, var(--color-info) 22%, transparent);
-  border-color: color-mix(in oklch, var(--color-info) 35%, transparent);
-  color: var(--color-info);
+/* ── File links (rendered by markdown renderer) ──────────────────────────── */
+.file-link {
+  color: color-mix(in oklch, var(--color-info) 92%, transparent);
   text-decoration: underline;
-  text-underline-offset: 2px;
+  text-underline-offset: 0.15em;
+  text-decoration-thickness: 1px;
+  font-family: ui-monospace, 'Cascadia Code', 'Fira Code', monospace;
+  cursor: pointer;
+  transition: color 0.15s ease, opacity 0.15s ease;
+}
+.file-link:hover {
+  color: var(--color-info);
+}
+.file-link:focus-visible {
+  outline: 2px solid color-mix(in oklch, var(--color-info) 65%, transparent);
+  outline-offset: 2px;
+  border-radius: 2px;
 }

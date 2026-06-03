@@ -1,6 +1,6 @@
 import type { Handle } from '@sveltejs/kit';
 import { redirect } from '@sveltejs/kit';
-import { verifySessionToken, getTokenFromCookies, COOKIE_NAME } from '$lib/auth/password';
+import { verifySessionToken, getTokenFromCookies } from '$lib/auth/password';
 
 const PUBLIC_PATHS = new Set(['/login']);
 

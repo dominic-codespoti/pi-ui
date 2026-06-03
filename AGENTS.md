@@ -25,7 +25,7 @@ Reference architecture: [OpenChamber](https://github.com/openchamber/openchamber
 | Server adapter | `svelte-adapter-bun` (community) | Fetch-API native handler; required for Bun WS interop |
 | Runtime | Bun | Lower memory than Node; native WebSocket in `Bun.serve` |
 | Styling | Tailwind CSS v4 | Utility-first, zero runtime |
-| PWA | `@vite-pwa/sveltekit` | `injectManifest` strategy, custom `src/service-worker.ts` |
+| PWA | SvelteKit native service worker | Custom `src/service-worker.ts`; no Workbox |
 | Pi integration | `@earendil-works/pi-coding-agent` SDK (server-side only) | In-process, typed; no subprocess overhead |
 | Auth | Bcrypt hash of `PI_PASSWORD` env var; signed HTTP-only cookie | Simple, no DB |
 
@@ -36,8 +36,8 @@ Reference architecture: [OpenChamber](https://github.com/openchamber/openchamber
 ```
 src/
   app.html                  # Shell; PWA manifest + iOS meta tags
-  app.css                   # Tailwind v4 import (single @import line)
-  service-worker.ts         # Minimal custom SW — IIFE bundle for iOS Safari; no Workbox
+  app.css                   # Tailwind v4 + daisyUI styles
+  service-worker.ts         # Minimal custom SW; no Workbox or offline cache
   lib/
     auth/
       password.ts           # bcryptjs hash (globalThis); jose JWT sign/verify
@@ -54,7 +54,7 @@ src/
 hooks.server.ts             # Auth guard — redirects unauthenticated → /login
 server.ts                   # Bun entry: pi session init, WS upgrade at /ws, SK handler fallback
 svelte.config.js            # svelte-adapter-bun adapter
-vite.config.ts              # Tailwind v4 + SvelteKit + SvelteKitPWA
+vite.config.ts              # Tailwind v4 + SvelteKit
 ```
 
 ---
@@ -169,16 +169,9 @@ must be ESM. `server.ts` and all lib files must use `.ts` extensions and
 
 ### PWA service worker
 
-Use `injectManifest` strategy (not `generateSW`) with a hand-written
-`src/service-worker.ts`. Bundle it as `iife` for iOS Safari compatibility:
-
-```ts
-// vite.config.ts (SvelteVitePWA plugin option)
-injectManifest: { rollupFormat: "iife" }
-```
-
-Keep the SW minimal — just `install` (skipWaiting), `activate` (clients.claim),
-and `fetch` passthrough. No offline caching of chat history (RPi storage is limited).
+Use SvelteKit's native `src/service-worker.ts` entry. Keep it minimal — just
+`install` (skipWaiting), `activate` (clients.claim), and `fetch` passthrough.
+No offline caching of chat history (RPi storage is limited).
 
 ---
 

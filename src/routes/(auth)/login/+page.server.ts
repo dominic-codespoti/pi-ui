@@ -1,8 +1,7 @@
 import { fail, redirect } from '@sveltejs/kit';
 import type { Actions, PageServerLoad } from './$types';
 import {
-  verifyPassword, verifySessionToken, createSessionToken,
-  extractJti, revokeToken, getTokenFromCookies, COOKIE_NAME,
+  verifyPassword, verifySessionToken, createSessionToken, COOKIE_NAME,
 } from '$lib/auth/password';
 import { checkRateLimit, recordFailure, clearRecord, getClientIp } from '$lib/auth/rate-limiter';
 
@@ -15,7 +14,7 @@ function isBehindProxy(request: Request): boolean {
   );
 }
 
-/** Cookie options shared between login and logout. */
+/** Cookie options shared by auth session writes. */
 function cookieOpts(request: Request): { path: string; httpOnly: boolean; sameSite: 'strict'; secure: boolean; maxAge: number } {
   return {
     path: '/',
@@ -90,16 +89,5 @@ export const actions: Actions = {
     cookies.set(COOKIE_NAME, token, cookieOpts(request));
 
     redirect(302, '/');
-  },
-
-  logout: async ({ request, cookies }) => {
-    const cookieHeader = request.headers.get('cookie') ?? '';
-    const token = getTokenFromCookies(cookieHeader);
-    if (token) {
-      const jti = await extractJti(token);
-      if (jti) revokeToken(jti);
-    }
-    cookies.delete(COOKIE_NAME, { path: '/' });
-    redirect(302, '/login');
   },
 };
