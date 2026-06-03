@@ -19,7 +19,7 @@ import type { Model } from '@earendil-works/pi-ai';
 import { rm, mkdir, writeFile } from 'node:fs/promises';
 import { join, resolve, basename } from 'node:path';
 import { initPassword, isValidSessionCookie } from './src/lib/auth/password.ts';
-import type { ClientMessage, ModelInfo, ProviderInfo, SessionSummary, SkillSummary, PromptSummary } from './src/lib/ws/protocol.ts';
+import type { ClientMessage, HistoryWindow, ModelInfo, ProviderInfo, SessionSummary, SkillSummary, PromptSummary } from './src/lib/ws/protocol.ts';
 import ownPkgJson from './package.json' with { type: 'json' };
 
 /** pi-ui version baked in at startup. */
@@ -69,6 +69,16 @@ if (!existsSync(cwd)) {
   console.error('[pifrontier] Set PI_CWD to a valid directory or run from the target project.');
   process.exit(1);
 }
+
+const MAX_HISTORY_PAGE_LIMIT = 300;
+
+function boundedInt(value: unknown, fallback: number, min: number, max: number): number {
+  const parsed = typeof value === 'number' ? value : Number.parseInt(String(value ?? ''), 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(min, Math.min(max, Math.floor(parsed)));
+}
+
+const HISTORY_PAGE_LIMIT = boundedInt(Bun.env.PI_UI_HISTORY_LIMIT, 80, 20, MAX_HISTORY_PAGE_LIMIT);
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function serializeModel(model: Model<any> | undefined | null): ModelInfo | null {
@@ -177,6 +187,28 @@ function serializeSession(s: Record<string, any>): SessionSummary {
     modified: s.modified instanceof Date ? s.modified.getTime() : s.modified,
     messageCount: s.messageCount,
     firstMessage: s.firstMessage,
+  };
+}
+
+function getHistoryPage(
+  allMessages: readonly unknown[],
+  options: { offset?: number; limit?: number } = {}
+): { messages: unknown[]; history: HistoryWindow } {
+  const total = allMessages.length;
+  const limit = boundedInt(options.limit, HISTORY_PAGE_LIMIT, 1, MAX_HISTORY_PAGE_LIMIT);
+  const offset = options.offset === undefined
+    ? Math.max(0, total - limit)
+    : boundedInt(options.offset, 0, 0, total);
+  const end = Math.min(total, offset + limit);
+
+  return {
+    messages: allMessages.slice(offset, end),
+    history: {
+      total,
+      offset,
+      limit,
+      hasMore: offset > 0,
+    },
   };
 }
 
@@ -412,6 +444,7 @@ async function setActiveSession(newSession: AgentSession) {
     broadcast(event);
   });
 
+  const page = getHistoryPage(session.messages as unknown[]);
   broadcast({
     type: 'session_loaded',
     sessionId: session.sessionId,
@@ -419,7 +452,8 @@ async function setActiveSession(newSession: AgentSession) {
     thinkingLevel: session.thinkingLevel,
     model: serializeModel(session.model),
     availableModels: session.modelRegistry.getAvailable().map(serializeModel),
-    messages: session.messages,
+    messages: page.messages,
+    history: page.history,
     cwd,
     sessionName: session.sessionManager.getSessionName(),
     isCompacting: session.isCompacting,
@@ -531,6 +565,7 @@ try {
 
       // Load SDK + session on first connection; subsequent calls return instantly.
       const sess = await ensureSession();
+      const page = getHistoryPage(sess.messages as unknown[]);
 
       ws.send(
         JSON.stringify({
@@ -540,7 +575,8 @@ try {
           thinkingLevel: sess.thinkingLevel,
           model: serializeModel(sess.model),
           availableModels: sess.modelRegistry.getAvailable().map(serializeModel),
-          messages: sess.messages,
+          messages: page.messages,
+          history: page.history,
           cwd,
           sessionName: sess.sessionManager.getSessionName(),
           isCompacting: sess.isCompacting,
@@ -685,6 +721,26 @@ try {
 
         case 'get_providers': {
           ws.send(JSON.stringify({ type: 'providers_list', providers: getProviders() }));
+          break;
+        }
+
+        case 'load_history': {
+          const req = msg as Extract<ClientMessage, { type: 'load_history' }>;
+          if (req.sessionId !== session!.sessionId) {
+            ws.send(JSON.stringify({
+              type: 'history_page',
+              sessionId: req.sessionId,
+              messages: [],
+              history: { total: 0, offset: 0, limit: boundedInt(req.limit, HISTORY_PAGE_LIMIT, 1, MAX_HISTORY_PAGE_LIMIT), hasMore: false },
+            }));
+            break;
+          }
+
+          const page = getHistoryPage(session!.messages as unknown[], {
+            offset: req.offset,
+            limit: req.limit,
+          });
+          ws.send(JSON.stringify({ type: 'history_page', sessionId: session!.sessionId, ...page }));
           break;
         }
 

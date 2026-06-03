@@ -2,7 +2,7 @@
   import { onMount, onDestroy, tick } from 'svelte';
   import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 
-  import type { ServerMessage, ClientMessage, ModelInfo, ProviderInfo, SessionSummary, SkillSummary, PromptSummary } from '$lib/ws/protocol';
+  import type { ServerMessage, ClientMessage, HistoryWindow, ModelInfo, ProviderInfo, SessionSummary, SkillSummary, PromptSummary } from '$lib/ws/protocol';
   import { renderMarkdown, highlightCode } from '$lib/markdown';
   import * as Tooltip from '$lib/components/ui/tooltip';
   import { Switch } from '$lib/components/ui/switch';
@@ -395,7 +395,12 @@
 
   // ── Core state ───────────────────────────────────────────────────────────────
 
+  const HISTORY_PAGE_SIZE = 80;
   let messages = $state<UIMessage[]>([]);
+  let historyOffset = $state(0);
+  let historyTotal = $state(0);
+  let hasOlderHistory = $state(false);
+  let historyLoading = $state(false);
   let expandedUserMsgs = $state<Record<string, boolean>>({});
   let input = $state('');
   /** Images staged for the next prompt (base64 data + display src). */
@@ -851,25 +856,11 @@
 
   // ── Server event handling ────────────────────────────────────────────────────
 
-  function applySessionState(payload: {
-    sessionId: string;
-    isStreaming: boolean;
-    thinkingLevel: string;
-    model: ModelInfo | null;
-    availableModels: ModelInfo[];
-    messages: unknown[];
-    cwd?: string;
-    sessionName?: string;
-  }) {
-    sessionId = payload.sessionId;
-    isStreaming = payload.isStreaming;
-    thinkingLevel = payload.thinkingLevel;
-    model = payload.model;
-    availableModels = payload.availableModels ?? [];
-    // Build a map of toolCallId → { name, input } from assistant content blocks
+  function rawMessagesToUI(rawMessages: unknown[]): UIMessage[] {
+    // Build a map of toolCallId -> { name, input } from assistant content blocks
     // so replayed toolResult messages can show their input args.
     const toolInputMap = new SvelteMap<string, { name: string; input: Record<string, unknown> }>();
-    for (const m of payload.messages ?? []) {
+    for (const m of rawMessages) {
       const raw = m as Record<string, unknown>;
       if (raw.role === 'assistant' && Array.isArray(raw.content)) {
         for (const blk of raw.content as { type: string; id?: string; name?: string; input?: Record<string, unknown>; arguments?: Record<string, unknown> }[]) {
@@ -881,7 +872,37 @@
         }
       }
     }
-    messages = (payload.messages ?? []).flatMap((m) => agentMsgToUI(m, toolInputMap)).filter(Boolean) as UIMessage[];
+
+    return rawMessages.flatMap((m) => agentMsgToUI(m, toolInputMap)).filter(Boolean) as UIMessage[];
+  }
+
+  function applySessionState(payload: {
+    sessionId: string;
+    isStreaming: boolean;
+    thinkingLevel: string;
+    model: ModelInfo | null;
+    availableModels: ModelInfo[];
+    messages: unknown[];
+    history?: HistoryWindow;
+    cwd?: string;
+    sessionName?: string;
+  }) {
+    sessionId = payload.sessionId;
+    isStreaming = payload.isStreaming;
+    thinkingLevel = payload.thinkingLevel;
+    model = payload.model;
+    availableModels = payload.availableModels ?? [];
+    messages = rawMessagesToUI(payload.messages ?? []);
+    const history = payload.history ?? {
+      total: payload.messages?.length ?? 0,
+      offset: 0,
+      limit: payload.messages?.length ?? 0,
+      hasMore: false,
+    };
+    historyOffset = history.offset;
+    historyTotal = history.total;
+    hasOlderHistory = history.hasMore;
+    historyLoading = false;
     if (payload.cwd) cwd = payload.cwd;
     sessionName = payload.sessionName;
     // Reset queue on session switch
@@ -919,6 +940,7 @@
           model: c.model,
           availableModels: c.availableModels,
           messages: c.messages,
+          history: c.history,
           cwd: c.cwd,
           sessionName: c.sessionName,
         });
@@ -936,6 +958,7 @@
           model: ModelInfo | null;
           availableModels: ModelInfo[];
           messages: unknown[];
+          history?: HistoryWindow;
           piVersion?: string;
           uiVersion?: string;
         };
@@ -943,6 +966,31 @@
         if (sl.piVersion) piVersion = sl.piVersion;
         if (sl.uiVersion) uiVersion = sl.uiVersion;
         break;
+      }
+
+      case 'history_page': {
+        const page = msg as {
+          type: 'history_page';
+          sessionId: string;
+          messages: unknown[];
+          history: HistoryWindow;
+        };
+        historyLoading = false;
+        if (page.sessionId !== sessionId) return;
+
+        const previousScrollHeight = scrollEl?.scrollHeight ?? 0;
+        const previousScrollTop = scrollEl?.scrollTop ?? 0;
+        const olderMessages = rawMessagesToUI(page.messages ?? []);
+        messages = [...olderMessages, ...messages];
+        historyOffset = page.history.offset;
+        historyTotal = page.history.total;
+        hasOlderHistory = page.history.hasMore;
+
+        tick().then(() => {
+          if (!scrollEl) return;
+          scrollEl.scrollTop = scrollEl.scrollHeight - previousScrollHeight + previousScrollTop;
+        });
+        return;
       }
 
       case 'model_changed': {
@@ -1817,6 +1865,15 @@
   function scrollToBottom() {
     isAtBottom = true;
     scrollEl?.scrollTo({ top: scrollEl.scrollHeight, behavior: 'smooth' });
+  }
+
+  function loadOlderHistory() {
+    if (!sessionId || historyLoading || !hasOlderHistory || historyOffset <= 0 || wsState !== 'open') return;
+    const nextOffset = Math.max(0, historyOffset - HISTORY_PAGE_SIZE);
+    const limit = historyOffset - nextOffset;
+    if (limit <= 0) return;
+    historyLoading = true;
+    send({ type: 'load_history', sessionId, offset: nextOffset, limit });
   }
 
   async function copyMessage(msg: UIMessage) {
@@ -2723,6 +2780,18 @@
         </div>
       {:else}
         <div class="w-full max-w-3xl lg:max-w-5xl xl:max-w-6xl 2xl:max-w-7xl mx-auto px-4 md:px-6 flex flex-col gap-1">
+          {#if hasOlderHistory || historyLoading}
+            <div class="flex justify-center py-3">
+              <button
+                onclick={loadOlderHistory}
+                disabled={historyLoading}
+                title={`${historyOffset} older raw messages out of ${historyTotal}`}
+                class="px-3 py-1.5 rounded-full text-xs text-base-content/45 bg-base-content/[0.045] hover:bg-base-content/[0.075] hover:text-base-content/70 transition-colors disabled:opacity-50 disabled:cursor-wait"
+              >
+                {historyLoading ? 'loading older...' : `load older (${historyOffset} raw messages)`}
+              </button>
+            </div>
+          {/if}
           {#each messages as msg (msg.id)}
 
             {#if msg.role === 'user'}

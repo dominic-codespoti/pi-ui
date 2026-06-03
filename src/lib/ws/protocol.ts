@@ -61,6 +61,17 @@ export interface PromptSummary {
   source: string;
 }
 
+export interface HistoryWindow {
+  /** Total raw SDK messages in the current session. */
+  total: number;
+  /** Start index of the message window included in this payload. */
+  offset: number;
+  /** Number of raw SDK messages requested for this window. */
+  limit: number;
+  /** True when older raw SDK messages exist before offset. */
+  hasMore: boolean;
+}
+
 // ── Server → Browser ─────────────────────────────────────────────────────────
 
 /** Sent once when a WebSocket connection is established. */
@@ -71,8 +82,10 @@ export interface ConnectedMessage {
   thinkingLevel: string;
   model: ModelInfo | null;
   availableModels: ModelInfo[];
-  /** Full message history at connect time. */
+  /** Recent raw SDK message window at connect time. */
   messages: unknown[];
+  /** Paging metadata for messages. */
+  history?: HistoryWindow;
   /** Server working directory. */
   cwd?: string;
   /** Display name of the current session (from session_info entries). */
@@ -113,6 +126,7 @@ export interface ConnectedMessage {
  *   { type: "tts_summary",             text: string }
  *   { type: "slash_result",            command: string, message: string, level?: "info" | "warning" | "error" }
  *   { type: "file_content",            path: string, content: string, error?: string }
+ *   { type: "history_page",            messages: unknown[], history: HistoryWindow }
  *
  * SDK events the browser must handle:
  *   { type: "agent_start" }
@@ -133,7 +147,14 @@ export interface ConnectedMessage {
  */
 export type PiEvent = { type: string } & Record<string, unknown>;
 
-export type ServerMessage = ConnectedMessage | PiEvent;
+export interface HistoryPageMessage {
+  type: 'history_page';
+  sessionId: string;
+  messages: unknown[];
+  history: HistoryWindow;
+}
+
+export type ServerMessage = ConnectedMessage | HistoryPageMessage | PiEvent;
 
 // ── Browser → Server ─────────────────────────────────────────────────────────
 
@@ -157,6 +178,8 @@ export type ClientMessage =
   | { type: 'extension_ui_response'; id: string; value?: string; confirmed?: boolean; cancelled?: true }
   /** Request list of all providers with auth status. */
   | { type: 'get_providers' }
+  /** Request an older raw SDK message page by start offset. Server replies with history_page. */
+  | { type: 'load_history'; sessionId: string; offset: number; limit?: number }
   /** Persist an API key for a provider. */
   | { type: 'set_provider_key'; provider: string; key: string }
   /** Remove stored API key for a provider. */
