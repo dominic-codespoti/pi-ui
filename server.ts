@@ -607,7 +607,13 @@ try {
 
         case 'new_session': {
           try {
-            const targetCwd = (msg as { type: 'new_session'; targetCwd?: string }).targetCwd ?? cwd;
+            const rawTargetCwd = (msg as { type: 'new_session'; targetCwd?: string }).targetCwd ?? cwd;
+            // Security: targetCwd must resolve within the server's cwd.
+            const targetCwd = resolve(rawTargetCwd);
+            if (!targetCwd.startsWith(resolve(cwd))) {
+              console.warn(`[pifrontier] new_session blocked: targetCwd escapes workspace: ${rawTargetCwd}`);
+              break;
+            }
             const sm = _sdk!.SessionManager.create(targetCwd);
             const { session: newSession } = await _sdk!.createAgentSession({
               cwd: targetCwd,
@@ -623,6 +629,13 @@ try {
 
         case 'switch_session': {
           try {
+            // Security: validate path is inside cwd before opening.
+            const resolvedPath = resolve(msg.path);
+            if (!resolvedPath.startsWith(resolve(cwd))) {
+              console.warn(`[pifrontier] switch_session blocked: path escapes workspace: ${msg.path}`);
+              ws.send(JSON.stringify({ type: 'sessions_error', message: 'Path escapes workspace.' }));
+              break;
+            }
             const sm = _sdk!.SessionManager.open(msg.path);
             const { session: newSession } = await _sdk!.createAgentSession({
               cwd: sm.getCwd() || cwd,
@@ -683,6 +696,12 @@ try {
 
         case 'rename_session': {
           try {
+            // Security: validate path is inside cwd.
+            const resolvedPath = resolve(msg.path);
+            if (!resolvedPath.startsWith(resolve(cwd))) {
+              ws.send(JSON.stringify({ type: 'sessions_error', message: 'Path escapes workspace.' }));
+              break;
+            }
             const sm = _sdk!.SessionManager.open(msg.path);
             sm.appendSessionInfo(msg.name);
             // If renaming the active session, also fire the SDK event so all
@@ -758,16 +777,22 @@ try {
           try {
             const prefix = (msg as { type: 'dir_complete'; prefix: string }).prefix;
             const { readdir } = await import('node:fs/promises');
-            const { dirname, basename, join } = await import('node:path');
+            const { dirname, basename: pathBasename, join: pathJoin } = await import('node:path');
             const isDir = prefix.endsWith('/');
             const dir = isDir ? prefix : dirname(prefix);
-            const fragment = isDir ? '' : basename(prefix).toLowerCase();
+            // Security: only complete directories within the server's cwd.
+            const resolvedDir = resolve(dir);
+            if (!resolvedDir.startsWith(resolve(cwd))) {
+              ws.send(JSON.stringify({ type: 'dir_completions', prefix, entries: [] }));
+              break;
+            }
+            const fragment = isDir ? '' : pathBasename(prefix).toLowerCase();
             let entries: string[] = [];
             try {
-              const dirents = await readdir(dir, { withFileTypes: true });
+              const dirents = await readdir(resolvedDir, { withFileTypes: true });
               entries = dirents
                 .filter((d) => d.isDirectory() && (fragment === '' || d.name.toLowerCase().startsWith(fragment)))
-                .map((d) => join(dir, d.name) + '/')
+                .map((d) => pathJoin(dir, d.name) + '/')
                 .slice(0, 20);
             } catch {
               entries = [];
@@ -1094,6 +1119,11 @@ try {
         case 'read_file': {
           try {
             const filePath = (msg as { type: 'read_file'; path: string }).path;
+            // Security: reject null bytes (path traversal via null injection).
+            if (filePath.includes('\0')) {
+              ws.send(JSON.stringify({ type: 'file_content', path: filePath, content: '', error: 'Invalid path' }));
+              break;
+            }
             // Security: resolve relative to cwd and ensure it doesn't escape
             const resolved = resolve(cwd, filePath);
             if (!resolved.startsWith(resolve(cwd))) {
