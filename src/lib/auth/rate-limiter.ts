@@ -37,6 +37,20 @@ function normalizeIp(ip: string): string {
   return ip.replace(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/, '$1');
 }
 
+/**
+ * Extract the real client IP, preferring Cloudflare's header over the raw
+ * connection address (which is Cloudflare's edge IP behind a tunnel).
+ */
+export function getClientIp(request: Request, fallbackIp: string): string {
+  return (
+    request.headers.get('cf-connecting-ip') ??
+    request.headers.get('x-real-ip') ??
+    // X-Forwarded-For may be comma-separated — take the leftmost (client) IP.
+    request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ??
+    fallbackIp
+  );
+}
+
 /** Read the current rate-limit status without recording anything. */
 export function checkRateLimit(rawIp: string): RateLimitResult {
   const ip = normalizeIp(rawIp);

@@ -3,46 +3,108 @@ import { SignJWT, jwtVerify } from 'jose';
 
 export const COOKIE_NAME = 'pi-session';
 
-// JWT secret derived from PI_PASSWORD at module load time.
-// Both server.ts and the SvelteKit bundle read the same process.env,
-// so tokens signed in one context verify in the other.
-const SECRET = new TextEncoder().encode(
-  process.env.PI_PASSWORD ?? 'dev-secret-replace-me-set-PI_PASSWORD'
-);
+// ── JWT secret ────────────────────────────────────────────────────────────────
+// Derived from HMAC-SHA256(password, random_salt) so the signing key is
+// independent of the password itself. A leaked password alone cannot forge
+// tokens — the per-boot salt is also required.
 
+const g = globalThis as Record<string, unknown>;
+
+/** Per-process random salt generated once at startup (32 bytes, hex). */
+function getOrCreateSalt(): string {
+  if (!g.__piJwtSalt) {
+    const buf = new Uint8Array(32);
+    crypto.getRandomValues(buf);
+    g.__piJwtSalt = Array.from(buf, (b) => b.toString(16).padStart(2, '0')).join('');
+  }
+  return g.__piJwtSalt as string;
+}
+
+/** Derive a 256-bit JWT signing key from the password + per-boot salt. */
+async function deriveSecret(): Promise<Uint8Array> {
+  if (g.__piJwtSecret) return g.__piJwtSecret as Uint8Array;
+  const password = process.env.PI_PASSWORD ?? 'dev-secret-replace-me-set-PI_PASSWORD';
+  const salt = getOrCreateSalt();
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey('raw', enc.encode(password), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = await crypto.subtle.sign('HMAC', key, enc.encode(salt));
+  g.__piJwtSecret = new Uint8Array(sig);
+  return g.__piJwtSecret as Uint8Array;
+}
+
+// ── Token revocation ──────────────────────────────────────────────────────────
+// Lightweight in-memory token ID blacklist. Cleared on restart (acceptable —
+// the per-boot salt already invalidates all tokens from previous runs).
+
+function revokedSet(): Set<string> {
+  if (!g.__piRevokedJtis) g.__piRevokedJtis = new Set<string>();
+  return g.__piRevokedJtis as Set<string>;
+}
+
+/** Revoke a specific token by its JTI claim (called on logout). */
+export function revokeToken(jti: string): void {
+  revokedSet().add(jti);
+}
+
+// ── Password hashing ──────────────────────────────────────────────────────────
 // bcrypt hash stored in globalThis so it is shared between server.ts's
 // module context and the SvelteKit bundle (separate module graphs, same process).
+
 export async function initPassword(plain: string): Promise<void> {
-  (globalThis as Record<string, unknown>).__piHash = await bcrypt.hash(plain, 10);
+  g.__piHash = await bcrypt.hash(plain, 10);
+  // Pre-derive the JWT secret so it's ready when the first token is created.
+  await deriveSecret();
 }
 
 export async function verifyPassword(plain: string): Promise<boolean> {
-  let hash = (globalThis as Record<string, unknown>).__piHash as string | undefined;
+  let hash = g.__piHash as string | undefined;
   if (!hash) {
     // In dev mode (Vite process) initPassword() is never called explicitly.
     // Auto-initialize from the env var so login works without a separate call.
     const envPwd = process.env.PI_PASSWORD;
     if (!envPwd) return false;
     await initPassword(envPwd);
-    hash = (globalThis as Record<string, unknown>).__piHash as string;
+    hash = g.__piHash as string;
   }
   return bcrypt.compare(plain, hash);
 }
 
+// ── JWT creation / verification ───────────────────────────────────────────────
+
+/** Session token expiry (24 hours instead of 7 days). */
+const TOKEN_EXPIRY = '24h';
+
 export async function createSessionToken(): Promise<string> {
+  const jti = crypto.randomUUID();
+  const secret = await deriveSecret();
   return new SignJWT({ pi: 1 })
     .setProtectedHeader({ alg: 'HS256' })
     .setIssuedAt()
-    .setExpirationTime('7d')
-    .sign(SECRET);
+    .setJti(jti)
+    .setExpirationTime(TOKEN_EXPIRY)
+    .sign(secret);
 }
 
 export async function verifySessionToken(token: string): Promise<boolean> {
   try {
-    await jwtVerify(token, SECRET);
+    const secret = await deriveSecret();
+    const { payload } = await jwtVerify(token, secret);
+    // Check revocation list
+    if (payload.jti && revokedSet().has(payload.jti)) return false;
     return true;
   } catch {
     return false;
+  }
+}
+
+/** Extract the JTI from a token without full verification (for logout). */
+export async function extractJti(token: string): Promise<string | undefined> {
+  try {
+    const secret = await deriveSecret();
+    const { payload } = await jwtVerify(token, secret);
+    return payload.jti;
+  } catch {
+    return undefined;
   }
 }
 

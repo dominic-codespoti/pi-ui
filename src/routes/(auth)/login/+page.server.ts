@@ -1,7 +1,32 @@
 import { fail, redirect } from '@sveltejs/kit';
 import type { Actions, PageServerLoad } from './$types';
-import { verifyPassword, verifySessionToken, createSessionToken, COOKIE_NAME } from '$lib/auth/password';
-import { checkRateLimit, recordFailure, clearRecord } from '$lib/auth/rate-limiter';
+import {
+  verifyPassword, verifySessionToken, createSessionToken,
+  extractJti, revokeToken, getTokenFromCookies, COOKIE_NAME,
+} from '$lib/auth/password';
+import { checkRateLimit, recordFailure, clearRecord, getClientIp } from '$lib/auth/rate-limiter';
+
+/** Detect if we're behind a reverse proxy (Cloudflare Tunnel, nginx, etc.). */
+function isBehindProxy(request: Request): boolean {
+  return !!(
+    request.headers.get('x-forwarded-proto') ||
+    request.headers.get('cf-connecting-ip') ||
+    request.headers.get('x-forwarded-for')
+  );
+}
+
+/** Cookie options shared between login and logout. */
+function cookieOpts(request: Request): { path: string; httpOnly: boolean; sameSite: 'strict'; secure: boolean; maxAge: number } {
+  return {
+    path: '/',
+    httpOnly: true,
+    sameSite: 'strict',
+    // Secure when behind a TLS-terminating proxy (Cloudflare Tunnel) or when
+    // the request itself is HTTPS. Only false for bare-HTTP local dev.
+    secure: isBehindProxy(request) || request.url.startsWith('https'),
+    maxAge: 60 * 60 * 24, // 24h — matches JWT expiry
+  };
+}
 
 export const load: PageServerLoad = async ({ cookies }) => {
   const token = cookies.get(COOKIE_NAME);
@@ -14,9 +39,23 @@ export const load: PageServerLoad = async ({ cookies }) => {
 
 export const actions: Actions = {
   default: async ({ request, cookies, getClientAddress }) => {
-    const ip = getClientAddress();
+    const ip = getClientIp(request, getClientAddress());
 
-    // Check rate limit before doing any work
+    // ── CSRF origin check ─────────────────────────────────────────────────
+    const origin = request.headers.get('origin');
+    const host = request.headers.get('host');
+    if (origin && host) {
+      try {
+        const originHost = new URL(origin).host;
+        if (originHost !== host) {
+          return fail(403, { error: 'Origin mismatch — request blocked.' });
+        }
+      } catch {
+        return fail(403, { error: 'Invalid origin header.' });
+      }
+    }
+
+    // ── Rate limit ────────────────────────────────────────────────────────
     const rl = checkRateLimit(ip);
     if (rl.blocked) {
       const mins = Math.ceil((rl.retryAfterSecs ?? 0) / 60);
@@ -48,15 +87,19 @@ export const actions: Actions = {
     clearRecord(ip);
 
     const token = await createSessionToken();
-    cookies.set(COOKIE_NAME, token, {
-      path: '/',
-      httpOnly: true,
-      sameSite: 'strict',
-      // Set secure: true in production behind HTTPS
-      secure: false,
-      maxAge: 60 * 60 * 24 * 7,
-    });
+    cookies.set(COOKIE_NAME, token, cookieOpts(request));
 
     redirect(302, '/');
+  },
+
+  logout: async ({ request, cookies }) => {
+    const cookieHeader = request.headers.get('cookie') ?? '';
+    const token = getTokenFromCookies(cookieHeader);
+    if (token) {
+      const jti = await extractJti(token);
+      if (jti) revokeToken(jti);
+    }
+    cookies.delete(COOKIE_NAME, { path: '/' });
+    redirect(302, '/login');
   },
 };

@@ -173,7 +173,12 @@ function serializeSession(s: Record<string, any>): SessionSummary {
   };
 }
 
-// ── 3. Extension UI — pending request map ─────────────────────────────────────
+// ── 3. Restart nonce ──────────────────────────────────────────────────────────
+// Single-use nonce for restart_server. Prevents replay and ensures the user
+// explicitly confirmed the restart via a request_restart → restart_server flow.
+let pendingRestartNonce: string | null = null;
+
+// ── 4. Extension UI — pending request map ─────────────────────────────────────
 
 type PendingRequest = { resolve: (response: Record<string, unknown>) => void };
 const pendingExtensionRequests = new Map<string, PendingRequest>();
@@ -711,14 +716,24 @@ try {
 
         case 'delete_session': {
           try {
-            // Guard against deleting the active session
+            // Validate the path is a known session file — never trust raw user paths.
             const list = await _sdk!.SessionManager.list(cwd);
             const target = list.find((s) => s.path === msg.path);
-            if (target && target.id === session!.sessionId) {
+            if (!target) {
+              ws.send(JSON.stringify({ type: 'sessions_error', message: 'Session not found.' }));
+              break;
+            }
+            if (target.id === session!.sessionId) {
               ws.send(JSON.stringify({ type: 'sessions_error', message: 'Cannot delete the active session.' }));
               break;
             }
-            await rm(msg.path);
+            // Double-check: resolved path must be inside the resolved cwd.
+            const resolvedPath = resolve(target.path);
+            if (!resolvedPath.startsWith(resolve(cwd))) {
+              ws.send(JSON.stringify({ type: 'sessions_error', message: 'Path escapes workspace.' }));
+              break;
+            }
+            await rm(resolvedPath);
             const updated = await _sdk!.SessionManager.list(cwd);
             ws.send(JSON.stringify({ type: 'sessions_list', sessions: updated.slice(0, 30).map(serializeSession) }));
           } catch (err) {
@@ -1009,6 +1024,18 @@ try {
         case 'install_skill': {
           try {
             const rawUrl = resolveGitHubRawUrl(msg.url as string);
+            // Security: only allow fetching from trusted hosts to prevent SSRF.
+            const ALLOWED_HOSTS = ['github.com', 'raw.githubusercontent.com', 'gist.githubusercontent.com'];
+            try {
+              const parsedUrl = new URL(rawUrl);
+              if (!ALLOWED_HOSTS.includes(parsedUrl.hostname)) {
+                ws.send(JSON.stringify({ type: 'skill_install_result', success: false, error: `Blocked: only GitHub URLs are allowed (got ${parsedUrl.hostname}).` }));
+                break;
+              }
+            } catch {
+              ws.send(JSON.stringify({ type: 'skill_install_result', success: false, error: 'Invalid URL.' }));
+              break;
+            }
             const res = await fetch(rawUrl);
             if (!res.ok) {
               ws.send(JSON.stringify({ type: 'skill_install_result', success: false, error: `HTTP ${res.status}: ${res.statusText}` }));
@@ -1087,10 +1114,24 @@ try {
           break;
         }
 
+        case 'request_restart': {
+          // Issue a single-use nonce — the client must send it back in restart_server.
+          pendingRestartNonce = crypto.randomUUID();
+          ws.send(JSON.stringify({ type: 'restart_nonce', nonce: pendingRestartNonce }));
+          break;
+        }
+
         case 'restart_server': {
-          console.log('[pifrontier] Restart requested — broadcasting and re-execing…');
+          // Restart requires a valid nonce obtained from a 'request_restart'
+          // message. This prevents replay attacks and ensures intentionality.
+          const nonce = (msg as { type: 'restart_server'; nonce?: string }).nonce;
+          if (!nonce || nonce !== pendingRestartNonce) {
+            ws.send(JSON.stringify({ type: 'sessions_error', message: 'Invalid or missing restart nonce.' }));
+            break;
+          }
+          pendingRestartNonce = null; // consume the nonce — single use
+          console.log('[pifrontier] Restart confirmed — broadcasting and re-execing…');
           broadcast({ type: 'server_restarting' });
-          // Give clients ~400 ms to receive the broadcast before the WS closes.
           setTimeout(() => {
             Bun.spawn([process.execPath, ...process.argv.slice(1)], {
               env: process.env as Record<string, string>,
@@ -1112,6 +1153,7 @@ try {
     },
 
     idleTimeout: 120,
+    maxPayloadLength: 4 * 1024 * 1024, // 4 MB — prevents OOM from oversized messages
     perMessageDeflate: true,
   },
 });
