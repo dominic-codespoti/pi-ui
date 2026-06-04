@@ -1,6 +1,6 @@
 @import "tailwindcss";
 @plugin "daisyui" {
-  themes: night;
+  themes: night, dark, dracula, synthwave, forest, luxury, coffee, sunset, dim, black, nord, abyss, winter, emerald;
 }
 
 html { height: 100%; overflow: hidden; }
@@ -18,7 +18,7 @@ html { height: 100%; overflow: hidden; }
 body { display: flex; flex-direction: row; height: 100dvh; overflow: hidden; }
 
 /* ── Make Tailwind dark: variants fire on our daisyUI night theme ─────────── */
-@custom-variant dark ([data-theme=night]);
+@custom-variant dark (&[data-theme]);
 
 /* ── Wire shadcn color names into Tailwind v4's --color-* namespace ─────── */
 /*
@@ -45,8 +45,9 @@ body { display: flex; flex-direction: row; height: 100dvh; overflow: hidden; }
 /*
  * shadcn components expect --background, --foreground, --primary, etc.
  * Map them onto daisyUI v5 vars (--color-*) so both systems coexist.
+ * Applied to any daisyUI theme via [data-theme].
  */
-[data-theme=night] {
+[data-theme] {
   --background:          var(--color-base-100);
   --foreground:          var(--color-base-content);
   --muted:               var(--color-base-200);

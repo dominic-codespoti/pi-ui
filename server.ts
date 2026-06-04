@@ -42,7 +42,7 @@ async function getSvelteHandler(): Promise<SvelteHandler> {
   if (!_svelteHandler) {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const mod = await import('./build/handler.js') as any;
-    _svelteHandler = mod.default(true).httpserver as SvelteHandler;
+    _svelteHandler = mod.getHandler().fetch as SvelteHandler;
   }
   return _svelteHandler;
 }

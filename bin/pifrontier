@@ -1,4 +1,17 @@
 #!/bin/sh
-# POSIX-compatible — works on macOS (BSD readlink) and Linux (GNU readlink).
-SELF_DIR="$(cd "$(dirname "$0")" && pwd -P)"
-exec bun "$SELF_DIR/pifrontier.ts" "$@"
+# Shim that locates pifrontier.ts and runs it with Bun.
+# Handles npm global installs where this script is behind a symlink.
+SELF="$0"
+case "$SELF" in
+  /*) ;;
+  *) SELF="$(pwd -P)/$SELF" ;;
+esac
+while [ -h "$SELF" ]; do
+  DIR="$(dirname "$SELF")"
+  LINK="$(readlink "$SELF")"
+  case "$LINK" in
+    /*) SELF="$LINK" ;;
+    *) SELF="$DIR/$LINK" ;;
+  esac
+done
+exec bun "$(dirname "$SELF")/pifrontier.ts" "$@"

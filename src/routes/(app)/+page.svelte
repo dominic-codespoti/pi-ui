@@ -504,6 +504,8 @@
   let sessionName = $state<string | undefined>(undefined);
   /** Most recent input token count (from message_end) — used for context % */
   let lastInputTokens = $state(0);
+  /** Timestamp (epoch ms) when the current session was loaded — for elapsed display. */
+  let sessionStartTime = $state(0);
   /** Pending steered messages (queue_update) */
   let queuedSteering = $state<string[]>([]);
   /** Pending follow-up messages (queue_update) */
@@ -536,6 +538,14 @@
    * Implies autoSpeak = true while active.
    */
   let conversationMode = $state(false);
+
+  /** Selected daisyUI theme — persisted in localStorage. */
+  let selectedTheme = $state('night');
+  function setTheme(t: string) {
+    selectedTheme = t;
+    document.documentElement.setAttribute('data-theme', t);
+    try { localStorage.setItem('pifrontier:theme', t); } catch { /* noop */ }
+  }
 
   /** Browser TTS settings exposed in the settings modal. */
   let speechVoices = $state<SpeechSynthesisVoice[]>([]);
@@ -597,6 +607,23 @@
     { id: 'shortcuts', label: 'Shortcuts', icon: '⌘' },
     { id: 'about', label: 'About', icon: 'π' },
   ] as const;
+
+  const THEMES: { id: string; name: string }[] = [
+    { id: 'night',     name: 'Night' },
+    { id: 'dark',      name: 'Dark' },
+    { id: 'dracula',   name: 'Dracula' },
+    { id: 'synthwave', name: 'Synthwave' },
+    { id: 'forest',    name: 'Forest' },
+    { id: 'luxury',    name: 'Luxury' },
+    { id: 'coffee',    name: 'Coffee' },
+    { id: 'sunset',    name: 'Sunset' },
+    { id: 'dim',       name: 'Dim' },
+    { id: 'black',     name: 'Black' },
+    { id: 'nord',      name: 'Nord' },
+    { id: 'abyss',     name: 'Abyss' },
+    { id: 'winter',    name: 'Winter' },
+    { id: 'emerald',   name: 'Emerald' },
+  ];
 
   const SHORTCUTS = [
     { keys: 'Ctrl / Cmd + /', action: 'Toggle sessions' },
@@ -704,6 +731,7 @@
 
   const sessionTokens = $derived(messages.reduce((s, m) => s + (m.usage?.totalTokens ?? 0), 0));
   const sessionCostTotal = $derived(messages.reduce((s, m) => s + (m.usage?.cost?.total ?? 0), 0));
+  const sessionDuration = $derived(sessionStartTime > 0 ? fmtDuration(Date.now() - sessionStartTime) : '');
   /** Context window fill percentage (0 if unknown) */
   const contextPercent = $derived(
     model?.contextWindow && model.contextWindow > 0 && lastInputTokens > 0
@@ -944,6 +972,7 @@
           cwd: c.cwd,
           sessionName: c.sessionName,
         });
+        sessionStartTime = Date.now();
         if (c.piVersion) piVersion = c.piVersion;
         if (c.uiVersion) uiVersion = c.uiVersion;
         break;
@@ -963,6 +992,7 @@
           uiVersion?: string;
         };
         applySessionState(sl);
+        sessionStartTime = Date.now();
         if (sl.piVersion) piVersion = sl.piVersion;
         if (sl.uiVersion) uiVersion = sl.uiVersion;
         break;
@@ -2364,6 +2394,8 @@
       selectedVoiceURI = localStorage.getItem('pifrontier:voice-uri') ?? '';
       speechRate = Number(localStorage.getItem('pifrontier:speech-rate') ?? '1') || 1;
       speechPitch = Number(localStorage.getItem('pifrontier:speech-pitch') ?? '1') || 1;
+      const savedTheme = localStorage.getItem('pifrontier:theme');
+      if (savedTheme) setTheme(savedTheme);
     } catch { /* localStorage unavailable */ }
     refreshSpeechVoices();
     if ('speechSynthesis' in window) window.speechSynthesis.onvoiceschanged = refreshSpeechVoices;
@@ -2448,13 +2480,13 @@
         {#if filteredTree.length === 0 && projects.length === 0}
           <div class="flex flex-col items-center justify-center gap-2 py-12 px-4 text-center">
             <svg class="w-8 h-8 text-base-content/15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h3l2 2h9a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
-            <p class="text-sm text-base-content/35 font-medium">No projects yet</p>
-            <p class="text-xs text-base-content/25">Open a folder below to start</p>
+            <p class="text-sm text-base-content/55 font-medium">No projects yet</p>
+            <p class="text-xs text-base-content/45">Open a folder below to start</p>
           </div>
         {:else if filteredTree.length === 0}
           <div class="flex flex-col items-center justify-center gap-1.5 py-10 px-4 text-center">
-            <p class="text-sm text-base-content/35">No match</p>
-            <p class="text-xs text-base-content/25">Try a different search term</p>
+            <p class="text-sm text-base-content/55">No match</p>
+            <p class="text-xs text-base-content/45">Try a different search term</p>
           </div>
         {:else}
           <div class="flex flex-col pt-1 gap-2">
@@ -2681,7 +2713,7 @@
         </span>
         <span class="hidden sm:flex max-w-full items-center justify-center gap-1.5 text-[11px] leading-tight text-base-content/38 truncate">
           <span class="truncate">{model?.provider || 'no provider'}</span>
-          {#if model?.name}<span class="text-base-content/20">›</span><span class="truncate">{model.name}</span>{/if}
+          {#if model?.name}<span class="text-base-content/40">›</span><span class="truncate">{model.name}</span>{/if}
           {#if thinkingLevel !== 'off'}<span class="text-success/65">{thinkingLevel}</span>{/if}
         </span>
       </button>
@@ -2689,18 +2721,73 @@
       <div class="relative z-10 flex items-center gap-1.5 shrink-0 ml-auto">
         {#if lastInputTokens > 0}
           <Tooltip.Root>
-            <Tooltip.Trigger class="h-9 hidden md:flex items-center gap-2 rounded-xl px-3 bg-base-content/[0.055] border border-base-content/8 text-xs text-base-content/65 tabular-nums cursor-default">
+            <Tooltip.Trigger class={[
+              'h-9 hidden md:flex items-center gap-2 rounded-xl px-3 border text-xs tabular-nums cursor-default transition-colors',
+              contextPercent >= 75
+                ? 'bg-error/8 border-error/18 text-error/70'
+                : contextPercent >= 50
+                  ? 'bg-warning/8 border-warning/18 text-warning/70'
+                  : 'bg-base-content/[0.055] border-base-content/8 text-base-content/65'
+            ].join(' ')}>
               <span class="relative flex h-4 w-4 items-center justify-center">
-                <span class="absolute inset-0 rounded-full border-2 border-success/35"></span>
-                <span class="h-1.5 w-1.5 rounded-full bg-success/70"></span>
+                <span class={[
+                  'absolute inset-0 rounded-full border-2 transition-colors',
+                  contextPercent >= 75
+                    ? 'border-error/40'
+                    : contextPercent >= 50
+                      ? 'border-warning/40'
+                      : 'border-success/35'
+                ].join(' ')}></span>
+                <span class={[
+                  'h-1.5 w-1.5 rounded-full transition-colors',
+                  contextPercent >= 75
+                    ? 'bg-error/70'
+                    : contextPercent >= 50
+                      ? 'bg-warning/70'
+                      : 'bg-success/70'
+                ].join(' ')}></span>
               </span>
               <span>{contextPercent > 0 ? `${contextPercent}%` : fmtTokens(lastInputTokens)}</span>
             </Tooltip.Trigger>
-            <Tooltip.Content sideOffset={8} class="min-w-[170px]">
-              <div class="flex flex-col gap-1 text-xs tabular-nums">
-                <p>Used tokens: {lastInputTokens.toLocaleString()}</p>
-                {#if model?.contextWindow}<p>Context limit: {model.contextWindow.toLocaleString()}</p>{/if}
-                {#if sessionTokens > 0}<p>Output/session: {sessionTokens.toLocaleString()}</p>{/if}
+            <Tooltip.Content sideOffset={8} class="min-w-[180px]">
+              <div class="flex flex-col gap-2 py-0.5">
+                <div class="flex items-center justify-between gap-3">
+                  <span class="text-background/60">Context</span>
+                  <span class="font-medium">{contextPercent > 0 ? `${contextPercent}%` : fmtTokens(lastInputTokens)}</span>
+                </div>
+                <div class="w-full h-1.5 rounded-full bg-background/15 overflow-hidden">
+                  <div
+                    class={[
+                      'h-full rounded-full transition-all',
+                      contextPercent >= 75 ? 'bg-error/70' : contextPercent >= 50 ? 'bg-warning/70' : 'bg-background/70'
+                    ].join(' ')}
+                    style="width: {Math.min(contextPercent, 100)}%"
+                  ></div>
+                </div>
+                <div class="flex items-center justify-between text-background/60">
+                  <span>{lastInputTokens.toLocaleString()}</span>
+                  {#if model?.contextWindow}
+                    <span>/ {model.contextWindow.toLocaleString()} tokens</span>
+                  {/if}
+                </div>
+                {#if sessionTokens > 0}
+                  <div class="flex items-center justify-between border-t border-background/10 pt-1.5 mt-0.5">
+                    <span class="text-background/45">Session</span>
+                    <span class="text-background/70">{sessionTokens.toLocaleString()} tokens</span>
+                  </div>
+                {/if}
+                {#if sessionCostTotal > 0}
+                  <div class="flex items-center justify-between">
+                    <span class="text-background/45">Cost</span>
+                    <span class="text-background/70">{fmtCost(sessionCostTotal)}</span>
+                  </div>
+                {/if}
+                {#if sessionDuration}
+                  <div class="flex items-center justify-between border-t border-background/10 pt-1.5 mt-0.5">
+                    <span class="text-background/45">Elapsed</span>
+                    <span class="text-background/70">{sessionDuration}</span>
+                  </div>
+                {/if}
               </div>
             </Tooltip.Content>
           </Tooltip.Root>
@@ -2766,17 +2853,17 @@
       {#if messages.length === 0 && wsState === 'connecting'}
         <div class="min-h-full flex flex-col items-center justify-center gap-3 select-none pointer-events-none">
           <span class="text-8xl font-light text-base-content/[0.08] animate-pulse">π</span>
-          <p class="text-sm text-base-content/30">connecting…</p>
+          <p class="text-sm text-base-content/55">connecting…</p>
         </div>
       {:else if messages.length === 0 && wsState === 'open' && !sessionId}
         <div class="min-h-full flex flex-col items-center justify-center gap-3 select-none pointer-events-none">
           <span class="text-8xl font-light text-base-content/[0.08] animate-pulse">π</span>
-          <p class="text-sm text-base-content/30">loading session…</p>
+          <p class="text-sm text-base-content/55">loading session…</p>
         </div>
       {:else if messages.length === 0 && wsState === 'open'}
         <div class="min-h-full flex flex-col items-center justify-center gap-3 select-none pointer-events-none">
           <span class="text-8xl font-light text-base-content/[0.08]">π</span>
-          <p class="text-sm text-base-content/30">start a conversation</p>
+          <p class="text-sm text-base-content/55">start a conversation</p>
         </div>
       {:else}
         <div class="w-full max-w-3xl lg:max-w-5xl xl:max-w-6xl 2xl:max-w-7xl mx-auto px-4 md:px-6 flex flex-col gap-1">
@@ -2833,41 +2920,41 @@
               </div>
 
             {:else if msg.role === 'assistant'}
-              <div class="group">
+              <div class="group trace-step asst-step">
 
                 <!-- THINKING TOGGLE (compact) -->
                 {#if msg.streaming}
                   {#if msg.thinking && msg.thinking.length > 0}
-                    <div class="flex items-center gap-1.5 text-[10px] text-base-content/25 py-0.5">
+                    <div class="flex items-center gap-1.5 text-[10px] text-base-content/50 py-0.5">
                       <Brain class="w-3 h-3 shrink-0" style="color:var(--color-secondary);animation:pulse 1.5s ease-in-out infinite" />
-                      <span class="text-base-content/35">{hiddenThinkingLabel}</span>
+                      <span class="text-base-content/55">{hiddenThinkingLabel}</span>
                       <span class="truncate">{msg.thinking.slice(0, 80)}{msg.thinking.length > 80 ? '…' : ''}</span>
                     </div>
                   {:else if !msg.content}
-                    <div class="flex items-center gap-1.5 text-[10px] text-base-content/20 py-0.5">
-                      <Loader class="w-3 h-3 animate-spin text-base-content/30" />
+                    <div class="flex items-center gap-1.5 text-[10px] text-base-content/45 py-0.5">
+                      <Loader class="w-3 h-3 animate-spin text-base-content/55" />
                       <span>{hiddenThinkingLabel}...</span>
                     </div>
                   {/if}
                 {:else if msg.thinking}
                   <button
                     onclick={() => { msg.thinkingExpanded = !msg.thinkingExpanded; }}
-                    class="flex items-center gap-1.5 text-[10px] text-base-content/25 hover:text-base-content/45 transition-colors py-0.5"
+                    class="flex items-center gap-1.5 text-[10px] text-base-content/50 hover:text-base-content/65 transition-colors py-0.5 mb-5"
                     aria-expanded={msg.thinkingExpanded}
                   >
                     <Brain class="w-3 h-3 shrink-0" style="color:var(--color-secondary)" />
-                    <span class="text-base-content/35">{hiddenThinkingLabel}</span>
+                    <span class="text-base-content/55">{hiddenThinkingLabel}</span>
                     <span class="truncate">{msg.thinking.slice(0, 80)}{msg.thinking.length > 80 ? '…' : ''}</span>
                     {#if msg.endMs && msg.thinkingStartMs}
-                      <span class="text-base-content/20 shrink-0">{fmtDuration(msg.endMs - msg.thinkingStartMs)}</span>
+                      <span class="text-base-content/45 shrink-0">{fmtDuration(msg.endMs - msg.thinkingStartMs)}</span>
                     {/if}
                     <ChevronRight class="w-2.5 h-2.5 shrink-0 {msg.thinkingExpanded ? 'rotate-90' : ''} transition-transform" />
                   </button>
                 {/if}
 
-                <!-- EXPANDED THINKING BLOCK -->
+                <!-- EXPANDED THINKING BLOCK (trailing margin creates gap before body) -->
                 {#if msg.thinkingExpanded && msg.thinking}
-                  <pre class="text-[11px] text-base-content/30 whitespace-pre-wrap break-words max-h-48 overflow-y-auto leading-relaxed bg-base-content/[0.03] rounded px-2 py-1.5 my-0.5 select-text ml-3 border-l-2 border-base-content/[0.08]">{msg.thinking}</pre>
+                  <pre class="text-[11px] text-base-content/60 whitespace-pre-wrap break-words max-h-48 overflow-y-auto leading-relaxed bg-base-content/[0.04] rounded px-2 py-1.5 mb-5 select-text ml-3 border-l-2 border-base-content/[0.12]">{msg.thinking}</pre>
                 {/if}
 
                 <!-- BODY -->
@@ -2891,18 +2978,22 @@
 
                 <!-- META + ACTIONS -->
                 {#if msg.content && !msg.streaming}
-                  <div class="flex items-center gap-2 text-[10px] text-base-content/20 py-0.5">
+                  <div class="flex items-center gap-2 text-[10px] py-0.5 select-none">
                     {#if msg.usage}
-                      <span class="tabular-nums">{fmtTokens(msg.usage.totalTokens)}t</span>
-                      {#if msg.usage.cost.total > 0}<span>· {fmtCost(msg.usage.cost.total)}</span>{/if}
-                      {#if msg.startMs && msg.endMs}<span>· {fmtDuration(msg.endMs - msg.startMs)}</span>{/if}
+                      <span class="tabular-nums text-base-content/50">{fmtTokens(msg.usage.totalTokens)}t</span>
+                      {#if msg.usage.cost?.total}
+                        <span class="tabular-nums text-base-content/45">{fmtCost(msg.usage.cost.total)}</span>
+                      {/if}
+                    {/if}
+                    {#if msg.endMs && msg.startMs}
+                      <span class="tabular-nums text-base-content/50">{fmtDuration(msg.endMs - msg.startMs)}</span>
                     {/if}
                     <span class="ml-auto flex items-center gap-0.5">
                       <button
                         onclick={() => copyMessage(msg)}
-                        class="flex items-center justify-center w-5 h-5 text-base-content/25 hover:text-base-content/55 rounded transition-colors select-none"
+                        class="flex items-center justify-center w-5 h-5 text-base-content/35 hover:text-base-content/60 rounded transition-colors select-none"
                         aria-label="Copy message"
-                      >{#if copiedId === msg.id}<svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m20 6-11 11-5-5"/></svg>{:else}<svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>{/if}</button>
+                      >{#if copiedId === msg.id}<svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m20 6-11 11-5-5"/></svg>{:else}<svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>{/if}</button>
                       {#if isSummarizing && msg.id === lastAsstId}
                         <span class="flex items-center justify-center w-5 h-5 text-primary/60" aria-label="Generating spoken summary…">
                           <svg class="w-3 h-3 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>
@@ -2910,7 +3001,7 @@
                       {:else}
                         <button
                           onclick={() => speakMsg(msg)}
-                          class="flex items-center justify-center w-5 h-5 rounded transition-colors select-none {speakingMsgId === msg.id ? 'text-primary' : 'text-base-content/25 hover:text-base-content/55'}"
+                          class="flex items-center justify-center w-5 h-5 rounded transition-colors select-none {speakingMsgId === msg.id ? 'text-primary' : 'text-base-content/35 hover:text-base-content/60'}"
                           aria-label={speakingMsgId === msg.id ? 'Stop speaking' : 'Speak message'}
                         >{#if speakingMsgId === msg.id}<svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>{:else}<svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>{/if}</button>
                       {/if}
@@ -2922,29 +3013,29 @@
             {:else if msg.role === 'tool'}
               {@const meta = getToolMeta(msg.toolName)}
               {@const detail = msg.toolInput ?? inferDetail(msg.toolName, msg.toolArgs)}
-              <div class="group/tool flex flex-col mb-1">
+              <div class="group/tool flex flex-col trace-step tool-step">
                 <button
                   onclick={() => { if (msg.content || msg.diff) msg.expanded = !msg.expanded; }}
-                  class="flex items-center gap-2 px-2 py-1 text-xs font-mono rounded hover:bg-base-content/[0.04] transition-colors text-left w-full"
+                  class="flex items-center gap-2 px-2 py-1 text-xs font-mono rounded hover:bg-base-content/[0.06] transition-colors text-left w-full"
                   disabled={!msg.content && !msg.diff}
                 >
                   <meta.icon class="w-3.5 h-3.5 shrink-0" style="color:{meta.color};{msg.streaming ? 'animation:pulse 1.5s ease-in-out infinite' : ''}" />
-                  <span class="text-base-content/50 shrink-0">{meta.label}</span>
+                  <span class="text-base-content/70 shrink-0">{meta.label}</span>
                   {#if detail}
-                    <span class="text-base-content/30 truncate flex-1 min-w-0">{detail}</span>
+                    <span class="text-base-content/55 truncate flex-1 min-w-0">{detail}</span>
                   {/if}
                   <span class="shrink-0 ml-auto flex items-center gap-1.5">
                     {#if msg.streaming}
-                      <Loader class="w-3 h-3 text-base-content/30 animate-spin" />
+                      <Loader class="w-3 h-3 text-base-content/55 animate-spin" />
                     {:else if msg.isError}
-                      <CircleX class="w-3 h-3 text-destructive/70" />
+                      <CircleX class="w-3 h-3 text-destructive" />
                     {:else if msg.content || msg.diff}
                       {#if msg.lineCount !== undefined}
-                        <span class="text-base-content/20 tabular-nums">{msg.lineCount}L</span>
+                        <span class="text-base-content/45 tabular-nums">{msg.lineCount}L</span>
                       {/if}
-                      <ChevronRight class="w-3 h-3 text-base-content/20 transition-transform {msg.expanded ? 'rotate-90' : ''}" />
+                      <ChevronRight class="w-3 h-3 text-base-content/45 transition-transform {msg.expanded ? 'rotate-90' : ''}" />
                     {:else}
-                      <Check class="w-3 h-3 text-success/50" />
+                      <Check class="w-3 h-3 text-success/60" />
                     {/if}
                   </span>
                 </button>
@@ -2956,16 +3047,16 @@
                   {:else if msg.content}
                     {@const toolLang = getToolLang(msg.toolName, msg.toolInput)}
                     {#if toolLang}
-                      <pre class="ml-4 pl-2 border-l border-base-content/[0.08] text-xs whitespace-pre-wrap break-words max-h-56 overflow-y-auto leading-relaxed select-text py-1"><code class="hljs">{@html highlightCode(msg.content, toolLang)}</code></pre>
+                      <pre class="ml-4 pl-2 border-l border-base-content/12 text-xs whitespace-pre-wrap break-words max-h-56 overflow-y-auto leading-relaxed select-text py-1"><code class="hljs">{@html highlightCode(msg.content, toolLang)}</code></pre>
                     {:else}
-                      <pre class="ml-4 pl-2 border-l border-base-content/[0.08] text-base-content/40 text-xs whitespace-pre-wrap break-words max-h-56 overflow-y-auto leading-relaxed select-text py-1">{msg.content}</pre>
+                      <pre class="ml-4 pl-2 border-l border-base-content/12 text-base-content/60 text-xs whitespace-pre-wrap break-words max-h-56 overflow-y-auto leading-relaxed select-text py-1">{msg.content}</pre>
                     {/if}
                   {/if}
                 {/if}
               </div>
 
             {:else if msg.role === 'notice'}
-              <div class="flex items-center gap-2 text-[10px] text-base-content/20 select-none py-0.5">
+              <div class="flex items-center gap-2 text-[10px] text-base-content/45 select-none py-0.5">
                 <span class="flex-1 h-px bg-base-content/[0.06]"></span>
                 <span class="flex items-center gap-1 shrink-0">
                   {#if msg.streaming}
@@ -3216,7 +3307,7 @@
       {#if Object.keys(extensionStatuses).length > 0 || lastInputTokens > 0 || sessionCostTotal > 0}
         <div class="hidden md:flex mt-1.5 px-1 items-center gap-2 text-xs select-none min-w-0">
           {#if Object.keys(extensionStatuses).length > 0}
-            <span class="text-base-content/25 truncate min-w-0">
+            <span class="text-base-content/50 truncate min-w-0">
               {Object.values(extensionStatuses).filter(Boolean).join(' · ')}
             </span>
           {/if}
@@ -3229,10 +3320,10 @@
                 class={[
                   'tabular-nums cursor-default',
                   contextPercent >= 75
-                    ? 'text-error/50'
+                    ? 'text-error/60'
                     : contextPercent >= 50
-                      ? 'text-warning/50'
-                      : 'text-base-content/20'
+                      ? 'text-warning/60'
+                      : 'text-base-content/40'
                 ].join(' ')}
               >
                 ctx {contextPercent}%
@@ -3260,7 +3351,7 @@
             </Tooltip.Root>
           {:else if lastInputTokens > 0}
             <Tooltip.Root>
-              <Tooltip.Trigger class="tabular-nums cursor-default text-base-content/20">
+              <Tooltip.Trigger class="tabular-nums cursor-default text-base-content/40">
                 {fmtTokens(lastInputTokens)} ctx
               </Tooltip.Trigger>
               <Tooltip.Content sideOffset={6} class="min-w-[140px]">
@@ -3279,7 +3370,7 @@
           {/if}
 
           {#if sessionCostTotal > 0}
-            <span class="text-base-content/20 tabular-nums">{fmtCost(sessionCostTotal)}</span>
+            <span class="text-base-content/40 tabular-nums">{fmtCost(sessionCostTotal)}</span>
           {/if}
         </div>
       {/if}
@@ -3372,7 +3463,7 @@
           <ScrollArea class="flex-1 min-h-0">
             {#if availableModels.length === 0}
               <div class="flex-1 flex items-center justify-center px-5 py-8">
-                <p class="text-xs text-base-content/20">no models configured</p>
+                <p class="text-xs text-base-content/45">no models configured</p>
               </div>
             {:else if filteredModelsByProvider.length === 0}
               <div class="flex-1 flex items-center justify-center px-5 py-8">
@@ -3435,7 +3526,7 @@
           <ScrollArea class="flex-1 min-h-0">
             {#if providers.length === 0}
               <div class="flex-1 flex items-center justify-center px-5 py-8">
-                <p class="text-xs text-base-content/20">loading…</p>
+                <p class="text-xs text-base-content/45">loading…</p>
               </div>
             {:else if filteredProviders.length === 0}
               <div class="flex-1 flex items-center justify-center px-5 py-8">
@@ -3897,6 +3988,17 @@
                 <Card.Root size="sm" class="py-0 overflow-hidden bg-base-100/60 border-base-content/10">
                   <div class="divide-y divide-base-content/8">
                     <div class="px-4 py-3">
+                      <p class="text-xs text-base-content/35 mb-2">Theme</p>
+                      <div class="flex flex-wrap gap-1.5">
+                        {#each THEMES as theme (theme.id)}
+                          <button
+                            onclick={() => setTheme(theme.id)}
+                            class="px-2.5 py-1 text-xs rounded-lg border transition-colors {selectedTheme === theme.id ? 'border-primary/50 bg-primary/12 text-primary' : 'border-base-content/12 text-base-content/50 hover:text-base-content/75 hover:border-base-content/25'}"
+                          >{theme.name}</button>
+                        {/each}
+                      </div>
+                    </div>
+                    <div class="px-4 py-3">
                       <p class="text-xs text-base-content/35">Working directory</p>
                       <p class="mt-1 text-xs text-base-content/65 font-mono break-all">{cwd || 'unknown'}</p>
                     </div>
@@ -4038,3 +4140,35 @@
     tick().then(() => { autoResizeTextarea(); inputEl?.focus(); });
   }}
 />
+
+<style>
+  /* ── Trace cluster two-level spacing ────────────────────────────────
+   * Thinking and tool messages form a flat DOM sequence.  Adjacent
+   * selectors create the grouped rhythm: tight inside a reasoning step,
+   * wider between steps, and a large gap before the main answer body.
+   *
+   *  .asst-step  – assistant message (may contain thinking + body)
+   *  .tool-step  – tool call
+   *
+   *  Relationship                         Gap
+   *  ──────────────────────────────       ─────
+   *  asst-step + tool-step                 6px  (thinking → its tool)
+   *  tool-step + tool-step                 8px  (tool → next tool)
+   *  tool-step + asst-step                16px  (new reasoning group)
+   *  asst-step + asst-step                16px  (consecutive assistant)
+   *  (inside asst-step: expanded thinking → body via mb-5 = 20px)
+   *  (inside asst-step: collapsed thinking → body via 0 — toggle is unobtrusive)
+   ─────────────────────────────────────────────────────────────────── */
+  .tool-step {
+    margin-bottom: 0.375rem; /* 6px — tight intra-cluster when followed by another tool */
+  }
+  .tool-step + .asst-step {
+    margin-top: 0.625rem; /* 10px — medium gap to next reasoning group */
+  }
+  .asst-step + .tool-step {
+    margin-top: 0;
+  }
+  .asst-step + .asst-step {
+    margin-top: 1rem; /* 16px — between consecutive assistant messages */
+  }
+</style>
