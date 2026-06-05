@@ -1,13 +1,10 @@
-import bcrypt from 'bcryptjs';
-import { SignJWT, jwtVerify } from 'jose';
-
 export const COOKIE_NAME = 'pi-session';
+
+const g = globalThis as Record<string, unknown>;
 
 // ── JWT secret ────────────────────────────────────────────────────────────────
 // Derived deterministically from the password so every process in a given
 // run can verify the same session tokens.
-
-const g = globalThis as Record<string, unknown>;
 
 /** Derive a 256-bit JWT signing key from the password. */
 async function deriveSecret(): Promise<Uint8Array> {
@@ -33,67 +30,110 @@ export function revokeToken(jti: string): void {
   revokedSet().add(jti);
 }
 
-// ── Password hashing ──────────────────────────────────────────────────────────
-// bcrypt hash stored in globalThis so it is shared between server.ts's
-// module context and the SvelteKit bundle (separate module graphs, same process).
+// ── Password hashing (Bun native) ─────────────────────────────────────────────
+// Uses Bun's native bcrypt implementation instead of the pure-JS bcryptjs.
 
 export async function initPassword(plain: string): Promise<void> {
-  g.__piHash = await bcrypt.hash(plain, 10);
-  // Pre-derive the JWT secret so it's ready when the first token is created.
+  g.__piHash = await Bun.password.hash(plain, { algorithm: 'bcrypt', cost: 10 });
   await deriveSecret();
 }
 
 export async function verifyPassword(plain: string): Promise<boolean> {
   let hash = g.__piHash as string | undefined;
   if (!hash) {
-    // In dev mode (Vite process) initPassword() is never called explicitly.
-    // Auto-initialize from the env var so login works without a separate call.
     const envPwd = process.env.PI_PASSWORD;
     if (!envPwd) return false;
     await initPassword(envPwd);
     hash = g.__piHash as string;
   }
-  return bcrypt.compare(plain, hash);
+  return Bun.password.verify(plain, hash);
 }
 
-// ── JWT creation / verification ───────────────────────────────────────────────
+// ── JWT helpers (native crypto.subtle, no jose) ───────────────────────────────
 
-/** Session token expiry (24 hours instead of 7 days). */
-const TOKEN_EXPIRY = '24h';
+const JWT_ALG = 'HS256';
+
+function b64url(buf: ArrayBuffer): string {
+  return btoa(String.fromCharCode(...new Uint8Array(buf)))
+    .replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+}
+
+function b64urlDecode(str: string): Uint8Array {
+  str = str.replace(/-/g, '+').replace(/_/g, '/');
+  while (str.length % 4) str += '=';
+  return Uint8Array.from(atob(str), c => c.charCodeAt(0));
+}
+
+async function hmacSign(data: Uint8Array, secret: Uint8Array): Promise<Uint8Array> {
+  const key = await crypto.subtle.importKey('raw', secret, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  return new Uint8Array(await crypto.subtle.sign('HMAC', key, data));
+}
+
+// ── Session token ─────────────────────────────────────────────────────────────
+
+/** Session token expiry (24 hours). */
+const TOKEN_EXPIRY_S = 86400;
 
 export async function createSessionToken(): Promise<string> {
   const jti = crypto.randomUUID();
   const secret = await deriveSecret();
-  return new SignJWT({ pi: 1 })
-    .setProtectedHeader({ alg: 'HS256' })
-    .setIssuedAt()
-    .setJti(jti)
-    .setExpirationTime(TOKEN_EXPIRY)
-    .sign(secret);
+  const iat = Math.floor(Date.now() / 1000);
+  const exp = iat + TOKEN_EXPIRY_S;
+
+  const header = b64url(new TextEncoder().encode(JSON.stringify({ alg: JWT_ALG, typ: 'JWT' })));
+  const payload = b64url(new TextEncoder().encode(JSON.stringify({ pi: 1, iat, jti, exp })));
+
+  const signingInput = new TextEncoder().encode(`${header}.${payload}`);
+  const signature = b64url(await hmacSign(signingInput, secret));
+
+  return `${header}.${payload}.${signature}`;
 }
 
 export async function verifySessionToken(token: string): Promise<boolean> {
   try {
+    const parts = token.split('.');
+    if (parts.length !== 3) return false;
+
+    const [headerB64, payloadB64, sigB64] = parts;
+    if (!headerB64 || !payloadB64 || !sigB64) return false;
+
     const secret = await deriveSecret();
-    const { payload } = await jwtVerify(token, secret);
-    // Check revocation list
+
+    // Verify signature
+    const signingInput = new TextEncoder().encode(`${headerB64}.${payloadB64}`);
+    const sigKey = await crypto.subtle.importKey('raw', secret, { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']);
+    const valid = await crypto.subtle.verify('HMAC', sigKey, b64urlDecode(sigB64), signingInput);
+    if (!valid) return false;
+
+    // Decode and validate payload
+    const payload = JSON.parse(new TextDecoder().decode(b64urlDecode(payloadB64)));
+
+    // Check expiration
+    if (payload.exp && Date.now() / 1000 > payload.exp) return false;
+
+    // Check revocation
     if (payload.jti && revokedSet().has(payload.jti)) return false;
+
     return true;
   } catch {
     return false;
   }
 }
 
-/** Extract the JTI from a token without full verification (for logout). */
+/** Extract the JTI from a token (with full verification). */
 export async function extractJti(token: string): Promise<string | undefined> {
   try {
-    const secret = await deriveSecret();
-    const { payload } = await jwtVerify(token, secret);
-    return payload.jti;
+    if (!(await verifySessionToken(token))) return undefined;
+    const payloadB64 = token.split('.')[1];
+    if (!payloadB64) return undefined;
+    const payload = JSON.parse(new TextDecoder().decode(b64urlDecode(payloadB64)));
+    return payload.jti as string | undefined;
   } catch {
     return undefined;
   }
 }
+
+// ── Cookie helpers ────────────────────────────────────────────────────────────
 
 export function getTokenFromCookies(cookieHeader: string): string | null {
   const match = cookieHeader.match(new RegExp(`(?:^|;\\s*)${COOKIE_NAME}=([^;]+)`));

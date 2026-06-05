@@ -9,11 +9,52 @@ import {
   COOKIE_NAME,
 } from './password';
 
-// Reset bcrypt hash before each suite that needs a known password
+// Clear cached secrets — needed when we temporarily change PI_PASSWORD.
+function clearSecrets() {
+  const g = globalThis as Record<string, unknown>;
+  delete g.__piHash;
+  delete g.__piJwtSecret;
+}
+
 async function setupPassword(plain = 'hunter2') {
-  delete (globalThis as Record<string, unknown>).__piHash;
+  clearSecrets();
   await initPassword(plain);
 }
+
+// ── Helpers to craft custom JWTs without jose ────────────────────────────────
+
+function b64url(buf: ArrayBuffer): string {
+  return btoa(String.fromCharCode(...new Uint8Array(buf)))
+    .replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+}
+
+function b64urlDecode(str: string): Uint8Array {
+  str = str.replace(/-/g, '+').replace(/_/g, '/');
+  while (str.length % 4) str += '=';
+  return Uint8Array.from(atob(str), c => c.charCodeAt(0));
+}
+
+/** Build a JWT signed with a raw HMAC-SHA256 key (not the derived secret). */
+async function makeJWT(
+  payload: Record<string, unknown>,
+  rawHmacKey: Uint8Array,
+): Promise<string> {
+  const header = b64url(new TextEncoder().encode(JSON.stringify({ alg: 'HS256', typ: 'JWT' })));
+  const payloadB64 = b64url(new TextEncoder().encode(JSON.stringify(payload)));
+  const signingInput = new TextEncoder().encode(`${header}.${payloadB64}`);
+  const k = await crypto.subtle.importKey('raw', rawHmacKey, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = b64url(await crypto.subtle.sign('HMAC', k, signingInput));
+  return `${header}.${payloadB64}.${sig}`;
+}
+
+/** Replicate the deriveSecret() logic so tests can create tokens with custom payloads. */
+async function deriveTestSecret(password: string): Promise<Uint8Array> {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey('raw', enc.encode(password), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  return new Uint8Array(await crypto.subtle.sign('HMAC', key, enc.encode('pi-ui-session-v1')));
+}
+
+// ── initPassword / verifyPassword ────────────────────────────────────────────
 
 describe('initPassword / verifyPassword', () => {
   beforeAll(() => setupPassword('hunter2'));
@@ -32,6 +73,8 @@ describe('initPassword / verifyPassword', () => {
     await initPassword('hunter2'); // restore for later tests
   });
 });
+
+// ── createSessionToken / verifySessionToken ──────────────────────────────────
 
 describe('createSessionToken / verifySessionToken', () => {
   it('produces a 3-part JWT string', async () => {
@@ -52,28 +95,27 @@ describe('createSessionToken / verifySessionToken', () => {
   });
 
   it('rejects a token signed with the wrong secret', async () => {
-    const { SignJWT } = await import('jose');
     const wrongSecret = new TextEncoder().encode('completely-different-secret');
-    const badToken = await new SignJWT({ pi: 1 })
-      .setProtectedHeader({ alg: 'HS256' })
-      .setIssuedAt()
-      .setExpirationTime('7d')
-      .sign(wrongSecret);
+    const badToken = await makeJWT(
+      { pi: 1, iat: Math.floor(Date.now() / 1000), jti: crypto.randomUUID(), exp: Math.floor(Date.now() / 1000) + 86400 },
+      wrongSecret,
+    );
     expect(await verifySessionToken(badToken)).toBe(false);
   });
 
   it('rejects an expired token', async () => {
-    const { SignJWT } = await import('jose');
-    const password = process.env.PI_PASSWORD ?? 'dev-secret-replace-me-set-PI_PASSWORD';
-    const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-    const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode('pi-ui-session-v1'));
-    const secret = new Uint8Array(sig);
-    // Set expiration 1 second in the past
-    const expiredToken = await new SignJWT({ pi: 1 })
-      .setProtectedHeader({ alg: 'HS256' })
-      .setIssuedAt(Math.floor(Date.now() / 1000) - 10)
-      .setExpirationTime(Math.floor(Date.now() / 1000) - 1)
-      .sign(secret);
+    const secret = await deriveTestSecret(
+      process.env.PI_PASSWORD ?? 'dev-secret-replace-me-set-PI_PASSWORD',
+    );
+    const expiredToken = await makeJWT(
+      {
+        pi: 1,
+        iat: Math.floor(Date.now() / 1000) - 10,
+        jti: crypto.randomUUID(),
+        exp: Math.floor(Date.now() / 1000) - 1,
+      },
+      secret,
+    );
     expect(await verifySessionToken(expiredToken)).toBe(false);
   });
 });
