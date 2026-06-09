@@ -2,7 +2,7 @@
   import { onMount, onDestroy, tick } from 'svelte';
   import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 
-  import type { ServerMessage, ClientMessage, HistoryWindow, ModelInfo, ProviderInfo, SessionSummary, SkillSummary, PromptSummary } from '$lib/ws/protocol';
+  import type { ServerMessage, ClientMessage, HistoryWindow, ModelInfo, ProviderInfo, SessionSummary, SkillSummary, PromptSummary, ExtensionSummary, WidgetContent } from '$lib/ws/protocol';
   import { renderMarkdown, highlightCode } from '$lib/markdown';
   import * as Tooltip from '$lib/components/ui/tooltip';
   import { Switch } from '$lib/components/ui/switch';
@@ -131,7 +131,9 @@
     if (toolMeta[key]) return toolMeta[key];
 
     // Try to find description from toolsList
-    const desc = toolsList.find((t) => t.name.toLowerCase() === key)?.description;
+    const desc = toolsList.find((t) => t.name.toLowerCase() === key)?.description
+      // Also check extension-provided tool lists for richer metadata
+      ?? extensionsList.flatMap((ext) => ext.tools).find((t) => t.name.toLowerCase() === key)?.description;
 
     // Heuristic icon from name patterns
     let icon = Cog;
@@ -291,16 +293,26 @@
     /** Whether the per-message detail panel (tokens / cost / latency) is expanded */
     detailExpanded?: boolean;
     /** Category of inline system notice */
-    noticeKind?: 'compaction' | 'retry';
+    noticeKind?: 'compaction' | 'retry' | 'custom';
+    /** Extension custom message type (e.g. pi-mermaid, btw-note, scheduled_prompt) */
+    customType?: string;
+    /** Unix ms when this UI message was created */
+    createdAt: number;
   };
 
   // ── Extension UI modal state ─────────────────────────────────────────────────
+
+  type ParsedSelect = { kind: 'select'; label: string; options: { value: string; label: string; description?: string }[] };
+  type ParsedInput = { kind: 'input'; label: string; placeholder?: string; value?: string; multiline?: boolean };
+  type ParsedText = { kind: 'text'; label: string; content: string };
+  type ParsedComponent = ParsedSelect | ParsedInput | ParsedText;
 
   type ModalState =
     | { method: 'confirm'; id: string; title: string; message: string }
     | { method: 'input'; id: string; title: string; placeholder?: string }
     | { method: 'select'; id: string; title: string; options: string[] }
-    | { method: 'editor'; id: string; title: string; prefill?: string };
+    | { method: 'editor'; id: string; title: string; prefill?: string }
+    | { method: 'custom'; id: string; title: string; parsed?: ParsedComponent };
 
   let modal = $state<ModalState | null>(null);
   let modalInput = $state('');
@@ -414,7 +426,9 @@
   /** Keyed status texts from extension setStatus() calls. */
   let extensionStatuses = $state<Record<string, string>>({});
   /** Keyed widget panels from extension setWidget() calls. */
-  let extensionWidgets = $state<Record<string, string[]>>({});
+  let extensionWidgets = $state<Record<string, WidgetContent>>({});
+  /** Widget placement mapping (aboveEditor / belowEditor). */
+  let extensionWidgetPlacement = $state<Record<string, string>>({});
   /** Custom working message from extension setWorkingMessage() calls. */
   let workingMessage = $state<string | undefined>(undefined);
   /** Whether the streaming working indicator is visible (setWorkingVisible). */
@@ -444,6 +458,10 @@
       const commands = SLASH_COMMANDS
         .filter((c) => !q || c.name.startsWith(q))
         .map((c) => ({ trigger: '/' as const, label: `/${c.name}`, description: c.description, insert: `/${c.name} ` }));
+      const extCmds = extensionCommands
+        .filter((c) => typeof c.name === 'string' && (!q || c.name.startsWith(q)))
+        .slice(0, 8)
+        .map((c) => ({ trigger: '/' as const, label: `/${c.name}`, description: c.description || `${c.source} command`, insert: `/${c.name} ` }));
       const skills = resourcesSkills
         .filter((s) => !q || match(s.name) || match(s.description))
         .slice(0, 8)
@@ -452,7 +470,7 @@
         .filter((p) => !q || match(p.name) || match(p.description))
         .slice(0, 8)
         .map((p) => ({ trigger: '/' as const, label: `/${p.name}`, description: p.description || p.argumentHint || `${p.scope} prompt`, insert: `/${p.name} `, muted: p.isBuiltin }));
-      return [...commands, ...skills, ...prompts].slice(0, 14);
+      return [...commands, ...extCmds, ...skills, ...prompts].slice(0, 14);
     }
 
     if (shortcutTrigger === '@') {
@@ -502,8 +520,13 @@
   let uiVersion = $state('');
   /** Display name of the current session */
   let sessionName = $state<string | undefined>(undefined);
+  /** Session storage mode reported by server */
+  let sessionMode = $state<string | undefined>(undefined);
   /** Most recent input token count (from message_end) — used for context % */
   let lastInputTokens = $state(0);
+  /** Real-time context usage from the pi SDK (via getContextUsage()). */
+  let contextUsageTokens = $state<number | null>(null);
+  let contextUsageWindow = $state(0);
   /** Timestamp (epoch ms) when the current session was loaded — for elapsed display. */
   let sessionStartTime = $state(0);
   /** Pending steered messages (queue_update) */
@@ -593,6 +616,10 @@
   let openFolderInput = $state('');
   /** Directory completions returned by the server for openFolderInput. */
   let dirCompletions = $state<string[]>([]);
+  /** True while waiting for a new_session response from the server. */
+  let pendingNewSession = $state(false);
+  /** Highlighted index in the dir completions list (-1 = none). */
+  let dirHighlightIndex = $state(-1);
   /** Workspace file completions shown for composer @ references. */
   let fileCompletions = $state<string[]>([]);
   let lastFileCompleteQuery = '';
@@ -605,6 +632,7 @@
     { id: 'session', label: 'Session', icon: '◐' },
     { id: 'voice', label: 'Voice', icon: '◌' },
     { id: 'shortcuts', label: 'Shortcuts', icon: '⌘' },
+    { id: 'extensions', label: 'Extensions', icon: '◆' },
     { id: 'about', label: 'About', icon: 'π' },
   ] as const;
 
@@ -677,16 +705,24 @@
   let toolsList = $state<{ name: string; description: string; isBuiltin: boolean }[]>([]);
   /** Names of currently active/enabled tools */
   let activeToolNames = $state<string[]>([]);
+  /** Registered slash commands from extensions */
+  let extensionCommands = $state<{ name: string; description?: string; source: string }[]>([]);
 
   /** Whether the settings modal is open */
   let showSettingsPanel = $state(false);
-  let settingsSection = $state<'session' | 'voice' | 'shortcuts' | 'about'>('session');
+  let settingsSection = $state<'session' | 'voice' | 'shortcuts' | 'extensions' | 'about'>('session');
   /** Skills returned by the server */
   let resourcesSkills = $state<SkillSummary[]>([]);
   /** Prompt templates returned by the server */
   let resourcesPrompts = $state<PromptSummary[]>([]);
   /** True once resources_list has been received (distinguishes "loading" from "empty") */
   let resourcesLoaded = $state(false);
+  /** Loaded extensions from the server */
+  let extensionsList = $state<ExtensionSummary[]>([]);
+  let extensionErrors = $state<{ path: string; error: string }[]>([]);
+  /** True once extensions_list has been received */
+  let extensionsLoaded = $state(false);
+
   /** Install skill form state */
   let skillInstallUrl = $state('');
   let skillInstallScope = $state<'project' | 'user'>('user');
@@ -734,9 +770,11 @@
   const sessionDuration = $derived(sessionStartTime > 0 ? fmtDuration(Date.now() - sessionStartTime) : '');
   /** Context window fill percentage (0 if unknown) */
   const contextPercent = $derived(
-    model?.contextWindow && model.contextWindow > 0 && lastInputTokens > 0
-      ? Math.round((lastInputTokens / model.contextWindow) * 100)
-      : 0
+    contextUsageTokens != null && contextUsageWindow > 0
+      ? Math.round((contextUsageTokens / contextUsageWindow) * 100)
+      : lastInputTokens > 0 && model?.contextWindow && model.contextWindow > 0
+        ? Math.round((lastInputTokens / model.contextWindow) * 100)
+        : 0
   );
   /** Basename of cwd for compact display */
   const cwdBasename = $derived(cwd ? cwd.split('/').filter(Boolean).pop() ?? cwd : '');
@@ -785,6 +823,8 @@
   let renameInputEl = $state<HTMLInputElement | undefined>(undefined);
   let ws: WebSocket | null = null;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let reconnectCountdown = $state(0);
+  let reconnectInterval: ReturnType<typeof setInterval> | null = null;
   let sendHoldTimer: ReturnType<typeof setTimeout> | null = null;
   let sendHoldSubmitted = false;
   /** True when the scroll container is at (or near) the bottom */
@@ -845,6 +885,15 @@
     }
   });
 
+  // ── Load extensions when settings extensions tab is active ──────────────────
+
+  $effect(() => {
+    if (showSettingsPanel && settingsSection === 'extensions') {
+      extensionsLoaded = false;
+      send({ type: 'get_extensions' });
+    }
+  });
+
   // ── WebSocket ───────────────────────────────────────────────────────────────
 
   function connect() {
@@ -858,6 +907,8 @@
       wsState = 'open';
       isRestarting = false;
       if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (reconnectInterval) { clearInterval(reconnectInterval); reconnectInterval = null; }
+      reconnectCountdown = 0;
     };
 
     ws.onmessage = ({ data }: MessageEvent<string>) => {
@@ -870,7 +921,13 @@
 
     ws.onclose = () => {
       wsState = 'closed';
-      reconnectTimer = setTimeout(connect, 3000);
+      reconnectCountdown = 3;
+      if (reconnectInterval) clearInterval(reconnectInterval);
+      reconnectInterval = setInterval(() => { reconnectCountdown = Math.max(0, reconnectCountdown - 1); }, 1000);
+      reconnectTimer = setTimeout(() => {
+        if (reconnectInterval) { clearInterval(reconnectInterval); reconnectInterval = null; }
+        connect();
+      }, 3000);
     };
 
     ws.onerror = () => ws?.close();
@@ -951,6 +1008,14 @@
       }
       lastInputTokens = restored;
     }
+    // Use real contextUsage from the server if available
+    if ('contextUsage' in payload) {
+      const cu = (payload as Record<string, unknown>).contextUsage as { tokens?: number | null; contextWindow?: number } | undefined;
+      if (cu) {
+        contextUsageTokens = cu.tokens ?? null;
+        contextUsageWindow = cu.contextWindow ?? 0;
+      }
+    }
     // Session-level settings (optional — present on connected/session_loaded)
     if ('isCompacting' in payload) isCompacting = Boolean((payload as Record<string, unknown>).isCompacting);
     if ('autoCompactionEnabled' in payload) autoCompactionEnabled = Boolean((payload as Record<string, unknown>).autoCompactionEnabled ?? true);
@@ -975,6 +1040,7 @@
         sessionStartTime = Date.now();
         if (c.piVersion) piVersion = c.piVersion;
         if (c.uiVersion) uiVersion = c.uiVersion;
+        if (c.sessionMode) sessionMode = c.sessionMode;
         break;
       }
 
@@ -990,11 +1056,17 @@
           history?: HistoryWindow;
           piVersion?: string;
           uiVersion?: string;
+          sessionMode?: string;
         };
         applySessionState(sl);
         sessionStartTime = Date.now();
         if (sl.piVersion) piVersion = sl.piVersion;
         if (sl.uiVersion) uiVersion = sl.uiVersion;
+        if (sl.sessionMode) sessionMode = sl.sessionMode;
+        if (pendingNewSession) {
+          pendingNewSession = false;
+          showSessionPanel = false;
+        }
         break;
       }
 
@@ -1043,6 +1115,7 @@
 
       case 'sessions_error': {
         sessionError = (msg as { type: string; message: string }).message ?? 'Unknown error';
+        pendingNewSession = false;
         break;
       }
 
@@ -1087,10 +1160,10 @@
         // the tts_summary response handler will call speakText() with the result.
         // Skip if pi is about to retry (willRetry=true) — we'll speak the final response instead.
         if (autoSpeak && !willRetry) {
-          const lastAsst = [...messages].reverse().find((m) => m.role === 'assistant' && m.content);
+          const lastAsst = [...messages].reverse().find((m) => m.role === 'assistant' && (m.content || m.thinking));
           if (lastAsst) {
             isSummarizing = true;
-            send({ type: 'summarize_for_tts', content: lastAsst.content });
+            send({ type: 'summarize_for_tts', content: lastAsst.content || lastAsst.thinking || '' });
           } else if (conversationMode && wsState === 'open') {
             // No content to summarise (e.g. empty turn) — restart STT directly
             toggleSTT();
@@ -1143,8 +1216,14 @@
             a.endMs = Date.now();
             a.streaming = false;
           }
-          // Track latest input token count for context % display
+          // Track latest input token count as fallback for context % display
           lastInputTokens = endMsg.usage.input;
+        }
+        // Use real context usage from the SDK (server enriches message_end with this)
+        const cu = (msg as Record<string, unknown>).contextUsage as { tokens?: number | null; contextWindow?: number } | undefined;
+        if (cu) {
+          contextUsageTokens = cu.tokens ?? null;
+          contextUsageWindow = cu.contextWindow ?? 0;
         }
         break;
       }
@@ -1163,6 +1242,7 @@
           toolArgs: details,
           streaming: true,
           expanded: toolsExpandedGlobal,
+          createdAt: Date.now(),
         });
         break;
       }
@@ -1255,6 +1335,23 @@
             modalInput = (msg.prefill as string | undefined) ?? '';
             break;
 
+          case 'custom': {
+            const parsed = msg.parsed as ParsedComponent | undefined;
+            modal = {
+              method: 'custom',
+              id,
+              title: (msg.title as string | undefined) ?? 'Extension Request',
+              parsed,
+            };
+            // Set initial input value from parsed data
+            if (parsed?.kind === 'input') {
+              modalInput = parsed.value ?? '';
+            } else {
+              modalInput = '';
+            }
+            break;
+          }
+
           case 'notify':
             addToast(
               (msg.message as string | undefined) ?? '',
@@ -1277,12 +1374,28 @@
 
           case 'setWidget': {
             const key = msg.widgetKey as string | undefined;
-            const lines = msg.widgetLines as string[] | undefined;
             if (key) {
-              if (lines == null) {
+              const widgetType = (msg.widgetType as string | undefined) ?? 'text';
+              const widgetLines = msg.widgetLines as string[] | undefined;
+              const widgetData = msg.widgetData as Record<string, unknown> | undefined;
+              const widgetPlacement = msg.widgetPlacement as string | undefined;
+              if (widgetType === 'text' && (!widgetLines || widgetLines.length === 0)) {
                 delete extensionWidgets[key];
+              } else if (widgetType === 'table') {
+                const headers = (widgetData?.headers as string[]) ?? [];
+                const rows = (widgetData?.rows as string[][]) ?? [];
+                extensionWidgets[key] = { type: 'table', headers, rows };
+              } else if (widgetType === 'badge') {
+                const text = (widgetData?.text as string) ?? '';
+                const variant = (widgetData?.variant as WidgetContent extends { variant: infer V } ? V : never) ?? 'info';
+                extensionWidgets[key] = { type: 'badge', text, variant };
               } else {
-                extensionWidgets[key] = lines;
+                // Default: text widget
+                extensionWidgets[key] = { type: 'text', lines: widgetLines ?? [] };
+              }
+              // Store placement for rendering order
+              if (widgetPlacement) {
+                extensionWidgetPlacement[key] = widgetPlacement;
               }
             }
             break;
@@ -1296,6 +1409,33 @@
             input = (msg.text as string | undefined) ?? '';
             tick().then(() => { autoResizeTextarea(); inputEl?.focus(); });
             break;
+
+          case 'paste_to_editor': {
+            const textToInsert = (msg.text as string | undefined) ?? '';
+            if (inputEl) {
+              const start = inputEl.selectionStart ?? input.length;
+              const end = inputEl.selectionEnd ?? input.length;
+              input = input.slice(0, start) + textToInsert + input.slice(end);
+              tick().then(() => {
+                if (inputEl) {
+                  inputEl.selectionStart = inputEl.selectionEnd = start + textToInsert.length;
+                  autoResizeTextarea();
+                  inputEl.focus();
+                }
+              });
+            } else {
+              input += textToInsert;
+            }
+            break;
+          }
+
+          case 'request_editor_text': {
+            const requestId = msg.id as string | undefined;
+            if (requestId) {
+              send({ type: 'editor_text_response', id: requestId, text: input });
+            }
+            break;
+          }
 
           case 'setWorkingMessage':
             workingMessage = (msg.message as string | undefined) ?? undefined;
@@ -1344,6 +1484,7 @@
           content: reason === 'manual' ? 'compacting context…' : `auto-compacting context (${reason})…`,
           noticeKind: 'compaction',
           streaming: true,
+          createdAt: Date.now(),
         });
         break;
       }
@@ -1374,6 +1515,7 @@
           content: `retrying (${attempt}/${max}${delayS > 0 ? `, ${delayS}s` : ''})${errMsg ? ` — ${errMsg}` : ''}`,
           noticeKind: 'retry',
           streaming: true,
+          createdAt: Date.now(),
         });
         break;
       }
@@ -1413,6 +1555,18 @@
         break;
       }
 
+      case 'extensions_list': {
+        extensionsList = (msg.extensions as ExtensionSummary[] | undefined) ?? [];
+        extensionErrors = (msg.errors as { path: string; error: string }[] | undefined) ?? [];
+        extensionsLoaded = true;
+        break;
+      }
+
+      case 'commands_list': {
+        extensionCommands = (msg.commands as { name: string; description?: string; source: string }[] | undefined) ?? [];
+        break;
+      }
+
       case 'skill_install_result': {
         skillInstalling = false;
         if (msg.success) {
@@ -1434,6 +1588,7 @@
 
       case 'dir_completions': {
         dirCompletions = ((msg as { type: string; entries: string[] }).entries) ?? [];
+        dirHighlightIndex = -1;
         break;
       }
 
@@ -1451,6 +1606,7 @@
           content: result.message,
           noticeKind: result.level === 'error' ? 'retry' : undefined,
           streaming: false,
+          createdAt: Date.now(),
         });
         if (result.level && result.level !== 'info') addToast(result.message.split('\n')[0], result.level);
         break;
@@ -1522,7 +1678,7 @@
     if (e.key === 'Enter' && !e.shiftKey && modal?.method !== 'editor') {
       e.preventDefault();
       if (modal?.method === 'confirm') modalConfirm(true);
-      else if (modal?.method === 'input') modalSubmitValue();
+      else if (modal?.method === 'input' || modal?.method === 'custom') modalSubmitValue();
     }
   }
 
@@ -1552,10 +1708,11 @@
 
   function newSession(targetCwd?: string) {
     send(targetCwd ? { type: 'new_session', targetCwd } : { type: 'new_session' });
-    showSessionPanel = false;
+    pendingNewSession = true;
     openFolderMode = false;
     openFolderInput = '';
     dirCompletions = [];
+    dirHighlightIndex = -1;
   }
 
   function startRename(s: SessionSummary) {
@@ -1700,7 +1857,7 @@
   }
 
   function freshAssistant(): UIMessage {
-    return { id: uid(), role: 'assistant', content: '', thinking: '', thinkingExpanded: false, streaming: true, startMs: Date.now() };
+    return { id: uid(), role: 'assistant', content: '', thinking: '', thinkingExpanded: false, streaming: true, startMs: Date.now(), createdAt: Date.now() };
   }
 
   function lastStreaming(role: UIMessage['role']): UIMessage | undefined {
@@ -1813,7 +1970,7 @@
         } else {
           text = JSON.stringify(msg.content);
         }
-        return [{ id: uid(), role: 'user', content: text, images, streaming: false }];
+        return [{ id: uid(), role: 'user', content: text, images, streaming: false, createdAt: Date.now() }];
       }
       case 'assistant': {
         const blocks = (msg.content as { type: string; text?: string; thinking?: string }[]) ?? [];
@@ -1829,7 +1986,7 @@
         const usage: MsgUsage | undefined = rawUsage?.totalTokens
           ? { input: rawUsage.input ?? 0, output: rawUsage.output ?? 0, totalTokens: rawUsage.totalTokens, cost: { total: rawUsage.cost?.total ?? 0 } }
           : undefined;
-        return text || thinkingText ? [{ id: uid(), role: 'assistant', content: text, thinking: thinkingText || undefined, thinkingExpanded: false, streaming: false, usage }] : [];
+        return text || thinkingText ? [{ id: uid(), role: 'assistant', content: text, thinking: thinkingText || undefined, thinkingExpanded: false, streaming: false, usage, createdAt: Date.now() }] : [];
       }
       case 'bashExecution': {
         const cmd = msg.command as string | undefined;
@@ -1844,6 +2001,7 @@
             content: output,
             isError: typeof msg.exitCode === 'number' && (msg.exitCode as number) !== 0,
             streaming: false,
+            createdAt: Date.now(),
           },
         ];
       }
@@ -1872,11 +2030,33 @@
             content: extractTextContent(blocks),
             isError: (msg.isError as boolean | undefined) ?? false,
             streaming: false,
+            createdAt: Date.now(),
           },
         ];
       }
-      default:
+      // Custom extension message types (pi-mermaid, btw-note, scheduled_prompt, etc.)
+      default: {
+        const customType = msg.customType as string | undefined;
+        if (customType) {
+          const details = msg.details as Record<string, unknown> | undefined;
+          const display = (msg.display as string | undefined) ?? '';
+          // Render custom type as a formatted notice with details
+          let content = display || `[${customType}]`;
+          if (details) {
+            content += '\n\n' + JSON.stringify(details, null, 2);
+          }
+          return [{
+            id: uid(),
+            role: 'notice',
+            content,
+            noticeKind: 'custom',
+            customType,
+            streaming: false,
+            createdAt: Date.now(),
+          }];
+        }
         return [];
+      }
     }
   }
 
@@ -1907,7 +2087,7 @@
   }
 
   async function copyMessage(msg: UIMessage) {
-    const text = msg.content;
+    const text = msg.content || msg.thinking;
     if (!text) return;
     try {
       await navigator.clipboard.writeText(text);
@@ -2027,6 +2207,11 @@
     if (idx >= 0) toasts.splice(idx, 1);
   }
 
+  function dismissWidget(key: string) {
+    delete extensionWidgets[key];
+    delete extensionWidgetPlacement[key];
+  }
+
   function selectSlashCommand(shortcut: ComposerShortcut) {
     input = shortcut.insert;
     showSlashMenu = false;
@@ -2091,7 +2276,7 @@
       stopSpeaking();
       return;
     }
-    speakText(stripMarkdown(msg.content ?? ''), msg.id);
+    speakText(stripMarkdown(msg.content || msg.thinking || ''), msg.id);
   }
 
   function stopSpeaking() {
@@ -2257,6 +2442,7 @@
       content: text,
       images: imgs ? attachedImages.map((img) => img.src) : undefined,
       streaming: false,
+      createdAt: Date.now(),
     });
 
     if (asFollowUp && attachedImages.length === 0) {
@@ -2642,22 +2828,41 @@
               onkeydown={(e) => {
                 if (e.key === 'Enter' && openFolderInput.trim()) {
                   e.preventDefault();
-                  newSession(openFolderInput.trim());
+                  if (dirHighlightIndex >= 0 && dirHighlightIndex < dirCompletions.length) {
+                    openFolderInput = dirCompletions[dirHighlightIndex];
+                    dirCompletions = [];
+                    dirHighlightIndex = -1;
+                  } else {
+                    newSession(openFolderInput.trim());
+                  }
+                }
+                if (e.key === 'ArrowDown') {
+                  e.preventDefault();
+                  if (dirCompletions.length > 0) {
+                    dirHighlightIndex = dirHighlightIndex < dirCompletions.length - 1 ? dirHighlightIndex + 1 : 0;
+                  }
+                }
+                if (e.key === 'ArrowUp') {
+                  e.preventDefault();
+                  if (dirCompletions.length > 0) {
+                    dirHighlightIndex = dirHighlightIndex > 0 ? dirHighlightIndex - 1 : dirCompletions.length - 1;
+                  }
                 }
                 if (e.key === 'Escape') {
                   e.preventDefault();
                   openFolderMode = false;
                   openFolderInput = '';
                   dirCompletions = [];
+                  dirHighlightIndex = -1;
                 }
               }}
             />
             {#if dirCompletions.length > 0}
               <div class="mt-1.5 flex flex-col gap-0.5">
-                {#each dirCompletions as entry (entry)}
+                {#each dirCompletions as entry, i (entry)}
                   <button
-                    onclick={() => { openFolderInput = entry; dirCompletions = []; }}
-                    class="text-left text-xs text-base-content/60 hover:text-base-content/90 py-1 px-1 rounded hover:bg-base-content/8 transition-colors truncate"
+                    onclick={() => { openFolderInput = entry; dirCompletions = []; dirHighlightIndex = -1; }}
+                    class="text-left text-xs py-1 px-1 rounded transition-colors truncate {i === dirHighlightIndex ? 'text-base-content/90 bg-base-content/12' : 'text-base-content/60 hover:text-base-content/90 hover:bg-base-content/8'}"
                     tabindex={showSessionPanel ? 0 : -1}
                   >{entry}</button>
                 {/each}
@@ -2719,7 +2924,7 @@
       </button>
 
       <div class="relative z-10 flex items-center gap-1.5 shrink-0 ml-auto">
-        {#if lastInputTokens > 0}
+        {#if lastInputTokens > 0 || contextUsageTokens != null}
           <Tooltip.Root>
             <Tooltip.Trigger class={[
               'h-9 hidden md:flex items-center gap-2 rounded-xl px-3 border text-xs tabular-nums cursor-default transition-colors',
@@ -2747,13 +2952,13 @@
                       : 'bg-success/70'
                 ].join(' ')}></span>
               </span>
-              <span>{contextPercent > 0 ? `${contextPercent}%` : fmtTokens(lastInputTokens)}</span>
+              <span>{contextPercent > 0 ? `${contextPercent}%` : fmtTokens(contextUsageTokens ?? lastInputTokens)}</span>
             </Tooltip.Trigger>
             <Tooltip.Content sideOffset={8} class="min-w-[180px]">
               <div class="flex flex-col gap-2 py-0.5">
                 <div class="flex items-center justify-between gap-3">
                   <span class="text-background/60">Context</span>
-                  <span class="font-medium">{contextPercent > 0 ? `${contextPercent}%` : fmtTokens(lastInputTokens)}</span>
+                  <span class="font-medium">{contextPercent > 0 ? `${contextPercent}%` : fmtTokens(contextUsageTokens ?? lastInputTokens)}</span>
                 </div>
                 <div class="w-full h-1.5 rounded-full bg-background/15 overflow-hidden">
                   <div
@@ -2765,9 +2970,9 @@
                   ></div>
                 </div>
                 <div class="flex items-center justify-between text-background/60">
-                  <span>{lastInputTokens.toLocaleString()}</span>
-                  {#if model?.contextWindow}
-                    <span>/ {model.contextWindow.toLocaleString()} tokens</span>
+                  <span>{(contextUsageTokens ?? lastInputTokens).toLocaleString()}</span>
+                  {#if contextUsageWindow > 0 || model?.contextWindow}
+                    <span>/ {((contextUsageWindow > 0 ? contextUsageWindow : null) ?? model?.contextWindow ?? 0).toLocaleString()} tokens</span>
                   {/if}
                 </div>
                 {#if sessionTokens > 0}
@@ -2834,9 +3039,62 @@
           </Tooltip.Trigger>
           <Tooltip.Content side="bottom">Settings</Tooltip.Content>
         </Tooltip.Root>
-        <div class="hidden md:flex h-8 w-8 items-center justify-center rounded-full bg-primary/15 text-primary text-xs font-semibold border border-primary/20">π</div>
+        <Tooltip.Root>
+          <Tooltip.Trigger>
+            {#snippet child({ props })}
+              <button
+                {...props}
+                class="h-9 w-9 flex items-center justify-center rounded-lg transition-colors relative {wsState === 'open' ? 'text-base-content/45 hover:text-base-content/75 hover:bg-base-content/8' : wsState === 'connecting' ? 'text-warning/50 hover:text-warning/70 hover:bg-warning/8' : 'text-error/50 hover:text-error/70 hover:bg-error/8'}"
+                aria-label="Connection info"
+              ><svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16"/><path d="M7 5v11a2 2 0 0 0 2 2h2"/><path d="M13 5v11a2 2 0 0 0 2 2h2"/></svg>
+                <span class="absolute top-0.5 right-0.5 w-2 h-2 rounded-full border border-base-100 {wsState === 'open' ? 'bg-success' : wsState === 'connecting' ? 'bg-warning animate-pulse' : 'bg-error'}"></span>
+              </button>
+            {/snippet}
+          </Tooltip.Trigger>
+          <Tooltip.Content sideOffset={8} class="min-w-[180px]">
+            <div class="flex flex-col gap-2 py-0.5">
+              <div class="flex items-center justify-between gap-3">
+                <span class="text-background/60">Connection</span>
+                <span class="flex items-center gap-1.5 font-medium">
+                  <span class="w-1.5 h-1.5 rounded-full {wsState === 'open' ? 'bg-success' : wsState === 'connecting' ? 'bg-warning animate-pulse' : 'bg-error'}"></span>
+                  {wsState === 'open' ? 'Connected' : wsState === 'connecting' ? 'Connecting' : 'Disconnected'}
+                </span>
+              </div>
+              {#if sessionMode}
+                <div class="flex items-center justify-between gap-3">
+                  <span class="text-background/60">Session</span>
+                  <span class="font-medium">{sessionMode}</span>
+                </div>
+              {/if}
+              {#if piVersion}
+                <div class="flex items-center justify-between gap-3">
+                  <span class="text-background/60">SDK</span>
+                  <span class="font-medium">v{piVersion}</span>
+                </div>
+              {/if}
+              {#if uiVersion}
+                <div class="flex items-center justify-between gap-3">
+                  <span class="text-background/60">UI</span>
+                  <span class="font-medium">v{uiVersion}</span>
+                </div>
+              {/if}
+            </div>
+          </Tooltip.Content>
+        </Tooltip.Root>
       </div>
     </header>
+
+    {#if wsState === 'closed'}
+      <div class="shrink-0 flex items-center justify-center gap-2 px-3 py-2 text-xs bg-error/10 text-error/80 border-b border-error/15">
+        <span class="w-1.5 h-1.5 rounded-full bg-error animate-pulse"></span>
+        <span>disconnected{reconnectCountdown > 0 ? ` — reconnecting in ${reconnectCountdown}s` : ''}</span>
+      </div>
+    {:else if wsState === 'connecting'}
+      <div class="shrink-0 flex items-center justify-center gap-2 px-3 py-2 text-xs bg-warning/10 text-warning/80 border-b border-warning/15">
+        <span class="w-1.5 h-1.5 rounded-full bg-warning animate-pulse"></span>
+        <span>connecting…</span>
+      </div>
+    {/if}
 
     <!-- Message list -->
     <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
@@ -2861,9 +3119,17 @@
           <p class="text-sm text-base-content/55">loading session…</p>
         </div>
       {:else if messages.length === 0 && wsState === 'open'}
-        <div class="min-h-full flex flex-col items-center justify-center gap-3 select-none pointer-events-none">
+        <div class="min-h-full flex flex-col items-center justify-center gap-4 select-none px-6">
           <span class="text-8xl font-light text-base-content/[0.08]">π</span>
           <p class="text-sm text-base-content/55">start a conversation</p>
+          <div class="flex flex-wrap justify-center gap-2 mt-1 max-w-xs pointer-events-auto">
+            <button onclick={() => { input = '/compact '; tick().then(() => inputEl?.focus()); }} class="px-2.5 py-1 text-xs rounded-full border border-base-content/12 text-base-content/45 hover:text-base-content/70 hover:border-base-content/30 transition-colors">/compact</button>
+            <button onclick={() => { input = '/fork '; tick().then(() => inputEl?.focus()); }} class="px-2.5 py-1 text-xs rounded-full border border-base-content/12 text-base-content/45 hover:text-base-content/70 hover:border-base-content/30 transition-colors">/fork</button>
+            <button onclick={() => { input = '/clone '; tick().then(() => inputEl?.focus()); }} class="px-2.5 py-1 text-xs rounded-full border border-base-content/12 text-base-content/45 hover:text-base-content/70 hover:border-base-content/30 transition-colors">/clone</button>
+            <button onclick={() => { input = '/session '; tick().then(() => inputEl?.focus()); }} class="px-2.5 py-1 text-xs rounded-full border border-base-content/12 text-base-content/45 hover:text-base-content/70 hover:border-base-content/30 transition-colors">/session</button>
+            <button onclick={() => { input = '! '; tick().then(() => inputEl?.focus()); }} class="px-2.5 py-1 text-xs rounded-full border border-base-content/12 text-base-content/45 hover:text-base-content/70 hover:border-base-content/30 transition-colors">! run a command</button>
+            <button onclick={() => { input = '#review '; tick().then(() => inputEl?.focus()); }} class="px-2.5 py-1 text-xs rounded-full border border-base-content/12 text-base-content/45 hover:text-base-content/70 hover:border-base-content/30 transition-colors">#review code</button>
+          </div>
         </div>
       {:else}
         <div class="w-full max-w-3xl lg:max-w-5xl xl:max-w-6xl 2xl:max-w-7xl mx-auto px-4 md:px-6 flex flex-col gap-1">
@@ -2908,7 +3174,8 @@
                       >{isExpanded ? 'show less' : 'show more'}</button>
                     {/if}
                   </div>
-                  <div class="flex justify-end {isMobile ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'} transition-opacity duration-150">
+                  <div class="flex justify-end items-center gap-1 {isMobile ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'} transition-opacity duration-150">
+                    <span class="text-[10px] text-base-content/25">{formatDate(msg.createdAt)}</span>
                     <button
                       onclick={() => copyMessage(msg)}
                       class="flex items-center justify-center w-7 h-7 text-base-content/25 hover:text-base-content/55 rounded transition-colors select-none"
@@ -2937,47 +3204,57 @@
                     </div>
                   {/if}
                 {:else if msg.thinking}
-                  <button
-                    onclick={() => { msg.thinkingExpanded = !msg.thinkingExpanded; }}
-                    class="flex items-center gap-1.5 text-[10px] text-base-content/50 hover:text-base-content/65 transition-colors py-0.5 mb-5"
-                    aria-expanded={msg.thinkingExpanded}
-                  >
-                    <Brain class="w-3 h-3 shrink-0" style="color:var(--color-secondary)" />
-                    <span class="text-base-content/55">{hiddenThinkingLabel}</span>
-                    <span class="truncate">{msg.thinking.slice(0, 80)}{msg.thinking.length > 80 ? '…' : ''}</span>
-                    {#if msg.endMs && msg.thinkingStartMs}
-                      <span class="text-base-content/45 shrink-0">{fmtDuration(msg.endMs - msg.thinkingStartMs)}</span>
-                    {/if}
-                    <ChevronRight class="w-2.5 h-2.5 shrink-0 {msg.thinkingExpanded ? 'rotate-90' : ''} transition-transform" />
-                  </button>
+                  {#if msg.content}
+                    <!-- Has both thinking and content: compact toggle -->
+                    <button
+                      onclick={() => { msg.thinkingExpanded = !msg.thinkingExpanded; }}
+                      class="flex items-center gap-1.5 text-[10px] text-base-content/50 hover:text-base-content/65 transition-colors py-0.5 mb-5"
+                      aria-expanded={msg.thinkingExpanded}
+                    >
+                      <Brain class="w-3 h-3 shrink-0" style="color:var(--color-secondary)" />
+                      <span class="text-base-content/55">{hiddenThinkingLabel}</span>
+                      <span class="truncate">{msg.thinking.slice(0, 80)}{msg.thinking.length > 80 ? '…' : ''}</span>
+                      {#if msg.endMs && msg.thinkingStartMs}
+                        <span class="text-base-content/45 shrink-0">{fmtDuration(msg.endMs - msg.thinkingStartMs)}</span>
+                      {/if}
+                      <ChevronRight class="w-2.5 h-2.5 shrink-0 {msg.thinkingExpanded ? 'rotate-90' : ''} transition-transform" />
+                    </button>
+                  {:else}
+                    <!-- Thinking-only response: show as the main message content -->
+                    <div class="prose text-base-content/80 text-sm leading-relaxed">
+                      {@html renderMarkdown(msg.thinking)}
+                    </div>
+                  {/if}
                 {/if}
 
                 <!-- EXPANDED THINKING BLOCK (trailing margin creates gap before body) -->
-                {#if msg.thinkingExpanded && msg.thinking}
+                {#if msg.thinkingExpanded && msg.thinking && msg.content}
                   <pre class="text-[11px] text-base-content/60 whitespace-pre-wrap break-words max-h-48 overflow-y-auto leading-relaxed bg-base-content/[0.04] rounded px-2 py-1.5 mb-5 select-text ml-3 border-l-2 border-base-content/[0.12]">{msg.thinking}</pre>
                 {/if}
 
                 <!-- BODY -->
-                <div class="leading-relaxed select-text">
-                  {#if !msg.content && msg.streaming}
-                    {#if workingVisible && !(msg.thinking && msg.thinking.length > 0)}
-                      <span class="flex items-center gap-[3px] h-5" aria-label={hiddenThinkingLabel}>
-                        <span class="typing-dot"></span>
-                        <span class="typing-dot"></span>
-                        <span class="typing-dot"></span>
-                        {#if workingMessage}
-                          <span class="ml-2 text-base-content/40 text-xs">{workingMessage}</span>
-                        {/if}
-                      </span>
+                {#if msg.content || msg.streaming}
+                  <div class="leading-relaxed select-text">
+                    {#if !msg.content && msg.streaming}
+                      {#if workingVisible && !(msg.thinking && msg.thinking.length > 0)}
+                        <span class="flex items-center gap-[3px] h-5" aria-label={hiddenThinkingLabel}>
+                          <span class="typing-dot"></span>
+                          <span class="typing-dot"></span>
+                          <span class="typing-dot"></span>
+                          {#if workingMessage}
+                            <span class="ml-2 text-base-content/40 text-xs">{workingMessage}</span>
+                          {/if}
+                        </span>
+                      {/if}
+                    {:else}
+                      <div class="prose text-base-content/90">{@html renderMarkdown(msg.content)}</div>
+                      {#if msg.streaming}<span class="text-primary animate-pulse">▌</span>{/if}
                     {/if}
-                  {:else}
-                    <div class="prose text-base-content/90">{@html renderMarkdown(msg.content)}</div>
-                    {#if msg.streaming}<span class="text-primary animate-pulse">▌</span>{/if}
-                  {/if}
-                </div>
+                  </div>
+                {/if}
 
                 <!-- META + ACTIONS -->
-                {#if msg.content && !msg.streaming}
+                {#if !msg.streaming}
                   <div class="flex items-center gap-2 text-[10px] py-0.5 select-none">
                     {#if msg.usage}
                       <span class="tabular-nums text-base-content/50">{fmtTokens(msg.usage.totalTokens)}t</span>
@@ -2988,6 +3265,7 @@
                     {#if msg.endMs && msg.startMs}
                       <span class="tabular-nums text-base-content/50">{fmtDuration(msg.endMs - msg.startMs)}</span>
                     {/if}
+                    <span class="text-base-content/35">{formatDate(msg.createdAt)}</span>
                     <span class="ml-auto flex items-center gap-0.5">
                       <button
                         onclick={() => copyMessage(msg)}
@@ -3065,6 +3343,8 @@
                     <span aria-hidden="true">✦</span>
                   {:else if msg.noticeKind === 'retry'}
                     <svg class="w-2 h-2" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
+                  {:else if msg.noticeKind === 'custom'}
+                    <span class="w-2 h-2 rounded-full bg-secondary inline-block"></span>
                   {/if}
                   <span>{msg.content}</span>
                 </span>
@@ -3118,8 +3398,48 @@
       <!-- Extension widget panels -->
       {#if Object.keys(extensionWidgets).length > 0}
         <div class="mb-2 flex flex-col gap-1">
-          {#each Object.entries(extensionWidgets) as [_key, lines] (_key)}
-            <div class="bg-base-content/5 rounded-xl px-3 py-2 text-xs text-base-content/45 font-mono whitespace-pre-wrap leading-relaxed">{lines.join('\n')}</div>
+          {#each Object.entries(extensionWidgets) as [key, widget] (key)}
+            <div class="group relative">
+              <button
+                onclick={() => dismissWidget(key)}
+                class="absolute -top-1 -right-1 w-4 h-4 bg-base-content/20 hover:bg-base-content/40 rounded-full flex items-center justify-center text-[9px] leading-none opacity-0 group-hover:opacity-100 transition-opacity z-10"
+                aria-label="Dismiss widget"
+              >×</button>
+              {#if widget.type === 'text'}
+                <div class="bg-base-content/5 rounded-xl px-3 py-2 text-xs text-base-content/45 font-mono whitespace-pre-wrap leading-relaxed">{widget.lines.join('\n')}</div>
+              {:else if widget.type === 'table'}
+                <div class="bg-base-content/5 rounded-xl px-3 py-2 text-xs text-base-content/45 font-mono overflow-x-auto">
+                  <table class="w-full border-collapse">
+                    {#if widget.headers.length > 0}
+                      <thead>
+                        <tr class="border-b border-base-content/10">
+                          {#each widget.headers as header}
+                            <th class="text-left px-2 py-1 text-base-content/60 font-semibold">{header}</th>
+                          {/each}
+                        </tr>
+                      </thead>
+                    {/if}
+                    <tbody>
+                      {#each widget.rows as row}
+                        <tr class="border-b border-base-content/5 last:border-0">
+                          {#each row as cell}
+                            <td class="px-2 py-1">{cell}</td>
+                          {/each}
+                        </tr>
+                      {/each}
+                    </tbody>
+                  </table>
+                </div>
+              {:else if widget.type === 'badge'}
+                <div class="flex items-center gap-2 px-2">
+                  <span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium
+                    {widget.variant === 'success' ? 'bg-success/15 text-success' :
+                     widget.variant === 'error' ? 'bg-error/15 text-error' :
+                     widget.variant === 'warning' ? 'bg-warning/15 text-warning' :
+                     'bg-info/15 text-info'}">{widget.text}</span>
+                </div>
+              {/if}
+            </div>
           {/each}
         </div>
       {/if}
@@ -3304,7 +3624,7 @@
       />
       </div><!-- end .relative slash/input wrapper -->
 
-      {#if Object.keys(extensionStatuses).length > 0 || lastInputTokens > 0 || sessionCostTotal > 0}
+      {#if Object.keys(extensionStatuses).length > 0 || lastInputTokens > 0 || contextUsageTokens != null || sessionCostTotal > 0}
         <div class="hidden md:flex mt-1.5 px-1 items-center gap-2 text-xs select-none min-w-0">
           {#if Object.keys(extensionStatuses).length > 0}
             <span class="text-base-content/50 truncate min-w-0">
@@ -3339,7 +3659,7 @@
                   </div>
                   <!-- token counts -->
                   <p class="text-xs tabular-nums">
-                    {lastInputTokens.toLocaleString()} / {(model?.contextWindow ?? 0).toLocaleString()} tokens
+                    {(contextUsageTokens ?? lastInputTokens).toLocaleString()} / {((contextUsageWindow > 0 ? contextUsageWindow : null) ?? model?.contextWindow ?? 0).toLocaleString()} tokens
                   </p>
                   {#if sessionTokens > 0}
                     <p class="text-xs tabular-nums text-background/60">
@@ -3349,15 +3669,15 @@
                 </div>
               </Tooltip.Content>
             </Tooltip.Root>
-          {:else if lastInputTokens > 0}
+          {:else if lastInputTokens > 0 || contextUsageTokens != null}
             <Tooltip.Root>
               <Tooltip.Trigger class="tabular-nums cursor-default text-base-content/40">
-                {fmtTokens(lastInputTokens)} ctx
+                {fmtTokens(contextUsageTokens ?? lastInputTokens)} ctx
               </Tooltip.Trigger>
               <Tooltip.Content sideOffset={6} class="min-w-[140px]">
                 <div class="flex flex-col gap-1.5">
                   <p class="text-xs tabular-nums">
-                    {lastInputTokens.toLocaleString()} tokens
+                    {(contextUsageTokens ?? lastInputTokens).toLocaleString()} tokens
                   </p>
                   {#if sessionTokens > 0}
                     <p class="text-xs tabular-nums text-background/60">
@@ -3904,7 +4224,7 @@
                 {SETTINGS_SECTIONS.find((s) => s.id === settingsSection)?.label ?? 'Settings'}
               </Dialog.Title>
               <Dialog.Description class="text-xs text-base-content/38 mt-0.5">
-                {#if settingsSection === 'session'}Defaults and behavior for session runs{:else if settingsSection === 'voice'}Speech synthesis and voice loop controls{:else if settingsSection === 'shortcuts'}Keyboard shortcuts available in the chat UI{:else}Runtime information and server controls{/if}
+                {#if settingsSection === 'session'}Defaults and behavior for session runs{:else if settingsSection === 'voice'}Speech synthesis and voice loop controls{:else if settingsSection === 'shortcuts'}Keyboard shortcuts available in the chat UI{:else if settingsSection === 'extensions'}Loaded extensions and their tools/commands{:else}Runtime information and server controls{/if}
               </Dialog.Description>
             </div>
             <button
@@ -3984,6 +4304,95 @@
                     {/each}
                   </div>
                 </Card.Root>
+              {:else if settingsSection === 'extensions'}
+                {#if !extensionsLoaded}
+                  <p class="text-sm text-base-content/45">Loading extensions…</p>
+                {:else if extensionsList.length === 0 && extensionErrors.length === 0}
+                  <p class="text-sm text-base-content/45">No extensions loaded.</p>
+                {:else}
+                  {#each ['user', 'project', 'temporary'] as scope}
+                    {@const grouped = extensionsList.filter((e) => e.scope === scope)}
+                    {#if grouped.length > 0}
+                      <div class="mb-5">
+                        <p class="text-xs font-semibold text-base-content/50 uppercase tracking-wider mb-2">{scope}</p>
+                        <div class="space-y-2">
+                          {#each grouped as ext (ext.path)}
+                            <Card.Root size="sm" class="py-0 overflow-hidden bg-base-100/60 border-base-content/10">
+                              <div class="divide-y divide-base-content/8">
+                                <div class="px-4 py-3">
+                                  <div class="flex items-center gap-2">
+                                    <p class="text-sm font-medium text-base-content/80">{ext.source}</p>
+                                    <span class="px-1.5 py-0.5 text-[10px] font-mono rounded bg-base-content/10 text-base-content/45">{scope === 'user' ? 'User' : scope === 'project' ? 'Project' : 'Temporary'}</span>
+                                  </div>
+                                  <p class="mt-0.5 text-xs text-base-content/35 font-mono truncate" title={ext.path}>{ext.path}</p>
+                                </div>
+                                {#if ext.tools.length > 0}
+                                  <details class="group px-4 py-2">
+                                    <summary class="cursor-pointer text-xs font-medium text-base-content/55 hover:text-base-content/75 transition-colors list-none flex items-center gap-1.5">
+                                      <span class="transition-transform group-open:rotate-90">▸</span>
+                                      Tools ({ext.tools.length})
+                                    </summary>
+                                    <div class="mt-1.5 ml-4 space-y-1">
+                                      {#each ext.tools as tool}
+                                        <div>
+                                          <p class="text-xs text-base-content/70 font-mono">{tool.name}</p>
+                                          {#if tool.description}
+                                            <p class="text-[11px] text-base-content/40 leading-snug">{tool.description}</p>
+                                          {/if}
+                                        </div>
+                                      {/each}
+                                    </div>
+                                  </details>
+                                {/if}
+                                {#if ext.commands.length > 0}
+                                  <details class="group px-4 py-2">
+                                    <summary class="cursor-pointer text-xs font-medium text-base-content/55 hover:text-base-content/75 transition-colors list-none flex items-center gap-1.5">
+                                      <span class="transition-transform group-open:rotate-90">▸</span>
+                                      Commands ({ext.commands.length})
+                                    </summary>
+                                    <div class="mt-1.5 ml-4 space-y-1">
+                                      {#each ext.commands as cmd}
+                                        <div>
+                                          <p class="text-xs text-base-content/70 font-mono">/{cmd.name}</p>
+                                          {#if cmd.description}
+                                            <p class="text-[11px] text-base-content/40 leading-snug">{cmd.description}</p>
+                                          {/if}
+                                        </div>
+                                      {/each}
+                                    </div>
+                                  </details>
+                                {/if}
+                                {#if ext.flags && ext.flags.length > 0}
+                                  <div class="px-4 py-2 flex flex-wrap gap-1">
+                                    {#each ext.flags as flag}
+                                      <span class="px-1.5 py-0.5 text-[10px] font-mono rounded-full bg-primary/8 text-primary/60">{flag}</span>
+                                    {/each}
+                                  </div>
+                                {/if}
+                              </div>
+                            </Card.Root>
+                          {/each}
+                        </div>
+                      </div>
+                    {/if}
+                  {/each}
+                  {#if extensionErrors.length > 0}
+                    <details class="group">
+                      <summary class="cursor-pointer text-xs font-medium text-error/70 hover:text-error transition-colors list-none flex items-center gap-1.5">
+                        <span class="transition-transform group-open:rotate-90">▸</span>
+                        Errors ({extensionErrors.length})
+                      </summary>
+                      <div class="mt-2 space-y-1.5">
+                        {#each extensionErrors as err}
+                          <div class="px-3 py-2 rounded-lg bg-error/8 border border-error/15">
+                            <p class="text-xs text-error/80 font-mono break-all">{err.path}</p>
+                            <p class="text-[11px] text-error/60 mt-0.5">{err.error}</p>
+                          </div>
+                        {/each}
+                      </div>
+                    </details>
+                  {/if}
+                {/if}
               {:else}
                 <Card.Root size="sm" class="py-0 overflow-hidden bg-base-100/60 border-base-content/10">
                   <div class="divide-y divide-base-content/8">
@@ -4079,6 +4488,33 @@
       </div>
     {:else if modal?.method === 'editor'}
       <textarea bind:this={modalFocusEl} bind:value={modalInput} rows={8} class="w-full bg-transparent border border-border focus:border-foreground/60 outline-none p-3 text-sm leading-relaxed resize-none rounded-lg transition-colors"></textarea>
+    {:else if modal?.method === 'custom'}
+      {#if modal.parsed?.kind === 'select'}
+        <p class="text-sm text-muted-foreground mb-2">{modal.parsed.label || 'Select an option:'}</p>
+        <div class="space-y-1 max-h-60 overflow-y-auto">
+          {#each modal.parsed.options as opt (opt.value)}
+            <button class="w-full text-left px-3 py-2.5 rounded-lg text-sm text-muted-foreground hover:bg-accent hover:text-accent-foreground transition-colors" onclick={() => modalSelectOption(opt.value)}>
+              {opt.label}
+              {#if opt.description}
+                <span class="text-xs text-muted-foreground/60 ml-2">{opt.description}</span>
+              {/if}
+            </button>
+          {/each}
+        </div>
+      {:else if modal.parsed?.kind === 'input'}
+        <p class="text-sm text-muted-foreground mb-2">{modal.parsed.label || 'Enter your response:'}</p>
+        {#if modal.parsed.multiline}
+          <textarea bind:this={modalFocusEl} bind:value={modalInput} placeholder={modal.parsed.placeholder ?? ''} rows={6} class="w-full bg-transparent border border-border focus:border-foreground/60 outline-none p-3 text-sm leading-relaxed resize-none rounded-lg transition-colors"></textarea>
+        {:else}
+          <input bind:this={modalFocusEl} type="text" bind:value={modalInput} placeholder={modal.parsed.placeholder ?? ''} class="w-full bg-transparent border-b border-border focus:border-foreground/60 outline-none py-2 text-sm placeholder-muted-foreground transition-colors" />
+        {/if}
+      {:else if modal.parsed?.kind === 'text'}
+        <pre class="text-xs text-muted-foreground whitespace-pre-wrap leading-relaxed bg-base-content/5 rounded p-3 mb-2 max-h-48 overflow-y-auto">{modal.parsed.content}</pre>
+        <input bind:this={modalFocusEl} type="text" bind:value={modalInput} placeholder="Type your response…" class="w-full bg-transparent border-b border-border focus:border-foreground/60 outline-none py-2 text-sm placeholder-muted-foreground transition-colors" />
+      {:else}
+        <p class="text-sm text-muted-foreground mb-2">Extension request:</p>
+        <input bind:this={modalFocusEl} type="text" bind:value={modalInput} placeholder="Type your response…" class="w-full bg-transparent border-b border-border focus:border-foreground/60 outline-none py-2 text-sm placeholder-muted-foreground transition-colors" />
+      {/if}
     {/if}
 
     <Dialog.Footer>
@@ -4086,6 +4522,8 @@
       {#if modal?.method === 'confirm'}
         <Button size="sm" onclick={() => modalConfirm(true)}>confirm</Button>
       {:else if modal?.method === 'input' || modal?.method === 'editor'}
+        <Button size="sm" onclick={modalSubmitValue}>submit</Button>
+      {:else if modal?.method === 'custom' && modal.parsed?.kind !== 'select'}
         <Button size="sm" onclick={modalSubmitValue}>submit</Button>
       {/if}
     </Dialog.Footer>

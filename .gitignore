@@ -10,6 +10,7 @@ coverage/
 # Local tool/runtime artifacts
 /.opencode/
 /.playwright-mcp/
+/.pi/extensions/
 
 # Temporary visual QA screenshots
 /sidebar-*.jpeg

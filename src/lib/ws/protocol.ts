@@ -14,6 +14,16 @@ export interface ModelInfo {
   contextWindow?: number;
 }
 
+/** Real-time context window usage — from pi SDK's getContextUsage(). */
+export interface ContextUsage {
+  /** Estimated context tokens, or null if unknown (e.g. after compaction). */
+  tokens: number | null;
+  /** Model's maximum context window. */
+  contextWindow: number;
+  /** Context usage as percentage, or null if tokens is unknown. */
+  percent: number | null;
+}
+
 export interface SessionSummary {
   id: string;
   path: string;
@@ -61,6 +71,23 @@ export interface PromptSummary {
   source: string;
 }
 
+export interface ExtensionSummary {
+  source: string;
+  path: string;
+  scope: 'user' | 'project' | 'temporary';
+  origin: 'package' | 'top-level';
+  tools: { name: string; description: string }[];
+  commands: { name: string; description: string }[];
+  flags?: string[];
+}
+
+// ── Extension widget content types ────────────────────────────────────────────
+
+export type WidgetContent =
+  | { type: 'text'; lines: string[] }
+  | { type: 'table'; headers: string[]; rows: string[][] }
+  | { type: 'badge'; text: string; variant: 'info' | 'warning' | 'error' | 'success' };
+
 export interface HistoryWindow {
   /** Total raw SDK messages in the current session. */
   total: number;
@@ -100,6 +127,10 @@ export interface ConnectedMessage {
   piVersion?: string;
   /** pi-ui server version (e.g. "0.1.6"). */
   uiVersion?: string;
+  /** 'in-memory' when SessionManager.inMemory() is active; omitted for disk-persisted sessions. */
+  sessionMode?: 'in-memory' | 'persisted';
+  /** Real-time context window usage from the SDK. */
+  contextUsage?: ContextUsage;
 }
 
 /**
@@ -109,7 +140,7 @@ export interface ConnectedMessage {
  *
  * Custom server events (not from the SDK):
  *   { type: "model_changed",           model: ModelInfo | null }
- *   { type: "session_loaded",          sessionId, isStreaming, thinkingLevel, model, availableModels, messages }
+ *   { type: "session_loaded",          sessionId, isStreaming, thinkingLevel, model, availableModels, messages, contextUsage }
  *   { type: "sessions_list",           sessions: SessionSummary[] }
  *   { type: "all_sessions_list",       sessions: SessionSummary[] }
  *   { type: "dir_completions",         prefix: string; entries: string[] }
@@ -120,6 +151,8 @@ export interface ConnectedMessage {
  *   { type: "fork_points",             entries: Array<{ entryId: string; text: string }> }
  *   { type: "tools_list",              tools: Array<{ name: string; description: string; isBuiltin: boolean }>, activeToolNames: string[] }
  *   { type: "resources_list",          skills: SkillSummary[], prompts: PromptSummary[] }
+ *   { type: "extensions_list",         extensions: ExtensionSummary[], errors: Array<{ path: string; error: string }> }
+ *   { type: "commands_list",           commands: Array<{ name: string; description?: string; source: string }> }
  *   { type: "skill_install_result",    success: boolean; name?: string; error?: string }
  *   { type: "restart_nonce",           nonce: string }
  *   { type: "server_restarting" }
@@ -144,6 +177,25 @@ export interface ConnectedMessage {
  *   { type: "auto_retry_start" }
  *   { type: "auto_retry_end" }
  *   { type: "extension_ui_request",    id, method, title?, message?, options?, placeholder?, prefill? }
+ *
+ *   Supported extension_ui_request methods:
+ *     confirm    – dialog with confirm/cancel (title, message)
+ *     input      – dialog with text input (title, placeholder)
+ *     select     – dialog with option buttons (title, options)
+ *     editor     – dialog with textarea (title, prefill)
+ *     custom     – generic overlay dialog (title) — promise resolves with user input
+ *     notify     – toast notification (message, notifyType)
+ *     setStatus  – update status text (statusKey, statusText)
+ *     setWidget  – register/update widget panel (widgetKey, widgetType?, widgetData?, widgetLines?, widgetPlacement?)
+ *     setTitle   – update document.title (title)
+ *     set_editor_text – replace textarea content (text)
+ *     paste_to_editor – insert text at cursor (text)
+ *     request_editor_text – request current textarea content (id)
+ *     setWorkingMessage – streaming indicator text (message)
+ *     setWorkingVisible – streaming indicator visibility (visible)
+ *     setWorkingIndicator – no-op in web (TUI-only frames/intervalMs)
+ *     setHiddenThinkingLabel – thinking label text (label)
+ *     setToolsExpanded – global tool output expansion (expanded)
  */
 export type PiEvent = { type: string } & Record<string, unknown>;
 
@@ -174,8 +226,10 @@ export type ClientMessage =
   | { type: 'dir_complete'; prefix: string }
   /** Request lightweight workspace file matches for composer @ references. */
   | { type: 'file_complete'; query: string }
-  /** Response to a blocking extension_ui_request (select / confirm / input / editor). */
+  /** Response to a blocking extension_ui_request (select / confirm / input / editor / custom). */
   | { type: 'extension_ui_response'; id: string; value?: string; confirmed?: boolean; cancelled?: true }
+  /** Editor text content response to a request_editor_text extension_ui_request. */
+  | { type: 'editor_text_response'; id: string; text: string }
   /** Request list of all providers with auth status. */
   | { type: 'get_providers' }
   /** Request an older raw SDK message page by start offset. Server replies with history_page. */
@@ -206,6 +260,10 @@ export type ClientMessage =
   | { type: 'set_active_tools'; toolNames: string[] }
   /** Request skills and prompt templates. Server replies with resources_list. */
   | { type: 'get_resources' }
+  /** Request loaded extensions. Server replies with extensions_list. */
+  | { type: 'get_extensions' }
+  /** Request registered slash commands (builtin + extension). Server replies with commands_list. */
+  | { type: 'get_commands' }
   /**
    * Fetch a skill markdown file from a URL (GitHub blob / raw / direct) and
    * write it to either the project or user skills directory.

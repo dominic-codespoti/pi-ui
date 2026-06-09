@@ -30,11 +30,39 @@ export function revokeToken(jti: string): void {
   revokedSet().add(jti);
 }
 
-// ── Password hashing (Bun native) ─────────────────────────────────────────────
-// Uses Bun's native bcrypt implementation instead of the pure-JS bcryptjs.
+// ── Password hashing ────────────────────────────────────────────────────────
+// Uses Bun's native bcrypt when available (production), falls back to Web
+// Crypto PBKDF2 for the Vite dev server (Node.js).
+
+const hasBun = typeof Bun !== 'undefined';
+
+async function pbkdf2Hash(plain: string): Promise<string> {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(plain), { name: 'PBKDF2' }, false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', salt, iterations: 600_000, hash: 'SHA-256' }, key, 256);
+  const saltB64 = btoa(String.fromCharCode(...salt));
+  const hashB64 = btoa(String.fromCharCode(...new Uint8Array(bits)));
+  return `$pbkdf2$600000$${saltB64}$${hashB64}`;
+}
+
+async function pbkdf2Verify(plain: string, stored: string): Promise<boolean> {
+  const parts = stored.split('$');
+  if (parts.length !== 5 || parts[1] !== 'pbkdf2') return false;
+  const iterations = parseInt(parts[2], 10);
+  const salt = Uint8Array.from(atob(parts[3]), c => c.charCodeAt(0));
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(plain), { name: 'PBKDF2' }, false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', salt, iterations, hash: 'SHA-256' }, key, 256);
+  const expected = atob(parts[4]);
+  const actual = String.fromCharCode(...new Uint8Array(bits));
+  return expected === actual;
+}
 
 export async function initPassword(plain: string): Promise<void> {
-  g.__piHash = await Bun.password.hash(plain, { algorithm: 'bcrypt', cost: 10 });
+  if (hasBun) {
+    g.__piHash = await Bun.password.hash(plain, { algorithm: 'bcrypt', cost: 10 });
+  } else {
+    g.__piHash = await pbkdf2Hash(plain);
+  }
   await deriveSecret();
 }
 
@@ -46,15 +74,23 @@ export async function verifyPassword(plain: string): Promise<boolean> {
     await initPassword(envPwd);
     hash = g.__piHash as string;
   }
-  return Bun.password.verify(plain, hash);
+  if (hasBun) {
+    return Bun.password.verify(plain, hash);
+  }
+  return pbkdf2Verify(plain, hash);
 }
 
 // ── JWT helpers (native crypto.subtle, no jose) ───────────────────────────────
 
 const JWT_ALG = 'HS256';
 
-function b64url(buf: ArrayBuffer): string {
-  return btoa(String.fromCharCode(...new Uint8Array(buf)))
+function toBuf(view: Uint8Array | ArrayBuffer): ArrayBuffer {
+  return view instanceof Uint8Array ? view.buffer as ArrayBuffer : view;
+}
+
+function b64url(buf: Uint8Array | ArrayBuffer): string {
+  const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+  return btoa(String.fromCharCode(...bytes))
     .replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
 }
 
@@ -65,8 +101,8 @@ function b64urlDecode(str: string): Uint8Array {
 }
 
 async function hmacSign(data: Uint8Array, secret: Uint8Array): Promise<Uint8Array> {
-  const key = await crypto.subtle.importKey('raw', secret, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-  return new Uint8Array(await crypto.subtle.sign('HMAC', key, data));
+  const key = await crypto.subtle.importKey('raw', toBuf(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  return new Uint8Array(await crypto.subtle.sign('HMAC', key, toBuf(data)));
 }
 
 // ── Session token ─────────────────────────────────────────────────────────────
@@ -101,8 +137,8 @@ export async function verifySessionToken(token: string): Promise<boolean> {
 
     // Verify signature
     const signingInput = new TextEncoder().encode(`${headerB64}.${payloadB64}`);
-    const sigKey = await crypto.subtle.importKey('raw', secret, { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']);
-    const valid = await crypto.subtle.verify('HMAC', sigKey, b64urlDecode(sigB64), signingInput);
+    const sigKey = await crypto.subtle.importKey('raw', toBuf(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']);
+    const valid = await crypto.subtle.verify('HMAC', sigKey, toBuf(b64urlDecode(sigB64)), toBuf(signingInput));
     if (!valid) return false;
 
     // Decode and validate payload

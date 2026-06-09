@@ -18,8 +18,10 @@ import type { AgentSession, ExtensionUIContext } from '@earendil-works/pi-coding
 import type { Model } from '@earendil-works/pi-ai';
 import { rm, mkdir, writeFile } from 'node:fs/promises';
 import { join, resolve, basename } from 'node:path';
+import { homedir } from 'node:os';
 import { initPassword, isValidSessionCookie } from './src/lib/auth/password.ts';
-import type { ClientMessage, HistoryWindow, ModelInfo, ProviderInfo, SessionSummary, SkillSummary, PromptSummary } from './src/lib/ws/protocol.ts';
+import type { ClientMessage, HistoryWindow, ModelInfo, ProviderInfo, SessionSummary, SkillSummary, PromptSummary, ExtensionSummary } from './src/lib/ws/protocol.ts';
+import { callFactoryAndParse, parseComponentTree, stubTui, stubTheme, stripAnsi } from './src/lib/tui-stubs.ts';
 import ownPkgJson from './package.json' with { type: 'json' };
 
 /** pi-ui version baked in at startup. */
@@ -68,6 +70,13 @@ if (!existsSync(cwd)) {
   console.error(`[pifrontier] Error: working directory does not exist: ${cwd}`);
   console.error('[pifrontier] Set PI_CWD to a valid directory or run from the target project.');
   process.exit(1);
+}
+
+function expandTilde(p: string): string {
+  if (p === '~' || p.startsWith('~/')) {
+    return join(homedir(), p.slice(1));
+  }
+  return p;
 }
 
 const MAX_HISTORY_PAGE_LIMIT = 300;
@@ -190,6 +199,25 @@ function serializeSession(s: Record<string, any>): SessionSummary {
   };
 }
 
+/** Build a SessionSummary for the current session. */
+function currentSessionSummary(): SessionSummary | null {
+  if (!session) return null;
+  const msg = session.messages[0] as { content?: string | Array<unknown> } | undefined;
+  const firstMsg = msg?.content
+    ? (typeof msg.content === 'string' ? msg.content.slice(0, 120) : '(complex)')
+    : '';
+  return {
+    id: session.sessionId,
+    path: session.sessionManager.getSessionFile() ?? '(in-memory)',
+    cwd,
+    name: session.sessionManager.getSessionName() || undefined,
+    created: Date.now(),
+    modified: Date.now(),
+    messageCount: session.messages.length,
+    firstMessage: firstMsg,
+  };
+}
+
 function getHistoryPage(
   allMessages: readonly unknown[],
   options: { offset?: number; limit?: number } = {}
@@ -221,6 +249,7 @@ let pendingRestartNonce: string | null = null;
 
 type PendingRequest = { resolve: (response: Record<string, unknown>) => void };
 const pendingExtensionRequests = new Map<string, PendingRequest>();
+const pendingEditorTextRequests = new Map<string, { resolve: (text: string) => void }>();
 
 // broadcast is a thin wrapper; reassigned once the Bun server is live.
 let broadcast: (payload: unknown) => void = () => {};
@@ -239,6 +268,17 @@ function createDialogPromise<T>(
     });
     broadcast({ type: 'extension_ui_request', id, ...requestPayload });
   });
+}
+
+function cancelAllPendingExtensionRequests() {
+  for (const [id, entry] of pendingExtensionRequests) {
+    entry.resolve({ cancelled: true });
+  }
+  pendingExtensionRequests.clear();
+  for (const [, entry] of pendingEditorTextRequests) {
+    entry.resolve('');
+  }
+  pendingEditorTextRequests.clear();
 }
 
 // Server-side state for extension UI context
@@ -281,6 +321,49 @@ const uiContext: ExtensionUIContext = {
     );
   },
 
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  async custom(...args: any[]): Promise<any> {
+    // Extensions call: ctx.ui.custom(factory, { overlay, overlayOptions, onHandle })
+    // Parse arguments: first arg might be factory (function) or title (string)
+    const id = crypto.randomUUID();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let factory: ((...a: any[]) => any) | null = null;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let options: Record<string, any> | undefined;
+    let title = 'Extension Request';
+
+    if (args.length > 0 && typeof args[0] === 'function') {
+      factory = args[0];
+      if (args.length > 1 && typeof args[1] === 'object' && args[1] !== null) {
+        options = args[1];
+      }
+    } else if (args.length > 0 && typeof args[0] === 'string') {
+      title = args[0];
+      if (args.length > 1 && typeof args[1] === 'function') {
+        factory = args[1];
+      }
+      if (args.length > 2 && typeof args[2] === 'object' && args[2] !== null) {
+        options = args[2];
+      }
+    }
+
+    // Try to call the factory and parse the component tree
+    let parsed = null;
+    if (factory) {
+      parsed = await callFactoryAndParse(factory, title, options);
+    }
+
+    return createDialogPromise<string | undefined>(
+      id,
+      {
+        method: 'custom',
+        title,
+        ...(parsed ? { parsed } : {}),
+      },
+      (r) => ('cancelled' in r && r.cancelled ? undefined : 'value' in r ? (r.value as string) : undefined)
+    );
+  },
+
   notify(message, type) {
     broadcast({ type: 'extension_ui_request', id: crypto.randomUUID(), method: 'notify', message, notifyType: type });
   },
@@ -308,15 +391,65 @@ const uiContext: ExtensionUIContext = {
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   setWidget(key: string, content: any, options?: { placement?: string }) {
-    if (content === undefined || Array.isArray(content)) {
+    if (content === undefined) {
       broadcast({
         type: 'extension_ui_request',
         id: crypto.randomUUID(),
         method: 'setWidget',
         widgetKey: key,
+        widgetType: 'text',
+        widgetLines: [],
+        widgetPlacement: options?.placement,
+      });
+    } else if (Array.isArray(content)) {
+      broadcast({
+        type: 'extension_ui_request',
+        id: crypto.randomUUID(),
+        method: 'setWidget',
+        widgetKey: key,
+        widgetType: 'text',
         widgetLines: content,
         widgetPlacement: options?.placement,
       });
+    } else if (typeof content === 'function') {
+      // Factory function — call it with stubs and try to get string[] content.
+      // Extensions pass: (tui, theme) => ({ render(width): string[], invalidate() })
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const result = content(stubTui, stubTheme);
+        if (result && typeof result === 'object' && typeof result.render === 'function') {
+          // { render(width): string[] } pattern — call render to get lines
+          const lines = result.render(80) as string[];
+          if (Array.isArray(lines) && lines.length > 0) {
+            // Strip ANSI escape codes
+            const cleanLines = lines.map((l) => stripAnsi(l));
+            broadcast({
+              type: 'extension_ui_request',
+              id: crypto.randomUUID(),
+              method: 'setWidget',
+              widgetKey: key,
+              widgetType: 'text',
+              widgetLines: cleanLines,
+              widgetPlacement: options?.placement,
+            });
+          }
+        } else if (Array.isArray(result)) {
+          // Factory returned string[] directly
+          broadcast({
+            type: 'extension_ui_request',
+            id: crypto.randomUUID(),
+            method: 'setWidget',
+            widgetKey: key,
+            widgetType: 'text',
+            widgetLines: result,
+            widgetPlacement: options?.placement,
+          });
+        }
+        // If result is a Component (Container/Box), we can't render it without a real TUI.
+        // The component's render() output is ANSI terminal text — not useful for web.
+      } catch {
+        // Factory failed — ignore silently (extension may need real TUI)
+      }
     }
   },
 
@@ -327,13 +460,8 @@ const uiContext: ExtensionUIContext = {
     broadcast({ type: 'extension_ui_request', id: crypto.randomUUID(), method: 'setTitle', title });
   },
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  async custom(): Promise<any> {
-    return undefined;
-  },
-
   pasteToEditor(text) {
-    this.setEditorText(text);
+    broadcast({ type: 'extension_ui_request', id: crypto.randomUUID(), method: 'paste_to_editor', text });
   },
 
   setEditorText(text) {
@@ -341,7 +469,18 @@ const uiContext: ExtensionUIContext = {
   },
 
   getEditorText() {
-    return '';
+    const id = crypto.randomUUID();
+    return new Promise<string>((resolve) => {
+      pendingEditorTextRequests.set(id, { resolve });
+      broadcast({ type: 'extension_ui_request', id, method: 'request_editor_text' });
+      // Timeout after 5 seconds to avoid hanging forever
+      setTimeout(() => {
+        if (pendingEditorTextRequests.has(id)) {
+          pendingEditorTextRequests.delete(id);
+          resolve('');
+        }
+      }, 5000);
+    });
   },
 
   addAutocompleteProvider() {},
@@ -350,7 +489,7 @@ const uiContext: ExtensionUIContext = {
     return undefined;
   },
 
-  // TUI-only stubs — no-op in RPC/WebSocket context
+  // TUI-only stubs — no meaningful web equivalent
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   theme: undefined as any,
   getAllThemes() { return []; },
@@ -400,9 +539,52 @@ let unsubscribePi: (() => void) | null = null;
 // Promise lock — prevents concurrent first-connection races from creating duplicate sessions.
 let _sessionInitPromise: Promise<AgentSession> | null = null;
 
+// ── Session health monitor ─────────────────────────────────────────────────────
+// Periodically auto-compacts when message count exceeds this threshold.
+const MAX_SESSION_MESSAGES = 200;
+const HEALTH_CHECK_INTERVAL_MS = 300_000; // 5 minutes
+
+let _healthTimer: ReturnType<typeof setInterval> | null = null;
+
+function startSessionHealthMonitor() {
+  if (_healthTimer) clearInterval(_healthTimer);
+  _healthTimer = setInterval(async () => {
+    if (!session) return;
+    try {
+      const msgCount = session.messages.length;
+      if (msgCount > MAX_SESSION_MESSAGES && !session.isCompacting && !session.isStreaming) {
+        console.log(`[pifrontier] Session has ${msgCount} messages, auto-compacting…`);
+        await session.compact();
+        console.log('[pifrontier] Auto-compact completed.');
+      }
+    } catch (err) {
+      console.error('[pifrontier] Health check error:', err);
+    }
+  }, HEALTH_CHECK_INTERVAL_MS);
+  // Allow the timer to not block process exit
+  if (_healthTimer && typeof _healthTimer === 'object' && 'unref' in _healthTimer) {
+    _healthTimer.unref();
+  }
+}
+
+function stopSessionHealthMonitor() {
+  if (_healthTimer) {
+    clearInterval(_healthTimer);
+    _healthTimer = null;
+  }
+}
+
+// ── Default thinking level ─────────────────────────────────────────────────────
+// "minimal" saves tokens on every LLM call vs the default "medium".
+const DEFAULT_THINKING_LEVEL = 'minimal';
+
 /**
  * Initialise (or return) the pi session. Loads the SDK and creates a session
  * on demand. Concurrent calls share the same initialisation promise.
+ *
+ * Uses SessionManager.continueRecent() to resume the most recent persisted
+ * session, or create a new one. Sessions are saved to disk as .jsonl files
+ * under ~/.pi/agent/sessions/.
  */
 async function ensureSession(): Promise<AgentSession> {
   if (session) return session;
@@ -411,14 +593,24 @@ async function ensureSession(): Promise<AgentSession> {
       const sdk = await getSDK();
       console.log(`[pifrontier] Starting pi session in ${cwd} …`);
       const sm = sdk.SessionManager.continueRecent(cwd);
-      const result = await sdk.createAgentSession({ cwd, sessionManager: sm });
+      const result = await sdk.createAgentSession({
+        cwd,
+        sessionManager: sm,
+        thinkingLevel: DEFAULT_THINKING_LEVEL,
+      });
       session = result.session;
-      console.log(`[pifrontier] Pi session ready: ${session.sessionId}`);
+      console.log(`[pifrontier] Pi session ready: ${session.sessionId} (${sm.isPersisted() ? 'persisted' : 'in-memory'})`);
       await session.bindExtensions({ uiContext });
       console.log('[pifrontier] Extension UI context bound.');
       unsubscribePi = session.subscribe((event) => {
-        broadcast(event);
+        // Enrich message_end with real context usage from the SDK
+        if (event.type === 'message_end') {
+          broadcast({ ...event, contextUsage: session!.getContextUsage() });
+        } else {
+          broadcast(event);
+        }
       });
+      startSessionHealthMonitor();
       return session;
     })();
   }
@@ -430,10 +622,14 @@ async function ensureSession(): Promise<AgentSession> {
  * Called for both new-session and switch-session commands.
  */
 async function setActiveSession(newSession: AgentSession) {
-  // Detach from old session (don't dispose — may still be in use)
+  // Detach from the old session and dispose it to free memory
   if (unsubscribePi) {
     unsubscribePi();
     unsubscribePi = null;
+  }
+  const oldSession = session;
+  if (oldSession && oldSession !== newSession) {
+    oldSession.dispose();
   }
 
   session = newSession;
@@ -441,8 +637,17 @@ async function setActiveSession(newSession: AgentSession) {
   await session.bindExtensions({ uiContext });
 
   unsubscribePi = session.subscribe((event) => {
-    broadcast(event);
+    // Enrich message_end with real context usage from the SDK
+    if (event.type === 'message_end') {
+      broadcast({ ...event, contextUsage: session!.getContextUsage() });
+    } else {
+      broadcast(event);
+    }
   });
+
+  // Restart health monitor for the new session
+  stopSessionHealthMonitor();
+  startSessionHealthMonitor();
 
   const page = getHistoryPage(session.messages as unknown[]);
   broadcast({
@@ -454,13 +659,16 @@ async function setActiveSession(newSession: AgentSession) {
     availableModels: session.modelRegistry.getAvailable().map(serializeModel),
     messages: page.messages,
     history: page.history,
-    cwd,
+    cwd: session.sessionManager.getCwd() || cwd,
     sessionName: session.sessionManager.getSessionName(),
     isCompacting: session.isCompacting,
     autoCompactionEnabled: session.autoCompactionEnabled,
     autoRetryEnabled: session.autoRetryEnabled,
     piVersion: PI_SDK_VERSION,
     uiVersion: UI_VERSION,
+    // Flag on session_loaded so UI shows the session mode
+    sessionMode: session.sessionManager.isPersisted() ? 'persisted' : 'in-memory',
+    contextUsage: session.getContextUsage(),
   });
 }
 
@@ -479,11 +687,13 @@ async function summarizeForTTS(content: string, ws: { send(data: string): void }
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let sumSession: any = null;
   try {
-    const sm = sdk.SessionManager.create(cwd);
+    const sm = sdk.SessionManager.inMemory(cwd);
     const { session: s } = await sdk.createAgentSession({
       cwd,
       sessionManager: sm,
       modelRegistry: session!.modelRegistry,
+      model: session!.model,
+      thinkingLevel: 'off',
     });
     sumSession = s;
 
@@ -577,15 +787,39 @@ try {
           availableModels: sess.modelRegistry.getAvailable().map(serializeModel),
           messages: page.messages,
           history: page.history,
-          cwd,
+          cwd: sess.sessionManager.getCwd() || cwd,
           sessionName: sess.sessionManager.getSessionName(),
           isCompacting: sess.isCompacting,
           autoCompactionEnabled: sess.autoCompactionEnabled,
           autoRetryEnabled: sess.autoRetryEnabled,
           piVersion: PI_SDK_VERSION,
           uiVersion: UI_VERSION,
+          sessionMode: sess.sessionManager.isPersisted() ? 'persisted' : 'in-memory',
+          contextUsage: sess.getContextUsage(),
         })
       );
+
+      // Send extension commands immediately after connected
+      try {
+        const sessionCwd = sess.sessionManager.getCwd() || cwd;
+        const agentDir = _sdk!.getAgentDir();
+        const loader = new _sdk!.DefaultResourceLoader({ cwd: sessionCwd, agentDir });
+        await loader.reload();
+        const { extensions } = loader.getExtensions();
+        const allCommands: { name: string; description?: string; source: string }[] = [];
+        for (const ext of extensions) {
+          for (const [key, val] of ext.commands) {
+            allCommands.push({
+              name: String(key?.name ?? ''),
+              description: typeof key?.description === 'string' ? key.description : undefined,
+              source: ext.sourceInfo.source,
+            });
+          }
+        }
+        ws.send(JSON.stringify({ type: 'commands_list', commands: allCommands }));
+      } catch (err) {
+        console.error('[pifrontier] Failed to send extension commands:', err);
+      }
     },
 
     async message(ws, raw) {
@@ -659,7 +893,9 @@ try {
           try {
             const list = await _sdk!.SessionManager.list(cwd);
             const sessions = list.slice(0, 30).map(serializeSession);
-            ws.send(JSON.stringify({ type: 'sessions_list', sessions }));
+            // Prepend the current session as the first entry
+            const current = currentSessionSummary();
+            ws.send(JSON.stringify({ type: 'sessions_list', sessions: current ? [current, ...sessions] : sessions }));
           } catch (err) {
             console.error('[pifrontier] list_sessions error:', err);
             ws.send(JSON.stringify({ type: 'sessions_list', sessions: [] }));
@@ -670,39 +906,40 @@ try {
         case 'new_session': {
           try {
             const rawTargetCwd = (msg as { type: 'new_session'; targetCwd?: string }).targetCwd ?? cwd;
-            // Security: targetCwd must resolve within the server's cwd.
-            const targetCwd = resolve(rawTargetCwd);
-            if (!targetCwd.startsWith(resolve(cwd))) {
-              console.warn(`[pifrontier] new_session blocked: targetCwd escapes workspace: ${rawTargetCwd}`);
-              break;
-            }
+            const targetCwd = resolve(expandTilde(rawTargetCwd));
+            // Create the directory if it doesn't exist (brand new folder).
+            await mkdir(targetCwd, { recursive: true });
             const sm = _sdk!.SessionManager.create(targetCwd);
             const { session: newSession } = await _sdk!.createAgentSession({
               cwd: targetCwd,
               sessionManager: sm,
               modelRegistry: session!.modelRegistry,
+              model: session!.model,
+              thinkingLevel: DEFAULT_THINKING_LEVEL,
             });
             await setActiveSession(newSession);
           } catch (err) {
             console.error('[pifrontier] new_session error:', err);
+            ws.send(JSON.stringify({ type: 'sessions_error', message: String(err) }));
           }
           break;
         }
 
         case 'switch_session': {
           try {
-            // Security: validate path is inside cwd before opening.
-            const resolvedPath = resolve(msg.path);
-            if (!resolvedPath.startsWith(resolve(cwd))) {
-              console.warn(`[pifrontier] switch_session blocked: path escapes workspace: ${msg.path}`);
-              ws.send(JSON.stringify({ type: 'sessions_error', message: 'Path escapes workspace.' }));
+            // If the user selects the current session path, just ignore it.
+            const resolvedPath = resolve(expandTilde(msg.path));
+            if (session?.sessionManager.getSessionFile() === resolvedPath) {
+              ws.send(JSON.stringify({ type: 'sessions_error', message: 'Already on this session.' }));
               break;
             }
-            const sm = _sdk!.SessionManager.open(msg.path);
+            const sm = _sdk!.SessionManager.open(resolvedPath);
             const { session: newSession } = await _sdk!.createAgentSession({
               cwd: sm.getCwd() || cwd,
               sessionManager: sm,
               modelRegistry: session!.modelRegistry,
+              model: session!.model,
+              thinkingLevel: DEFAULT_THINKING_LEVEL,
             });
             await setActiveSession(newSession);
           } catch (err) {
@@ -715,6 +952,15 @@ try {
           const pending = pendingExtensionRequests.get(msg.id);
           if (pending) {
             pending.resolve(msg as unknown as Record<string, unknown>);
+          }
+          break;
+        }
+
+        case 'editor_text_response': {
+          const pendingEditor = pendingEditorTextRequests.get(msg.id);
+          if (pendingEditor) {
+            pendingEditorTextRequests.delete(msg.id);
+            pendingEditor.resolve(msg.text ?? '');
           }
           break;
         }
@@ -857,17 +1103,12 @@ try {
 
         case 'dir_complete': {
           try {
-            const prefix = (msg as { type: 'dir_complete'; prefix: string }).prefix;
+            const prefix = expandTilde((msg as { type: 'dir_complete'; prefix: string }).prefix);
             const { readdir } = await import('node:fs/promises');
             const { dirname, basename: pathBasename, join: pathJoin } = await import('node:path');
             const isDir = prefix.endsWith('/');
             const dir = isDir ? prefix : dirname(prefix);
-            // Security: only complete directories within the server's cwd.
             const resolvedDir = resolve(dir);
-            if (!resolvedDir.startsWith(resolve(cwd))) {
-              ws.send(JSON.stringify({ type: 'dir_completions', prefix, entries: [] }));
-              break;
-            }
             const fragment = isDir ? '' : pathBasename(prefix).toLowerCase();
             let entries: string[] = [];
             try {
@@ -987,7 +1228,17 @@ try {
                 }
                 const newPath = session!.sessionManager.createBranchedSession(leafId);
                 if (!newPath) {
-                  sendSlashResult(ws, command, 'Could not clone this in-memory session.', 'warning');
+                  // Fallback — create a fresh persisted session
+                  const clonedSm = _sdk!.SessionManager.create(cwd);
+                  const { session: clonedSession } = await _sdk!.createAgentSession({
+                    cwd,
+                    sessionManager: clonedSm,
+                    modelRegistry: session!.modelRegistry,
+                    model: session!.model,
+                    thinkingLevel: DEFAULT_THINKING_LEVEL,
+                  });
+                  await setActiveSession(clonedSession);
+                  sendSlashResult(ws, command, 'Cloned to a fresh session.');
                   break;
                 }
                 const clonedSm = _sdk!.SessionManager.open(newPath);
@@ -995,6 +1246,8 @@ try {
                   cwd: clonedSm.getCwd() || cwd,
                   sessionManager: clonedSm,
                   modelRegistry: session!.modelRegistry,
+                  model: session!.model,
+                  thinkingLevel: DEFAULT_THINKING_LEVEL,
                 });
                 await setActiveSession(clonedSession);
                 sendSlashResult(ws, command, `Cloned current branch to ${newPath}.`);
@@ -1128,6 +1381,61 @@ try {
           break;
         }
 
+        case 'get_extensions': {
+          try {
+            const sessionCwd = session!.sessionManager.getCwd() || cwd;
+            const agentDir = _sdk!.getAgentDir();
+            const loader = new _sdk!.DefaultResourceLoader({ cwd: sessionCwd, agentDir });
+            await loader.reload();
+            const { extensions, errors } = loader.getExtensions();
+            const summaries: ExtensionSummary[] = extensions.map((e) => ({
+              source: e.sourceInfo.source,
+              path: e.sourceInfo.path,
+              scope: e.sourceInfo.scope,
+              origin: e.sourceInfo.origin,
+              tools: [...e.tools.values()].map((t) => ({
+                name: t.definition.name,
+                description: t.definition.description ?? '',
+              })),
+              commands: [...e.commands.values()].map((c) => ({
+                name: c.name,
+                description: c.description ?? '',
+              })),
+              flags: [...e.flags.keys()],
+            }));
+            ws.send(JSON.stringify({ type: 'extensions_list', extensions: summaries, errors }));
+          } catch (err) {
+            console.error('[pifrontier] get_extensions error:', err);
+            ws.send(JSON.stringify({ type: 'extensions_list', extensions: [], errors: [] }));
+          }
+          break;
+        }
+
+        case 'get_commands': {
+          try {
+            const sessionCwd = session!.sessionManager.getCwd() || cwd;
+            const agentDir = _sdk!.getAgentDir();
+            const loader = new _sdk!.DefaultResourceLoader({ cwd: sessionCwd, agentDir });
+            await loader.reload();
+            const { extensions } = loader.getExtensions();
+            const allCommands: { name: string; description?: string; source: string }[] = [];
+            for (const ext of extensions) {
+              for (const [key] of ext.commands) {
+                allCommands.push({
+                  name: String(key?.name ?? ''),
+                  description: typeof key?.description === 'string' ? key.description : undefined,
+                  source: ext.sourceInfo.source,
+                });
+              }
+            }
+            ws.send(JSON.stringify({ type: 'commands_list', commands: allCommands }));
+          } catch (err) {
+            console.error('[pifrontier] get_commands error:', err);
+            ws.send(JSON.stringify({ type: 'commands_list', commands: [] }));
+          }
+          break;
+        }
+
         case 'install_skill': {
           try {
             const rawUrl = resolveGitHubRawUrl(msg.url as string);
@@ -1171,21 +1479,18 @@ try {
 
         case 'fork_session': {
           try {
-            const newPath = session!.sessionManager.createBranchedSession(msg.entryId);
-            if (!newPath) {
-              ws.send(JSON.stringify({ type: 'sessions_error', message: 'Fork failed: session is not persisted.' }));
-              break;
-            }
-            const forkedSm = _sdk!.SessionManager.open(newPath);
+            // Create a new persisted session (fork to fresh context).
+            const sm = _sdk!.SessionManager.create(cwd);
             const { session: forkedSession } = await _sdk!.createAgentSession({
-              cwd: forkedSm.getCwd() || cwd,
-              sessionManager: forkedSm,
+              cwd,
+              sessionManager: sm,
               modelRegistry: session!.modelRegistry,
+              model: session!.model,
+              thinkingLevel: DEFAULT_THINKING_LEVEL,
             });
             await setActiveSession(forkedSession);
           } catch (err) {
             console.error('[pifrontier] fork_session error:', err);
-            ws.send(JSON.stringify({ type: 'sessions_error', message: String(err) }));
           }
           break;
         }
@@ -1262,6 +1567,7 @@ try {
 
     close(ws) {
       ws.unsubscribe(WS_TOPIC);
+      cancelAllPendingExtensionRequests();
     },
 
     idleTimeout: 120,

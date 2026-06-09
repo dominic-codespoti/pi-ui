@@ -47,7 +47,8 @@
     "prepublishOnly": "bun run build && bun run build:server"
   },
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "^0.78.0"
+    "@earendil-works/pi-coding-agent": "^0.78.0",
+    "pi-web-access": "^0.10.7"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

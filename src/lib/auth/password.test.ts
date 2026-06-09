@@ -23,8 +23,9 @@ async function setupPassword(plain = 'hunter2') {
 
 // ── Helpers to craft custom JWTs without jose ────────────────────────────────
 
-function b64url(buf: ArrayBuffer): string {
-  return btoa(String.fromCharCode(...new Uint8Array(buf)))
+function b64url(buf: Uint8Array | ArrayBuffer): string {
+  const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+  return btoa(String.fromCharCode(...bytes))
     .replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
 }
 
@@ -32,6 +33,10 @@ function b64urlDecode(str: string): Uint8Array {
   str = str.replace(/-/g, '+').replace(/_/g, '/');
   while (str.length % 4) str += '=';
   return Uint8Array.from(atob(str), c => c.charCodeAt(0));
+}
+
+function toBuf(view: Uint8Array | ArrayBuffer): ArrayBuffer {
+  return view instanceof Uint8Array ? view.buffer as ArrayBuffer : view;
 }
 
 /** Build a JWT signed with a raw HMAC-SHA256 key (not the derived secret). */
@@ -42,8 +47,8 @@ async function makeJWT(
   const header = b64url(new TextEncoder().encode(JSON.stringify({ alg: 'HS256', typ: 'JWT' })));
   const payloadB64 = b64url(new TextEncoder().encode(JSON.stringify(payload)));
   const signingInput = new TextEncoder().encode(`${header}.${payloadB64}`);
-  const k = await crypto.subtle.importKey('raw', rawHmacKey, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-  const sig = b64url(await crypto.subtle.sign('HMAC', k, signingInput));
+  const k = await crypto.subtle.importKey('raw', toBuf(rawHmacKey), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = b64url(await crypto.subtle.sign('HMAC', k, toBuf(signingInput)));
   return `${header}.${payloadB64}.${sig}`;
 }
 
