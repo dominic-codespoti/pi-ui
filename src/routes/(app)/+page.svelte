@@ -3413,16 +3413,16 @@
                     {#if widget.headers.length > 0}
                       <thead>
                         <tr class="border-b border-base-content/10">
-                          {#each widget.headers as header}
+                          {#each widget.headers as header (header)}
                             <th class="text-left px-2 py-1 text-base-content/60 font-semibold">{header}</th>
                           {/each}
                         </tr>
                       </thead>
                     {/if}
                     <tbody>
-                      {#each widget.rows as row}
+                      {#each widget.rows as row (row)}
                         <tr class="border-b border-base-content/5 last:border-0">
-                          {#each row as cell}
+                          {#each row as cell (cell)}
                             <td class="px-2 py-1">{cell}</td>
                           {/each}
                         </tr>
@@ -4310,7 +4310,7 @@
                 {:else if extensionsList.length === 0 && extensionErrors.length === 0}
                   <p class="text-sm text-base-content/45">No extensions loaded.</p>
                 {:else}
-                  {#each ['user', 'project', 'temporary'] as scope}
+                  {#each ['user', 'project', 'temporary'] as scope (scope)}
                     {@const grouped = extensionsList.filter((e) => e.scope === scope)}
                     {#if grouped.length > 0}
                       <div class="mb-5">
@@ -4333,7 +4333,7 @@
                                       Tools ({ext.tools.length})
                                     </summary>
                                     <div class="mt-1.5 ml-4 space-y-1">
-                                      {#each ext.tools as tool}
+                                      {#each ext.tools as tool (tool.name)}
                                         <div>
                                           <p class="text-xs text-base-content/70 font-mono">{tool.name}</p>
                                           {#if tool.description}
@@ -4351,7 +4351,7 @@
                                       Commands ({ext.commands.length})
                                     </summary>
                                     <div class="mt-1.5 ml-4 space-y-1">
-                                      {#each ext.commands as cmd}
+                                      {#each ext.commands as cmd (cmd.name)}
                                         <div>
                                           <p class="text-xs text-base-content/70 font-mono">/{cmd.name}</p>
                                           {#if cmd.description}
@@ -4364,7 +4364,7 @@
                                 {/if}
                                 {#if ext.flags && ext.flags.length > 0}
                                   <div class="px-4 py-2 flex flex-wrap gap-1">
-                                    {#each ext.flags as flag}
+                                    {#each ext.flags as flag (flag)}
                                       <span class="px-1.5 py-0.5 text-[10px] font-mono rounded-full bg-primary/8 text-primary/60">{flag}</span>
                                     {/each}
                                   </div>
@@ -4383,7 +4383,7 @@
                         Errors ({extensionErrors.length})
                       </summary>
                       <div class="mt-2 space-y-1.5">
-                        {#each extensionErrors as err}
+                        {#each extensionErrors as err (err.path)}
                           <div class="px-3 py-2 rounded-lg bg-error/8 border border-error/15">
                             <p class="text-xs text-error/80 font-mono break-all">{err.path}</p>
                             <p class="text-[11px] text-error/60 mt-0.5">{err.error}</p>

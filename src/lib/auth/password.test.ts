@@ -29,12 +29,6 @@ function b64url(buf: Uint8Array | ArrayBuffer): string {
     .replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
 }
 
-function b64urlDecode(str: string): Uint8Array {
-  str = str.replace(/-/g, '+').replace(/_/g, '/');
-  while (str.length % 4) str += '=';
-  return Uint8Array.from(atob(str), c => c.charCodeAt(0));
-}
-
 function toBuf(view: Uint8Array | ArrayBuffer): ArrayBuffer {
   return view instanceof Uint8Array ? view.buffer as ArrayBuffer : view;
 }

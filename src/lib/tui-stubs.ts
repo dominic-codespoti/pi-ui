@@ -38,7 +38,7 @@ export const stubTui = {
   removeChild() {},
   clear() {},
   children: [] as unknown[],
-  render(_w: number) { return []; },
+  render() { return []; },
   invalidate() {},
 };
 

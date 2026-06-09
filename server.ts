@@ -21,7 +21,7 @@ import { join, resolve, basename } from 'node:path';
 import { homedir } from 'node:os';
 import { initPassword, isValidSessionCookie } from './src/lib/auth/password.ts';
 import type { ClientMessage, HistoryWindow, ModelInfo, ProviderInfo, SessionSummary, SkillSummary, PromptSummary, ExtensionSummary } from './src/lib/ws/protocol.ts';
-import { callFactoryAndParse, parseComponentTree, stubTui, stubTheme, stripAnsi } from './src/lib/tui-stubs.ts';
+import { callFactoryAndParse, stubTui, stubTheme, stripAnsi } from './src/lib/tui-stubs.ts';
 import ownPkgJson from './package.json' with { type: 'json' };
 
 /** pi-ui version baked in at startup. */
@@ -271,7 +271,7 @@ function createDialogPromise<T>(
 }
 
 function cancelAllPendingExtensionRequests() {
-  for (const [id, entry] of pendingExtensionRequests) {
+  for (const [, entry] of pendingExtensionRequests) {
     entry.resolve({ cancelled: true });
   }
   pendingExtensionRequests.clear();
@@ -415,7 +415,6 @@ const uiContext: ExtensionUIContext = {
       // Factory function — call it with stubs and try to get string[] content.
       // Extensions pass: (tui, theme) => ({ render(width): string[], invalidate() })
       try {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const result = content(stubTui, stubTheme);
         if (result && typeof result === 'object' && typeof result.render === 'function') {
           // { render(width): string[] } pattern — call render to get lines
@@ -808,7 +807,7 @@ try {
         const { extensions } = loader.getExtensions();
         const allCommands: { name: string; description?: string; source: string }[] = [];
         for (const ext of extensions) {
-          for (const [key, val] of ext.commands) {
+          for (const [key] of ext.commands) {
             allCommands.push({
               name: String(key?.name ?? ''),
               description: typeof key?.description === 'string' ? key.description : undefined,
