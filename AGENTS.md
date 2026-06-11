@@ -13,6 +13,11 @@ A SvelteKit + Bun application that:
 3. Serves a Svelte 5 SPA with PWA support
 4. Guards access with a password set at startup via `PI_PASSWORD=... bun run start`
 
+**Design philosophy: pass-through GUI, not business logic.** pi-ui does not impose
+its own data model or behavior on top of Pi — it forwards SDK events verbatim,
+passes user gestures through as SDK calls, and provides a web interface for Pi's
+native session/project concepts.
+
 Reference architecture: [OpenChamber](https://github.com/openchamber/openchamber) ↔ OpenCode.
 
 ---
@@ -41,8 +46,23 @@ src/
   lib/
     auth/
       password.ts           # bcryptjs hash (globalThis); jose JWT sign/verify
+      rate-limiter.ts       # In-memory IP-based login rate limiter
     ws/
       protocol.ts           # Shared ServerMessage / ClientMessage types
+    server/
+      project-registry.ts   # Persisted JSON project registry (sessions grouped by cwd)
+    state/
+      projects-state.svelte.ts # Runes-based shared projects/session list state
+    tui-stubs.ts            # Minimal pi-tui stub bridge for extension UI rendering
+    markdown.ts             # Configured marked + highlight.js renderer
+    diff-parser.ts          # Unified diff parser for DiffViewer
+    utils.ts                # cn(), formatRelativeDate(), type helpers
+    components/
+      ui/                   # shadcn-style UI primitives (dialog, button, select, switch, card, etc.)
+      sidebar-panel.svelte  # Reusable slide-out panel
+      diff-viewer.svelte    # Inline unified-diff renderer
+      file-viewer-modal.svelte # Workspace file viewer/editor
+      projects/             # Projects sidebar, project picker components
   routes/
     (auth)/+layout.svelte
       login/+page.svelte    # Password form (Svelte 5 runes)
@@ -50,7 +70,7 @@ src/
     (app)/
       +layout.ts            # ssr=false, prerender=false
       +layout.svelte
-      +page.svelte          # Main chat UI (WS client, message rendering)
+      +page.svelte          # Main chat UI (WS client, message rendering, STT)
 hooks.server.ts             # Auth guard — redirects unauthenticated → /login
 server.ts                   # Bun entry: pi session init, WS upgrade at /ws, SK handler fallback
 svelte.config.js            # svelte-adapter-bun adapter
@@ -128,10 +148,15 @@ const { session } = await createAgentSession({ cwd: process.cwd() });
 // Send a prompt
 await session.prompt("Hello");
 
-// Stream events to browser
+// Stream events to browser — forwarded verbatim, no enrichment
 const unsubscribe = session.subscribe((event) => {
   ws.send(JSON.stringify(event));
 });
+
+// Forking uses the SDK's native branching API
+import { SessionManager } from "@earendil-works/pi-coding-agent";
+const sm = SessionManager.open(session.sessionFile!);
+const forkPath = sm.createBranchedSession(entryId);
 
 // Key events to handle
 // "agent_start" / "agent_end"        → isStreaming state
@@ -166,6 +191,20 @@ must be ESM. `server.ts` and all lib files must use `.ts` extensions and
    (use `jose` for HS256 JWT or `crypto.subtle` — no external session DB)
 3. `hooks.server.ts` checks cookie on every request; redirects to `/login` if invalid
 4. WS upgrade in `server.ts` re-validates cookie before upgrade
+
+### Design principles — things we intentionally don't do
+
+pi-ui avoids imposing logic on Pi. Features that were removed to stay lean:
+
+- **No TTS** — no speech synthesis, no LLM-generated spoken summaries, no auto-speak.
+  Speech-to-text (STT) dictation via the browser's `SpeechRecognition` API is kept
+  as a text input convenience — it doesn't touch Pi.
+- **No auto-compaction health monitor** — the SDK handles compaction natively.
+- **No history paging** — full `session.messages` array is sent on connect/switch.
+  No `HistoryWindow`, no `load_history` protocol message.
+- **No contextUsage enrichment** — SDK events forwarded as-is, no data grafted on.
+- **No default thinking level override** — SDK's own default is used.
+- **No `boundedInt` / history limits** — removed with paging.
 
 ### PWA service worker
 

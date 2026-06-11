@@ -22,7 +22,7 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { initPassword, isValidSessionCookie } from './src/lib/auth/password.ts';
 import { listProjects, touchProject, removeProject, setProjectPinned, renameProject } from './src/lib/server/project-registry.ts';
-import type { ClientMessage, HistoryWindow, ModelInfo, ProjectInfo, ProviderInfo, SessionSummary, SkillSummary, PromptSummary, ExtensionSummary, UpdatePackageStatus, UpdateStatus, UpdateTarget } from './src/lib/ws/protocol.ts';
+import type { ClientMessage, ModelInfo, ProjectInfo, ProviderInfo, SessionSummary, SkillSummary, PromptSummary, ExtensionSummary, UpdatePackageStatus, UpdateStatus, UpdateTarget } from './src/lib/ws/protocol.ts';
 import { callFactoryAndParse, stubTui, stubTheme, stripAnsi } from './src/lib/tui-stubs.ts';
 import ownPkgJson from './package.json' with { type: 'json' };
 
@@ -105,15 +105,7 @@ function expandTilde(p: string): string {
   return p;
 }
 
-const MAX_HISTORY_PAGE_LIMIT = 300;
 
-function boundedInt(value: unknown, fallback: number, min: number, max: number): number {
-  const parsed = typeof value === 'number' ? value : Number.parseInt(String(value ?? ''), 10);
-  if (!Number.isFinite(parsed)) return fallback;
-  return Math.max(min, Math.min(max, Math.floor(parsed)));
-}
-
-const HISTORY_PAGE_LIMIT = boundedInt(Bun.env.PI_UI_HISTORY_LIMIT, 80, 20, MAX_HISTORY_PAGE_LIMIT);
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function serializeModel(model: Model<any> | undefined | null): ModelInfo | null {
@@ -513,28 +505,6 @@ function currentSessionSummary(): SessionSummary | null {
   };
 }
 
-function getHistoryPage(
-  allMessages: readonly unknown[],
-  options: { offset?: number; limit?: number } = {}
-): { messages: unknown[]; history: HistoryWindow } {
-  const total = allMessages.length;
-  const limit = boundedInt(options.limit, HISTORY_PAGE_LIMIT, 1, MAX_HISTORY_PAGE_LIMIT);
-  const offset = options.offset === undefined
-    ? Math.max(0, total - limit)
-    : boundedInt(options.offset, 0, 0, total);
-  const end = Math.min(total, offset + limit);
-
-  return {
-    messages: allMessages.slice(offset, end),
-    history: {
-      total,
-      offset,
-      limit,
-      hasMore: offset > 0,
-    },
-  };
-}
-
 // ── 3. Restart nonce ──────────────────────────────────────────────────────────
 // Single-use nonce for restart_server. Prevents replay and ensures the user
 // explicitly confirmed the restart via a request_restart → restart_server flow.
@@ -896,45 +866,6 @@ let unsubscribePi: (() => void) | null = null;
 // Promise lock — prevents concurrent first-connection races from creating duplicate sessions.
 let _sessionInitPromise: Promise<AgentSession> | null = null;
 
-// ── Session health monitor ─────────────────────────────────────────────────────
-// Periodically auto-compacts when message count exceeds this threshold.
-const MAX_SESSION_MESSAGES = 200;
-const HEALTH_CHECK_INTERVAL_MS = 300_000; // 5 minutes
-
-let _healthTimer: ReturnType<typeof setInterval> | null = null;
-
-function startSessionHealthMonitor() {
-  if (_healthTimer) clearInterval(_healthTimer);
-  _healthTimer = setInterval(async () => {
-    if (!session) return;
-    try {
-      const msgCount = session.messages.length;
-      if (msgCount > MAX_SESSION_MESSAGES && !session.isCompacting && !session.isStreaming) {
-        console.log(`[pifrontier] Session has ${msgCount} messages, auto-compacting…`);
-        await session.compact();
-        console.log('[pifrontier] Auto-compact completed.');
-      }
-    } catch (err) {
-      console.error('[pifrontier] Health check error:', err);
-    }
-  }, HEALTH_CHECK_INTERVAL_MS);
-  // Allow the timer to not block process exit
-  if (_healthTimer && typeof _healthTimer === 'object' && 'unref' in _healthTimer) {
-    _healthTimer.unref();
-  }
-}
-
-function stopSessionHealthMonitor() {
-  if (_healthTimer) {
-    clearInterval(_healthTimer);
-    _healthTimer = null;
-  }
-}
-
-// ── Default thinking level ─────────────────────────────────────────────────────
-// "minimal" saves tokens on every LLM call vs the default "medium".
-const DEFAULT_THINKING_LEVEL = 'minimal';
-
 /**
  * Initialise (or return) the pi session. Loads the SDK and creates a session
  * on demand. Concurrent calls share the same initialisation promise.
@@ -953,7 +884,6 @@ async function ensureSession(): Promise<AgentSession> {
       const result = await sdk.createAgentSession({
         cwd,
         sessionManager: sm,
-        thinkingLevel: DEFAULT_THINKING_LEVEL,
       });
       session = result.session;
       touchProject(session.sessionManager.getCwd() || cwd);
@@ -961,14 +891,8 @@ async function ensureSession(): Promise<AgentSession> {
       await session.bindExtensions({ uiContext: uiContext as unknown as ExtensionUIContext });
       console.log('[pifrontier] Extension UI context bound.');
       unsubscribePi = session.subscribe((event) => {
-        // Enrich message_end with real context usage from the SDK
-        if (event.type === 'message_end') {
-          broadcast({ ...event, contextUsage: session!.getContextUsage() });
-        } else {
-          broadcast(event);
-        }
+        broadcast(event);
       });
-      startSessionHealthMonitor();
       return session;
     })();
   }
@@ -999,19 +923,9 @@ async function setActiveSession(newSession: AgentSession) {
   await session.bindExtensions({ uiContext: uiContext as unknown as ExtensionUIContext });
 
   unsubscribePi = session.subscribe((event) => {
-    // Enrich message_end with real context usage from the SDK
-    if (event.type === 'message_end') {
-      broadcast({ ...event, contextUsage: session!.getContextUsage() });
-    } else {
-      broadcast(event);
-    }
+    broadcast(event);
   });
 
-  // Restart health monitor for the new session
-  stopSessionHealthMonitor();
-  startSessionHealthMonitor();
-
-  const page = getHistoryPage(session.messages as unknown[]);
   broadcast({
     type: 'session_loaded',
     sessionId: session.sessionId,
@@ -1019,8 +933,7 @@ async function setActiveSession(newSession: AgentSession) {
     thinkingLevel: session.thinkingLevel,
     model: serializeModel(session.model),
     availableModels: session.modelRegistry.getAvailable().map(serializeModel),
-    messages: page.messages,
-    history: page.history,
+    messages: session.messages,
     cwd: session.sessionManager.getCwd() || cwd,
     sessionName: session.sessionManager.getSessionName(),
     isCompacting: session.isCompacting,
@@ -1051,69 +964,7 @@ async function setActiveSession(newSession: AgentSession) {
   await broadcastProjects();
 }
 
-// ── 5. TTS summarisation helper ───────────────────────────────────────────────
-
-/**
- * Spin up a temporary pi session, prompt it to summarise `content` into
- * 1-2 spoken sentences, collect the streamed text, and send
- * { type: 'tts_summary', text } back to the requesting WebSocket client.
- *
- * The session is immediately disposed on completion or error so it does not
- * linger in memory. Tools are disabled to prevent any tool-use overhead.
- */
-async function summarizeForTTS(content: string, ws: { send(data: string): void }): Promise<void> {
-  const sdk = await getSDK();
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let sumSession: any = null;
-  try {
-    const sm = sdk.SessionManager.inMemory(cwd);
-    const { session: s } = await sdk.createAgentSession({
-      cwd,
-      sessionManager: sm,
-      modelRegistry: session!.modelRegistry,
-      model: session!.model,
-      thinkingLevel: 'off',
-    });
-    sumSession = s;
-
-    // Disable all tools — this is a pure text completion
-    sumSession.setActiveToolsByName([]);
-
-    let summary = '';
-    const done = new Promise<void>((resolve) => {
-      const unsub = sumSession!.subscribe((event: Record<string, unknown>) => {
-        if (event.type === 'message_update') {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const inner = (event as any).assistantMessageEvent as { type?: string; delta?: string } | undefined;
-          if (inner?.type === 'text_delta' && typeof inner.delta === 'string') {
-            summary += inner.delta;
-          }
-        } else if (event.type === 'agent_end') {
-          unsub();
-          resolve();
-        }
-      });
-    });
-
-    const prompt =
-      `Summarize the following AI assistant response in 1-2 short spoken sentences suitable for text-to-speech. ` +
-      `Skip all code snippets and technical specifics. Be natural and conversational.\n\nResponse:\n${content.slice(0, 3000)}`;
-
-    await sumSession.prompt(prompt);
-
-    // Await agent_end with a 30 s safety timeout
-    await Promise.race([done, new Promise<void>((r) => setTimeout(r, 30_000))]);
-
-    ws.send(JSON.stringify({ type: 'tts_summary', text: summary.trim() }));
-  } catch (err) {
-    console.error('[pifrontier] summarizeForTTS error:', err);
-    ws.send(JSON.stringify({ type: 'tts_summary', text: '' }));
-  } finally {
-    sumSession?.dispose();
-  }
-}
-
-// ── 6. Start server ───────────────────────────────────────────────────────────
+// ── 5. Start server ───────────────────────────────────────────────────────────
 
 const PORT = parseInt(Bun.env.PORT ?? '3000');
 
@@ -1155,7 +1006,6 @@ try {
 
       // Load SDK + session on first connection; subsequent calls return instantly.
       const sess = await ensureSession();
-      const page = getHistoryPage(sess.messages as unknown[]);
 
       ws.send(
         JSON.stringify({
@@ -1165,8 +1015,7 @@ try {
           thinkingLevel: sess.thinkingLevel,
           model: serializeModel(sess.model),
           availableModels: sess.modelRegistry.getAvailable().map(serializeModel),
-          messages: page.messages,
-          history: page.history,
+          messages: sess.messages,
           cwd: sess.sessionManager.getCwd() || cwd,
           sessionName: sess.sessionManager.getSessionName(),
           isCompacting: sess.isCompacting,
@@ -1299,7 +1148,6 @@ try {
               sessionManager: sm,
               modelRegistry: session!.modelRegistry,
               model: session!.model,
-              thinkingLevel: DEFAULT_THINKING_LEVEL,
             });
             await setActiveSession(newSession);
           } catch (err) {
@@ -1329,7 +1177,6 @@ try {
               sessionManager: sm,
               modelRegistry: session!.modelRegistry,
               model: session!.model,
-              thinkingLevel: DEFAULT_THINKING_LEVEL,
             });
             await setActiveSession(newSession);
           } catch (err) {
@@ -1357,26 +1204,6 @@ try {
 
         case 'get_providers': {
           ws.send(JSON.stringify({ type: 'providers_list', providers: getProviders() }));
-          break;
-        }
-
-        case 'load_history': {
-          const req = msg as Extract<ClientMessage, { type: 'load_history' }>;
-          if (req.sessionId !== session!.sessionId) {
-            ws.send(JSON.stringify({
-              type: 'history_page',
-              sessionId: req.sessionId,
-              messages: [],
-              history: { total: 0, offset: 0, limit: boundedInt(req.limit, HISTORY_PAGE_LIMIT, 1, MAX_HISTORY_PAGE_LIMIT), hasMore: false },
-            }));
-            break;
-          }
-
-          const page = getHistoryPage(session!.messages as unknown[], {
-            offset: req.offset,
-            limit: req.limit,
-          });
-          ws.send(JSON.stringify({ type: 'history_page', sessionId: session!.sessionId, ...page }));
           break;
         }
 
@@ -1712,8 +1539,7 @@ try {
                     sessionManager: clonedSm,
                     modelRegistry: session!.modelRegistry,
                     model: session!.model,
-                    thinkingLevel: DEFAULT_THINKING_LEVEL,
-                  });
+                        });
                   await setActiveSession(clonedSession);
                   sendSlashResult(ws, command, 'Cloned to a fresh session.');
                   break;
@@ -1724,8 +1550,7 @@ try {
                   sessionManager: clonedSm,
                   modelRegistry: session!.modelRegistry,
                   model: session!.model,
-                  thinkingLevel: DEFAULT_THINKING_LEVEL,
-                });
+                    });
                 await setActiveSession(clonedSession);
                 sendSlashResult(ws, command, `Cloned current branch to ${newPath}.`);
                 break;
@@ -1987,27 +1812,22 @@ try {
 
         case 'fork_session': {
           try {
-            // Create a new persisted session (fork to fresh context).
-            const sm = _sdk!.SessionManager.create(cwd);
+            const entryId = (msg as { type: 'fork_session'; entryId: string }).entryId;
+            if (!session!.sessionFile) throw new Error('Active session is not persisted');
+            const sm = _sdk!.SessionManager.open(session!.sessionFile);
+            const forkPath = sm.createBranchedSession(entryId);
+            const sm2 = _sdk!.SessionManager.open(forkPath);
             const { session: forkedSession } = await _sdk!.createAgentSession({
               cwd,
-              sessionManager: sm,
+              sessionManager: sm2,
               modelRegistry: session!.modelRegistry,
               model: session!.model,
-              thinkingLevel: DEFAULT_THINKING_LEVEL,
             });
             await setActiveSession(forkedSession);
           } catch (err) {
             console.error('[pifrontier] fork_session error:', err);
+            ws.send(JSON.stringify({ type: 'sessions_error', message: String(err) }));
           }
-          break;
-        }
-
-        case 'summarize_for_tts': {
-          // Fire-and-forget — response is sent asynchronously via ws.send inside summarizeForTTS
-          summarizeForTTS((msg as { type: 'summarize_for_tts'; content: string }).content, ws).catch(
-            (err) => console.error('[pifrontier] summarize_for_tts unhandled:', err)
-          );
           break;
         }
 

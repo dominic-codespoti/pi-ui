@@ -132,17 +132,6 @@ export type WidgetContent =
   | { type: 'table'; headers: string[]; rows: string[][] }
   | { type: 'badge'; text: string; variant: 'info' | 'warning' | 'error' | 'success' };
 
-export interface HistoryWindow {
-  /** Total raw SDK messages in the current session. */
-  total: number;
-  /** Start index of the message window included in this payload. */
-  offset: number;
-  /** Number of raw SDK messages requested for this window. */
-  limit: number;
-  /** True when older raw SDK messages exist before offset. */
-  hasMore: boolean;
-}
-
 /** A node in the session tree for visual display. */
 export interface TreeNode {
   entryId: string;
@@ -165,8 +154,6 @@ export interface ConnectedMessage {
   availableModels: ModelInfo[];
   /** Recent raw SDK message window at connect time. */
   messages: unknown[];
-  /** Paging metadata for messages. */
-  history?: HistoryWindow;
   /** Server working directory. */
   cwd?: string;
   /** Display name of the current session (from session_info entries). */
@@ -214,10 +201,9 @@ export interface ConnectedMessage {
  *   { type: "update_result",           target: "ui" | "sdk", success: boolean, message: string, output?: string, restartRequired?: boolean, reloadRequired?: boolean }
  *   { type: "restart_nonce",           nonce: string }
  *   { type: "server_restarting" }
- *   { type: "tts_summary",             text: string }
+
  *   { type: "slash_result",            command: string, message: string, level?: "info" | "warning" | "error" }
  *   { type: "file_content",            path: string, content: string, error?: string }
- *   { type: "history_page",            messages: unknown[], history: HistoryWindow }
  *
  * SDK events the browser must handle:
  *   { type: "agent_start" }
@@ -261,14 +247,7 @@ export interface ConnectedMessage {
  */
 export type PiEvent = { type: string } & Record<string, unknown>;
 
-export interface HistoryPageMessage {
-  type: 'history_page';
-  sessionId: string;
-  messages: unknown[];
-  history: HistoryWindow;
-}
-
-export type ServerMessage = ConnectedMessage | HistoryPageMessage | PiEvent;
+export type ServerMessage = ConnectedMessage | PiEvent;
 
 // ── Browser → Server ─────────────────────────────────────────────────────────
 
@@ -306,8 +285,6 @@ export type ClientMessage =
   | { type: 'editor_text_response'; id: string; text: string }
   /** Request list of all providers with auth status. */
   | { type: 'get_providers' }
-  /** Request an older raw SDK message page by start offset. Server replies with history_page. */
-  | { type: 'load_history'; sessionId: string; offset: number; limit?: number }
   /** Persist an API key for a provider. */
   | { type: 'set_provider_key'; provider: string; key: string }
   /** Remove stored API key for a provider. */
@@ -352,16 +329,10 @@ export type ClientMessage =
   | { type: 'request_restart' }
   /** Restart the server process in-place (re-exec with same args + env). */
   | { type: 'restart_server'; nonce?: string }
-  /**
-   * Request an LLM-generated TTS-friendly summary of a long assistant response.
-   * Server creates a temporary pi session, generates a 1-2 sentence summary, and
-   * replies with { type: 'tts_summary', text: string }.
-   */
   /** Execute a built-in slash command in the server session context. */
   | { type: 'run_builtin'; command: string; args?: string }
   /** Request the session tree data for visual display. Server replies with session_tree. */
   | { type: 'get_session_tree' }
-  | { type: 'summarize_for_tts'; content: string }
   /** Request file contents for the file viewer modal. */
   | { type: 'read_file'; path: string }
   /** Write file content from the file viewer modal's edit mode. */

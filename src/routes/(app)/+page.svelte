@@ -2,7 +2,7 @@
   import { onMount, onDestroy, tick } from 'svelte';
   import { SvelteMap } from 'svelte/reactivity';
 
-  import type { ServerMessage, ClientMessage, HistoryWindow, ModelInfo, ProviderInfo, SkillSummary, PromptSummary, ExtensionSummary, WidgetContent, TreeNode, UpdateStatus, UpdateTarget } from '$lib/ws/protocol';
+  import type { ServerMessage, ClientMessage, ModelInfo, ProviderInfo, SkillSummary, PromptSummary, ExtensionSummary, WidgetContent, TreeNode, UpdateStatus, UpdateTarget } from '$lib/ws/protocol';
   import type { PiEvent } from '$lib/ws/protocol';
   import { renderMarkdown, highlightCode } from '$lib/markdown';
   import { formatRelativeDate as formatDate } from '$lib/utils';
@@ -40,8 +40,7 @@
   import SquareCheck from '@lucide/svelte/icons/square-check';
   import Keyboard from '@lucide/svelte/icons/keyboard';
   import Blocks from '@lucide/svelte/icons/blocks';
-  import AudioLines from '@lucide/svelte/icons/audio-lines';
-  import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
+import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
   import PiIcon from '@lucide/svelte/icons/pi';
   import CornerDownLeft from '@lucide/svelte/icons/corner-down-left';
   import RefreshCw from '@lucide/svelte/icons/refresh-cw';
@@ -436,12 +435,7 @@
 
   // ── Core state ───────────────────────────────────────────────────────────────
 
-  const HISTORY_PAGE_SIZE = 80;
   let messages = $state<UIMessage[]>([]);
-  let historyOffset = $state(0);
-  let historyTotal = $state(0);
-  let hasOlderHistory = $state(false);
-  let historyLoading = $state(false);
   let expandedUserMsgs = $state<Record<string, boolean>>({});
   let input = $state('');
   /** Images staged for the next prompt (base64 data + display src). */
@@ -597,16 +591,6 @@
   let autoCompactionEnabled = $state(true);
   /** Whether auto-retry on transient errors is enabled */
   let autoRetryEnabled = $state(true);
-  /** TTS: whether to auto-speak each assistant response. */
-  let autoSpeak = $state(false);
-  /** TTS: true while speechSynthesis is playing. */
-  let isSpeaking = $state(false);
-  /** TTS: ID of the message currently being spoken (null = none). */
-  let speakingMsgId = $state<string | null>(null);
-  /** TTS: true while waiting for an LLM-generated summary from the server. */
-  let isSummarizing = $state(false);
-  /** ID of the most-recent assistant message — used to target the summarising spinner. */
-  const lastAsstId = $derived([...messages].reverse().find((m) => m.role === 'assistant')?.id ?? null);
   /** STT: true while SpeechRecognition is active. */
   let isRecording = $state(false);
   /** STT: active SpeechRecognition instance (not reactive — plain ref). */
@@ -614,9 +598,8 @@
   /** STT: true when the user manually stopped recording (so onend does NOT auto-submit). */
   let sttManualStop = false;
   /**
-   * Conversation mode: when on, the mic auto-restarts after each TTS response so the
+   * Conversation mode: when on, the mic auto-restarts after each assistant response so the
    * user can speak → send → listen → speak again without touching the UI.
-   * Implies autoSpeak = true while active.
    */
   let conversationMode = $state(false);
 
@@ -627,12 +610,6 @@
     document.documentElement.setAttribute('data-theme', t);
     try { localStorage.setItem('pifrontier:theme', t); } catch { /* noop */ }
   }
-
-  /** Browser TTS settings exposed in the settings modal. */
-  let speechVoices = $state<SpeechSynthesisVoice[]>([]);
-  let selectedVoiceURI = $state('');
-  let speechRate = $state(1);
-  let speechPitch = $state(1);
 
   // ── Panel state ──────────────────────────────────────────────────────────────
 
@@ -667,7 +644,6 @@
 
   const SETTINGS_SECTIONS = [
     { id: 'session', label: 'Session', icon: SlidersHorizontal },
-    { id: 'voice', label: 'Voice', icon: AudioLines },
     { id: 'shortcuts', label: 'Shortcuts', icon: Keyboard },
     { id: 'extensions', label: 'Extensions', icon: Blocks },
     { id: 'updates', label: 'Updates', icon: RefreshCw },
@@ -713,7 +689,7 @@
 
   /** Whether the settings modal is open */
   let showSettingsPanel = $state(false);
-  let settingsSection = $state<'session' | 'voice' | 'shortcuts' | 'extensions' | 'updates' | 'about'>('session');
+  let settingsSection = $state<'session' | 'shortcuts' | 'extensions' | 'updates' | 'about'>('session');
   /** Skills returned by the server */
   let resourcesSkills = $state<SkillSummary[]>([]);
   /** Prompt templates returned by the server */
@@ -999,7 +975,6 @@
     model: ModelInfo | null;
     availableModels: ModelInfo[];
     messages: unknown[];
-    history?: HistoryWindow;
     cwd?: string;
     sessionName?: string;
   }) {
@@ -1009,16 +984,6 @@
     model = payload.model;
     availableModels = payload.availableModels ?? [];
     messages = rawMessagesToUI(payload.messages ?? []);
-    const history = payload.history ?? {
-      total: payload.messages?.length ?? 0,
-      offset: 0,
-      limit: payload.messages?.length ?? 0,
-      hasMore: false,
-    };
-    historyOffset = history.offset;
-    historyTotal = history.total;
-    hasOlderHistory = history.hasMore;
-    historyLoading = false;
     if (payload.cwd) cwd = payload.cwd;
     sessionName = payload.sessionName;
     // Sync the shared projects store with the active session.
@@ -1053,7 +1018,6 @@
           model: c.model,
           availableModels: c.availableModels,
           messages: c.messages,
-          history: c.history,
           cwd: c.cwd,
           sessionName: c.sessionName,
         });
@@ -1075,7 +1039,6 @@
           model: ModelInfo | null;
           availableModels: ModelInfo[];
           messages: unknown[];
-          history?: HistoryWindow;
           piVersion?: string;
           uiVersion?: string;
           sessionMode?: string;
@@ -1088,31 +1051,6 @@
         if (projectsState.onSessionLoaded()) showSessionPanel = false;
         projectPickerOpen = false;
         break;
-      }
-
-      case 'history_page': {
-        const page = msg as {
-          type: 'history_page';
-          sessionId: string;
-          messages: unknown[];
-          history: HistoryWindow;
-        };
-        historyLoading = false;
-        if (page.sessionId !== sessionId) return;
-
-        const previousScrollHeight = scrollEl?.scrollHeight ?? 0;
-        const previousScrollTop = scrollEl?.scrollTop ?? 0;
-        const olderMessages = rawMessagesToUI(page.messages ?? []);
-        messages = [...olderMessages, ...messages];
-        historyOffset = page.history.offset;
-        historyTotal = page.history.total;
-        hasOlderHistory = page.history.hasMore;
-
-        tick().then(() => {
-          if (!scrollEl) return;
-          scrollEl.scrollTop = scrollEl.scrollHeight - previousScrollHeight + previousScrollTop;
-        });
-        return;
       }
 
       case 'model_changed': {
@@ -1167,20 +1105,7 @@
         projectsState.isStreaming = false;
         sealStreaming();
         if (sessionId) projectsState.markUnchecked(sessionId);
-        // Auto-speak: request an LLM-generated summary from the server;
-        // the tts_summary response handler will call speakText() with the result.
-        // Skip if pi is about to retry (willRetry=true) — we'll speak the final response instead.
-        if (autoSpeak && !willRetry) {
-          const lastAsst = [...messages].reverse().find((m) => m.role === 'assistant' && (m.content || m.thinking));
-          if (lastAsst) {
-            isSummarizing = true;
-            send({ type: 'summarize_for_tts', content: lastAsst.content || lastAsst.thinking || '' });
-          } else if (conversationMode && wsState === 'open') {
-            // No content to summarise (e.g. empty turn) — restart STT directly
-            toggleSTT();
-          }
-        } else if (conversationMode && !willRetry && wsState === 'open') {
-          // autoSpeak is off but conversation mode is on: restart STT directly after response
+        if (conversationMode && !willRetry && wsState === 'open') {
           toggleSTT();
         }
         break;
@@ -1727,19 +1652,6 @@
         break;
       }
 
-      case 'tts_summary': {
-        isSummarizing = false;
-        const summaryText = (msg as { type: 'tts_summary'; text: string }).text;
-        const lastAsst = [...messages].reverse().find((m) => m.role === 'assistant' && m.content);
-        if (summaryText) {
-          // Speak the LLM-generated summary, attributed to the last assistant message
-          speakText(summaryText, lastAsst?.id ?? null);
-        } else if (lastAsst) {
-          // Fallback: speak stripped raw content if summarisation failed/timed out
-          speakText(stripMarkdown(lastAsst.content ?? ''), lastAsst.id);
-        }
-        break;
-      }
     }
 
     scrollBottom();
@@ -1863,16 +1775,6 @@
     const s = ms / 1000;
     if (s < 60) return `${s.toFixed(1)}s`;
     return `${Math.round(s / 60)}m`;
-  }
-
-  function refreshSpeechVoices() {
-    if (!('speechSynthesis' in window)) return;
-    speechVoices = window.speechSynthesis.getVoices();
-    if (!selectedVoiceURI && speechVoices[0]) selectedVoiceURI = speechVoices[0].voiceURI;
-  }
-
-  function selectedVoice(): SpeechSynthesisVoice | undefined {
-    return speechVoices.find((v) => v.voiceURI === selectedVoiceURI);
   }
 
   // ── Message helpers ──────────────────────────────────────────────────────────
@@ -2107,15 +2009,6 @@
     scrollEl?.scrollTo({ top: scrollEl.scrollHeight, behavior: 'smooth' });
   }
 
-  function loadOlderHistory() {
-    if (!sessionId || historyLoading || !hasOlderHistory || historyOffset <= 0 || wsState !== 'open') return;
-    const nextOffset = Math.max(0, historyOffset - HISTORY_PAGE_SIZE);
-    const limit = historyOffset - nextOffset;
-    if (limit <= 0) return;
-    historyLoading = true;
-    send({ type: 'load_history', sessionId, offset: nextOffset, limit });
-  }
-
   async function copyMessage(msg: UIMessage) {
     const text = msg.content || msg.thinking;
     if (!text) return;
@@ -2309,64 +2202,7 @@
     resetTextareaHeight();
   }
 
-  // ── TTS / STT ────────────────────────────────────────────────────────────────
-
-  /** Strip markdown so text sounds natural when spoken. */
-  function stripMarkdown(text: string): string {
-    return text
-      .replace(/```[\s\S]*?```/g, '') // fenced code blocks → drop
-      .replace(/`[^`\n]+`/g, '') // inline code → drop
-      .replace(/\*\*([^*]+)\*\*/g, '$1') // bold → plain
-      .replace(/\*([^*]+)\*/g, '$1') // italic → plain
-      .replace(/#{1,6}\s+/g, '') // headings → plain
-      .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1') // links → label only
-      .replace(/!\[[^\]]*\]\([^)]+\)/g, '') // images → drop
-      .replace(/^\s*[-*+]\s+/gm, '') // list bullets → drop
-      .replace(/^\s*\d+\.\s+/gm, '') // numbered list → drop
-      .replace(/\n{2,}/g, '. ') // paragraph breaks → short pause
-      .replace(/\n/g, ' ')
-      .trim();
-  }
-
-  /** Speak arbitrary text via the browser SpeechSynthesis API, optionally tracking it to a message ID. */
-  function speakText(text: string, msgId: string | null = null) {
-    if (!('speechSynthesis' in window)) return;
-    stopSpeaking();
-    if (!text.trim()) return;
-    const utt = new SpeechSynthesisUtterance(text);
-    const voice = selectedVoice();
-    if (voice) utt.voice = voice;
-    utt.rate = speechRate;
-    utt.pitch = speechPitch;
-    speakingMsgId = msgId;
-    isSpeaking = true;
-    utt.onend = () => {
-      isSpeaking = false;
-      speakingMsgId = null;
-      // Conversation mode: after TTS finishes, start listening for the next turn
-      if (conversationMode && wsState === 'open' && !isRecording && !isStreaming) {
-        toggleSTT();
-      }
-    };
-    utt.onerror = () => { isSpeaking = false; speakingMsgId = null; };
-    window.speechSynthesis.speak(utt);
-  }
-
-  function speakMsg(msg: UIMessage) {
-    if (!('speechSynthesis' in window)) return;
-    // Toggle off if already speaking this message
-    if (speakingMsgId === msg.id) {
-      stopSpeaking();
-      return;
-    }
-    speakText(stripMarkdown(msg.content || msg.thinking || ''), msg.id);
-  }
-
-  function stopSpeaking() {
-    if ('speechSynthesis' in window) window.speechSynthesis.cancel();
-    isSpeaking = false;
-    speakingMsgId = null;
-  }
+  // ── STT ──────────────────────────────────────────────────────────────────────
 
   function toggleSTT() {
     if (isRecording) {
@@ -2418,21 +2254,17 @@
 
   /**
    * Toggle conversation mode on/off.
-   * ON  → forces autoSpeak, starts STT immediately (if idle).
-   * OFF → stops TTS + STT and clears the mode flag.
+   * ON  → starts STT immediately (if idle), auto-restarts mic after each response.
+   * OFF → stops STT and clears the mode flag.
    */
   function toggleConversationMode() {
     if (conversationMode) {
       conversationMode = false;
-      // Stop any in-flight TTS or STT when exiting
       sttManualStop = true;
       speechRec?.stop();
-      stopSpeaking();
     } else {
       conversationMode = true;
-      autoSpeak = true; // conversation mode requires auto-speak
-      // Kick off the first listening turn if nothing is happening
-      if (!isStreaming && !isSpeaking && !isRecording && wsState === 'open') {
+      if (!isStreaming && !isRecording && wsState === 'open') {
         toggleSTT();
       }
     }
@@ -2713,14 +2545,9 @@
       if (!isNaN(rw)) rightPanelWidth = Math.max(PANEL_MIN_W, Math.min(PANEL_MAX_W, rw));
     } catch { /* localStorage unavailable */ }
     try {
-      selectedVoiceURI = localStorage.getItem('pifrontier:voice-uri') ?? '';
-      speechRate = Number(localStorage.getItem('pifrontier:speech-rate') ?? '1') || 1;
-      speechPitch = Number(localStorage.getItem('pifrontier:speech-pitch') ?? '1') || 1;
       const savedTheme = localStorage.getItem('pifrontier:theme');
       if (savedTheme) setTheme(savedTheme);
     } catch { /* localStorage unavailable */ }
-    refreshSpeechVoices();
-    if ('speechSynthesis' in window) window.speechSynthesis.onvoiceschanged = refreshSpeechVoices;
   });
 
   onDestroy(() => {
@@ -2728,7 +2555,6 @@
     if (sendHoldTimer) clearTimeout(sendHoldTimer);
     ws?.close();
     if (_mq && _mqHandler) _mq.removeEventListener('change', _mqHandler);
-    if ('speechSynthesis' in window) window.speechSynthesis.onvoiceschanged = null;
   });
 </script>
 
@@ -3106,18 +2932,6 @@
         </div>
       {:else}
         <div class="w-full max-w-3xl lg:max-w-5xl xl:max-w-6xl 2xl:max-w-7xl mx-auto px-4 md:px-6 flex flex-col gap-1">
-          {#if hasOlderHistory || historyLoading}
-            <div class="flex justify-center py-3">
-              <button
-                onclick={loadOlderHistory}
-                disabled={historyLoading}
-                title={`${historyOffset} older raw messages out of ${historyTotal}`}
-                class="px-3 py-1.5 rounded-full text-xs text-base-content/45 bg-base-content/[0.045] hover:bg-base-content/[0.075] hover:text-base-content/70 transition-colors disabled:opacity-50 disabled:cursor-wait"
-              >
-                {historyLoading ? 'loading older...' : `load older (${historyOffset} raw messages)`}
-              </button>
-            </div>
-          {/if}
           {#each messages as msg (msg.id)}
 
             {#if msg.role === 'user'}
@@ -3267,17 +3081,7 @@
                         class="flex items-center justify-center w-5 h-5 text-base-content/35 hover:text-base-content/60 rounded transition-colors select-none"
                         aria-label="Copy message"
                       >{#if copiedId === msg.id}<svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m20 6-11 11-5-5"/></svg>{:else}<svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>{/if}</button>
-                      {#if isSummarizing && msg.id === lastAsstId}
-                        <span class="flex items-center justify-center w-5 h-5 text-primary/60" aria-label="Generating spoken summary…">
-                          <svg class="w-3 h-3 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>
-                        </span>
-                      {:else}
-                        <button
-                          onclick={() => speakMsg(msg)}
-                          class="flex items-center justify-center w-5 h-5 rounded transition-colors select-none {speakingMsgId === msg.id ? 'text-primary' : 'text-base-content/35 hover:text-base-content/60'}"
-                          aria-label={speakingMsgId === msg.id ? 'Stop speaking' : 'Speak message'}
-                        >{#if speakingMsgId === msg.id}<svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>{:else}<svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>{/if}</button>
-                      {/if}
+
                     </span>
                   </div>
                 {/if}
@@ -4240,7 +4044,7 @@
                 {SETTINGS_SECTIONS.find((s) => s.id === settingsSection)?.label ?? 'Settings'}
               </Dialog.Title>
               <Dialog.Description class="text-xs text-base-content/38 mt-0.5">
-                {#if settingsSection === 'session'}Defaults and behavior for session runs{:else if settingsSection === 'voice'}Speech synthesis and voice loop controls{:else if settingsSection === 'shortcuts'}Keyboard shortcuts available in the chat UI{:else if settingsSection === 'extensions'}Loaded extensions and their tools/commands{:else if settingsSection === 'updates'}Check and apply pi-ui or SDK updates{:else}Runtime information and server controls{/if}
+                {#if settingsSection === 'session'}Defaults and behavior for session runs{:else if settingsSection === 'shortcuts'}Keyboard shortcuts available in the chat UI{:else if settingsSection === 'extensions'}Loaded extensions and their tools/commands{:else if settingsSection === 'updates'}Check and apply pi-ui or SDK updates{:else}Runtime information and server controls{/if}
               </Dialog.Description>
             </div>
             <button
@@ -4268,44 +4072,6 @@
                         <p class="text-xs text-base-content/35 mt-0.5">Retry transient model errors automatically.</p>
                       </div>
                       <Switch checked={autoRetryEnabled} onCheckedChange={(v) => { autoRetryEnabled = v; send({ type: 'set_auto_retry', enabled: v }); }} disabled={wsState !== 'open'} aria-label="Toggle auto-retry" />
-                    </div>
-                  </div>
-                </Card.Root>
-              {:else if settingsSection === 'voice'}
-                <Card.Root size="sm" class="py-0 overflow-hidden bg-base-100/60 border-base-content/10">
-                  <div class="divide-y divide-base-content/8">
-                    <div class="flex items-center gap-3 px-4 py-3">
-                      <div class="flex-1 min-w-0">
-                        <p class="text-sm text-base-content/75">Auto-speak responses</p>
-                        <p class="text-xs text-base-content/35 mt-0.5">Speak assistant responses after each completed turn.</p>
-                      </div>
-                      <Switch checked={autoSpeak} onCheckedChange={(v) => { autoSpeak = v; if (!v) stopSpeaking(); }} disabled={wsState !== 'open'} aria-label="Toggle auto-speak" />
-                    </div>
-                    <div class="flex items-center gap-3 px-4 py-3">
-                      <div class="flex-1 min-w-0">
-                        <p class="text-sm text-base-content/75">Voice</p>
-                        <p class="text-xs text-base-content/35 mt-0.5">Browser-provided speech synthesis voice.</p>
-                      </div>
-                      <Select.Root type="single" value={selectedVoiceURI} onValueChange={(v: string) => { selectedVoiceURI = v; try { localStorage.setItem('pifrontier:voice-uri', v); } catch { /* localStorage unavailable */ } }}>
-                        <Select.Trigger size="sm" class="w-56 text-xs" disabled={speechVoices.length === 0}>{selectedVoice()?.name ?? 'Default voice'}</Select.Trigger>
-                        <Select.Content>
-                          {#each speechVoices as voice (voice.voiceURI)}
-                            <Select.Item value={voice.voiceURI}>{voice.name} {voice.lang ? `(${voice.lang})` : ''}</Select.Item>
-                          {/each}
-                        </Select.Content>
-                      </Select.Root>
-                    </div>
-                    <div class="px-4 py-3 space-y-3">
-                      <div class="flex items-center gap-4">
-                        <span class="w-20 text-sm text-base-content/65">Rate</span>
-                        <input type="range" min="0.6" max="1.6" step="0.1" value={speechRate} oninput={(e) => { speechRate = Number(e.currentTarget.value); try { localStorage.setItem('pifrontier:speech-rate', String(speechRate)); } catch { /* localStorage unavailable */ } }} class="flex-1 accent-primary" />
-                        <span class="w-10 text-right text-xs text-base-content/40 tabular-nums">{speechRate.toFixed(1)}</span>
-                      </div>
-                      <div class="flex items-center gap-4">
-                        <span class="w-20 text-sm text-base-content/65">Pitch</span>
-                        <input type="range" min="0.6" max="1.6" step="0.1" value={speechPitch} oninput={(e) => { speechPitch = Number(e.currentTarget.value); try { localStorage.setItem('pifrontier:speech-pitch', String(speechPitch)); } catch { /* localStorage unavailable */ } }} class="flex-1 accent-primary" />
-                        <span class="w-10 text-right text-xs text-base-content/40 tabular-nums">{speechPitch.toFixed(1)}</span>
-                      </div>
                     </div>
                   </div>
                 </Card.Root>
