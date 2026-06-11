@@ -920,7 +920,12 @@ async function setActiveSession(newSession: AgentSession) {
 
   session = newSession;
 
-  await session.bindExtensions({ uiContext: uiContext as unknown as ExtensionUIContext });
+  try {
+    await session.bindExtensions({ uiContext: uiContext as unknown as ExtensionUIContext });
+  } catch (err) {
+    console.error('[pifrontier] bindExtensions (non-fatal):', err);
+    broadcast({ type: 'agent_error', error: `Extension install failed: ${err instanceof Error ? err.message : String(err)}` });
+  }
 
   unsubscribePi = session.subscribe((event) => {
     broadcast(event);
@@ -1181,6 +1186,7 @@ try {
             await setActiveSession(newSession);
           } catch (err) {
             console.error('[pifrontier] switch_session error:', err);
+            ws.send(JSON.stringify({ type: 'sessions_error', message: String(err) }));
           }
           break;
         }
@@ -1943,6 +1949,7 @@ try {
       } // end switch
       } catch (err) {
         console.error('[pifrontier] WS message handler error:', err);
+        try { ws.send(JSON.stringify({ type: 'agent_error', error: String(err) })); } catch { /* ws may be closed */ }
       }
     },
 

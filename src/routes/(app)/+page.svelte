@@ -437,6 +437,21 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
 
   let messages = $state<UIMessage[]>([]);
   let expandedUserMsgs = $state<Record<string, boolean>>({});
+  let truncatedUserMsgs = $state<Record<string, boolean>>({});
+
+  function checkOverflow(node: HTMLElement, msgId: string) {
+    const update = () => {
+      if (!expandedUserMsgs[msgId]) {
+        truncatedUserMsgs[msgId] = node.scrollHeight > node.clientHeight + 2;
+      }
+    };
+    const ro = new ResizeObserver(update);
+    ro.observe(node);
+    update();
+    return {
+      destroy() { ro.disconnect(); }
+    };
+  }
   let input = $state('');
   /** Images staged for the next prompt (base64 data + display src). */
   let attachedImages = $state<Array<{ data: string; mimeType: string; name: string; src: string }>>([]);
@@ -1064,8 +1079,14 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
       }
 
       case 'sessions_list':
-      case 'sessions_error':
       case 'projects_list': {
+        projectsState.handleMessage(msg as PiEvent);
+        break;
+      }
+
+      case 'sessions_error': {
+        const errMsg = (msg as Record<string, unknown>).message ?? 'Unknown session error';
+        addToast(errMsg as string, 'warning');
         projectsState.handleMessage(msg as PiEvent);
         break;
       }
@@ -2951,14 +2972,17 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
                     {#if msg.content}
                       <button
                         type="button"
-                        class="block w-full appearance-none bg-transparent border-0 p-0 text-left whitespace-pre-wrap break-words leading-relaxed text-base-content/90 select-text {!isExpanded ? 'line-clamp-3' : ''}"
-                        onclick={() => { expandedUserMsgs[msg.id] = !isExpanded; }}
+                        use:checkOverflow={msg.id}
+                        class="w-full appearance-none bg-transparent border-0 p-0 text-left whitespace-pre-wrap break-words leading-relaxed text-base-content/90 select-text {isExpanded ? 'block' : 'line-clamp-3'}"
+                        onclick={() => { if (truncatedUserMsgs[msg.id] || isExpanded) expandedUserMsgs[msg.id] = !isExpanded; }}
                         aria-expanded={isExpanded}
                       >{msg.content}</button>
-                      <button
-                        onclick={() => { expandedUserMsgs[msg.id] = !isExpanded; }}
-                        class="text-[10px] text-base-content/30 hover:text-base-content/55 transition-colors select-none"
-                      >{isExpanded ? 'show less' : 'show more'}</button>
+                      {#if truncatedUserMsgs[msg.id] || isExpanded}
+                        <button
+                          onclick={() => { expandedUserMsgs[msg.id] = !isExpanded; }}
+                          class="text-[10px] text-base-content/30 hover:text-base-content/55 transition-colors select-none"
+                        >{isExpanded ? 'show less' : 'show more'}</button>
+                      {/if}
                     {/if}
                   </div>
                   <div class="flex justify-end items-center gap-1 {isMobile ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'} transition-opacity duration-150">
