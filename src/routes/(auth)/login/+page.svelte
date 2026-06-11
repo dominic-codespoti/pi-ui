@@ -11,17 +11,21 @@
   <title>pi UI | Login</title>
 </svelte:head>
 
-<div class="flex min-h-dvh items-center justify-center bg-base-100 px-4">
-  <div class="w-full max-w-xs font-mono text-sm text-base-content">
-    <p class="mb-6 text-base-content/40">pi</p>
+<div class="aurora flex min-h-dvh w-full items-center justify-center bg-base-100 px-4">
+  <div class="w-full max-w-sm font-mono text-sm text-base-content">
+    <!-- Glyph + wordmark -->
+    <div class="mb-10 flex flex-col items-center gap-3 select-none">
+      <span class="pi-glyph pi-glyph-breathe text-7xl font-light leading-none">π</span>
+      <p class="text-xs tracking-[0.35em] uppercase text-base-content/35">pi · coding agent</p>
+    </div>
 
     <form
       method="POST"
       onsubmit={() => (loading = true)}
-      class="flex flex-col gap-4"
+      class="composer rounded-2xl px-5 py-5 flex flex-col gap-4"
     >
-      <div class="flex flex-col gap-1">
-        <label for="password" class="text-base-content/40 text-xs">password</label>
+      <div class="flex flex-col gap-2">
+        <label for="password" class="text-[11px] uppercase tracking-[0.18em] text-base-content/40">password</label>
         <input
           id="password"
           name="password"
@@ -29,22 +33,32 @@
           bind:value={password}
           autocomplete="current-password"
           required
-          class="bg-transparent border-b border-base-content/20 pb-1 outline-none focus:border-base-content/60 transition-colors placeholder-base-content/10"
+          class="w-full bg-transparent border-b border-base-content/15 pb-2 outline-none focus:border-primary/60 transition-colors placeholder-base-content/15 text-base"
           placeholder="········"
         />
       </div>
 
       {#if form?.error}
-        <p class="text-error text-xs">{form.error}</p>
+        <p class="text-error text-xs flex items-center gap-1.5">
+          <span class="w-1 h-1 rounded-full bg-error inline-block"></span>
+          {form.error}
+        </p>
       {/if}
 
       <button
         type="submit"
         disabled={loading || !password}
-        class="mt-2 self-end text-base-content/40 hover:text-base-content disabled:opacity-20 transition-colors"
+        class="mt-1 h-10 w-full rounded-xl text-sm font-semibold transition-all duration-200
+          {password && !loading
+            ? 'bg-primary text-primary-content hover:brightness-110 shadow-[0_0_24px_-6px_color-mix(in_oklch,var(--color-primary)_60%,transparent)]'
+            : 'bg-base-content/[0.06] text-base-content/25 cursor-default'}"
       >
-        {loading ? '…' : '→'}
+        {loading ? 'unlocking…' : 'unlock'}
       </button>
     </form>
+
+    <p class="mt-6 text-center text-[11px] text-base-content/25">
+      set via <span class="text-base-content/40">PI_PASSWORD</span> at server start
+    </p>
   </div>
 </div>

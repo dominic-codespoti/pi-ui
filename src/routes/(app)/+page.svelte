@@ -1,9 +1,12 @@
 <script lang="ts">
   import { onMount, onDestroy, tick } from 'svelte';
-  import { SvelteMap, SvelteSet } from 'svelte/reactivity';
+  import { SvelteMap } from 'svelte/reactivity';
 
-  import type { ServerMessage, ClientMessage, HistoryWindow, ModelInfo, ProviderInfo, SessionSummary, SkillSummary, PromptSummary, ExtensionSummary, WidgetContent } from '$lib/ws/protocol';
+  import type { ServerMessage, ClientMessage, HistoryWindow, ModelInfo, ProviderInfo, SkillSummary, PromptSummary, ExtensionSummary, WidgetContent, TreeNode, UpdateStatus, UpdateTarget } from '$lib/ws/protocol';
+  import type { PiEvent } from '$lib/ws/protocol';
   import { renderMarkdown, highlightCode } from '$lib/markdown';
+  import { formatRelativeDate as formatDate } from '$lib/utils';
+  import { projectsState } from '$lib/state/projects-state.svelte';
   import * as Tooltip from '$lib/components/ui/tooltip';
   import { Switch } from '$lib/components/ui/switch';
   import * as Dialog from '$lib/components/ui/dialog';
@@ -15,6 +18,8 @@
   import SidebarPanel from '$lib/components/sidebar-panel.svelte';
   import DiffViewer from '$lib/components/diff-viewer.svelte';
   import FileViewerModal from '$lib/components/file-viewer-modal.svelte';
+  import ProjectsSidebar from '$lib/components/projects/projects-sidebar.svelte';
+  import ProjectPicker from '$lib/components/projects/project-picker.svelte';
 
   import Terminal from '@lucide/svelte/icons/terminal';
   import FileText from '@lucide/svelte/icons/file-text';
@@ -29,6 +34,17 @@
   import ChevronRight from '@lucide/svelte/icons/chevron-right';
   import Loader from '@lucide/svelte/icons/loader';
   import CircleX from '@lucide/svelte/icons/circle-x';
+  import X from '@lucide/svelte/icons/x';
+  import Sparkles from '@lucide/svelte/icons/sparkles';
+  import Square from '@lucide/svelte/icons/square';
+  import SquareCheck from '@lucide/svelte/icons/square-check';
+  import Keyboard from '@lucide/svelte/icons/keyboard';
+  import Blocks from '@lucide/svelte/icons/blocks';
+  import AudioLines from '@lucide/svelte/icons/audio-lines';
+  import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
+  import PiIcon from '@lucide/svelte/icons/pi';
+  import CornerDownLeft from '@lucide/svelte/icons/corner-down-left';
+  import RefreshCw from '@lucide/svelte/icons/refresh-cw';
 
   // ── Provider colour chips ────────────────────────────────────────────────────
 
@@ -55,6 +71,10 @@
       if (lower.includes(key)) return color;
     }
     return '#6B7280';
+  }
+
+  function versionText(version?: string): string {
+    return version && version !== 'unknown' ? `v${version}` : 'unknown';
   }
 
   // ── Tool output language detection ──────────────────────────────────────────
@@ -305,7 +325,10 @@
   type ParsedSelect = { kind: 'select'; label: string; options: { value: string; label: string; description?: string }[] };
   type ParsedInput = { kind: 'input'; label: string; placeholder?: string; value?: string; multiline?: boolean };
   type ParsedText = { kind: 'text'; label: string; content: string };
-  type ParsedComponent = ParsedSelect | ParsedInput | ParsedText;
+  type ParsedButton = { kind: 'button'; label: string; variant?: 'default' | 'primary' | 'danger' };
+  type ParsedCheckbox = { kind: 'checkbox'; label: string; checked: boolean };
+  type ParsedContainer = { kind: 'container'; children: ParsedComponent[]; direction?: 'vertical' | 'horizontal' };
+  type ParsedComponent = ParsedSelect | ParsedInput | ParsedText | ParsedButton | ParsedCheckbox | ParsedContainer;
 
   type ModalState =
     | { method: 'confirm'; id: string; title: string; message: string }
@@ -332,6 +355,7 @@
   let fileViewerContent = $state('');
   let fileViewerLoading = $state(false);
   let fileViewerError = $state<string | null>(null);
+  let fileSaving = $state(false);
 
   function openFileViewer(path: string, line?: number) {
     fileViewerPath = path;
@@ -341,6 +365,11 @@
     fileViewerError = null;
     fileViewerLoading = true;
     send({ type: 'read_file', path });
+  }
+
+  function handleFileSave(content: string) {
+    fileSaving = true;
+    send({ type: 'write_file', path: fileViewerPath, content });
   }
 
   // ── Mobile detection ──────────────────────────────────────────────────────
@@ -417,6 +446,8 @@
   let input = $state('');
   /** Images staged for the next prompt (base64 data + display src). */
   let attachedImages = $state<Array<{ data: string; mimeType: string; name: string; src: string }>>([]);
+  /** Text files staged for the next prompt (content read as text). */
+  let attachedFiles = $state<Array<{ name: string; content: string; size: number }>>([]);
   let fileInputEl = $state<HTMLInputElement | undefined>(undefined);
 
   // ── Extension UI state ───────────────────────────────────────────────────────
@@ -433,10 +464,22 @@
   let workingMessage = $state<string | undefined>(undefined);
   /** Whether the streaming working indicator is visible (setWorkingVisible). */
   let workingVisible = $state(true);
+  /** Frames for the working indicator animation (setWorkingIndicator). */
+  let workingIndicatorFrames = $state<string[]>([]);
+  /** Interval in ms between frame ticks (setWorkingIndicator). */
+  let workingIndicatorMs = $state(80);
+  /** Current frame index for the working indicator animation. */
+  let workingFrameIndex = $state(0);
   /** Label shown for collapsed thinking blocks (setHiddenThinkingLabel). */
   let hiddenThinkingLabel = $state('thinking');
   /** Global tool output expansion state (setToolsExpanded). */
   let toolsExpandedGlobal = $state(false);
+  /** Extension-injected header content (setHeader). */
+  let extensionHeader = $state('');
+  /** Extension-injected footer content (setFooter). */
+  let extensionFooter = $state('');
+  /** Extension-injected editor component panel (setEditorComponent). */
+  let editorComponentPanel = $state<ParsedComponent | null>(null);
   /** Whether the composer shortcut menu is open. */
   let showSlashMenu = $state(false);
   /** Currently highlighted index in the composer shortcut menu (-1 = none). */
@@ -470,19 +513,26 @@
         .filter((p) => !q || match(p.name) || match(p.description))
         .slice(0, 8)
         .map((p) => ({ trigger: '/' as const, label: `/${p.name}`, description: p.description || p.argumentHint || `${p.scope} prompt`, insert: `/${p.name} `, muted: p.isBuiltin }));
-      return [...commands, ...extCmds, ...skills, ...prompts].slice(0, 14);
+      const extAuto = extensionCompletions
+        .filter((c) => !q || match(c.label) || match(c.description ?? ''))
+        .slice(0, 8)
+        .map((c) => ({ trigger: '/' as const, label: `/${c.label}`, description: c.description ?? 'extension', insert: `/${c.value} ` }));
+      return [...commands, ...extCmds, ...skills, ...prompts, ...extAuto].slice(0, 14);
     }
 
     if (shortcutTrigger === '@') {
       const refs = [
         ...fileCompletions.map((path) => ({ label: `@${path}`, description: 'workspace file', insert: `@${path} ` })),
         ...(cwd ? [{ label: '@current', description: cwd, insert: `@${cwd} ` }] : []),
-        ...projects.map((p) => ({ label: `@${p.basename}`, description: p.cwd, insert: `@${p.cwd} ` })),
-        ...allSessions.slice(0, 24).map((s) => ({
+        ...projectsState.groups.map((p) => ({ label: `@${p.name}`, description: p.cwd, insert: `@${p.cwd} ` })),
+        ...projectsState.allSessions.slice(0, 24).map((s) => ({
           label: `@${s.name || s.firstMessage || '(empty)'}`,
           description: s.cwd,
           insert: `@${s.path} `,
         })),
+        ...extensionCompletions
+          .filter((c) => !q || match(c.label) || match(c.description ?? ''))
+          .map((c) => ({ label: `@${c.label}`, description: c.description ?? 'extension', insert: `@${c.value} ` })),
       ];
       return refs
         .filter((r) => !q || match(r.label) || match(r.description))
@@ -491,14 +541,24 @@
     }
 
     if (shortcutTrigger === '!') {
-      return SHELL_SHORTCUTS
-        .filter((s) => !q || match(s.label) || match(s.description) || match(s.insert))
-        .map((s) => ({ trigger: '!' as const, ...s }));
+      const extAuto = extensionCompletions
+        .filter((c) => !q || match(c.label) || match(c.description ?? ''))
+        .map((c) => ({ label: c.label, description: c.description ?? 'extension', insert: `!${c.value} ` }));
+      return [
+        ...SHELL_SHORTCUTS
+          .filter((s) => !q || match(s.label) || match(s.description) || match(s.insert))
+          .map((s) => ({ trigger: '!' as const, ...s })),
+        ...extAuto.map((c) => ({ trigger: '!' as const, ...c })),
+      ];
     }
 
+    const extAuto = extensionCompletions
+      .filter((c) => !q || match(c.label) || match(c.description ?? ''))
+      .map((c) => ({ label: c.label, description: c.description ?? 'extension', insert: `#${c.value} `, muted: false }));
     return [
       ...SNIPPET_SHORTCUTS,
       ...resourcesPrompts.map((p) => ({ label: p.name, description: p.description || p.argumentHint || `${p.scope} prompt`, insert: `#${p.name} `, muted: p.isBuiltin })),
+      ...extAuto,
     ]
       .filter((s) => !q || match(s.label) || match(s.description))
       .slice(0, 12)
@@ -522,8 +582,6 @@
   let sessionName = $state<string | undefined>(undefined);
   /** Session storage mode reported by server */
   let sessionMode = $state<string | undefined>(undefined);
-  /** Most recent input token count (from message_end) — used for context % */
-  let lastInputTokens = $state(0);
   /** Real-time context usage from the pi SDK (via getContextUsage()). */
   let contextUsageTokens = $state<number | null>(null);
   let contextUsageWindow = $state(0);
@@ -563,7 +621,7 @@
   let conversationMode = $state(false);
 
   /** Selected daisyUI theme — persisted in localStorage. */
-  let selectedTheme = $state('night');
+  let selectedTheme = $state('pi');
   function setTheme(t: string) {
     selectedTheme = t;
     document.documentElement.setAttribute('data-theme', t);
@@ -594,49 +652,30 @@
   let sessionResizing = $state(false);
   /** True while the user is dragging a right panel resize handle. */
   let rightResizing = $state(false);
-  /** Filter text for sessions list */
-  let sessionFilter = $state('');
-  /** Path of the session currently being renamed inline (null = none) */
-  let renamingPath = $state<string | null>(null);
-  /** Draft name for inline rename */
-  let renameDraft = $state('');
-  /** Error from rename/delete operations */
-  let sessionError = $state<string | null>(null);
-  /** Collapsed directory cwds in the session sidebar tree. */
-  let collapsedDirs = $state<Set<string>>(new Set());
-  /** Project groups whose full session list is visible. */
-  let expandedSessionGroups = $state<Set<string>>(new Set());
-  /** Session IDs that have unchecked/unseen results since last switch. */
-  let uncheckedSessions = $state<Set<string>>(new Set());
-  /** All sessions across all projects (from get_all_sessions). */
-  let allSessions = $state<SessionSummary[]>([]);
-  /** Whether the open-folder path input is visible in the sidebar footer. */
-  let openFolderMode = $state(false);
-  /** Text typed in the open-folder input. */
-  let openFolderInput = $state('');
-  /** Directory completions returned by the server for openFolderInput. */
-  let dirCompletions = $state<string[]>([]);
-  /** True while waiting for a new_session response from the server. */
-  let pendingNewSession = $state(false);
-  /** Highlighted index in the dir completions list (-1 = none). */
-  let dirHighlightIndex = $state(-1);
+  // Project / session list state lives in projectsState
+  // (src/lib/state/projects-state.svelte.ts) — shared with the sidebar and picker.
+
+  /** Whether the project picker dropdown is visible in the empty chat state. */
+  let projectPickerOpen = $state(false);
   /** Workspace file completions shown for composer @ references. */
   let fileCompletions = $state<string[]>([]);
+  /** Extension-registered autocomplete items for the current trigger menu. */
+  let extensionCompletions = $state<{ value: string; label: string; description?: string }[]>([]);
+  /** Last trigger we requested extension completions for. */
+  let lastExtensionTrigger = $state('');
   let lastFileCompleteQuery = '';
 
-  interface ProjectGroup { cwd: string; basename: string; sessions: SessionSummary[]; lastModified: number; }
-
-  const SESSION_PREVIEW_LIMIT = 5;
-
   const SETTINGS_SECTIONS = [
-    { id: 'session', label: 'Session', icon: '◐' },
-    { id: 'voice', label: 'Voice', icon: '◌' },
-    { id: 'shortcuts', label: 'Shortcuts', icon: '⌘' },
-    { id: 'extensions', label: 'Extensions', icon: '◆' },
-    { id: 'about', label: 'About', icon: 'π' },
+    { id: 'session', label: 'Session', icon: SlidersHorizontal },
+    { id: 'voice', label: 'Voice', icon: AudioLines },
+    { id: 'shortcuts', label: 'Shortcuts', icon: Keyboard },
+    { id: 'extensions', label: 'Extensions', icon: Blocks },
+    { id: 'updates', label: 'Updates', icon: RefreshCw },
+    { id: 'about', label: 'About', icon: PiIcon },
   ] as const;
 
   const THEMES: { id: string; name: string }[] = [
+    { id: 'pi',        name: 'Pi' },
     { id: 'night',     name: 'Night' },
     { id: 'dark',      name: 'Dark' },
     { id: 'dracula',   name: 'Dracula' },
@@ -656,50 +695,14 @@
   const SHORTCUTS = [
     { keys: 'Ctrl / Cmd + /', action: 'Toggle sessions' },
     { keys: 'Ctrl / Cmd + K', action: 'Toggle model picker' },
+    { keys: 'Ctrl / Cmd + T', action: 'Open thinking level' },
+    { keys: 'Ctrl / Cmd + Shift + T', action: 'Cycle thinking level' },
     { keys: 'Escape', action: 'Close modal or panel' },
     { keys: 'Enter', action: 'Send from composer' },
     { keys: 'Shift + Enter', action: 'New line in composer' },
     { keys: '/', action: 'Open slash menu' },
     { keys: '@', action: 'Attach file context' },
   ];
-
-  /** allSessions grouped by cwd, sorted by most-recently-modified first. */
-  const projects = $derived.by<ProjectGroup[]>(() => {
-    const map = new SvelteMap<string, SessionSummary[]>();
-    for (const s of allSessions) {
-      const key = s.cwd ?? '';
-      if (!map.has(key)) map.set(key, []);
-      map.get(key)!.push(s);
-    }
-    return [...map.entries()]
-      .map(([c, ss]) => ({
-        cwd: c,
-        basename: c.split('/').filter(Boolean).pop() ?? c,
-        sessions: ss,
-        lastModified: Math.max(...ss.map((s) => s.modified)),
-      }))
-      .sort((a, b) => b.lastModified - a.lastModified);
-  });
-
-  /** Filtered project tree for the sidebar — inline hierarchy with collapsible dirs. */
-  const filteredTree = $derived.by(() => {
-    const q = sessionFilter.trim().toLowerCase();
-    return projects
-      .map((p) => ({
-        cwd: p.cwd,
-        basename: p.basename,
-        lastModified: p.lastModified,
-        streaming: isStreaming && p.cwd === cwd,
-        sessions: p.sessions.filter(
-          (s) =>
-            !q ||
-            (s.name ?? '').toLowerCase().includes(q) ||
-            (s.firstMessage ?? '').toLowerCase().includes(q) ||
-            p.basename.toLowerCase().includes(q)
-        ),
-      }))
-      .filter((p) => !q || p.sessions.length > 0 || p.basename.toLowerCase().includes(q));
-  });
 
   /** All tools reported by the server */
   let toolsList = $state<{ name: string; description: string; isBuiltin: boolean }[]>([]);
@@ -710,7 +713,7 @@
 
   /** Whether the settings modal is open */
   let showSettingsPanel = $state(false);
-  let settingsSection = $state<'session' | 'voice' | 'shortcuts' | 'extensions' | 'about'>('session');
+  let settingsSection = $state<'session' | 'voice' | 'shortcuts' | 'extensions' | 'updates' | 'about'>('session');
   /** Skills returned by the server */
   let resourcesSkills = $state<SkillSummary[]>([]);
   /** Prompt templates returned by the server */
@@ -722,6 +725,15 @@
   let extensionErrors = $state<{ path: string; error: string }[]>([]);
   /** True once extensions_list has been received */
   let extensionsLoaded = $state(false);
+
+  /** Update tab state */
+  let updateStatus = $state<UpdateStatus | null>(null);
+  let updateLoading = $state(false);
+  let updateRunning = $state(false);
+  let updateTarget = $state<UpdateTarget | null>(null);
+  let updateLog = $state('');
+  let updateFeedback = $state<{ success: boolean; message: string; restartRequired?: boolean; reloadRequired?: boolean } | null>(null);
+  let reloadAfterRestart = false;
 
   /** Install skill form state */
   let skillInstallUrl = $state('');
@@ -749,6 +761,10 @@
 
   /** Whether the fork-point picker dialog is open */
   let showForkDialog = $state(false);
+  /** Raw session tree data for the visual tree modal. */
+  let treeData = $state<TreeNode[]>([]);
+  let showTreeModal = $state(false);
+  let treeLoading = $state(false);
   /** Fork-able user message entries returned by the server */
   let forkPoints = $state<{ entryId: string; text: string }[]>([]);
   /** True while waiting for the server to return fork_points */
@@ -768,16 +784,28 @@
   const sessionTokens = $derived(messages.reduce((s, m) => s + (m.usage?.totalTokens ?? 0), 0));
   const sessionCostTotal = $derived(messages.reduce((s, m) => s + (m.usage?.cost?.total ?? 0), 0));
   const sessionDuration = $derived(sessionStartTime > 0 ? fmtDuration(Date.now() - sessionStartTime) : '');
+  /** Context tokens from the client-side messages — last assistant's totalTokens is the context size. */
+  const clientContextTokens = $derived.by(() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i];
+      if (m.role === 'assistant' && m.usage?.totalTokens && m.usage.totalTokens > 0) {
+        return m.usage.totalTokens;
+      }
+    }
+    return 0;
+  });
+  /** Best available context token count: SDK contextUsage when present, else client-side estimate. */
+  const effectiveContextTokens = $derived(contextUsageTokens ?? clientContextTokens);
   /** Context window fill percentage (0 if unknown) */
   const contextPercent = $derived(
     contextUsageTokens != null && contextUsageWindow > 0
       ? Math.round((contextUsageTokens / contextUsageWindow) * 100)
-      : lastInputTokens > 0 && model?.contextWindow && model.contextWindow > 0
-        ? Math.round((lastInputTokens / model.contextWindow) * 100)
+      : effectiveContextTokens > 0 && model?.contextWindow && model.contextWindow > 0
+        ? Math.round((effectiveContextTokens / model.contextWindow) * 100)
         : 0
   );
-  /** Basename of cwd for compact display */
-  const cwdBasename = $derived(cwd ? cwd.split('/').filter(Boolean).pop() ?? cwd : '');
+  /** Display name of the active project (custom name → directory basename). */
+  const activeProjectName = $derived(projectsState.activeProjectName);
 
   // ── Derived ──────────────────────────────────────────────────────────────────
 
@@ -820,7 +848,6 @@
 
   let scrollEl = $state<HTMLElement | undefined>(undefined);
   let inputEl = $state<HTMLTextAreaElement | undefined>(undefined);
-  let renameInputEl = $state<HTMLInputElement | undefined>(undefined);
   let ws: WebSocket | null = null;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let reconnectCountdown = $state(0);
@@ -832,31 +859,10 @@
   /** The message id whose copy action is in the "copied" confirmation state */
   let copiedId = $state<string | null>(null);
 
-  // ── Load sessions when panel opens ───────────────────────────────────────────
+  // ── Refresh project/session lists when the sidebar opens ────────────────────
 
   $effect(() => {
-    if (showSessionPanel) {
-      send({ type: 'list_sessions' });
-      send({ type: 'get_all_sessions' });
-    }
-  });
-
-  $effect(() => {
-    if (!renamingPath) return;
-    tick().then(() => {
-      renameInputEl?.focus();
-      renameInputEl?.select();
-    });
-  });
-
-  // ── Request dir completions as user types open-folder path ───────────────────
-
-  $effect(() => {
-    if (openFolderMode && openFolderInput.trim()) {
-      send({ type: 'dir_complete', prefix: openFolderInput });
-    } else {
-      dirCompletions = [];
-    }
+    if (showSessionPanel) projectsState.refresh();
   });
 
   // ── Load providers when models tab is active ──────────────────────────────────
@@ -885,12 +891,33 @@
     }
   });
 
+  // ── Working indicator frame animation ──────────────────────────────────────
+
+  $effect(() => {
+    const frames = workingIndicatorFrames;
+    const ms = workingIndicatorMs;
+    if (frames.length === 0) return;
+    workingFrameIndex = 0;
+    const id = setInterval(() => {
+      workingFrameIndex = (workingFrameIndex + 1) % frames.length;
+    }, ms);
+    return () => clearInterval(id);
+  });
+
   // ── Load extensions when settings extensions tab is active ──────────────────
 
   $effect(() => {
     if (showSettingsPanel && settingsSection === 'extensions') {
       extensionsLoaded = false;
       send({ type: 'get_extensions' });
+    }
+  });
+
+  // ── Load update status when settings updates tab is active ──────────────────
+
+  $effect(() => {
+    if (showSettingsPanel && settingsSection === 'updates' && wsState === 'open') {
+      refreshUpdateStatus();
     }
   });
 
@@ -909,6 +936,7 @@
       if (reconnectTimer) clearTimeout(reconnectTimer);
       if (reconnectInterval) { clearInterval(reconnectInterval); reconnectInterval = null; }
       reconnectCountdown = 0;
+      if (reloadAfterRestart) location.reload();
     };
 
     ws.onmessage = ({ data }: MessageEvent<string>) => {
@@ -938,6 +966,9 @@
       ws.send(JSON.stringify(msg));
     }
   }
+
+  // Give the shared projects store access to the live socket.
+  projectsState.send = send;
 
   // ── Server event handling ────────────────────────────────────────────────────
 
@@ -990,24 +1021,13 @@
     historyLoading = false;
     if (payload.cwd) cwd = payload.cwd;
     sessionName = payload.sessionName;
+    // Sync the shared projects store with the active session.
+    projectsState.cwd = cwd;
+    projectsState.activeSessionId = payload.sessionId;
+    projectsState.isStreaming = payload.isStreaming;
     // Reset queue on session switch
     queuedSteering = [];
     queuedFollowUp = [];
-    // Restore lastInputTokens from the most recent assistant message that has usage data,
-    // so the ctx indicator re-appears immediately after a hard refresh / session switch.
-    {
-      const msgs = (payload.messages ?? []) as Record<string, unknown>[];
-      let restored = 0;
-      for (let i = msgs.length - 1; i >= 0; i--) {
-        const raw = msgs[i];
-        const inp = (raw.usage as Record<string, unknown> | undefined)?.input;
-        if (raw.role === 'assistant' && typeof inp === 'number' && inp > 0) {
-          restored = inp;
-          break;
-        }
-      }
-      lastInputTokens = restored;
-    }
     // Use real contextUsage from the server if available
     if ('contextUsage' in payload) {
       const cu = (payload as Record<string, unknown>).contextUsage as { tokens?: number | null; contextWindow?: number } | undefined;
@@ -1041,6 +1061,8 @@
         if (c.piVersion) piVersion = c.piVersion;
         if (c.uiVersion) uiVersion = c.uiVersion;
         if (c.sessionMode) sessionMode = c.sessionMode;
+        // Warm the project/session lists so pickers have data immediately.
+        projectsState.refresh();
         break;
       }
 
@@ -1063,10 +1085,8 @@
         if (sl.piVersion) piVersion = sl.piVersion;
         if (sl.uiVersion) uiVersion = sl.uiVersion;
         if (sl.sessionMode) sessionMode = sl.sessionMode;
-        if (pendingNewSession) {
-          pendingNewSession = false;
-          showSessionPanel = false;
-        }
+        if (projectsState.onSessionLoaded()) showSessionPanel = false;
+        projectPickerOpen = false;
         break;
       }
 
@@ -1105,17 +1125,10 @@
         break;
       }
 
-      case 'sessions_list': {
-        const listedSessions = ((msg as { type: string; sessions: SessionSummary[] }).sessions) ?? [];
-        if (allSessions.length === 0) allSessions = listedSessions;
-        sessionError = null;
-        renamingPath = null;
-        break;
-      }
-
-      case 'sessions_error': {
-        sessionError = (msg as { type: string; message: string }).message ?? 'Unknown error';
-        pendingNewSession = false;
+      case 'sessions_list':
+      case 'sessions_error':
+      case 'projects_list': {
+        projectsState.handleMessage(msg as PiEvent);
         break;
       }
 
@@ -1137,6 +1150,7 @@
 
       case 'agent_start':
         isStreaming = true;
+        projectsState.isStreaming = true;
         break;
 
       case 'message_start':
@@ -1150,12 +1164,9 @@
       case 'agent_end': {
         const { willRetry } = msg as { type: 'agent_end'; willRetry?: boolean };
         isStreaming = false;
+        projectsState.isStreaming = false;
         sealStreaming();
-        if (sessionId) {
-          const next = new SvelteSet(uncheckedSessions);
-          next.add(sessionId);
-          uncheckedSessions = next;
-        }
+        if (sessionId) projectsState.markUnchecked(sessionId);
         // Auto-speak: request an LLM-generated summary from the server;
         // the tts_summary response handler will call speakText() with the result.
         // Skip if pi is about to retry (willRetry=true) — we'll speak the final response instead.
@@ -1178,6 +1189,7 @@
       case 'agent_error': {
         // Server-side error during prompt/steer/followUp — unfreeze the UI.
         isStreaming = false;
+        projectsState.isStreaming = false;
         sealStreaming();
         const errMsg = (msg as { error?: string }).error ?? 'Unknown error';
         addToast(`Agent error: ${errMsg}`, 'error');
@@ -1203,7 +1215,7 @@
       }
 
       case 'message_end': {
-        const endMsg = msg.message as { role?: string; usage?: { input: number; output: number; totalTokens: number; cost: { total: number } } } | undefined;
+        const endMsg = msg.message as { role?: string; usage?: { input: number; output: number; totalTokens: number; cost: { total: number } }; content?: { type: string; data?: string; mimeType?: string }[] } | undefined;
         if (endMsg?.role === 'assistant' && endMsg.usage) {
           const a = lastStreaming('assistant');
           if (a) {
@@ -1215,9 +1227,14 @@
             };
             a.endMs = Date.now();
             a.streaming = false;
+            // Extract any image blocks from the final message content
+            if (endMsg.content) {
+              const imgBlocks = endMsg.content.filter((b) => b.type === 'image' && b.data && b.mimeType);
+              if (imgBlocks.length > 0) {
+                a.images = imgBlocks.map((b) => `data:${b.mimeType};base64,${b.data}`);
+              }
+            }
           }
-          // Track latest input token count as fallback for context % display
-          lastInputTokens = endMsg.usage.input;
         }
         // Use real context usage from the SDK (server enriches message_end with this)
         const cu = (msg as Record<string, unknown>).contextUsage as { tokens?: number | null; contextWindow?: number } | undefined;
@@ -1266,11 +1283,15 @@
           t.streaming = false;
           t.isError = (msg.isError as boolean | undefined) ?? false;
           const result = msg.result as {
-            content?: { type: string; text?: string }[];
+            content?: { type: string; text?: string; data?: string; mimeType?: string }[];
             details?: { diff?: string; patch?: string };
           } | undefined;
           if (result?.content) {
             t.content = extractTextContent(result.content);
+            const imgBlocks = result.content.filter((b) => b.type === 'image' && b.data && b.mimeType);
+            if (imgBlocks.length > 0) {
+              t.images = imgBlocks.map((b) => `data:${b.mimeType};base64,${b.data}`);
+            }
           }
           // Capture diff for edit tool
           const diff = result?.details?.diff;
@@ -1445,9 +1466,13 @@
             workingVisible = (msg.visible as boolean | undefined) ?? true;
             break;
 
-          case 'setWorkingIndicator':
-            // No-op: web UI uses CSS animations; frames/intervalMs are TUI-only.
+          case 'setWorkingIndicator': {
+            const frames = (msg.frames as string[] | undefined) ?? [];
+            workingIndicatorFrames = frames;
+            workingIndicatorMs = (msg.intervalMs as number | undefined) ?? 80;
+            workingFrameIndex = 0;
             break;
+          }
 
           case 'setHiddenThinkingLabel':
             hiddenThinkingLabel = (msg.label as string | undefined) ?? 'thinking';
@@ -1462,6 +1487,18 @@
             }
             break;
           }
+
+          case 'set_header':
+            extensionHeader = (msg.content as string | undefined) ?? '';
+            break;
+
+          case 'set_footer':
+            extensionFooter = (msg.content as string | undefined) ?? '';
+            break;
+
+          case 'set_editor_component':
+            editorComponentPanel = (msg.parsed as ParsedComponent | null) ?? null;
+            break;
 
           default:
             break;
@@ -1542,6 +1579,12 @@
         break;
       }
 
+      case 'session_tree': {
+        treeData = (msg.tree as TreeNode[] | undefined) ?? [];
+        treeLoading = false;
+        break;
+      }
+
       case 'tools_list': {
         toolsList = (msg.tools as { name: string; description: string; isBuiltin: boolean }[] | undefined) ?? [];
         activeToolNames = (msg.activeToolNames as string[] | undefined) ?? [];
@@ -1581,20 +1624,58 @@
         break;
       }
 
-      case 'all_sessions_list': {
-        allSessions = ((msg as { type: string; sessions: SessionSummary[] }).sessions) ?? [];
+      case 'update_status': {
+        const status = { ...(msg as unknown as UpdateStatus & { type?: string }) };
+        delete status.type;
+        updateStatus = status;
+        updateLoading = false;
+        updateRunning = status.busy;
         break;
       }
 
+      case 'update_progress': {
+        const progress = msg as { type: 'update_progress'; target: UpdateTarget; command?: string; message: string };
+        updateRunning = true;
+        updateTarget = progress.target;
+        updateFeedback = null;
+        updateLog = updateLog ? `${updateLog}\n\n${progress.message}` : progress.message;
+        break;
+      }
+
+      case 'update_result': {
+        const result = msg as { type: 'update_result'; target: UpdateTarget; success: boolean; message: string; output?: string; restartRequired?: boolean; reloadRequired?: boolean };
+        updateRunning = false;
+        updateTarget = null;
+        updateFeedback = {
+          success: result.success,
+          message: result.message,
+          restartRequired: result.restartRequired,
+          reloadRequired: result.reloadRequired,
+        };
+        if (result.output) updateLog = result.output;
+        if (result.success && result.target === 'ui' && result.restartRequired) {
+          requestServerRestart(Boolean(result.reloadRequired));
+        } else if (result.success) {
+          refreshUpdateStatus();
+        }
+        break;
+      }
+
+      case 'all_sessions_list':
       case 'dir_completions': {
-        dirCompletions = ((msg as { type: string; entries: string[] }).entries) ?? [];
-        dirHighlightIndex = -1;
+        projectsState.handleMessage(msg as PiEvent);
         break;
       }
 
       case 'file_completions': {
         const fileMsg = msg as { type: string; query: string; entries: string[] };
         if (fileMsg.query === shortcutQuery) fileCompletions = fileMsg.entries ?? [];
+        break;
+      }
+
+      case 'extension_completions': {
+        const extMsg = msg as unknown as { trigger: string; items: { value: string; label: string; description?: string }[] };
+        if (extMsg.trigger === shortcutTrigger) extensionCompletions = extMsg.items ?? [];
         break;
       }
 
@@ -1605,6 +1686,7 @@
           role: 'notice',
           content: result.message,
           noticeKind: result.level === 'error' ? 'retry' : undefined,
+          customType: 'slash_result',
           streaming: false,
           createdAt: Date.now(),
         });
@@ -1622,8 +1704,26 @@
         break;
       }
 
+      case 'file_saved': {
+        const fs = msg as { type: 'file_saved'; path: string; error?: string };
+        fileSaving = false;
+        if (fs.error) {
+          addToast(`Failed to save ${fs.path}: ${fs.error}`, 'error');
+        } else {
+          addToast(`Saved ${fs.path}`, 'info');
+          fileViewerContent = ''; // trigger re-read on next open
+        }
+        break;
+      }
+
       case 'server_restarting': {
         isRestarting = true;
+        break;
+      }
+
+      case 'restart_nonce': {
+        const nonce = (msg as { type: 'restart_nonce'; nonce: string }).nonce;
+        send({ type: 'restart_server', nonce });
         break;
       }
 
@@ -1694,63 +1794,6 @@
     send({ type: 'set_thinking_level', level });
   }
 
-  function switchSession(path: string) {
-    send({ type: 'switch_session', path });
-    showSessionPanel = false;
-    // Clear unchecked for the session we're switching to
-    const s = allSessions.find((s) => s.path === path);
-    if (s && uncheckedSessions.has(s.id)) {
-      const next = new SvelteSet(uncheckedSessions);
-      next.delete(s.id);
-      uncheckedSessions = next;
-    }
-  }
-
-  function newSession(targetCwd?: string) {
-    send(targetCwd ? { type: 'new_session', targetCwd } : { type: 'new_session' });
-    pendingNewSession = true;
-    openFolderMode = false;
-    openFolderInput = '';
-    dirCompletions = [];
-    dirHighlightIndex = -1;
-  }
-
-  function startRename(s: SessionSummary) {
-    renameDraft = s.name ?? '';
-    renamingPath = s.path;
-  }
-
-  function commitRename() {
-    if (!renamingPath) return;
-    const name = renameDraft.trim();
-    if (name) send({ type: 'rename_session', path: renamingPath, name });
-    renamingPath = null;
-    renameDraft = '';
-  }
-
-  function cancelRename() {
-    renamingPath = null;
-    renameDraft = '';
-  }
-
-  function deleteSession(path: string) {
-    send({ type: 'delete_session', path });
-  }
-
-  function toggleDir(cwd: string) {
-    const next = new SvelteSet(collapsedDirs);
-    if (next.has(cwd)) next.delete(cwd);
-    else next.add(cwd);
-    collapsedDirs = next;
-  }
-
-  function toggleSessionGroup(cwd: string) {
-    const next = new SvelteSet(expandedSessionGroups);
-    if (next.has(cwd)) next.delete(cwd);
-    else next.add(cwd);
-    expandedSessionGroups = next;
-  }
-
   function openTab(tab: 'models' | 'tools' | 'skills') {
     if (showRightPanel && rightPanelTab === tab) {
       showRightPanel = false;
@@ -1760,10 +1803,6 @@
     }
     showSessionPanel = false;
     showSettingsPanel = false;
-  }
-
-  function visibleSessions(p: ProjectGroup): SessionSummary[] {
-    return expandedSessionGroups.has(p.cwd) ? p.sessions : p.sessions.slice(0, SESSION_PREVIEW_LIMIT);
   }
 
   function openForkDialog() {
@@ -1806,20 +1845,6 @@
   /** True only when the credential was stored by the user and can be removed via the UI. */
   function canRemove(source?: string): boolean {
     return source === 'stored';
-  }
-
-  function formatDate(ms: number): string {
-    const diff = Date.now() - ms;
-    const min = 60_000;
-    const hour = 3_600_000;
-    const day = 86_400_000;
-    if (diff < 2 * min) return 'just now';
-    if (diff < hour) return `${Math.floor(diff / min)}m ago`;
-    if (diff < day) return `${Math.floor(diff / hour)}h ago`;
-    if (diff < 2 * day) return 'yesterday';
-    if (diff < 7 * day) return `${Math.floor(diff / day)}d ago`;
-    const d = new Date(ms);
-    return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
   }
 
   function fmtTokens(n: number): string {
@@ -1973,7 +1998,7 @@
         return [{ id: uid(), role: 'user', content: text, images, streaming: false, createdAt: Date.now() }];
       }
       case 'assistant': {
-        const blocks = (msg.content as { type: string; text?: string; thinking?: string }[]) ?? [];
+        const blocks = (msg.content as { type: string; text?: string; thinking?: string; data?: string; mimeType?: string }[]) ?? [];
         const text = blocks
           .filter((b) => b.type === 'text')
           .map((b) => b.text ?? '')
@@ -1982,11 +2007,13 @@
           .filter((b) => b.type === 'thinking')
           .map((b) => b.thinking ?? '')
           .join('');
+        const imgBlocks = blocks.filter((b): b is { type: 'image'; data: string; mimeType: string } => b.type === 'image' && !!b.data && !!b.mimeType);
+        const images = imgBlocks.length > 0 ? imgBlocks.map((b) => `data:${b.mimeType};base64,${b.data}`) : undefined;
         const rawUsage = msg.usage as { input?: number; output?: number; totalTokens?: number; cost?: { total?: number } } | undefined;
         const usage: MsgUsage | undefined = rawUsage?.totalTokens
           ? { input: rawUsage.input ?? 0, output: rawUsage.output ?? 0, totalTokens: rawUsage.totalTokens, cost: { total: rawUsage.cost?.total ?? 0 } }
           : undefined;
-        return text || thinkingText ? [{ id: uid(), role: 'assistant', content: text, thinking: thinkingText || undefined, thinkingExpanded: false, streaming: false, usage, createdAt: Date.now() }] : [];
+        return text || thinkingText || images ? [{ id: uid(), role: 'assistant', content: text, images, thinking: thinkingText || undefined, thinkingExpanded: false, streaming: false, usage, createdAt: Date.now() }] : [];
       }
       case 'bashExecution': {
         const cmd = msg.command as string | undefined;
@@ -2018,7 +2045,9 @@
         }
         const toolName = (msg.toolName as string | undefined) ?? toolInfo?.name ?? 'tool';
         const toolInput = toolInfo ? formatToolInput(toolName, toolInfo.input) : undefined;
-        const blocks = (msg.content as { type: string; text?: string }[]) ?? [];
+        const blocks = (msg.content as { type: string; text?: string; data?: string; mimeType?: string }[]) ?? [];
+        const imgBlocks = blocks.filter((b): b is { type: 'image'; data: string; mimeType: string } => b.type === 'image' && !!b.data && !!b.mimeType);
+        const images = imgBlocks.length > 0 ? imgBlocks.map((b) => `data:${b.mimeType};base64,${b.data}`) : undefined;
         return [
           {
             id: uid(),
@@ -2028,6 +2057,7 @@
             toolInput,
             toolArgs: toolInfo?.input,
             content: extractTextContent(blocks),
+            images,
             isError: (msg.isError as boolean | undefined) ?? false,
             streaming: false,
             createdAt: Date.now(),
@@ -2161,6 +2191,25 @@
       return;
     }
 
+    // Ctrl+T — open thinking level selector
+    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key === 't') {
+      e.preventDefault();
+      openTab('models');
+      return;
+    }
+
+    // Ctrl+Shift+T — cycle thinking level
+    if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 't' || e.key === 'T')) {
+      e.preventDefault();
+      const cycle = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'];
+      const current = thinkingLevel;
+      const idx = cycle.indexOf(current);
+      const next = cycle[(idx + 1) % cycle.length];
+      pickThinkingLevel(next);
+      addToast(`Thinking level: ${next}`, 'info');
+      return;
+    }
+
     // Any printable character when no input is focused → focus textarea
     if (!inEditable() && !e.ctrlKey && !e.metaKey && !e.altKey && e.key.length === 1) {
       inputEl?.focus();
@@ -2168,6 +2217,14 @@
   }
 
   // ── User input ───────────────────────────────────────────────────────────────
+
+  const TEXT_FILE_EXTENSIONS = new Set([
+    'txt', 'md', 'json', 'yaml', 'yml', 'xml', 'html', 'css', 'js', 'ts', 'jsx', 'tsx',
+    'py', 'rb', 'go', 'rs', 'java', 'kt', 'swift', 'c', 'cpp', 'h', 'hpp', 'cs',
+    'sh', 'bash', 'zsh', 'fish', 'toml', 'ini', 'cfg', 'conf', 'env', 'gitignore',
+    'svelte', 'vue', 'sass', 'scss', 'less', 'sql', 'graphql', 'r', 'mjs', 'cjs',
+    'npmrc', 'editorconfig', 'prettierrc', 'eslintrc',
+  ]);
 
   function fileToBase64(file: File): Promise<string> {
     return new Promise((resolve, reject) => {
@@ -2178,19 +2235,45 @@
     });
   }
 
+  function fileToText(file: File): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => { resolve(reader.result as string); };
+      reader.onerror = reject;
+      reader.readAsText(file);
+    });
+  }
+
   async function handleFileInput(e: Event) {
     const files = (e.target as HTMLInputElement).files;
     if (!files) return;
     for (const file of Array.from(files)) {
-      if (!file.type.startsWith('image/')) continue;
-      const data = await fileToBase64(file);
-      attachedImages.push({ data, mimeType: file.type, name: file.name, src: `data:${file.type};base64,${data}` });
+      if (file.type.startsWith('image/')) {
+        const data = await fileToBase64(file);
+        attachedImages.push({ data, mimeType: file.type, name: file.name, src: `data:${file.type};base64,${data}` });
+      } else {
+        const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
+        if (!TEXT_FILE_EXTENSIONS.has(ext)) {
+          addToast(`Unsupported file type: ${file.name} (only text files and images are supported)`, 'warning');
+          continue;
+        }
+        if (file.size > 1024 * 1024) {
+          addToast(`File too large: ${file.name} (max 1MB)`, 'warning');
+          continue;
+        }
+        const content = await fileToText(file);
+        attachedFiles.push({ name: file.name, content, size: file.size });
+      }
     }
     (e.target as HTMLInputElement).value = '';
   }
 
   function removeAttachment(idx: number) {
     attachedImages.splice(idx, 1);
+  }
+
+  function removeFileAttachment(idx: number) {
+    attachedFiles.splice(idx, 1);
   }
 
   function addToast(message: string, type: Toast['type'] = 'info') {
@@ -2356,10 +2439,21 @@
   }
 
   function canSubmitFollowUp() {
-    return wsState === 'open' && !isStreaming && input.trim().length > 0 && attachedImages.length === 0;
+    return wsState === 'open' && !isStreaming && input.trim().length > 0 && attachedImages.length === 0 && attachedFiles.length === 0;
   }
 
   function runSlashCommand(text: string): boolean {
+    // Handle ! shell commands – bypass the AI, execute directly.
+    if (text.startsWith('!')) {
+      const command = text.slice(1).trim();
+      if (command) {
+        send({ type: 'run_builtin', command: 'shell', args: command });
+        input = '';
+        resetTextareaHeight();
+        return true;
+      }
+      return false;
+    }
     if (!text.startsWith('/')) return false;
     const [rawCommand, ...rest] = text.slice(1).split(/\s+/);
     const command = rawCommand.toLowerCase();
@@ -2367,7 +2461,7 @@
 
     switch (command) {
       case 'new':
-        newSession(args || undefined);
+        projectsState.newSession(args || undefined);
         return true;
       case 'compact':
         compactSession();
@@ -2405,9 +2499,12 @@
       case 'export':
       case 'share':
       case 'changelog':
-      case 'tree':
       case 'name':
         send({ type: 'run_builtin', command, args });
+        return true;
+      case 'tree':
+        send({ type: 'get_session_tree' });
+        showTreeModal = true;
         return true;
       default:
         return false;
@@ -2424,9 +2521,9 @@
       return;
     }
 
-    if (!text && attachedImages.length === 0) return;
+    if (!text && attachedImages.length === 0 && attachedFiles.length === 0) return;
 
-    if (attachedImages.length === 0 && !asFollowUp && runSlashCommand(text)) {
+    if (attachedImages.length === 0 && attachedFiles.length === 0 && !asFollowUp && runSlashCommand(text)) {
       input = '';
       resetTextareaHeight();
       return;
@@ -2436,22 +2533,30 @@
       ? attachedImages.map((img) => ({ data: img.data, mimeType: img.mimeType }))
       : undefined;
 
+    // Prepend file contents as text blocks before the user message
+    let fullText = text;
+    if (attachedFiles.length > 0) {
+      const fileBlocks = attachedFiles.map((f) => `Content of ${f.name}:\n${f.content}`);
+      fullText = fileBlocks.join('\n\n---\n\n') + (text ? '\n\n---\n\n' + text : '');
+    }
+
     messages.push({
       id: uid(),
       role: 'user',
-      content: text,
+      content: fullText,
       images: imgs ? attachedImages.map((img) => img.src) : undefined,
       streaming: false,
       createdAt: Date.now(),
     });
 
-    if (asFollowUp && attachedImages.length === 0) {
+    if (asFollowUp && attachedImages.length === 0 && attachedFiles.length === 0) {
       send({ type: 'follow_up', message: text });
     } else {
-      send({ type: 'prompt', message: text, ...(imgs ? { images: imgs } : {}) });
+      send({ type: 'prompt', message: fullText, ...(imgs ? { images: imgs } : {}) });
     }
     input = '';
     attachedImages = [];
+    attachedFiles = [];
     resetTextareaHeight();
     scrollBottom();
   }
@@ -2525,9 +2630,31 @@
     send({ type: 'compact' });
   }
 
-  function restartServer() {
+  function refreshUpdateStatus() {
+    if (wsState !== 'open') return;
+    updateLoading = true;
+    send({ type: 'get_update_status' });
+  }
+
+  function runUpdate(target: UpdateTarget) {
+    const label = target === 'ui' ? 'pi-ui' : 'pi SDK';
+    const suffix = target === 'ui' ? ' The server will restart and the page will reload when it finishes.' : '';
+    if (!confirm(`Update ${label}? This will run package commands on the server.${suffix}`)) return;
+    updateRunning = true;
+    updateTarget = target;
+    updateLog = '';
+    updateFeedback = null;
+    send({ type: 'run_update', target });
+  }
+
+  function requestServerRestart(reloadPage = false) {
+    reloadAfterRestart = reloadPage;
+    send({ type: 'request_restart' });
+  }
+
+  function restartServer(reloadPage = false) {
     if (!confirm('Restart the server? The page will reconnect automatically in a few seconds.')) return;
-    send({ type: 'restart_server' });
+    requestServerRestart(reloadPage);
   }
 
   function toggleTool(toolName: string) {
@@ -2555,6 +2682,15 @@
     } else if (shortcutTrigger !== '@') {
       lastFileCompleteQuery = '';
       fileCompletions = [];
+    }
+    // Request extension autocomplete items when trigger changes
+    if (shortcutTrigger && wsState === 'open' && shortcutTrigger !== lastExtensionTrigger) {
+      lastExtensionTrigger = shortcutTrigger;
+      extensionCompletions = [];
+      send({ type: 'get_extension_autocomplete', trigger: shortcutTrigger, query: shortcutQuery });
+    } else if (!shortcutTrigger) {
+      lastExtensionTrigger = '';
+      extensionCompletions = [];
     }
   });
 
@@ -2602,6 +2738,39 @@
 
 <svelte:window onkeydown={handleGlobalKeydown} />
 
+<!-- ── Shared template snippets ──────────────────────────────────────────── -->
+
+<!-- Sticky group header used across the right-panel lists -->
+{#snippet sectionHeader(letter: string, badgeClass: string, label: string, bg?: string)}
+  <div class="sticky top-0 z-10 bg-base-200 px-5 py-2 flex items-center gap-2 border-b border-base-content/6">
+    <span
+      class="inline-flex items-center justify-center w-3.5 h-3.5 rounded-[3px] text-[8px] text-white font-bold leading-none select-none shrink-0 {badgeClass}"
+      style={bg ? `background: ${bg}` : undefined}
+      aria-hidden="true"
+    >{letter}</span>
+    <span class="text-[10px] text-base-content/35 uppercase tracking-[0.1em] font-semibold">{label}</span>
+  </div>
+{/snippet}
+
+<!-- Prompt row in the skills tab -->
+{#snippet promptItem(prompt: PromptSummary)}
+  <div class="px-5 py-2.5 flex items-start gap-3 transition-colors hover:bg-base-content/[0.03]">
+    <span class="min-w-0 flex-1">
+      <span class="flex items-center gap-2 mb-0.5">
+        <span class="text-sm font-mono text-base-content/80 truncate">{prompt.name}</span>
+        {#if prompt.argumentHint}<span class="shrink-0 text-xs text-base-content/35 font-mono">{prompt.argumentHint}</span>{/if}
+      </span>
+      {#if prompt.description}<span class="text-xs text-base-content/40 leading-relaxed line-clamp-2">{prompt.description}</span>{/if}
+    </span>
+    <button
+      onclick={() => { input = `/${prompt.name} `; showRightPanel = false; tick().then(() => inputEl?.focus()); }}
+      class="shrink-0 mt-0.5 w-7 h-7 flex items-center justify-center text-base-content/30 hover:text-primary hover:bg-primary/10 rounded transition-colors"
+      title="Use prompt"
+      tabindex={showRightPanel ? 0 : -1}
+    ><CornerDownLeft class="w-3.5 h-3.5" /></button>
+  </div>
+{/snippet}
+
 <!--
   Root: flex-row — three columns:
     [session panel] [main content] [model picker panel]
@@ -2619,13 +2788,13 @@
   <!-- ── LEFT SIDEBAR: Session panel ─────────────────────────────────────── -->
 
   <SidebarPanel
-    title={projects.length ? `projects (${projects.length})` : 'projects'}
+    title={projectsState.groups.length ? `projects (${projectsState.groups.length})` : 'projects'}
     open={showSessionPanel}
     {isMobile}
     width={sessionPanelWidth}
     side="left"
     resizing={sessionResizing}
-    closeLabel="Close session panel"
+    closeLabel="Close projects panel"
     onClose={() => (showSessionPanel = false)}
     onResizeStart={startSessionResize}
     onResizeMove={onSessionResizeMove}
@@ -2633,244 +2802,11 @@
   >
     {#snippet header()}{/snippet}
 
-      <!-- Filter input — capsule with search icon -->
-      <div class="shrink-0 px-3 py-3">
-        <div class="flex items-center gap-2 bg-base-content/[0.055] border border-base-content/[0.04] rounded-2xl px-3 py-2.5 shadow-inner shadow-black/5">
-          <svg class="w-4 h-4 shrink-0 text-base-content/30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
-          <input
-            type="search"
-            placeholder="search projects &amp; sessions…"
-            bind:value={sessionFilter}
-            class="flex-1 bg-transparent outline-none text-sm placeholder-base-content/30 text-base-content/80 min-w-0"
-            aria-label="Filter projects and sessions"
-            tabindex={showSessionPanel ? 0 : -1}
-          />
-        </div>
-      </div>
-
-      <!-- Error banner -->
-      {#if sessionError}
-        <div class="shrink-0 mx-3 mb-2 px-3 py-2.5 bg-error/10 border border-error/20 rounded-xl flex items-center justify-between gap-2">
-          <span class="text-sm text-error break-words min-w-0">{sessionError}</span>
-          <button
-            onclick={() => (sessionError = null)}
-            class="w-7 h-7 flex items-center justify-center text-error/50 hover:text-error/80 shrink-0 rounded-lg transition-colors"
-            aria-label="Dismiss error"
-          ><svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
-        </div>
-      {/if}
-
-      <!-- Scrollable content area — hierarchical tree with collapsible directories -->
-      <ScrollArea class="flex-1 min-h-0">
-      <div class="px-2.5 pb-2">
-        {#if filteredTree.length === 0 && projects.length === 0}
-          <div class="flex flex-col items-center justify-center gap-2 py-12 px-4 text-center">
-            <svg class="w-8 h-8 text-base-content/15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h3l2 2h9a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
-            <p class="text-sm text-base-content/55 font-medium">No projects yet</p>
-            <p class="text-xs text-base-content/45">Open a folder below to start</p>
-          </div>
-        {:else if filteredTree.length === 0}
-          <div class="flex flex-col items-center justify-center gap-1.5 py-10 px-4 text-center">
-            <p class="text-sm text-base-content/55">No match</p>
-            <p class="text-xs text-base-content/45">Try a different search term</p>
-          </div>
-        {:else}
-          <div class="flex flex-col pt-1 gap-2">
-            {#each filteredTree as p (p.cwd)}
-              {@const isDirActive = p.cwd === cwd}
-              {@const dirCollapsed = collapsedDirs.has(p.cwd)}
-              <!-- Directory header — collapsible + new-session action -->
-              <div class="group/dir relative rounded-2xl transition-colors duration-150 hover:bg-base-content/[0.035]">
-                <div class="flex items-center">
-                  <button
-                    onclick={() => toggleDir(p.cwd)}
-                    class="flex-1 min-w-0 flex items-center gap-2 px-3 py-2.5 text-left transition-colors duration-150 rounded-2xl {isDirActive ? 'text-base-content font-semibold' : 'text-base-content/60 hover:text-base-content/85'}"
-                    tabindex={showSessionPanel ? 0 : -1}
-                    aria-expanded={!dirCollapsed}
-                  >
-                    <!-- Collapse/expand chevron -->
-                    <svg class="w-3 h-3 shrink-0 text-base-content/40 transition-transform duration-150 {dirCollapsed ? '' : 'rotate-90'}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>
-                    <!-- Folder icon -->
-                    <svg class="w-4 h-4 shrink-0 text-base-content/45" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h3l2 2h9a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
-                    <!-- Dir name -->
-                    <span class="flex-1 truncate text-sm">{p.basename}</span>
-                    <!-- Streaming indicator on dir -->
-                    {#if p.streaming}
-                      <span class="w-1.5 h-1.5 rounded-full bg-success shadow-[0_0_6px_1px_var(--color-success)/0.6] animate-pulse shrink-0" aria-label="Generating"></span>
-                    {/if}
-                    <!-- Session count -->
-                    <span class="text-[11px] text-base-content/28 shrink-0 tabular-nums">{p.sessions.length}</span>
-                  </button>
-                  <!-- New session in this dir — visible on row hover -->
-                  <button
-                    onclick={() => { if (dirCollapsed) toggleDir(p.cwd); newSession(p.cwd); }}
-                    class="w-7 h-7 mr-1.5 flex items-center justify-center text-base-content/30 hover:text-primary hover:bg-primary/10 rounded-xl transition-colors opacity-0 group-hover/dir:opacity-100 shrink-0"
-                    title="New session in {p.basename}"
-                    aria-label="New session in {p.basename}"
-                    tabindex={showSessionPanel ? 0 : -1}
-                  >
-                    <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
-                  </button>
-                </div>
-                <!-- Sessions nested under this directory -->
-                {#if !dirCollapsed}
-                  <div class="ml-3 pl-3 pt-1.5 pb-1.5 border-l border-base-content/8 space-y-1">
-                    {#each visibleSessions(p) as s (s.id)}
-                      {@const isActive = sessionId === s.id}
-                      {@const isRenaming = renamingPath === s.path}
-                      {@const hasUnchecked = uncheckedSessions.has(s.id)}
-                      <div class="group rounded-2xl transition-colors duration-150 hover:bg-base-content/[0.035]">
-                        {#if isRenaming}
-                          <div class="px-3 py-2 flex items-center gap-2">
-                            <input
-                              bind:this={renameInputEl}
-                              type="text"
-                              bind:value={renameDraft}
-                              onkeydown={(e) => {
-                                if (e.key === 'Enter') { e.preventDefault(); commitRename(); }
-                                if (e.key === 'Escape') { e.preventDefault(); cancelRename(); }
-                              }}
-                              class="flex-1 bg-transparent border-b border-base-content/30 focus:border-base-content/60 outline-none text-sm py-1 text-base-content/90 min-w-0 transition-colors"
-                              placeholder="session name…"
-                              aria-label="Session name"
-                            />
-                            <button onclick={commitRename} class="w-7 h-7 flex items-center justify-center text-primary/70 hover:text-primary hover:bg-primary/8 rounded-lg transition-colors" aria-label="Confirm rename"><svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m20 6-11 11-5-5"/></svg></button>
-                            <button onclick={cancelRename} class="w-7 h-7 flex items-center justify-center text-base-content/35 hover:text-base-content/70 hover:bg-base-content/8 rounded-lg transition-colors" aria-label="Cancel rename"><svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
-                          </div>
-                        {:else}
-                          <div class="flex items-stretch">
-                            <button
-                              onclick={() => switchSession(s.path)}
-                              class="flex-1 text-left px-3 py-2 min-w-0"
-                              aria-current={isActive ? 'true' : undefined}
-                              tabindex={showSessionPanel ? 0 : -1}
-                            >
-                              <!-- Title row with indicators -->
-                              <div class="flex items-center gap-2">
-                                <!-- Status dot: streaming ⇢ animated pulse, unchecked ⇢ filled, else outline -->
-                                {#if isStreaming && isActive}
-                                  <span class="w-2 h-2 rounded-full bg-success shrink-0 animate-pulse shadow-[0_0_5px_1px_var(--color-success)/0.5]" aria-label="Streaming"></span>
-                                {:else if hasUnchecked}
-                                  <span class="w-2 h-2 rounded-full bg-primary shrink-0 shadow-[0_0_4px_1px_var(--color-primary)/0.3]" aria-label="Unchecked result"></span>
-                                {:else}
-                                  <span class="w-2 h-2 rounded-full bg-base-content/20 shrink-0"></span>
-                                {/if}
-                                <span class="text-sm truncate leading-snug {isActive ? 'text-base-content font-semibold tracking-[-0.01em]' : 'text-base-content/68'}">
-                                  {s.name ? s.name : (s.firstMessage || '(empty)')}
-                                </span>
-                              </div>
-                              {#if s.name && s.firstMessage}
-                                <p class="text-xs text-base-content/35 mt-0.5 truncate pl-4">{s.firstMessage}</p>
-                              {/if}
-                               <p class="text-xs text-base-content/24 mt-0.5 pl-4 flex items-center gap-1.5">
-                                 <span>{formatDate(s.modified)}</span>
-                                 {#if s.messageCount > 0}
-                                   <span class="text-base-content/18">·</span>
-                                   <span>{s.messageCount} msg{s.messageCount === 1 ? '' : 's'}</span>
-                                 {/if}
-                               </p>
-                            </button>
-                            <!-- Actions — visible on row hover only -->
-                            <div class="flex flex-col justify-center gap-0.5 pr-1.5 opacity-0 group-hover:opacity-100 transition-opacity">
-                              <button onclick={() => startRename(s)} class="w-7 h-7 flex items-center justify-center text-base-content/40 hover:text-base-content/70 hover:bg-base-content/8 rounded-lg transition-colors" title="Rename" aria-label="Rename session" tabindex={showSessionPanel ? 0 : -1}><svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg></button>
-                              {#if isActive && messages.length > 0}
-                                <button onclick={() => { showSessionPanel = false; openForkDialog(); }} disabled={isStreaming} class="w-7 h-7 flex items-center justify-center text-base-content/35 hover:text-primary hover:bg-primary/8 rounded-lg transition-colors disabled:opacity-30 disabled:cursor-not-allowed" title="Fork session" aria-label="Fork session" tabindex={showSessionPanel ? 0 : -1}><svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3v4"/><path d="M18 3v4"/><path d="M6 7a6 6 0 0 0 6 6 6 6 0 0 0 6-6"/><path d="M12 13v8"/></svg></button>
-                              {/if}
-                              {#if !isActive}
-                                <button onclick={() => deleteSession(s.path)} class="w-7 h-7 flex items-center justify-center text-base-content/30 hover:text-error hover:bg-error/8 rounded-lg transition-colors" title="Delete" aria-label="Delete session" tabindex={showSessionPanel ? 0 : -1}><svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/></svg></button>
-                              {/if}
-                            </div>
-                          </div>
-                        {/if}
-                      </div>
-                    {/each}
-                    {#if p.sessions.length > SESSION_PREVIEW_LIMIT}
-                      {@const expanded = expandedSessionGroups.has(p.cwd)}
-                      <button
-                        onclick={() => toggleSessionGroup(p.cwd)}
-                        class="w-full text-left pl-4 pr-3 py-1.5 text-xs text-base-content/32 hover:text-base-content/55 transition-colors"
-                        tabindex={showSessionPanel ? 0 : -1}
-                      >
-                        {expanded ? 'Show fewer sessions' : `Show ${p.sessions.length - SESSION_PREVIEW_LIMIT} more sessions`}
-                      </button>
-                    {/if}
-                  </div>
-                {/if}
-              </div>
-            {/each}
-          </div>
-        {/if}
-      </div>
-      </ScrollArea>
-
-      <!-- Footer -->
-      <div class="shrink-0 p-3 pt-2 space-y-2 bg-gradient-to-t from-base-300/25 to-transparent">
-        <!-- Open-folder toggle -->
-        <button
-          onclick={() => { openFolderMode = !openFolderMode; openFolderInput = ''; dirCompletions = []; }}
-          class="w-full flex items-center justify-center gap-2 text-sm text-base-content/50 hover:text-base-content/80 transition-colors py-3 bg-base-content/[0.045] hover:bg-base-content/[0.075] border border-base-content/[0.035] rounded-2xl"
-          tabindex={showSessionPanel ? 0 : -1}
-        >
-          <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h3l2 2h9a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>
-          <span>{openFolderMode ? 'cancel' : 'open folder…'}</span>
-        </button>
-        {#if openFolderMode}
-          <div class="bg-base-content/5 rounded-xl px-3 py-2.5">
-            <!-- svelte-ignore a11y_autofocus -->
-            <input
-              autofocus
-              type="text"
-              bind:value={openFolderInput}
-              placeholder="/path/to/project"
-              class="w-full bg-transparent outline-none text-sm text-base-content/80 placeholder-base-content/30"
-              aria-label="Project path"
-              tabindex={showSessionPanel ? 0 : -1}
-              onkeydown={(e) => {
-                if (e.key === 'Enter' && openFolderInput.trim()) {
-                  e.preventDefault();
-                  if (dirHighlightIndex >= 0 && dirHighlightIndex < dirCompletions.length) {
-                    openFolderInput = dirCompletions[dirHighlightIndex];
-                    dirCompletions = [];
-                    dirHighlightIndex = -1;
-                  } else {
-                    newSession(openFolderInput.trim());
-                  }
-                }
-                if (e.key === 'ArrowDown') {
-                  e.preventDefault();
-                  if (dirCompletions.length > 0) {
-                    dirHighlightIndex = dirHighlightIndex < dirCompletions.length - 1 ? dirHighlightIndex + 1 : 0;
-                  }
-                }
-                if (e.key === 'ArrowUp') {
-                  e.preventDefault();
-                  if (dirCompletions.length > 0) {
-                    dirHighlightIndex = dirHighlightIndex > 0 ? dirHighlightIndex - 1 : dirCompletions.length - 1;
-                  }
-                }
-                if (e.key === 'Escape') {
-                  e.preventDefault();
-                  openFolderMode = false;
-                  openFolderInput = '';
-                  dirCompletions = [];
-                  dirHighlightIndex = -1;
-                }
-              }}
-            />
-            {#if dirCompletions.length > 0}
-              <div class="mt-1.5 flex flex-col gap-0.5">
-                {#each dirCompletions as entry, i (entry)}
-                  <button
-                    onclick={() => { openFolderInput = entry; dirCompletions = []; dirHighlightIndex = -1; }}
-                    class="text-left text-xs py-1 px-1 rounded transition-colors truncate {i === dirHighlightIndex ? 'text-base-content/90 bg-base-content/12' : 'text-base-content/60 hover:text-base-content/90 hover:bg-base-content/8'}"
-                    tabindex={showSessionPanel ? 0 : -1}
-                  >{entry}</button>
-                {/each}
-              </div>
-            {/if}
-          </div>
-        {/if}
-      </div>
+    <ProjectsSidebar
+      open={showSessionPanel}
+      canFork={messages.length > 0 && !isStreaming}
+      onFork={() => { showSessionPanel = false; openForkDialog(); }}
+    />
   </SidebarPanel>
 
   <!-- ── MAIN COLUMN ──────────────────────────────────────────────────────── -->
@@ -2881,6 +2817,7 @@
       class="relative shrink-0 h-14 flex items-center gap-2 px-3 bg-[color-mix(in_oklch,var(--color-base-200)_86%,black_8%)] shadow-sm shadow-black/10"
       style="padding-top: env(safe-area-inset-top, 0px);"
     >
+      <div class="absolute inset-x-0 bottom-0 hairline-x pointer-events-none"></div>
       <div class="relative z-10 flex items-center gap-1.5 shrink-0">
         <Tooltip.Root>
           <Tooltip.Trigger>
@@ -2909,12 +2846,12 @@
 
       <button
         onclick={() => openTab('models')}
-        class="absolute left-1/2 top-0 bottom-0 z-0 w-[min(52rem,calc(100vw-8.5rem))] -translate-x-1/2 min-w-0 flex flex-col items-center justify-center px-3 text-center rounded-t-none sm:rounded-t-xl border-x border-transparent hover:bg-base-content/[0.035] transition-colors"
+        class="absolute left-1/2 top-0 bottom-0 z-0 w-[min(52rem,calc(100vw-14rem))] sm:w-[min(52rem,calc(100vw-8.5rem))] -translate-x-1/2 min-w-0 flex flex-col items-center justify-center px-3 text-center rounded-t-none sm:rounded-t-xl border-x border-transparent hover:bg-base-content/[0.035] transition-colors"
         aria-label="Open model and provider panel"
         aria-expanded={showRightPanel && rightPanelTab === 'models'}
       >
         <span class="max-w-full text-sm sm:text-[15px] leading-tight text-base-content/82 truncate">
-          {sessionName || cwdBasename || 'New chat'}
+          {sessionName || activeProjectName || 'New chat'}
         </span>
         <span class="hidden sm:flex max-w-full items-center justify-center gap-1.5 text-[11px] leading-tight text-base-content/38 truncate">
           <span class="truncate">{model?.provider || 'no provider'}</span>
@@ -2924,7 +2861,7 @@
       </button>
 
       <div class="relative z-10 flex items-center gap-1.5 shrink-0 ml-auto">
-        {#if lastInputTokens > 0 || contextUsageTokens != null}
+        {#if effectiveContextTokens > 0}
           <Tooltip.Root>
             <Tooltip.Trigger class={[
               'h-9 hidden md:flex items-center gap-2 rounded-xl px-3 border text-xs tabular-nums cursor-default transition-colors',
@@ -2952,13 +2889,13 @@
                       : 'bg-success/70'
                 ].join(' ')}></span>
               </span>
-              <span>{contextPercent > 0 ? `${contextPercent}%` : fmtTokens(contextUsageTokens ?? lastInputTokens)}</span>
+              <span>{contextPercent > 0 ? `${contextPercent}%` : fmtTokens(effectiveContextTokens)}</span>
             </Tooltip.Trigger>
             <Tooltip.Content sideOffset={8} class="min-w-[180px]">
               <div class="flex flex-col gap-2 py-0.5">
                 <div class="flex items-center justify-between gap-3">
                   <span class="text-background/60">Context</span>
-                  <span class="font-medium">{contextPercent > 0 ? `${contextPercent}%` : fmtTokens(contextUsageTokens ?? lastInputTokens)}</span>
+                  <span class="font-medium">{contextPercent > 0 ? `${contextPercent}%` : fmtTokens(effectiveContextTokens)}</span>
                 </div>
                 <div class="w-full h-1.5 rounded-full bg-background/15 overflow-hidden">
                   <div
@@ -2970,7 +2907,7 @@
                   ></div>
                 </div>
                 <div class="flex items-center justify-between text-background/60">
-                  <span>{(contextUsageTokens ?? lastInputTokens).toLocaleString()}</span>
+                  <span>{effectiveContextTokens.toLocaleString()}</span>
                   {#if contextUsageWindow > 0 || model?.contextWindow}
                     <span>/ {((contextUsageWindow > 0 ? contextUsageWindow : null) ?? model?.contextWindow ?? 0).toLocaleString()} tokens</span>
                   {/if}
@@ -3096,6 +3033,14 @@
       </div>
     {/if}
 
+    <!-- Extension header -->
+    {#if extensionHeader}
+      <div class="shrink-0 px-3 py-1.5 text-xs text-base-content/60 bg-base-200/50 border-b border-base-content/10 font-mono whitespace-pre-wrap flex items-start gap-2">
+        <span class="flex-1">{extensionHeader}</span>
+        <button onclick={() => { extensionHeader = ''; }} class="text-base-content/30 hover:text-base-content/60 transition-colors shrink-0" aria-label="Dismiss header"><X class="w-3 h-3" /></button>
+      </div>
+    {/if}
+
     <!-- Message list -->
     <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
     <main
@@ -3109,26 +3054,54 @@
       style="overflow-anchor: none; overscroll-behavior: contain;"
     >
       {#if messages.length === 0 && wsState === 'connecting'}
-        <div class="min-h-full flex flex-col items-center justify-center gap-3 select-none pointer-events-none">
-          <span class="text-8xl font-light text-base-content/[0.08] animate-pulse">π</span>
-          <p class="text-sm text-base-content/55">connecting…</p>
+        <div class="aurora min-h-full flex flex-col items-center justify-center gap-4 select-none pointer-events-none">
+          <span class="pi-glyph pi-glyph-breathe text-8xl font-light leading-none">π</span>
+          <p class="text-sm text-base-content/50 tracking-wide">connecting…</p>
         </div>
       {:else if messages.length === 0 && wsState === 'open' && !sessionId}
-        <div class="min-h-full flex flex-col items-center justify-center gap-3 select-none pointer-events-none">
-          <span class="text-8xl font-light text-base-content/[0.08] animate-pulse">π</span>
-          <p class="text-sm text-base-content/55">loading session…</p>
+        <div class="aurora min-h-full flex flex-col items-center justify-center gap-4 select-none pointer-events-none">
+          <span class="pi-glyph pi-glyph-breathe text-8xl font-light leading-none">π</span>
+          <p class="text-sm text-base-content/50 tracking-wide">loading session…</p>
         </div>
       {:else if messages.length === 0 && wsState === 'open'}
-        <div class="min-h-full flex flex-col items-center justify-center gap-4 select-none px-6">
-          <span class="text-8xl font-light text-base-content/[0.08]">π</span>
-          <p class="text-sm text-base-content/55">start a conversation</p>
-          <div class="flex flex-wrap justify-center gap-2 mt-1 max-w-xs pointer-events-auto">
-            <button onclick={() => { input = '/compact '; tick().then(() => inputEl?.focus()); }} class="px-2.5 py-1 text-xs rounded-full border border-base-content/12 text-base-content/45 hover:text-base-content/70 hover:border-base-content/30 transition-colors">/compact</button>
-            <button onclick={() => { input = '/fork '; tick().then(() => inputEl?.focus()); }} class="px-2.5 py-1 text-xs rounded-full border border-base-content/12 text-base-content/45 hover:text-base-content/70 hover:border-base-content/30 transition-colors">/fork</button>
-            <button onclick={() => { input = '/clone '; tick().then(() => inputEl?.focus()); }} class="px-2.5 py-1 text-xs rounded-full border border-base-content/12 text-base-content/45 hover:text-base-content/70 hover:border-base-content/30 transition-colors">/clone</button>
-            <button onclick={() => { input = '/session '; tick().then(() => inputEl?.focus()); }} class="px-2.5 py-1 text-xs rounded-full border border-base-content/12 text-base-content/45 hover:text-base-content/70 hover:border-base-content/30 transition-colors">/session</button>
-            <button onclick={() => { input = '! '; tick().then(() => inputEl?.focus()); }} class="px-2.5 py-1 text-xs rounded-full border border-base-content/12 text-base-content/45 hover:text-base-content/70 hover:border-base-content/30 transition-colors">! run a command</button>
-            <button onclick={() => { input = '#review '; tick().then(() => inputEl?.focus()); }} class="px-2.5 py-1 text-xs rounded-full border border-base-content/12 text-base-content/45 hover:text-base-content/70 hover:border-base-content/30 transition-colors">#review code</button>
+        <div
+          class="aurora min-h-full flex flex-col items-center justify-center gap-5 select-none px-6"
+          role="presentation"
+          onclick={(e) => {
+            if (projectPickerOpen) {
+              const target = e.target as HTMLElement;
+              if (!target.closest('[data-project-picker]')) {
+                projectPickerOpen = false;
+              }
+            }
+          }}
+        >
+          <span class="pi-glyph pi-glyph-breathe text-8xl font-light leading-none">π</span>
+          <div class="flex flex-col items-center gap-1">
+            <p class="text-base text-base-content/75">What should we build?</p>
+            <!-- Project picker trigger -->
+            <button
+              onclick={(e) => { e.stopPropagation(); projectPickerOpen = !projectPickerOpen; }}
+              class="text-xs text-base-content/35 hover:text-base-content/60 transition-colors pointer-events-auto flex items-center gap-1"
+              aria-expanded={projectPickerOpen}
+            >
+              <span>{activeProjectName ? `working in ${activeProjectName}` : 'start a conversation'}</span>
+              <svg class="w-3 h-3 transition-transform duration-150 {projectPickerOpen ? 'rotate-180' : ''}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+            </button>
+          </div>
+
+          <!-- Project picker dropdown -->
+          {#if projectPickerOpen}
+            <ProjectPicker onClose={() => (projectPickerOpen = false)} />
+          {/if}
+
+          <div class="flex flex-wrap justify-center gap-2 mt-1 max-w-sm pointer-events-auto">
+            <button onclick={() => { input = '/compact '; tick().then(() => inputEl?.focus()); }} class="px-3 py-1.5 text-xs rounded-full border border-base-content/10 bg-base-content/[0.03] text-base-content/50 hover:text-primary hover:border-primary/35 hover:bg-primary/[0.06] transition-all duration-150 hover:-translate-y-px">/compact</button>
+            <button onclick={() => { input = '/fork '; tick().then(() => inputEl?.focus()); }} class="px-3 py-1.5 text-xs rounded-full border border-base-content/10 bg-base-content/[0.03] text-base-content/50 hover:text-primary hover:border-primary/35 hover:bg-primary/[0.06] transition-all duration-150 hover:-translate-y-px">/fork</button>
+            <button onclick={() => { input = '/clone '; tick().then(() => inputEl?.focus()); }} class="px-3 py-1.5 text-xs rounded-full border border-base-content/10 bg-base-content/[0.03] text-base-content/50 hover:text-primary hover:border-primary/35 hover:bg-primary/[0.06] transition-all duration-150 hover:-translate-y-px">/clone</button>
+            <button onclick={() => { input = '/session '; tick().then(() => inputEl?.focus()); }} class="px-3 py-1.5 text-xs rounded-full border border-base-content/10 bg-base-content/[0.03] text-base-content/50 hover:text-primary hover:border-primary/35 hover:bg-primary/[0.06] transition-all duration-150 hover:-translate-y-px">/session</button>
+            <button onclick={() => { input = '! '; tick().then(() => inputEl?.focus()); }} class="px-3 py-1.5 text-xs rounded-full border border-base-content/10 bg-base-content/[0.03] text-base-content/50 hover:text-secondary hover:border-secondary/35 hover:bg-secondary/[0.06] transition-all duration-150 hover:-translate-y-px">! run a command</button>
+            <button onclick={() => { input = '#review '; tick().then(() => inputEl?.focus()); }} class="px-3 py-1.5 text-xs rounded-full border border-base-content/10 bg-base-content/[0.03] text-base-content/50 hover:text-accent hover:border-accent/35 hover:bg-accent/[0.06] transition-all duration-150 hover:-translate-y-px">#review code</button>
           </div>
         </div>
       {:else}
@@ -3149,11 +3122,11 @@
 
             {#if msg.role === 'user'}
               {@const isExpanded = expandedUserMsgs[msg.id] ?? false}
-              <div class="group sticky top-0 z-20 bg-base-100 relative pt-2 -mx-4 md:-mx-6">
+              <div class="group msg-in sticky top-0 z-20 bg-base-100 relative pt-2 -mx-4 md:-mx-6">
                 <div class="absolute bottom-0 left-0 right-0 h-5 bg-gradient-to-b from-base-100 to-transparent pointer-events-none"></div>
                 <div class="flex justify-end px-4 md:px-6">
                 <div class="max-w-[82%] space-y-0.5">
-                  <div class="bg-base-content/[0.10] rounded-none sm:rounded-lg sm:rounded-br-sm px-3 py-2 space-y-1">
+                  <div class="bg-[color-mix(in_oklch,var(--color-primary)_11%,transparent)] border border-primary/[0.08] rounded-2xl rounded-br-md px-3.5 py-2.5 space-y-1">
                     {#if msg.images?.length}
                       <div class="flex gap-2 flex-wrap -mx-1">
                         {#each msg.images as src (src)}
@@ -3187,20 +3160,27 @@
               </div>
 
             {:else if msg.role === 'assistant'}
-              <div class="group trace-step asst-step">
+              <div class="group msg-in trace-step asst-step">
 
                 <!-- THINKING TOGGLE (compact) -->
                 {#if msg.streaming}
                   {#if msg.thinking && msg.thinking.length > 0}
-                    <div class="flex items-center gap-1.5 text-[10px] text-base-content/50 py-0.5">
-                      <Brain class="w-3 h-3 shrink-0" style="color:var(--color-secondary);animation:pulse 1.5s ease-in-out infinite" />
-                      <span class="text-base-content/55">{hiddenThinkingLabel}</span>
-                      <span class="truncate">{msg.thinking.slice(0, 80)}{msg.thinking.length > 80 ? '…' : ''}</span>
+                    <div class="trace-row font-mono w-full min-w-0">
+                      <span class="trace-row-icon">
+                        <Brain class="w-3.5 h-3.5" style="color:var(--color-secondary);animation:pulse 1.5s ease-in-out infinite" />
+                      </span>
+                      <span class="trace-row-label shimmer-text">{hiddenThinkingLabel}</span>
+                      <span class="trace-row-detail">{msg.thinking.slice(0, 80)}{msg.thinking.length > 80 ? '…' : ''}</span>
+                      <span class="trace-row-meta"></span>
                     </div>
                   {:else if !msg.content}
-                    <div class="flex items-center gap-1.5 text-[10px] text-base-content/45 py-0.5">
-                      <Loader class="w-3 h-3 animate-spin text-base-content/55" />
-                      <span>{hiddenThinkingLabel}...</span>
+                    <div class="trace-row font-mono">
+                      <span class="trace-row-icon">
+                        <Loader class="w-3.5 h-3.5 animate-spin text-base-content/55" />
+                      </span>
+                      <span class="trace-row-label shimmer-text">{hiddenThinkingLabel}</span>
+                      <span class="trace-row-detail">…</span>
+                      <span class="trace-row-meta"></span>
                     </div>
                   {/if}
                 {:else if msg.thinking}
@@ -3208,20 +3188,24 @@
                     <!-- Has both thinking and content: compact toggle -->
                     <button
                       onclick={() => { msg.thinkingExpanded = !msg.thinkingExpanded; }}
-                      class="flex items-center gap-1.5 text-[10px] text-base-content/50 hover:text-base-content/65 transition-colors py-0.5 mb-5"
+                      class="trace-row trace-row-toggle font-mono mb-3 w-full min-w-0 text-left"
                       aria-expanded={msg.thinkingExpanded}
                     >
-                      <Brain class="w-3 h-3 shrink-0" style="color:var(--color-secondary)" />
-                      <span class="text-base-content/55">{hiddenThinkingLabel}</span>
-                      <span class="truncate">{msg.thinking.slice(0, 80)}{msg.thinking.length > 80 ? '…' : ''}</span>
-                      {#if msg.endMs && msg.thinkingStartMs}
-                        <span class="text-base-content/45 shrink-0">{fmtDuration(msg.endMs - msg.thinkingStartMs)}</span>
-                      {/if}
-                      <ChevronRight class="w-2.5 h-2.5 shrink-0 {msg.thinkingExpanded ? 'rotate-90' : ''} transition-transform" />
+                      <span class="trace-row-icon">
+                        <Brain class="w-3.5 h-3.5" style="color:var(--color-secondary)" />
+                      </span>
+                      <span class="trace-row-label">{hiddenThinkingLabel}</span>
+                      <span class="trace-row-detail">{msg.thinking.slice(0, 80)}{msg.thinking.length > 80 ? '…' : ''}</span>
+                      <span class="trace-row-meta">
+                        {#if msg.endMs && msg.thinkingStartMs}
+                          <span>{fmtDuration(msg.endMs - msg.thinkingStartMs)}</span>
+                        {/if}
+                        <ChevronRight class="w-3 h-3 transition-transform {msg.thinkingExpanded ? 'rotate-90' : ''}" />
+                      </span>
                     </button>
                   {:else}
                     <!-- Thinking-only response: show as the main message content -->
-                    <div class="prose text-base-content/80 text-sm leading-relaxed">
+                    <div class="trace-body prose text-base-content/80 text-sm leading-relaxed">
                       {@html renderMarkdown(msg.thinking)}
                     </div>
                   {/if}
@@ -3229,18 +3213,22 @@
 
                 <!-- EXPANDED THINKING BLOCK (trailing margin creates gap before body) -->
                 {#if msg.thinkingExpanded && msg.thinking && msg.content}
-                  <pre class="text-[11px] text-base-content/60 whitespace-pre-wrap break-words max-h-48 overflow-y-auto leading-relaxed bg-base-content/[0.04] rounded px-2 py-1.5 mb-5 select-text ml-3 border-l-2 border-base-content/[0.12]">{msg.thinking}</pre>
+                  <pre class="trace-output text-[11px] text-base-content/60 whitespace-pre-wrap break-words max-h-48 overflow-y-auto leading-relaxed bg-base-content/[0.04] rounded-r px-2 py-1.5 mb-5 select-text">{msg.thinking}</pre>
                 {/if}
 
                 <!-- BODY -->
                 {#if msg.content || msg.streaming}
-                  <div class="leading-relaxed select-text">
+                  <div class="trace-body leading-relaxed select-text">
                     {#if !msg.content && msg.streaming}
                       {#if workingVisible && !(msg.thinking && msg.thinking.length > 0)}
-                        <span class="flex items-center gap-[3px] h-5" aria-label={hiddenThinkingLabel}>
-                          <span class="typing-dot"></span>
-                          <span class="typing-dot"></span>
-                          <span class="typing-dot"></span>
+                        <span class="flex items-center gap-1.5 h-5" aria-label={hiddenThinkingLabel}>
+                          {#if workingIndicatorFrames.length > 0}
+                            <span class="text-base-content/60 text-sm font-mono">{workingIndicatorFrames[workingFrameIndex]}</span>
+                          {:else}
+                            <span class="typing-dot"></span>
+                            <span class="typing-dot"></span>
+                            <span class="typing-dot"></span>
+                          {/if}
                           {#if workingMessage}
                             <span class="ml-2 text-base-content/40 text-xs">{workingMessage}</span>
                           {/if}
@@ -3248,6 +3236,13 @@
                       {/if}
                     {:else}
                       <div class="prose text-base-content/90">{@html renderMarkdown(msg.content)}</div>
+                      {#if msg.images?.length}
+                        <div class="flex gap-2 flex-wrap mt-2">
+                          {#each msg.images as src (src)}
+                            <img {src} alt="" class="max-h-64 max-w-full rounded-lg object-contain border border-base-content/10" />
+                          {/each}
+                        </div>
+                      {/if}
                       {#if msg.streaming}<span class="text-primary animate-pulse">▌</span>{/if}
                     {/if}
                   </div>
@@ -3255,7 +3250,7 @@
 
                 <!-- META + ACTIONS -->
                 {#if !msg.streaming}
-                  <div class="flex items-center gap-2 text-[10px] py-0.5 select-none">
+                  <div class="trace-meta flex items-center gap-2 text-[10px] py-0.5 select-none">
                     {#if msg.usage}
                       <span class="tabular-nums text-base-content/50">{fmtTokens(msg.usage.totalTokens)}t</span>
                       {#if msg.usage.cost?.total}
@@ -3291,25 +3286,28 @@
             {:else if msg.role === 'tool'}
               {@const meta = getToolMeta(msg.toolName)}
               {@const detail = msg.toolInput ?? inferDetail(msg.toolName, msg.toolArgs)}
-              <div class="group/tool flex flex-col trace-step tool-step">
+              <div class="group/tool msg-in flex flex-col trace-step tool-step">
                 <button
-                  onclick={() => { if (msg.content || msg.diff) msg.expanded = !msg.expanded; }}
-                  class="flex items-center gap-2 px-2 py-1 text-xs font-mono rounded hover:bg-base-content/[0.06] transition-colors text-left w-full"
-                  disabled={!msg.content && !msg.diff}
+                  onclick={() => { if (msg.content || msg.diff || msg.images?.length) msg.expanded = !msg.expanded; }}
+                  class="trace-row trace-row-toggle font-mono text-left w-full disabled:cursor-default"
+                  disabled={!msg.content && !msg.diff && !msg.images?.length}
                 >
-                  <meta.icon class="w-3.5 h-3.5 shrink-0" style="color:{meta.color};{msg.streaming ? 'animation:pulse 1.5s ease-in-out infinite' : ''}" />
-                  <span class="text-base-content/70 shrink-0">{meta.label}</span>
-                  {#if detail}
-                    <span class="text-base-content/55 truncate flex-1 min-w-0">{detail}</span>
-                  {/if}
-                  <span class="shrink-0 ml-auto flex items-center gap-1.5">
+                  <span class="trace-row-icon">
+                    <meta.icon class="w-3.5 h-3.5" style="color:{meta.color};{msg.streaming ? 'animation:pulse 1.5s ease-in-out infinite' : ''}" />
+                  </span>
+                  <span class="trace-row-label">{meta.label}</span>
+                  <span class="trace-row-detail">{#if detail}{detail}{/if}</span>
+                  <span class="trace-row-meta">
                     {#if msg.streaming}
                       <Loader class="w-3 h-3 text-base-content/55 animate-spin" />
                     {:else if msg.isError}
                       <CircleX class="w-3 h-3 text-destructive" />
-                    {:else if msg.content || msg.diff}
+                    {:else if msg.content || msg.diff || msg.images?.length}
                       {#if msg.lineCount !== undefined}
                         <span class="text-base-content/45 tabular-nums">{msg.lineCount}L</span>
+                      {/if}
+                      {#if msg.images?.length}
+                        <span class="text-base-content/40 tabular-nums">{msg.images.length}img</span>
                       {/if}
                       <ChevronRight class="w-3 h-3 text-base-content/45 transition-transform {msg.expanded ? 'rotate-90' : ''}" />
                     {:else}
@@ -3319,43 +3317,64 @@
                 </button>
                 {#if msg.expanded && !msg.streaming}
                   {#if msg.diff}
-                    <div class="ml-4 mt-1">
+                    <div class="trace-output mt-1">
                       <DiffViewer diff={msg.diff} />
                     </div>
                   {:else if msg.content}
                     {@const toolLang = getToolLang(msg.toolName, msg.toolInput)}
                     {#if toolLang}
-                      <pre class="ml-4 pl-2 border-l border-base-content/12 text-xs whitespace-pre-wrap break-words max-h-56 overflow-y-auto leading-relaxed select-text py-1"><code class="hljs">{@html highlightCode(msg.content, toolLang)}</code></pre>
+                      <pre class="trace-output mt-1 text-xs whitespace-pre-wrap break-words max-h-56 overflow-y-auto leading-relaxed select-text py-1"><code class="hljs">{@html highlightCode(msg.content, toolLang)}</code></pre>
                     {:else}
-                      <pre class="ml-4 pl-2 border-l border-base-content/12 text-base-content/60 text-xs whitespace-pre-wrap break-words max-h-56 overflow-y-auto leading-relaxed select-text py-1">{msg.content}</pre>
+                      <pre class="trace-output mt-1 text-base-content/60 text-xs whitespace-pre-wrap break-words max-h-56 overflow-y-auto leading-relaxed select-text py-1">{msg.content}</pre>
                     {/if}
+                  {/if}
+                  {#if msg.images?.length}
+                    <div class="trace-output flex gap-2 flex-wrap mt-2">
+                      {#each msg.images as src (src)}
+                        <img {src} alt="" class="max-h-64 max-w-full rounded-lg object-contain border border-base-content/10" />
+                      {/each}
+                    </div>
                   {/if}
                 {/if}
               </div>
 
             {:else if msg.role === 'notice'}
-              <div class="flex items-center gap-2 text-[10px] text-base-content/45 select-none py-0.5">
-                <span class="flex-1 h-px bg-base-content/[0.06]"></span>
-                <span class="flex items-center gap-1 shrink-0">
-                  {#if msg.streaming}
-                    <svg class="w-2 h-2 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>
-                  {:else if msg.noticeKind === 'compaction'}
-                    <span aria-hidden="true">✦</span>
-                  {:else if msg.noticeKind === 'retry'}
-                    <svg class="w-2 h-2" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
-                  {:else if msg.noticeKind === 'custom'}
-                    <span class="w-2 h-2 rounded-full bg-secondary inline-block"></span>
-                  {/if}
-                  <span>{msg.content}</span>
-                </span>
-                <span class="flex-1 h-px bg-base-content/[0.06]"></span>
-              </div>
+              {#if msg.customType === 'slash_result'}
+                <div class="msg-in my-2 px-4 py-3 bg-base-content/[0.04] border border-base-content/[0.06] rounded-xl font-mono text-[11px] leading-relaxed text-base-content/70 whitespace-pre-wrap break-words overflow-hidden select-text shadow-inner shadow-black/5">
+                  {msg.content}
+                </div>
+              {:else}
+                <div class="msg-in flex items-center gap-2.5 text-[10px] text-base-content/45 select-none py-1">
+                  <span class="flex-1 h-px bg-gradient-to-r from-transparent to-base-content/15"></span>
+                  <span class="flex items-center gap-1 shrink-0">
+                    {#if msg.streaming}
+                      <svg class="w-2 h-2 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>
+                    {:else if msg.noticeKind === 'compaction'}
+                      <Sparkles class="w-2.5 h-2.5" aria-hidden="true" />
+                    {:else if msg.noticeKind === 'retry'}
+                      <svg class="w-2 h-2" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
+                    {:else if msg.noticeKind === 'custom'}
+                      <span class="w-2 h-2 rounded-full bg-secondary inline-block"></span>
+                    {/if}
+                    <span>{msg.content}</span>
+                  </span>
+                  <span class="flex-1 h-px bg-gradient-to-l from-transparent to-base-content/15"></span>
+                </div>
+              {/if}
             {/if}
 
           {/each}
         </div>
       {/if}
     </main>
+
+    <!-- Extension footer -->
+    {#if extensionFooter}
+      <div class="shrink-0 px-3 py-1.5 text-xs text-base-content/60 bg-base-200/50 border-t border-base-content/10 font-mono whitespace-pre-wrap flex items-start gap-2">
+        <span class="flex-1">{extensionFooter}</span>
+        <button onclick={() => { extensionFooter = ''; }} class="text-base-content/30 hover:text-base-content/60 transition-colors shrink-0" aria-label="Dismiss footer"><X class="w-3 h-3" /></button>
+      </div>
+    {/if}
 
     <!-- Scroll-to-bottom button — fades in when user scrolls up -->
     <div
@@ -3366,7 +3385,7 @@
     >
       <button
         onclick={scrollToBottom}
-        class="pointer-events-auto w-9 h-9 rounded-full bg-base-200 border border-base-content/20 shadow-md flex items-center justify-center text-base-content/55 hover:text-base-content hover:bg-base-300 transition-colors"
+        class="pointer-events-auto w-9 h-9 rounded-full bg-base-200/85 backdrop-blur-md border border-base-content/15 shadow-lg shadow-black/25 flex items-center justify-center text-base-content/55 hover:text-base-content hover:border-primary/40 transition-colors"
         aria-label="Scroll to bottom"
         tabindex={isAtBottom ? -1 : 0}
       ><svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14m0 0-7-7m7 7 7-7"/></svg></button>
@@ -3395,6 +3414,47 @@
         </div>
       {/if}
 
+      <!-- Extension editor component panel -->
+      {#if editorComponentPanel}
+        <div class="mb-2 bg-base-content/5 rounded-xl px-3 py-2 text-xs text-base-content/60 font-mono leading-relaxed flex items-start gap-2">
+          <span class="flex-1 whitespace-pre-wrap">
+            {#if editorComponentPanel.kind === 'text'}
+              {editorComponentPanel.content}
+            {:else if editorComponentPanel.kind === 'select'}
+              <span class="font-semibold">{editorComponentPanel.label}</span>
+              <div class="flex flex-wrap gap-1 mt-1">
+                {#each editorComponentPanel.options as opt (opt.value)}
+                  <span class="px-2 py-0.5 bg-base-content/10 rounded">{opt.label}</span>
+                {/each}
+              </div>
+            {:else if editorComponentPanel.kind === 'input'}
+              <span class="font-semibold">{editorComponentPanel.label}</span>
+              {#if editorComponentPanel.placeholder}<span class="text-base-content/40 ml-1">{editorComponentPanel.placeholder}</span>{/if}
+            {:else if editorComponentPanel.kind === 'button'}
+              <span class="font-semibold" class:text-primary={editorComponentPanel.variant === 'primary'}>{editorComponentPanel.label}</span>
+            {:else if editorComponentPanel.kind === 'checkbox'}
+              <span class="inline-flex items-center gap-1.5">
+                {#if editorComponentPanel.checked}<SquareCheck class="w-3.5 h-3.5 text-primary/70" />{:else}<Square class="w-3.5 h-3.5 text-base-content/35" />{/if}
+                {editorComponentPanel.label}
+              </span>
+            {:else if editorComponentPanel.kind === 'container'}
+              {#if editorComponentPanel.direction === 'horizontal'}
+                <span class="flex flex-wrap gap-2">
+                  {#each editorComponentPanel.children as child (child.kind + (JSON.stringify(child).slice(0, 20)))}
+                    <span>{#if child.kind === 'text'}{child.content}{:else if child.kind === 'button'}{child.label}{:else}{child.kind}{/if}</span>
+                  {/each}
+                </span>
+              {:else}
+                {#each editorComponentPanel.children as child (child.kind + (JSON.stringify(child).slice(0, 20)))}
+                  <div>{#if child.kind === 'text'}{child.content}{:else if child.kind === 'button'}{child.label}{:else}{child.kind}{/if}</div>
+                {/each}
+              {/if}
+            {/if}
+          </span>
+          <button onclick={() => { editorComponentPanel = null; }} class="text-base-content/30 hover:text-base-content/60 transition-colors shrink-0" aria-label="Dismiss editor panel"><X class="w-3 h-3" /></button>
+        </div>
+      {/if}
+
       <!-- Extension widget panels -->
       {#if Object.keys(extensionWidgets).length > 0}
         <div class="mb-2 flex flex-col gap-1">
@@ -3404,7 +3464,7 @@
                 onclick={() => dismissWidget(key)}
                 class="absolute -top-1 -right-1 w-4 h-4 bg-base-content/20 hover:bg-base-content/40 rounded-full flex items-center justify-center text-[9px] leading-none opacity-0 group-hover:opacity-100 transition-opacity z-10"
                 aria-label="Dismiss widget"
-              >×</button>
+              ><X class="w-2.5 h-2.5" /></button>
               {#if widget.type === 'text'}
                 <div class="bg-base-content/5 rounded-xl px-3 py-2 text-xs text-base-content/45 font-mono whitespace-pre-wrap leading-relaxed">{widget.lines.join('\n')}</div>
               {:else if widget.type === 'table'}
@@ -3448,7 +3508,7 @@
       <div class="relative">
         {#if showSlashMenu && filteredSlashCommands.length > 0}
           <div class="absolute bottom-full left-0 right-0 mb-1 z-10">
-            <div class="bg-base-200 border border-base-content/10 rounded-xl overflow-hidden shadow-lg max-h-60 overflow-y-auto" role="listbox" aria-label="Composer shortcuts">
+            <div class="bg-base-200/95 backdrop-blur-md border border-base-content/10 rounded-2xl overflow-hidden shadow-xl shadow-black/30 max-h-60 overflow-y-auto" role="listbox" aria-label="Composer shortcuts">
               {#each filteredSlashCommands as cmd, i (cmd.label ?? i)}
                 <button
                   onclick={() => selectSlashCommand(cmd)}
@@ -3467,8 +3527,8 @@
           </div>
         {/if}
 
-      <div class="bg-base-100 border border-primary/25 shadow-[0_2px_8px_-2px_rgba(0,0,0,0.3),0_0_0_1px_color-mix(in_oklch,var(--color-primary)_12%,transparent)] rounded-2xl px-3 py-2.5 flex flex-col gap-2.5">
-        {#if attachedImages.length > 0}
+      <div class="composer rounded-2xl px-3 py-2.5 flex flex-col gap-2.5">
+        {#if attachedImages.length > 0 || attachedFiles.length > 0}
           <div class="flex gap-2 flex-wrap pt-1">
             {#each attachedImages as img, i (img.src)}
               <div class="relative group/thumb">
@@ -3477,7 +3537,20 @@
                   onclick={() => removeAttachment(i)}
                   class="absolute -top-1.5 -right-1.5 w-5 h-5 bg-base-content text-base-100 rounded-full flex items-center justify-center text-xs leading-none opacity-0 group-hover/thumb:opacity-100 transition-opacity"
                   aria-label="Remove {img.name}"
-                >×</button>
+                ><X class="w-3 h-3" /></button>
+              </div>
+            {/each}
+            {#each attachedFiles as f, i (f.name)}
+              <div class="relative group/thumb">
+                <div class="h-16 w-16 flex flex-col items-center justify-center rounded-lg bg-base-content/10 text-center p-1">
+                  <svg class="w-5 h-5 text-base-content/40 mb-0.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"/><polyline points="14 2 14 8 20 8"/></svg>
+                  <span class="text-[10px] text-base-content/40 leading-tight truncate max-w-full">{f.name}</span>
+                </div>
+                <button
+                  onclick={() => removeFileAttachment(i)}
+                  class="absolute -top-1.5 -right-1.5 w-5 h-5 bg-base-content text-base-100 rounded-full flex items-center justify-center text-xs leading-none opacity-0 group-hover/thumb:opacity-100 transition-opacity"
+                  aria-label="Remove {f.name}"
+                ><X class="w-3 h-3" /></button>
               </div>
             {/each}
           </div>
@@ -3488,7 +3561,7 @@
           onkeydown={handleKeydown}
           oninput={autoResizeTextarea}
           rows={1}
-          placeholder={wsState !== 'open' ? wsState + '…' : isStreaming ? 'Steer pi…' : 'Use @ / ! # for helpers'}
+          placeholder={wsState !== 'open' ? wsState + '…' : isStreaming ? 'Steer pi…' : isMobile ? 'Message pi…' : 'Message pi — @ files · / commands · ! shell'}
           aria-label="Message to pi"
           disabled={wsState !== 'open'}
           class="w-full min-h-12 mt-1 bg-transparent resize-none outline-none placeholder-base-content/45 disabled:opacity-40 leading-relaxed max-h-48 overflow-y-auto transition-opacity text-base"
@@ -3526,11 +3599,11 @@
                     onclick={() => fileInputEl?.click()}
                     disabled={wsState !== 'open'}
                     class="w-8 h-8 flex items-center justify-center text-base-content/45 hover:text-base-content/70 hover:bg-base-content/8 rounded-full transition-colors shrink-0 disabled:opacity-30 disabled:cursor-default"
-                    aria-label="Attach image"
+                    aria-label="Attach file"
                   ><svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg></button>
                 {/snippet}
               </Tooltip.Trigger>
-              <Tooltip.Content>Attach image</Tooltip.Content>
+              <Tooltip.Content>Attach file</Tooltip.Content>
             </Tooltip.Root>
             {#if isCompacting}
               <span class="hidden md:flex w-8 h-8 items-center justify-center text-base-content/20 animate-pulse">
@@ -3585,10 +3658,13 @@
             <span class="flex-1"></span>
             <button
               onclick={() => openTab('models')}
-              class="min-w-0 max-w-[12rem] md:max-w-[20rem] h-8 px-2.5 flex items-center gap-1.5 rounded-full text-sm font-semibold text-base-content/70 hover:text-base-content/90 hover:bg-base-content/7 transition-colors"
+              class="min-w-0 max-w-[12rem] md:max-w-[20rem] h-8 px-3 flex items-center gap-2 rounded-full text-xs font-medium bg-base-content/[0.045] border border-base-content/[0.07] text-base-content/65 hover:text-base-content/90 hover:border-base-content/15 hover:bg-base-content/[0.07] transition-colors"
               aria-label="Select model"
               aria-expanded={showRightPanel && rightPanelTab === 'models'}
             >
+              {#if model?.provider}
+                <span class="w-1.5 h-1.5 rounded-full shrink-0" style="background:{providerColor(model.provider)}"></span>
+              {/if}
               <span class="truncate">{model?.name ?? 'Select model'}</span>
             </button>
             <Tooltip.Root>
@@ -3602,8 +3678,8 @@
                     onpointerleave={cancelSendHold}
                     onpointercancel={cancelSendHold}
                     oncontextmenu={(e) => e.preventDefault()}
-                    disabled={(!input.trim() && attachedImages.length === 0) || wsState !== 'open'}
-                    class="w-8 h-8 flex items-center justify-center rounded-full transition-colors shrink-0 {(input.trim() || attachedImages.length > 0) && wsState === 'open' ? 'text-primary hover:bg-primary/10' : 'text-base-content/25'} disabled:cursor-default"
+                    disabled={(!input.trim() && attachedImages.length === 0 && attachedFiles.length === 0) || wsState !== 'open'}
+                    class="w-8 h-8 flex items-center justify-center rounded-full transition-all duration-200 shrink-0 {(input.trim() || attachedImages.length > 0 || attachedFiles.length > 0) && wsState === 'open' ? 'bg-primary text-primary-content hover:brightness-110 shadow-[0_0_16px_-4px_color-mix(in_oklch,var(--color-primary)_60%,transparent)]' : 'text-base-content/25'} disabled:cursor-default"
                     aria-label="Send message"
                   ><svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5m0 0-7 7m7-7 7 7"/></svg></button>
                 {/snippet}
@@ -3617,14 +3693,14 @@
       <input
         bind:this={fileInputEl}
         type="file"
-        accept="image/*"
+        accept="image/*,.txt,.md,.json,.yaml,.yml,.xml,.html,.css,.js,.ts,.jsx,.tsx,.py,.rb,.go,.rs,.java,.kt,.swift,.c,.cpp,.h,.hpp,.cs,.sh,.bash,.zsh,.toml,.ini,.cfg,.conf,.env,.gitignore,.svelte,.vue,.sass,.scss,.less,.sql,.graphql,.r,.mjs,.cjs"
         multiple
         class="hidden"
         onchange={handleFileInput}
       />
       </div><!-- end .relative slash/input wrapper -->
 
-      {#if Object.keys(extensionStatuses).length > 0 || lastInputTokens > 0 || contextUsageTokens != null || sessionCostTotal > 0}
+      {#if Object.keys(extensionStatuses).length > 0 || effectiveContextTokens > 0 || sessionCostTotal > 0}
         <div class="hidden md:flex mt-1.5 px-1 items-center gap-2 text-xs select-none min-w-0">
           {#if Object.keys(extensionStatuses).length > 0}
             <span class="text-base-content/50 truncate min-w-0">
@@ -3659,7 +3735,7 @@
                   </div>
                   <!-- token counts -->
                   <p class="text-xs tabular-nums">
-                    {(contextUsageTokens ?? lastInputTokens).toLocaleString()} / {((contextUsageWindow > 0 ? contextUsageWindow : null) ?? model?.contextWindow ?? 0).toLocaleString()} tokens
+                    {effectiveContextTokens.toLocaleString()} / {((contextUsageWindow > 0 ? contextUsageWindow : null) ?? model?.contextWindow ?? 0).toLocaleString()} tokens
                   </p>
                   {#if sessionTokens > 0}
                     <p class="text-xs tabular-nums text-background/60">
@@ -3669,15 +3745,15 @@
                 </div>
               </Tooltip.Content>
             </Tooltip.Root>
-          {:else if lastInputTokens > 0 || contextUsageTokens != null}
+          {:else if effectiveContextTokens > 0}
             <Tooltip.Root>
               <Tooltip.Trigger class="tabular-nums cursor-default text-base-content/40">
-                {fmtTokens(contextUsageTokens ?? lastInputTokens)} ctx
+                {fmtTokens(effectiveContextTokens)} ctx
               </Tooltip.Trigger>
               <Tooltip.Content sideOffset={6} class="min-w-[140px]">
                 <div class="flex flex-col gap-1.5">
                   <p class="text-xs tabular-nums">
-                    {(contextUsageTokens ?? lastInputTokens).toLocaleString()} tokens
+                    {effectiveContextTokens.toLocaleString()} tokens
                   </p>
                   {#if sessionTokens > 0}
                     <p class="text-xs tabular-nums text-background/60">
@@ -3716,24 +3792,33 @@
   >
     {#snippet header()}{/snippet}
 
-    <div class="shrink-0 px-4 py-2 border-b border-base-content/8 flex items-center gap-2">
-      <div class="flex items-center gap-1 flex-1">
+    <div class="shrink-0 px-3 py-2.5 border-b border-base-content/8 flex items-center gap-2">
+      <div role="tablist" aria-label="Panel sections" class="flex items-center flex-1 bg-base-content/[0.045] border border-base-content/[0.05] rounded-full p-0.5 gap-0.5">
         <button
+          role="tab"
+          aria-selected={rightPanelTab === 'models'}
           onclick={() => { rightPanelTab = 'models'; }}
-          class="px-2.5 py-1.5 text-xs font-medium rounded-full transition-colors {rightPanelTab === 'models' ? 'text-base-content bg-base-content/10' : 'text-base-content/45 hover:text-base-content/70 hover:bg-base-content/8'}"
+          class="flex-1 px-2.5 py-1.5 text-xs font-medium rounded-full transition-colors {rightPanelTab === 'models' ? 'text-base-content bg-base-content/12 shadow-sm shadow-black/10' : 'text-base-content/45 hover:text-base-content/70'}"
+          tabindex={showRightPanel ? 0 : -1}
         >models</button>
         <button
+          role="tab"
+          aria-selected={rightPanelTab === 'tools'}
           onclick={() => { rightPanelTab = 'tools'; }}
-          class="px-2.5 py-1.5 text-xs font-medium rounded-full transition-colors {rightPanelTab === 'tools' ? 'text-base-content bg-base-content/10' : 'text-base-content/45 hover:text-base-content/70 hover:bg-base-content/8'}"
+          class="flex-1 px-2.5 py-1.5 text-xs font-medium rounded-full transition-colors {rightPanelTab === 'tools' ? 'text-base-content bg-base-content/12 shadow-sm shadow-black/10' : 'text-base-content/45 hover:text-base-content/70'}"
+          tabindex={showRightPanel ? 0 : -1}
         >tools{#if toolsList.length} <span class="text-base-content/30 font-normal ml-0.5">{activeToolNames.length}/{toolsList.length}</span>{/if}</button>
         <button
+          role="tab"
+          aria-selected={rightPanelTab === 'skills'}
           onclick={() => { rightPanelTab = 'skills'; }}
-          class="px-2.5 py-1.5 text-xs font-medium rounded-full transition-colors {rightPanelTab === 'skills' ? 'text-base-content bg-base-content/10' : 'text-base-content/45 hover:text-base-content/70 hover:bg-base-content/8'}"
+          class="flex-1 px-2.5 py-1.5 text-xs font-medium rounded-full transition-colors {rightPanelTab === 'skills' ? 'text-base-content bg-base-content/12 shadow-sm shadow-black/10' : 'text-base-content/45 hover:text-base-content/70'}"
+          tabindex={showRightPanel ? 0 : -1}
         >skills</button>
       </div>
       <button
         onclick={() => (showRightPanel = false)}
-        class="w-8 h-8 flex items-center justify-center text-base-content/40 hover:text-base-content hover:bg-base-content/10 rounded-md transition-all duration-150 shrink-0"
+        class="w-8 h-8 flex items-center justify-center text-base-content/40 hover:text-base-content hover:bg-base-content/10 rounded-full transition-all duration-150 shrink-0"
         aria-label="Close panel"
       ><svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
     </div>
@@ -3758,7 +3843,7 @@
               {#each ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'] as lvl (lvl)}
                 <button
                   onclick={() => pickThinkingLevel(lvl)}
-                  class="px-2.5 py-1 text-xs font-medium rounded-md border transition-all duration-150 {thinkingLevel === lvl ? 'border-primary/60 text-primary bg-primary/10 shadow-[0_0_10px_-2px_var(--color-primary)/0.25]' : 'border-base-content/12 text-base-content/40 hover:border-base-content/30 hover:text-base-content/70 hover:bg-base-content/5'}"
+                  class="px-3 py-1 text-xs font-medium rounded-full border transition-all duration-150 {thinkingLevel === lvl ? 'border-primary/60 text-primary bg-primary/10 glow-primary' : 'border-base-content/12 text-base-content/40 hover:border-base-content/30 hover:text-base-content/70 hover:bg-base-content/5'}"
                   tabindex={showRightPanel ? 0 : -1}
                 >{lvl}</button>
               {/each}
@@ -3792,14 +3877,7 @@
             {:else}
               {#each filteredModelsByProvider as [provider, models] (provider)}
                 <div>
-                  <div class="sticky top-0 z-10 bg-base-200 px-5 py-2 flex items-center gap-2 border-b border-base-content/6">
-                    <span
-                      style="background:{providerColor(provider)}"
-                      class="inline-flex items-center justify-center w-3.5 h-3.5 rounded-[3px] text-[8px] text-white font-bold leading-none select-none shrink-0"
-                      aria-hidden="true"
-                    >{provider[0].toUpperCase()}</span>
-                    <span class="text-[10px] text-base-content/35 uppercase tracking-[0.1em] font-semibold">{provider}</span>
-                  </div>
+                  {@render sectionHeader(provider[0].toUpperCase(), '', provider, providerColor(provider))}
                   {#each models as m (m.id)}
                     {@const isActive = model?.id === m.id && model?.provider === m.provider}
                     <button
@@ -3808,9 +3886,9 @@
                       aria-pressed={isActive}
                       tabindex={showRightPanel ? 0 : -1}
                     >
-                      {#if isActive}<span class="absolute left-0 top-1 bottom-1 w-0.5 rounded-r-full bg-primary shadow-[0_0_6px_1px_var(--color-primary)/0.4]"></span>{/if}
+                      {#if isActive}<span class="absolute left-0 top-1 bottom-1 w-0.5 rounded-r-full bg-primary glow-primary"></span>{/if}
                       <span class="flex-1 truncate">{m.name}</span>
-                      {#if m.reasoning}<span class="text-base-content/20 shrink-0 text-[10px]">✦</span>{/if}
+                      {#if m.reasoning}<Sparkles class="w-3 h-3 text-base-content/25 shrink-0" aria-label="Supports reasoning" />{/if}
                       {#if isActive}<span class="text-primary shrink-0"><svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m20 6-11 11-5-5"/></svg></span>{/if}
                     </button>
                   {/each}
@@ -3860,7 +3938,11 @@
                   <div class="flex items-center gap-3 mb-2">
                     <span class="text-sm flex-1 truncate {p.configured ? 'text-base-content/85' : 'text-base-content/40'} {isCurrentProvider ? 'text-primary' : ''}">{p.name}</span>
                     {#if label}<span class="text-[10px] text-base-content/25 shrink-0 font-mono">{label}</span>{/if}
-                    <span class="text-xs shrink-0 {p.configured ? 'text-primary/70' : 'text-base-content/15'}">{p.configured ? '●' : '○'}</span>
+                    <span
+                      class="w-2 h-2 rounded-full shrink-0 {p.configured ? 'bg-primary/70 glow-primary' : 'border border-base-content/25'}"
+                      role="img"
+                      aria-label={p.configured ? 'Configured' : 'Not configured'}
+                    ></span>
                     <span class="text-[10px] text-base-content/25 shrink-0">{p.modelCount}m</span>
                   </div>
                   {#if p.configured}
@@ -3936,7 +4018,7 @@
                   tabindex={showRightPanel ? 0 : -1}
                   aria-pressed={isActive}
                 >
-                  {#if isActive}<span class="absolute left-0 top-1 bottom-1 w-0.5 rounded-r-full bg-primary shadow-[0_0_6px_1px_var(--color-primary)/0.4]"></span>{/if}
+                  {#if isActive}<span class="absolute left-0 top-1 bottom-1 w-0.5 rounded-r-full bg-primary glow-primary"></span>{/if}
                   <span class="min-w-0 flex-1">
                     <span class="text-sm font-mono text-base-content/80 block truncate">{tool.name}</span>
                     {#if tool.description}<span class="text-xs text-base-content/40 leading-relaxed line-clamp-2">{tool.description}</span>{/if}
@@ -3960,7 +4042,7 @@
                   tabindex={showRightPanel ? 0 : -1}
                   aria-pressed={isActive}
                 >
-                  {#if isActive}<span class="absolute left-0 top-1 bottom-1 w-0.5 rounded-r-full bg-primary shadow-[0_0_6px_1px_var(--color-primary)/0.4]"></span>{/if}
+                  {#if isActive}<span class="absolute left-0 top-1 bottom-1 w-0.5 rounded-r-full bg-primary glow-primary"></span>{/if}
                   <span class="min-w-0 flex-1">
                     <span class="text-sm font-mono text-base-content/80 block truncate">{tool.name}</span>
                     {#if tool.description}<span class="text-xs text-base-content/40 leading-relaxed line-clamp-2">{tool.description}</span>{/if}
@@ -4033,31 +4115,22 @@
                     class="shrink-0 mt-0.5 w-7 h-7 flex items-center justify-center text-base-content/30 hover:text-primary hover:bg-primary/10 rounded transition-colors"
                     title="Use skill"
                     tabindex={showRightPanel ? 0 : -1}
-                  ><svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 10 4 15 9 20"/><path d="M20 4v7a4 4 0 0 1-4 4H4"/></svg></button>
+                   ><CornerDownLeft class="w-3.5 h-3.5" /></button>
                 </div>
               {/snippet}
 
               {#if projectSkills.length > 0}
-                <div class="sticky top-0 z-10 bg-base-200 px-5 py-2 flex items-center gap-2 border-b border-base-content/6">
-                  <span class="inline-flex items-center justify-center w-3.5 h-3.5 rounded-[3px] text-[8px] text-white font-bold leading-none select-none shrink-0 bg-primary/70" aria-hidden="true">P</span>
-                  <span class="text-[10px] text-base-content/35 uppercase tracking-[0.1em] font-semibold">project skills</span>
-                </div>
+                {@render sectionHeader('P', 'bg-primary/70', 'project skills')}
                 {#each projectSkills as skill (skill.name)}{@render skillItem(skill)}{/each}
               {/if}
 
               {#if userSkills.length > 0}
-                <div class="sticky top-0 z-10 bg-base-200 px-5 py-2 flex items-center gap-2 border-b border-base-content/6">
-                  <span class="inline-flex items-center justify-center w-3.5 h-3.5 rounded-[3px] text-[8px] text-white font-bold leading-none select-none shrink-0 bg-accent/70" aria-hidden="true">U</span>
-                  <span class="text-[10px] text-base-content/35 uppercase tracking-[0.1em] font-semibold">user skills</span>
-                </div>
+                {@render sectionHeader('U', 'bg-accent/70', 'user skills')}
                 {#each userSkills as skill (skill.name)}{@render skillItem(skill)}{/each}
               {/if}
 
               {#if builtinSkills.length > 0}
-                <div class="sticky top-0 z-10 bg-base-200 px-5 py-2 flex items-center gap-2 border-b border-base-content/6">
-                  <span class="inline-flex items-center justify-center w-3.5 h-3.5 rounded-[3px] text-[8px] text-white font-bold leading-none select-none shrink-0 bg-base-content/30" aria-hidden="true">B</span>
-                  <span class="text-[10px] text-base-content/35 uppercase tracking-[0.1em] font-semibold">built-in skills</span>
-                </div>
+                {@render sectionHeader('B', 'bg-base-content/30', 'built-in skills')}
                 <div class="opacity-70">
                   {#each builtinSkills as skill (skill.name)}{@render skillItem(skill)}{/each}
                 </div>
@@ -4070,76 +4143,19 @@
               {@const builtinPrompts = filteredSkills.prompts.filter((p) => p.isBuiltin)}
 
               {#if projectPrompts.length > 0}
-                <div class="sticky top-0 z-10 bg-base-200 px-5 py-2 flex items-center gap-2 border-b border-base-content/6">
-                  <span class="inline-flex items-center justify-center w-3.5 h-3.5 rounded-[3px] text-[8px] text-white font-bold leading-none select-none shrink-0 bg-primary/70" aria-hidden="true">P</span>
-                  <span class="text-[10px] text-base-content/35 uppercase tracking-[0.1em] font-semibold">project prompts</span>
-                </div>
-                {#each projectPrompts as prompt (prompt.name)}
-                  <div class="px-5 py-2.5 flex items-start gap-3 transition-colors hover:bg-base-content/[0.03]">
-                    <span class="min-w-0 flex-1">
-                      <span class="flex items-center gap-2 mb-0.5">
-                        <span class="text-sm font-mono text-base-content/80 truncate">{prompt.name}</span>
-                        {#if prompt.argumentHint}<span class="shrink-0 text-xs text-base-content/35 font-mono">{prompt.argumentHint}</span>{/if}
-                      </span>
-                      {#if prompt.description}<span class="text-xs text-base-content/40 leading-relaxed line-clamp-2">{prompt.description}</span>{/if}
-                    </span>
-                    <button
-                      onclick={() => { input = `/${prompt.name} `; showRightPanel = false; tick().then(() => inputEl?.focus()); }}
-                      class="shrink-0 mt-0.5 w-7 h-7 flex items-center justify-center text-base-content/30 hover:text-primary hover:bg-primary/10 rounded transition-colors"
-                      title="Use prompt"
-                      tabindex={showRightPanel ? 0 : -1}
-                    ><svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 10 4 15 9 20"/><path d="M20 4v7a4 4 0 0 1-4 4H4"/></svg></button>
-                  </div>
-                {/each}
+                {@render sectionHeader('P', 'bg-primary/70', 'project prompts')}
+                {#each projectPrompts as prompt (prompt.name)}{@render promptItem(prompt)}{/each}
               {/if}
 
               {#if userPrompts.length > 0}
-                <div class="sticky top-0 z-10 bg-base-200 px-5 py-2 flex items-center gap-2 border-b border-base-content/6">
-                  <span class="inline-flex items-center justify-center w-3.5 h-3.5 rounded-[3px] text-[8px] text-white font-bold leading-none select-none shrink-0 bg-accent/70" aria-hidden="true">U</span>
-                  <span class="text-[10px] text-base-content/35 uppercase tracking-[0.1em] font-semibold">user prompts</span>
-                </div>
-                {#each userPrompts as prompt (prompt.name)}
-                  <div class="px-5 py-2.5 flex items-start gap-3 transition-colors hover:bg-base-content/[0.03]">
-                    <span class="min-w-0 flex-1">
-                      <span class="flex items-center gap-2 mb-0.5">
-                        <span class="text-sm font-mono text-base-content/80 truncate">{prompt.name}</span>
-                        {#if prompt.argumentHint}<span class="shrink-0 text-xs text-base-content/35 font-mono">{prompt.argumentHint}</span>{/if}
-                      </span>
-                      {#if prompt.description}<span class="text-xs text-base-content/40 leading-relaxed line-clamp-2">{prompt.description}</span>{/if}
-                    </span>
-                    <button
-                      onclick={() => { input = `/${prompt.name} `; showRightPanel = false; tick().then(() => inputEl?.focus()); }}
-                      class="shrink-0 mt-0.5 w-7 h-7 flex items-center justify-center text-base-content/30 hover:text-primary hover:bg-primary/10 rounded transition-colors"
-                      title="Use prompt"
-                      tabindex={showRightPanel ? 0 : -1}
-                    ><svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 10 4 15 9 20"/><path d="M20 4v7a4 4 0 0 1-4 4H4"/></svg></button>
-                  </div>
-                {/each}
+                {@render sectionHeader('U', 'bg-accent/70', 'user prompts')}
+                {#each userPrompts as prompt (prompt.name)}{@render promptItem(prompt)}{/each}
               {/if}
 
               {#if builtinPrompts.length > 0}
-                <div class="sticky top-0 z-10 bg-base-200 px-5 py-2 flex items-center gap-2 border-b border-base-content/6">
-                  <span class="inline-flex items-center justify-center w-3.5 h-3.5 rounded-[3px] text-[8px] text-white font-bold leading-none select-none shrink-0 bg-base-content/30" aria-hidden="true">B</span>
-                  <span class="text-[10px] text-base-content/35 uppercase tracking-[0.1em] font-semibold">built-in prompts</span>
-                </div>
+                {@render sectionHeader('B', 'bg-base-content/30', 'built-in prompts')}
                 <div class="opacity-70">
-                  {#each builtinPrompts as prompt (prompt.name)}
-                    <div class="px-5 py-2.5 flex items-start gap-3 transition-colors hover:bg-base-content/[0.03]">
-                      <span class="min-w-0 flex-1">
-                        <span class="flex items-center gap-2 mb-0.5">
-                          <span class="text-sm font-mono text-base-content/80 truncate">{prompt.name}</span>
-                          {#if prompt.argumentHint}<span class="shrink-0 text-xs text-base-content/35 font-mono">{prompt.argumentHint}</span>{/if}
-                        </span>
-                        {#if prompt.description}<span class="text-xs text-base-content/40 leading-relaxed line-clamp-2">{prompt.description}</span>{/if}
-                      </span>
-                      <button
-                        onclick={() => { input = `/${prompt.name} `; showRightPanel = false; tick().then(() => inputEl?.focus()); }}
-                        class="shrink-0 mt-0.5 w-7 h-7 flex items-center justify-center text-base-content/30 hover:text-primary hover:bg-primary/10 rounded transition-colors"
-                        title="Use prompt"
-                        tabindex={showRightPanel ? 0 : -1}
-                      ><svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 10 4 15 9 20"/><path d="M20 4v7a4 4 0 0 1-4 4H4"/></svg></button>
-                    </div>
-                  {/each}
+                  {#each builtinPrompts as prompt (prompt.name)}{@render promptItem(prompt)}{/each}
                 </div>
               {/if}
             {/if}
@@ -4197,7 +4213,7 @@
                 onclick={() => (settingsSection = section.id)}
                 class="w-full flex items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm transition-colors {settingsSection === section.id ? 'bg-base-content/10 text-base-content' : 'text-base-content/62 hover:text-base-content/85 hover:bg-base-content/[0.055]'}"
               >
-                <span class="w-5 text-center text-base-content/45">{section.icon}</span>
+                <span class="w-5 flex items-center justify-center text-base-content/45"><section.icon class="w-4 h-4" /></span>
                 <span>{section.label}</span>
               </button>
             {/each}
@@ -4224,7 +4240,7 @@
                 {SETTINGS_SECTIONS.find((s) => s.id === settingsSection)?.label ?? 'Settings'}
               </Dialog.Title>
               <Dialog.Description class="text-xs text-base-content/38 mt-0.5">
-                {#if settingsSection === 'session'}Defaults and behavior for session runs{:else if settingsSection === 'voice'}Speech synthesis and voice loop controls{:else if settingsSection === 'shortcuts'}Keyboard shortcuts available in the chat UI{:else if settingsSection === 'extensions'}Loaded extensions and their tools/commands{:else}Runtime information and server controls{/if}
+                {#if settingsSection === 'session'}Defaults and behavior for session runs{:else if settingsSection === 'voice'}Speech synthesis and voice loop controls{:else if settingsSection === 'shortcuts'}Keyboard shortcuts available in the chat UI{:else if settingsSection === 'extensions'}Loaded extensions and their tools/commands{:else if settingsSection === 'updates'}Check and apply pi-ui or SDK updates{:else}Runtime information and server controls{/if}
               </Dialog.Description>
             </div>
             <button
@@ -4329,7 +4345,7 @@
                                 {#if ext.tools.length > 0}
                                   <details class="group px-4 py-2">
                                     <summary class="cursor-pointer text-xs font-medium text-base-content/55 hover:text-base-content/75 transition-colors list-none flex items-center gap-1.5">
-                                      <span class="transition-transform group-open:rotate-90">▸</span>
+                                      <ChevronRight class="w-3 h-3 transition-transform group-open:rotate-90" />
                                       Tools ({ext.tools.length})
                                     </summary>
                                     <div class="mt-1.5 ml-4 space-y-1">
@@ -4347,7 +4363,7 @@
                                 {#if ext.commands.length > 0}
                                   <details class="group px-4 py-2">
                                     <summary class="cursor-pointer text-xs font-medium text-base-content/55 hover:text-base-content/75 transition-colors list-none flex items-center gap-1.5">
-                                      <span class="transition-transform group-open:rotate-90">▸</span>
+                                      <ChevronRight class="w-3 h-3 transition-transform group-open:rotate-90" />
                                       Commands ({ext.commands.length})
                                     </summary>
                                     <div class="mt-1.5 ml-4 space-y-1">
@@ -4379,7 +4395,7 @@
                   {#if extensionErrors.length > 0}
                     <details class="group">
                       <summary class="cursor-pointer text-xs font-medium text-error/70 hover:text-error transition-colors list-none flex items-center gap-1.5">
-                        <span class="transition-transform group-open:rotate-90">▸</span>
+                        <ChevronRight class="w-3 h-3 transition-transform group-open:rotate-90" />
                         Errors ({extensionErrors.length})
                       </summary>
                       <div class="mt-2 space-y-1.5">
@@ -4393,6 +4409,116 @@
                     </details>
                   {/if}
                 {/if}
+              {:else if settingsSection === 'updates'}
+                <div class="space-y-4">
+                  <Card.Root size="sm" class="py-0 overflow-hidden bg-base-100/60 border-base-content/10">
+                    <div class="divide-y divide-base-content/8">
+                      <div class="flex items-center gap-3 px-4 py-3">
+                        <div class="flex-1 min-w-0">
+                          <p class="text-sm text-base-content/75">Update status</p>
+                          <p class="text-xs text-base-content/35 mt-0.5">Checks npm for latest versions. Update actions run on the server.</p>
+                        </div>
+                        <button
+                          onclick={refreshUpdateStatus}
+                          disabled={wsState !== 'open' || updateLoading || updateRunning}
+                          class="px-3 py-1.5 text-xs rounded-lg font-medium transition-colors {wsState === 'open' && !updateLoading && !updateRunning ? 'text-primary hover:bg-primary/10' : 'text-base-content/25 cursor-default'}"
+                        >{updateLoading ? 'Checking…' : 'Check'}</button>
+                      </div>
+
+                      <div class="grid grid-cols-1 sm:grid-cols-2 divide-y sm:divide-y-0 sm:divide-x divide-base-content/8">
+                        <div class="px-4 py-3 space-y-3">
+                          <div>
+                            <p class="text-xs text-base-content/35">pi-ui</p>
+                            <p class="mt-1 text-sm text-base-content/75 font-mono">{versionText(updateStatus?.ui.current ?? uiVersion)}</p>
+                            <p class="mt-0.5 text-xs text-base-content/40">Latest: {versionText(updateStatus?.ui.latest)}</p>
+                            {#if updateStatus?.ui.error}
+                              <p class="mt-1 text-xs text-warning/80">{updateStatus.ui.error}</p>
+                            {:else if updateStatus?.ui.updateAvailable}
+                              <p class="mt-1 text-xs text-success/80">Update available</p>
+                            {:else if updateStatus?.ui.latest}
+                              <p class="mt-1 text-xs text-base-content/35">Up to date</p>
+                            {/if}
+                          </div>
+                          <button
+                            onclick={() => runUpdate('ui')}
+                            disabled={wsState !== 'open' || updateRunning || !updateStatus?.canUpdateUi}
+                            class="w-full px-3 py-2 text-xs rounded-lg font-medium transition-colors {wsState === 'open' && !updateRunning && updateStatus?.canUpdateUi ? 'bg-primary/15 text-primary hover:bg-primary/25' : 'bg-base-content/8 text-base-content/28 cursor-default'}"
+                          >{updateRunning && updateTarget === 'ui' ? 'Updating pi-ui…' : 'Update pi-ui'}</button>
+                          {#if updateStatus && !updateStatus.canUpdateUi}
+                            <p class="text-[11px] text-base-content/35 leading-snug">This run is ephemeral; restart with the latest package instead.</p>
+                          {/if}
+                        </div>
+
+                        <div class="px-4 py-3 space-y-3">
+                          <div>
+                            <p class="text-xs text-base-content/35">pi SDK</p>
+                            <p class="mt-1 text-sm text-base-content/75 font-mono">{versionText(updateStatus?.sdk.current ?? piVersion)}</p>
+                            <p class="mt-0.5 text-xs text-base-content/40">Latest: {versionText(updateStatus?.sdk.latest)}</p>
+                            {#if updateStatus?.sdk.error}
+                              <p class="mt-1 text-xs text-warning/80">{updateStatus.sdk.error}</p>
+                            {:else if updateStatus?.sdk.updateAvailable}
+                              <p class="mt-1 text-xs text-success/80">Update available</p>
+                            {:else if updateStatus?.sdk.latest}
+                              <p class="mt-1 text-xs text-base-content/35">Up to date</p>
+                            {/if}
+                          </div>
+                          <button
+                            onclick={() => runUpdate('sdk')}
+                            disabled={wsState !== 'open' || updateRunning || !updateStatus?.canUpdateSdk}
+                            class="w-full px-3 py-2 text-xs rounded-lg font-medium transition-colors {wsState === 'open' && !updateRunning && updateStatus?.canUpdateSdk ? 'bg-primary/15 text-primary hover:bg-primary/25' : 'bg-base-content/8 text-base-content/28 cursor-default'}"
+                          >{updateRunning && updateTarget === 'sdk' ? 'Updating SDK…' : 'Update SDK'}</button>
+                          {#if updateStatus && !updateStatus.canUpdateSdk}
+                            <p class="text-[11px] text-base-content/35 leading-snug">SDK-only updates are available from source checkouts only. Package installs update the SDK with pi-ui.</p>
+                          {/if}
+                        </div>
+                      </div>
+
+                      {#if updateStatus}
+                        <div class="px-4 py-3 space-y-1.5">
+                          <p class="text-xs text-base-content/35">App directory</p>
+                          <p class="text-xs text-base-content/65 font-mono break-all">{updateStatus.appRoot}</p>
+                          <p class="text-xs text-base-content/35">Mode: {updateStatus.mode === 'source' ? 'source checkout' : updateStatus.mode === 'ephemeral' ? 'ephemeral run' : 'package install'}</p>
+                          {#if updateStatus.updateCommand}
+                            <p class="text-xs text-base-content/35">Update command: <span class="font-mono text-base-content/60">{updateStatus.updateCommand}</span></p>
+                          {/if}
+                        </div>
+                      {/if}
+                    </div>
+                  </Card.Root>
+
+                  {#if updateFeedback}
+                    <Card.Root size="sm" class="py-0 overflow-hidden {updateFeedback.success ? 'bg-success/5 border-success/20' : 'bg-error/5 border-error/20'}">
+                      <div class="px-4 py-3 flex flex-col sm:flex-row sm:items-center gap-3">
+                        <div class="flex-1 min-w-0">
+                          <p class="text-sm {updateFeedback.success ? 'text-success/85' : 'text-error/85'}">{updateFeedback.message}</p>
+                          {#if updateFeedback.restartRequired}
+                            <p class="text-xs text-base-content/40 mt-0.5">Restart is required before the new version is loaded.</p>
+                          {/if}
+                        </div>
+                        {#if updateFeedback.restartRequired}
+                          <button
+                            onclick={() => restartServer(Boolean(updateFeedback?.reloadRequired))}
+                            class="px-3 py-1.5 text-xs rounded-lg font-medium text-primary bg-primary/12 hover:bg-primary/20 transition-colors"
+                          >{updateFeedback.reloadRequired ? 'Restart + reload' : 'Restart now'}</button>
+                        {/if}
+                      </div>
+                    </Card.Root>
+                  {/if}
+
+                  {#if updateStatus?.notes.length}
+                    <Card.Root size="sm" class="py-0 overflow-hidden bg-base-100/45 border-base-content/10">
+                      <div class="px-4 py-3 space-y-1">
+                        {#each updateStatus.notes as note (note)}
+                          <p class="text-xs text-base-content/42 leading-snug">{note}</p>
+                        {/each}
+                      </div>
+                    </Card.Root>
+                  {/if}
+
+                  {#if updateLog}
+                    <pre class="max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-xl border border-base-content/10 bg-base-300/70 p-3 text-[11px] leading-relaxed text-base-content/60 font-mono">{updateLog}</pre>
+                  {/if}
+                </div>
               {:else}
                 <Card.Root size="sm" class="py-0 overflow-hidden bg-base-100/60 border-base-content/10">
                   <div class="divide-y divide-base-content/8">
@@ -4427,7 +4553,7 @@
                         <p class="text-xs text-base-content/35 mt-0.5">Reconnects after the Bun process restarts.</p>
                       </div>
                       <button
-                        onclick={restartServer}
+                        onclick={() => restartServer()}
                         class="px-3 py-1.5 text-xs rounded-lg font-medium transition-colors {wsState === 'open' ? 'text-error/75 hover:text-error hover:bg-error/10' : 'text-base-content/25 cursor-default'}"
                         disabled={wsState !== 'open'}
                         aria-label="Restart server"
@@ -4449,7 +4575,8 @@
 
 <!-- ── Restarting overlay ───────────────────────────────────────────────────── -->
 {#if isRestarting}
-  <div class="fixed inset-0 z-50 flex flex-col items-center justify-center bg-base-100/90 backdrop-blur-sm gap-3">
+  <div class="aurora fixed inset-0 z-50 flex flex-col items-center justify-center bg-base-100/92 backdrop-blur-sm gap-4">
+    <span class="pi-glyph pi-glyph-breathe text-6xl font-light leading-none select-none">π</span>
     <p class="font-mono text-base-content/70 text-sm">restarting server…</p>
     <p class="font-mono text-base-content/35 text-xs">reconnecting automatically</p>
   </div>
@@ -4457,12 +4584,17 @@
 
 <!-- ── Toast notifications ─────────────────────────────────────────────────── -->
 {#if toasts.length > 0}
-  <div class="fixed bottom-4 right-4 z-50 flex flex-col gap-2 pointer-events-none" aria-live="polite">
+  <div
+    class="fixed left-4 right-4 sm:left-auto z-50 flex flex-col items-stretch sm:items-end gap-2 pointer-events-none"
+    style="bottom: calc(env(safe-area-inset-bottom, 0px) + 1rem);"
+    aria-live="polite"
+  >
     {#each toasts as toast (toast.id)}
-      <div class="pointer-events-auto flex items-start gap-2 px-4 py-3 rounded-xl text-sm max-w-xs shadow-lg
-        {toast.type === 'error' ? 'bg-error/90 text-error-content' : toast.type === 'warning' ? 'bg-warning/90 text-warning-content' : 'bg-base-content/90 text-base-100'}">
+      <div class="pointer-events-auto msg-in flex items-start gap-2.5 px-4 py-3 rounded-2xl text-sm sm:max-w-xs shadow-xl shadow-black/30 backdrop-blur-md border bg-base-200/92 text-base-content
+        {toast.type === 'error' ? 'border-error/35' : toast.type === 'warning' ? 'border-warning/35' : 'border-base-content/12'}">
+        <span class="mt-1.5 w-1.5 h-1.5 rounded-full shrink-0 {toast.type === 'error' ? 'bg-error' : toast.type === 'warning' ? 'bg-warning' : 'bg-primary'}"></span>
         <span class="flex-1 leading-relaxed">{toast.message}</span>
-        <button onclick={() => dismissToast(toast.id)} class="shrink-0 opacity-50 hover:opacity-100 transition-opacity leading-none mt-0.5" aria-label="Dismiss">×</button>
+        <button onclick={() => dismissToast(toast.id)} class="shrink-0 text-base-content/40 hover:text-base-content transition-colors mt-0.5" aria-label="Dismiss"><X class="w-3.5 h-3.5" /></button>
       </div>
     {/each}
   </div>
@@ -4488,8 +4620,50 @@
       </div>
     {:else if modal?.method === 'editor'}
       <textarea bind:this={modalFocusEl} bind:value={modalInput} rows={8} class="w-full bg-transparent border border-border focus:border-foreground/60 outline-none p-3 text-sm leading-relaxed resize-none rounded-lg transition-colors"></textarea>
-    {:else if modal?.method === 'custom'}
-      {#if modal.parsed?.kind === 'select'}
+      {:else if modal?.method === 'custom'}
+      {#if modal.parsed?.kind === 'container'}
+        {#snippet renderParsed(comp: ParsedComponent)}
+          {#if comp.kind === 'select'}
+            <div class="space-y-1 max-h-60 overflow-y-auto">
+              {#each comp.options as opt (opt.value)}
+                <button class="w-full text-left px-3 py-2.5 rounded-lg text-sm text-muted-foreground hover:bg-accent hover:text-accent-foreground transition-colors" onclick={() => modalSelectOption(opt.value)}>
+                  {opt.label}
+                  {#if opt.description}
+                    <span class="text-xs text-muted-foreground/60 ml-2">{opt.description}</span>
+                  {/if}
+                </button>
+              {/each}
+            </div>
+          {:else if comp.kind === 'input'}
+            <p class="text-sm text-muted-foreground mb-2">{comp.label || 'Enter your response:'}</p>
+            {#if comp.multiline}
+              <textarea bind:this={modalFocusEl} bind:value={modalInput} placeholder={comp.placeholder ?? ''} rows={6} class="w-full bg-transparent border border-border focus:border-foreground/60 outline-none p-3 text-sm leading-relaxed resize-none rounded-lg transition-colors"></textarea>
+            {:else}
+              <input bind:this={modalFocusEl} type="text" bind:value={modalInput} placeholder={comp.placeholder ?? ''} class="w-full bg-transparent border-b border-border focus:border-foreground/60 outline-none py-2 text-sm placeholder-muted-foreground transition-colors" />
+            {/if}
+          {:else if comp.kind === 'text'}
+            <pre class="text-xs text-muted-foreground whitespace-pre-wrap leading-relaxed bg-base-content/5 rounded p-3 mb-2 max-h-48 overflow-y-auto">{comp.content}</pre>
+          {:else if comp.kind === 'button'}
+            <button class="w-full text-left px-3 py-2 rounded-lg text-sm hover:bg-accent hover:text-accent-foreground transition-colors border border-border {comp.variant === 'primary' ? 'bg-primary/10 text-primary' : ''}" onclick={() => modalSelectOption(comp.label)}>{comp.label}</button>
+          {:else if comp.kind === 'checkbox'}
+            <div class="flex items-center gap-2 px-3 py-2 text-sm text-muted-foreground">
+              <span class="w-4 h-4 rounded border {comp.checked ? 'bg-primary/20 border-primary' : 'border-border'} flex items-center justify-center text-xs">
+                {#if comp.checked}<svg class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M5 12l5 5 9-9"/></svg>{/if}
+              </span>
+              <span>{comp.label}</span>
+            </div>
+          {:else if comp.kind === 'container'}
+            <div class="flex flex-col gap-1 {comp.direction === 'horizontal' ? 'flex-row gap-3' : ''}">
+              {#each comp.children as child (child.kind + (JSON.stringify(child)))}
+                {@render renderParsed(child)}
+              {/each}
+            </div>
+          {/if}
+        {/snippet}
+
+        {@render renderParsed(modal.parsed)}
+        <input bind:this={modalFocusEl} type="text" bind:value={modalInput} placeholder="Type your response…" class="w-full bg-transparent border-b border-border focus:border-foreground/60 outline-none py-2 text-sm placeholder-muted-foreground transition-colors" />
+      {:else if modal.parsed?.kind === 'select'}
         <p class="text-sm text-muted-foreground mb-2">{modal.parsed.label || 'Select an option:'}</p>
         <div class="space-y-1 max-h-60 overflow-y-auto">
           {#each modal.parsed.options as opt (opt.value)}
@@ -4563,6 +4737,70 @@
   </Dialog.Content>
 </Dialog.Root>
 
+{#snippet renderNode(nodes: TreeNode[], depth: number)}
+  {#each nodes as node (node.entryId)}
+    <div class="flex items-start gap-2" style="padding-left: {depth * 1.25}rem;">
+      {#if node.children.length > 0}
+        <span class="text-base-content/30 shrink-0 mt-0.5 select-none">
+          <svg class="w-3 h-3" viewBox="0 0 24 24" fill="currentColor"><path d="M9 5l7 7-7 7"/></svg>
+        </span>
+      {:else}
+        <span class="w-3 shrink-0"></span>
+      {/if}
+      <div class="min-w-0 flex-1 py-1.5">
+        <div class="flex items-baseline gap-2">
+          {#if node.role === 'user'}
+            <span class="text-xs font-semibold text-info/80">user</span>
+          {:else if node.role === 'assistant'}
+            <span class="text-xs font-semibold text-success/80">assistant</span>
+          {:else if node.role === 'toolResult'}
+            <span class="text-xs font-semibold text-warning/80">tool</span>
+          {:else}
+            <span class="text-xs font-semibold text-base-content/40">{node.type}</span>
+          {/if}
+          {#if node.text}
+            <span class="text-xs text-base-content/60 truncate">{node.text}</span>
+          {:else if node.label}
+            <span class="text-xs text-base-content/40 italic truncate">[{node.label}]</span>
+          {:else}
+            <span class="text-xs text-base-content/30 italic">(empty)</span>
+          {/if}
+        </div>
+      </div>
+    </div>
+    {#if node.children.length > 0}
+      {@render renderNode(node.children, depth + 1)}
+    {/if}
+  {/each}
+{/snippet}
+
+<!-- ── Session tree modal ──────────────────────────────────────────────────── -->
+<Dialog.Root bind:open={showTreeModal}>
+  <Dialog.Content class="font-mono max-w-2xl">
+    <Dialog.Header>
+      <Dialog.Title>Session tree</Dialog.Title>
+      <Dialog.Description>Hierarchical view of the session branch structure.</Dialog.Description>
+    </Dialog.Header>
+
+    {#if treeLoading}
+      <div class="flex items-center justify-center py-6 text-muted-foreground text-sm gap-2">
+        <svg class="w-4 h-4 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>
+        loading…
+      </div>
+    {:else if treeData.length === 0}
+      <p class="text-sm text-muted-foreground py-4 text-center">Session tree is empty.</p>
+    {:else}
+      <div class="max-h-96 overflow-y-auto py-2 space-y-0.5">
+        {@render renderNode(treeData, 0)}
+      </div>
+    {/if}
+
+    <Dialog.Footer>
+      <Button variant="ghost" size="sm" onclick={() => { showTreeModal = false; }}>close</Button>
+    </Dialog.Footer>
+  </Dialog.Content>
+</Dialog.Root>
+
 <FileViewerModal
   open={fileViewerOpen}
   path={fileViewerPath}
@@ -4570,7 +4808,9 @@
   content={fileViewerContent}
   loading={fileViewerLoading}
   error={fileViewerError}
+  saving={fileSaving}
   onclose={() => { fileViewerOpen = false; }}
+  onsave={handleFileSave}
   oninsert={() => {
     const ref = fileViewerPath.includes('/') ? fileViewerPath.split('/').pop() ?? fileViewerPath : fileViewerPath;
     input = input + `@${ref} `;
@@ -4580,6 +4820,85 @@
 />
 
 <style>
+  .trace-step {
+    --trace-icon-col: 1.25rem;
+    --trace-label-col: 5.75rem;
+    --trace-gap: 0.5rem;
+  }
+
+  .trace-row {
+    display: grid;
+    grid-template-columns: var(--trace-icon-col) var(--trace-label-col) minmax(0, 1fr) auto;
+    column-gap: var(--trace-gap);
+    align-items: center;
+    min-height: 1.5rem;
+    padding: 0.125rem 0;
+    font-size: 0.75rem;
+    line-height: 1.25rem;
+    color: color-mix(in oklch, var(--color-base-content) 56%, transparent);
+  }
+
+  .trace-row-toggle {
+    border-radius: 0.625rem;
+    transition: background-color 150ms ease, color 150ms ease;
+  }
+
+  .trace-row-toggle:hover {
+    background: color-mix(in oklch, var(--color-base-content) 5%, transparent);
+  }
+
+  .trace-row-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    justify-self: center;
+    width: 1rem;
+    height: 1rem;
+  }
+
+  .trace-row-label {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-weight: 600;
+    color: color-mix(in oklch, var(--color-base-content) 72%, transparent);
+  }
+
+  .trace-row-detail {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: color-mix(in oklch, var(--color-base-content) 52%, transparent);
+  }
+
+  .trace-row-meta {
+    display: inline-flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 0.375rem;
+    min-width: max-content;
+    color: color-mix(in oklch, var(--color-base-content) 42%, transparent);
+  }
+
+  .trace-body,
+  .trace-meta,
+  .trace-output {
+    margin-left: calc(var(--trace-icon-col) + var(--trace-gap));
+  }
+
+  .trace-output {
+    padding-left: 0.75rem;
+    border-left: 1px solid color-mix(in oklch, var(--color-base-content) 12%, transparent);
+  }
+
+  @media (max-width: 639px) {
+    .trace-step {
+      --trace-label-col: 4.5rem;
+    }
+  }
+
   /* ── Trace cluster two-level spacing ────────────────────────────────
    * Thinking and tool messages form a flat DOM sequence.  Adjacent
    * selectors create the grouped rhythm: tight inside a reasoning step,

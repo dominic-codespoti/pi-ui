@@ -10,6 +10,8 @@
     error,
     onclose,
     oninsert,
+    onsave,
+    saving,
   }: {
     open: boolean;
     path: string;
@@ -19,10 +21,36 @@
     error: string | null;
     onclose: () => void;
     oninsert: () => void;
+    onsave?: (content: string) => void;
+    saving?: boolean;
   } = $props();
 
   let copied = $state(false);
+  let editing = $state(false);
+  let editContent = $state('');
   let contentEl = $state<HTMLElement | undefined>(undefined);
+
+  function startEdit() {
+    editContent = content;
+    editing = true;
+  }
+
+  function cancelEdit() {
+    editing = false;
+    editContent = '';
+  }
+
+  function saveEdit() {
+    onsave?.(editContent);
+  }
+
+  // Close edit mode after successful save
+  $effect(() => {
+    if (saving === false && editing) {
+      editing = false;
+      editContent = '';
+    }
+  });
 
   // Detect language from file extension
   const lang = $derived.by(() => {
@@ -39,8 +67,7 @@
 
   // Scroll to target line when content loads
   $effect(() => {
-    if (content && line && contentEl) {
-      // Find the target line element
+    if (content && line && contentEl && !editing) {
       const timer = setTimeout(() => {
         const lineEl = contentEl?.querySelector(`[data-line="${line}"]`);
         if (lineEl) {
@@ -59,7 +86,7 @@
   }
 
   function handleKeydown(e: KeyboardEvent) {
-    if (e.key === 'Escape') onclose();
+    if (e.key === 'Escape' && !editing) onclose();
   }
 
   const lines = $derived(content ? content.split('\n') : []);
@@ -87,25 +114,39 @@
           <span class="text-xs text-base-content/40 shrink-0">:{line}</span>
         {/if}
         <div class="flex items-center gap-1.5 ml-auto shrink-0">
-          <button
-            class="px-2 py-1 text-xs rounded-md text-base-content/60 hover:text-base-content hover:bg-base-content/8 transition-colors"
-            onclick={handleCopy}
-          >
-            {#if copied}Copied{:else}Copy{/if}
-          </button>
-          <button
-            class="px-2 py-1 text-xs rounded-md text-primary/70 hover:text-primary hover:bg-primary/10 transition-colors"
-            onclick={oninsert}
-          >
-            Insert @file
-          </button>
-          <button
-            class="ml-1 p-1 rounded-md text-base-content/40 hover:text-base-content hover:bg-base-content/8 transition-colors"
-            onclick={onclose}
-            aria-label="Close"
-          >
-            <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
-          </button>
+          {#if editing}
+            <button
+              class="px-2 py-1 text-xs rounded-md text-base-content/60 hover:text-base-content hover:bg-base-content/8 transition-colors"
+              onclick={cancelEdit}
+            >Cancel</button>
+            <button
+              class="px-2 py-1 text-xs rounded-md text-success/80 hover:text-success hover:bg-success/10 transition-colors"
+              onclick={saveEdit}
+              disabled={saving}
+            >{#if saving}saving…{:else}Save{/if}</button>
+          {:else}
+            <button
+              class="px-2 py-1 text-xs rounded-md text-base-content/60 hover:text-base-content hover:bg-base-content/8 transition-colors"
+              onclick={handleCopy}
+            >
+              {#if copied}Copied{:else}Copy{/if}
+            </button>
+            <button
+              class="px-2 py-1 text-xs rounded-md text-primary/70 hover:text-primary hover:bg-primary/10 transition-colors"
+              onclick={oninsert}
+            >Insert @file</button>
+            <button
+              class="px-2 py-1 text-xs rounded-md text-warning/70 hover:text-warning hover:bg-warning/10 transition-colors"
+              onclick={startEdit}
+            >Edit</button>
+            <button
+              class="ml-1 p-1 rounded-md text-base-content/40 hover:text-base-content hover:bg-base-content/8 transition-colors"
+              onclick={onclose}
+              aria-label="Close"
+            >
+              <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+            </button>
+          {/if}
         </div>
       </div>
 
@@ -122,6 +163,11 @@
           <div class="flex items-center justify-center py-16 text-error/60 text-sm">
             {error}
           </div>
+        {:else if editing}
+          <textarea
+            class="w-full h-full min-h-[50vh] bg-transparent border-0 outline-none p-4 font-mono text-xs leading-relaxed resize-none"
+            bind:value={editContent}
+          ></textarea>
         {:else}
           <div class="file-content font-mono text-xs leading-[1.5] select-text">
             {#each lines as contentLine, i (i)}

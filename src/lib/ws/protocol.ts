@@ -38,6 +38,28 @@ export interface SessionSummary {
   firstMessage: string;
 }
 
+/**
+ * A first-class project — a working directory pi-ui knows about.
+ * Combines the server's persisted project registry with directories
+ * discovered from existing session files.
+ */
+export interface ProjectInfo {
+  /** Absolute path of the project directory (canonical identifier). */
+  cwd: string;
+  /** Display name — defaults to the directory basename, user-renamable. */
+  name: string;
+  /** Pinned projects sort to the top of pickers and the sidebar. */
+  pinned: boolean;
+  /** Whether the directory currently exists on disk. */
+  exists: boolean;
+  /** True when the project is in the persisted registry (vs. only inferred from sessions). */
+  registered: boolean;
+  /** Number of persisted sessions whose cwd is this directory. */
+  sessionCount: number;
+  /** Unix ms of the most recent activity (session modified or last opened). */
+  lastActivity: number;
+}
+
 export interface ProviderInfo {
   id: string;
   /** Human-readable display name */
@@ -81,6 +103,28 @@ export interface ExtensionSummary {
   flags?: string[];
 }
 
+export interface UpdatePackageStatus {
+  name: string;
+  current: string;
+  latest?: string;
+  updateAvailable?: boolean;
+  error?: string;
+}
+
+export interface UpdateStatus {
+  appRoot: string;
+  mode: 'source' | 'package' | 'ephemeral';
+  updateCommand?: string;
+  busy: boolean;
+  canUpdateUi: boolean;
+  canUpdateSdk: boolean;
+  ui: UpdatePackageStatus;
+  sdk: UpdatePackageStatus;
+  notes: string[];
+}
+
+export type UpdateTarget = 'ui' | 'sdk';
+
 // ── Extension widget content types ────────────────────────────────────────────
 
 export type WidgetContent =
@@ -97,6 +141,16 @@ export interface HistoryWindow {
   limit: number;
   /** True when older raw SDK messages exist before offset. */
   hasMore: boolean;
+}
+
+/** A node in the session tree for visual display. */
+export interface TreeNode {
+  entryId: string;
+  type: string;
+  role?: string;
+  text?: string;
+  label?: string;
+  children: TreeNode[];
 }
 
 // ── Server → Browser ─────────────────────────────────────────────────────────
@@ -143,6 +197,7 @@ export interface ConnectedMessage {
  *   { type: "session_loaded",          sessionId, isStreaming, thinkingLevel, model, availableModels, messages, contextUsage }
  *   { type: "sessions_list",           sessions: SessionSummary[] }
  *   { type: "all_sessions_list",       sessions: SessionSummary[] }
+ *   { type: "projects_list",           projects: ProjectInfo[] }
  *   { type: "dir_completions",         prefix: string; entries: string[] }
  *   { type: "file_completions",        query: string; entries: string[] }
  *   { type: "providers_list",          providers: ProviderInfo[] }
@@ -154,6 +209,9 @@ export interface ConnectedMessage {
  *   { type: "extensions_list",         extensions: ExtensionSummary[], errors: Array<{ path: string; error: string }> }
  *   { type: "commands_list",           commands: Array<{ name: string; description?: string; source: string }> }
  *   { type: "skill_install_result",    success: boolean; name?: string; error?: string }
+ *   { type: "update_status",           ...UpdateStatus }
+ *   { type: "update_progress",         target: "ui" | "sdk", command?: string, message: string }
+ *   { type: "update_result",           target: "ui" | "sdk", success: boolean, message: string, output?: string, restartRequired?: boolean, reloadRequired?: boolean }
  *   { type: "restart_nonce",           nonce: string }
  *   { type: "server_restarting" }
  *   { type: "tts_summary",             text: string }
@@ -193,9 +251,13 @@ export interface ConnectedMessage {
  *     request_editor_text – request current textarea content (id)
  *     setWorkingMessage – streaming indicator text (message)
  *     setWorkingVisible – streaming indicator visibility (visible)
- *     setWorkingIndicator – no-op in web (TUI-only frames/intervalMs)
+ *     setWorkingIndicator – animated frame indicator (frames/intervalMs)
  *     setHiddenThinkingLabel – thinking label text (label)
  *     setToolsExpanded – global tool output expansion (expanded)
+ *     set_header – extension header content (content), or empty to clear
+ *     set_footer – extension footer content (content), or empty to clear
+ *     set_editor_component – parsed component panel above composer (parsed), or null to clear
+ *     extension_completions – response to get_extension_autocomplete (trigger, query, items[])
  */
 export type PiEvent = { type: string } & Record<string, unknown>;
 
@@ -222,10 +284,22 @@ export type ClientMessage =
   | { type: 'switch_session'; path: string }
   /** Request all sessions across all project directories. Server replies with all_sessions_list. */
   | { type: 'get_all_sessions' }
+  /** Request the merged project list (registry + session dirs). Server replies with projects_list. */
+  | { type: 'get_projects' }
+  /** Register a directory as a project without switching to it (created if missing). */
+  | { type: 'add_project'; path: string }
+  /** Forget a project from the registry. Sessions and files are untouched. */
+  | { type: 'remove_project'; cwd: string }
+  /** Pin or unpin a project. Pinning an unregistered project registers it. */
+  | { type: 'pin_project'; cwd: string; pinned: boolean }
+  /** Set a custom display name for a project. Empty name resets to the basename. */
+  | { type: 'rename_project'; cwd: string; name: string }
   /** Request filesystem directory entries for path autocomplete. Server replies with dir_completions. */
   | { type: 'dir_complete'; prefix: string }
   /** Request lightweight workspace file matches for composer @ references. */
   | { type: 'file_complete'; query: string }
+  /** Request extension-registered autocomplete items for a trigger character. */
+  | { type: 'get_extension_autocomplete'; trigger: string; query: string }
   /** Response to a blocking extension_ui_request (select / confirm / input / editor / custom). */
   | { type: 'extension_ui_response'; id: string; value?: string; confirmed?: boolean; cancelled?: true }
   /** Editor text content response to a request_editor_text extension_ui_request. */
@@ -270,6 +344,10 @@ export type ClientMessage =
    * Server replies with skill_install_result.
    */
   | { type: 'install_skill'; url: string; scope: 'project' | 'user' }
+  /** Check current and latest available pi-ui / pi SDK versions. */
+  | { type: 'get_update_status' }
+  /** Run an authenticated in-app update for the UI source checkout or pi SDK package. */
+  | { type: 'run_update'; target: UpdateTarget }
   /** Request a single-use nonce before restarting the server. */
   | { type: 'request_restart' }
   /** Restart the server process in-place (re-exec with same args + env). */
@@ -281,6 +359,10 @@ export type ClientMessage =
    */
   /** Execute a built-in slash command in the server session context. */
   | { type: 'run_builtin'; command: string; args?: string }
+  /** Request the session tree data for visual display. Server replies with session_tree. */
+  | { type: 'get_session_tree' }
   | { type: 'summarize_for_tts'; content: string }
   /** Request file contents for the file viewer modal. */
-  | { type: 'read_file'; path: string };
+  | { type: 'read_file'; path: string }
+  /** Write file content from the file viewer modal's edit mode. */
+  | { type: 'write_file'; path: string; content: string };

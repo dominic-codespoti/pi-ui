@@ -42,7 +42,7 @@
   const resizeCursorClass = $derived(side === 'left' ? 'cursor-col-resize' : 'cursor-col-resize');
   const panelStyle = $derived(
     isMobile
-      ? `width: min(${width}px, 90vw); transform: translateX(${open ? '0' : translateClosed}); transition: transform 220ms cubic-bezier(0.33,1,0.68,1); padding-top: env(safe-area-inset-top, 0px);`
+      ? `width: min(${width}px, 90vw); transform: translateX(${open ? '0' : translateClosed}); transition: transform 220ms cubic-bezier(0.33,1,0.68,1); padding-top: env(safe-area-inset-top, 0px); padding-bottom: env(safe-area-inset-bottom, 0px);`
       : `width: ${open ? width + 'px' : '0'}; transition: ${resizing ? 'none' : 'width 220ms cubic-bezier(0.33,1,0.68,1)'};`
   );
   const surfaceClass = $derived(

@@ -18,7 +18,5 @@ self.addEventListener('activate', (event) => {
   event.waitUntil(self.clients.claim());
 });
 
-self.addEventListener('fetch', (event) => {
-  // Let the browser handle all requests normally — no caching.
-  event.respondWith(fetch(event.request));
-});
+// No fetch handler — skip the SW hop entirely. The browser handles all
+// requests natively, which is faster than a no-op passthrough SW.

@@ -73,7 +73,25 @@ export interface ParsedText {
   content: string;
 }
 
-export type ParsedComponent = ParsedSelect | ParsedInput | ParsedText;
+export interface ParsedButton {
+  kind: 'button';
+  label: string;
+  variant?: 'default' | 'primary' | 'danger';
+}
+
+export interface ParsedCheckbox {
+  kind: 'checkbox';
+  label: string;
+  checked: boolean;
+}
+
+export interface ParsedContainer {
+  kind: 'container';
+  children: ParsedComponent[];
+  direction?: 'vertical' | 'horizontal';
+}
+
+export type ParsedComponent = ParsedContainer | ParsedSelect | ParsedInput | ParsedText | ParsedButton | ParsedCheckbox;
 
 // ── Component tree walker ─────────────────────────────────────────────────────
 
@@ -129,10 +147,58 @@ function isText(comp: Record<string, unknown>): boolean {
 }
 
 /**
+ * Duck-type check: does this object look like a Button?
+ * Button has: label (string), onClick (function), optionally variant (string)
+ */
+function isButton(comp: Record<string, unknown>): boolean {
+  return (
+    typeof comp.label === 'string' &&
+    typeof comp.onClick === 'function'
+  );
+}
+
+/**
+ * Duck-type check: does this object look like a Checkbox / toggle?
+ * Checkbox has: checked (boolean), onToggle (function), optionally label (string)
+ */
+function isCheckbox(comp: Record<string, unknown>): boolean {
+  return (
+    typeof comp.checked === 'boolean' &&
+    typeof comp.onToggle === 'function'
+  );
+}
+
+/**
+ * Duck-type check: does this object look like a Spacer (used for layout gaps)?
+ * Spacer has: size (number), render returns empty lines.
+ */
+function isSpacer(comp: Record<string, unknown>): boolean {
+  return (
+    typeof comp.size === 'number' &&
+    typeof comp.addChild !== 'function' &&
+    !isText(comp)
+  );
+}
+
+/**
+ * Duck-type check: does this object look like a Markdown block?
+ * Markdown has: markdown (string), options (object)
+ */
+function isMarkdownBlock(comp: Record<string, unknown>): boolean {
+  return (
+    typeof comp.markdown === 'string' &&
+    typeof comp.invalidate === 'function'
+  );
+}
+
+/**
  * Walk a pi-tui Component tree and extract structured data for web rendering.
  *
- * Returns the most prominent interactive element found (SelectList > Input > Text),
- * plus all text content as a fallback label.
+ * Unlike the previous version which returned only the first interactive element,
+ * this version returns a recursive container tree that preserves the full layout:
+ * - Containers with children are returned as ParsedContainer 
+ * - Leaf components are returned as their respective types
+ * - Direction (vertical/horizontal) is inferred from container properties
  */
 export function parseComponentTree(
   comp: Record<string, unknown>,
@@ -141,7 +207,6 @@ export function parseComponentTree(
   // ── Leaf: SelectList ──────────────────────────────────────────────────
   if (isSelectList(comp)) {
     const items = comp.items as { value: string; label: string; description?: string }[];
-    // Try to find a label from sibling Text components (check parent context)
     const label = extractLabel(comp);
     return { kind: 'select', label, options: items };
   }
@@ -160,32 +225,52 @@ export function parseComponentTree(
     return { kind: 'text', label: '', content };
   }
 
+  // ── Leaf: Button ──────────────────────────────────────────────────────
+  if (isButton(comp)) {
+    const label = typeof comp.label === 'string' ? comp.label : '';
+    const variant = typeof comp.variant === 'string' ? comp.variant as 'default' | 'primary' | 'danger' : undefined;
+    return { kind: 'button', label, variant };
+  }
+
+  // ── Leaf: Checkbox ────────────────────────────────────────────────────
+  if (isCheckbox(comp)) {
+    const label = extractLabel(comp) || '';
+    return { kind: 'checkbox', label, checked: !!comp.checked };
+  }
+
+  // ── Composite: Spacer (skip — no visual content) ──────────────────────
+  if (isSpacer(comp)) {
+    return { kind: 'text', label: '', content: '' };
+  }
+
+  // ── Composite: Markdown ───────────────────────────────────────────────
+  if (isMarkdownBlock(comp)) {
+    return { kind: 'text', label: '', content: comp.markdown as string };
+  }
+
   // ── Composite: Container/Box — recurse into children ──────────────────
   if (isContainer(comp)) {
     const children = comp.children as Record<string, unknown>[];
-    // First pass: look for interactive elements
+    const direction = typeof comp.direction === 'string'
+      ? (comp.direction === 'row' ? 'horizontal' as const : 'vertical' as const)
+      : typeof comp.align === 'string'
+        ? 'horizontal' as const
+        : 'vertical' as const;
+
+    const parsedChildren: ParsedComponent[] = [];
     for (const child of children) {
-      if (isSelectList(child)) return parseComponentTree(child, width);
-      if (isInput(child)) return parseComponentTree(child, width);
+      const parsed = parseComponentTree(child, width);
+      // Skip empty text results (from spacers, empty containers)
+      if (parsed.kind === 'text' && !parsed.content) continue;
+      parsedChildren.push(parsed);
     }
-    // Second pass: look for text content (used as labels/descriptions)
-    const textParts: string[] = [];
-    for (const child of children) {
-      if (isText(child)) {
-        const raw = child.text as string;
-        textParts.push(stripAnsi(raw));
-      } else if (isContainer(child)) {
-        // Recurse into nested containers
-        const nested = parseComponentTree(child, width);
-        if (nested.kind === 'text' && nested.content) {
-          textParts.push(nested.content);
-        }
-      }
+    if (parsedChildren.length === 0) {
+      return { kind: 'text', label: '', content: '' };
     }
-    // If we found text but no interactive element, return as text
-    if (textParts.length > 0) {
-      return { kind: 'text', label: '', content: textParts.join('\n').trim() };
+    if (parsedChildren.length === 1) {
+      return parsedChildren[0];
     }
+    return { kind: 'container', children: parsedChildren, direction };
   }
 
   // ── Fallback: try render() for unknown components ─────────────────────
@@ -255,7 +340,10 @@ export async function callFactoryAndParse(
 
     const parsed = parseComponentTree(component);
     // Inject title if the component didn't provide one
-    if (!parsed.label && title) parsed.label = title;
+    if (title && parsed.kind !== 'container') {
+      const p = parsed as unknown as { label?: string };
+      if (!p.label) p.label = title;
+    }
     return parsed;
   } catch {
     return null;

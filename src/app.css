@@ -3,6 +3,56 @@
   themes: night, dark, dracula, synthwave, forest, luxury, coffee, sunset, dim, black, nord, abyss, winter, emerald;
 }
 
+/* ── Signature theme: "pi" ─────────────────────────────────────────────────
+ * Deep ink-violet obsidian base with an iridescent violet → cyan → mint
+ * accent ramp. Designed for long terminal-adjacent reading sessions:
+ * low-chroma surfaces, calm contrast tiers, glowing accents used sparingly.
+ */
+@plugin "daisyui/theme" {
+  name: "pi";
+  default: true;
+  prefersdark: true;
+  color-scheme: dark;
+
+  --color-base-100: oklch(20% 0.018 290);
+  --color-base-200: oklch(16% 0.016 290);
+  --color-base-300: oklch(13% 0.015 290);
+  --color-base-content: oklch(88% 0.012 290);
+
+  --color-primary: oklch(74% 0.15 300);
+  --color-primary-content: oklch(16% 0.04 300);
+
+  --color-secondary: oklch(76% 0.11 215);
+  --color-secondary-content: oklch(16% 0.04 215);
+
+  --color-accent: oklch(79% 0.13 170);
+  --color-accent-content: oklch(16% 0.04 170);
+
+  --color-neutral: oklch(24% 0.02 290);
+  --color-neutral-content: oklch(88% 0.012 290);
+
+  --color-info: oklch(74% 0.12 230);
+  --color-info-content: oklch(16% 0.04 230);
+
+  --color-success: oklch(76% 0.14 160);
+  --color-success-content: oklch(16% 0.04 160);
+
+  --color-warning: oklch(83% 0.13 85);
+  --color-warning-content: oklch(20% 0.05 85);
+
+  --color-error: oklch(70% 0.17 22);
+  --color-error-content: oklch(97% 0.01 22);
+
+  --radius-selector: 0.75rem;
+  --radius-field: 0.75rem;
+  --radius-box: 1rem;
+  --size-selector: 0.25rem;
+  --size-field: 0.25rem;
+  --border: 1px;
+  --depth: 0;
+  --noise: 0;
+}
+
 html { height: 100%; overflow: hidden; }
 
 /* ── Hide scrollbars on mobile while keeping scroll functionality ───────── */
@@ -17,7 +67,30 @@ html { height: 100%; overflow: hidden; }
 }
 body { display: flex; flex-direction: row; height: 100dvh; overflow: hidden; }
 
-/* ── Make Tailwind dark: variants fire on our daisyUI night theme ─────────── */
+/* ── Slim, theme-aware scrollbars on pointer devices ─────────────────────── */
+@media (pointer: fine) {
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: color-mix(in oklch, var(--color-base-content) 16%, transparent) transparent;
+  }
+  *::-webkit-scrollbar { width: 8px; height: 8px; }
+  *::-webkit-scrollbar-track { background: transparent; }
+  *::-webkit-scrollbar-thumb {
+    background: color-mix(in oklch, var(--color-base-content) 16%, transparent);
+    border-radius: 8px;
+  }
+  *::-webkit-scrollbar-thumb:hover {
+    background: color-mix(in oklch, var(--color-base-content) 28%, transparent);
+  }
+}
+
+/* ── Text selection — primary tinted ──────────────────────────────────────── */
+::selection {
+  background: color-mix(in oklch, var(--color-primary) 32%, transparent);
+  color: var(--color-base-content);
+}
+
+/* ── Make Tailwind dark: variants fire on our daisyUI themes ──────────────── */
 @custom-variant dark (&[data-theme]);
 
 /* ── Wire shadcn color names into Tailwind v4's --color-* namespace ─────── */
@@ -93,9 +166,112 @@ button, a, input, textarea, select, [role="button"] {
   touch-action: manipulation;
 }
 
+/* ════════════════════════════════════════════════════════════════════════
+ *  FLARE — signature visual elements
+ * ════════════════════════════════════════════════════════════════════════ */
+
+/* ── The π glyph — iridescent gradient with a soft halo ──────────────────── */
+.pi-glyph {
+  background: linear-gradient(
+    135deg,
+    var(--color-primary) 0%,
+    var(--color-secondary) 55%,
+    var(--color-accent) 100%
+  );
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  filter: drop-shadow(0 0 32px color-mix(in oklch, var(--color-primary) 30%, transparent));
+}
+
+@keyframes pi-breathe {
+  0%, 100% { opacity: 0.7; filter: drop-shadow(0 0 22px color-mix(in oklch, var(--color-primary) 22%, transparent)); }
+  50%      { opacity: 1;   filter: drop-shadow(0 0 40px color-mix(in oklch, var(--color-primary) 40%, transparent)); }
+}
+.pi-glyph-breathe {
+  animation: pi-breathe 4.5s ease-in-out infinite;
+}
+
+/* ── Aurora backdrop — ambient radial color wash (login / empty states) ──── */
+.aurora {
+  position: relative;
+  isolation: isolate;
+}
+.aurora::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(ellipse 50% 38% at 18% 8%,  color-mix(in oklch, var(--color-primary) 10%, transparent), transparent 70%),
+    radial-gradient(ellipse 44% 34% at 85% 18%, color-mix(in oklch, var(--color-secondary) 7%, transparent), transparent 70%),
+    radial-gradient(ellipse 56% 40% at 50% 100%, color-mix(in oklch, var(--color-accent) 5%, transparent), transparent 70%);
+}
+
+/* ── Message entrance — gentle rise & fade ───────────────────────────────── */
+@keyframes msg-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.msg-in {
+  animation: msg-in 260ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* ── Composer — focus-charged input surface ──────────────────────────────── */
+.composer {
+  background: color-mix(in oklch, var(--color-base-100) 92%, white 3%);
+  border: 1px solid color-mix(in oklch, var(--color-primary) 20%, transparent);
+  box-shadow:
+    0 4px 20px -8px rgb(0 0 0 / 0.45),
+    0 0 0 1px color-mix(in oklch, var(--color-primary) 8%, transparent);
+  transition: border-color 200ms ease, box-shadow 260ms ease;
+}
+.composer:focus-within {
+  border-color: color-mix(in oklch, var(--color-primary) 42%, transparent);
+  box-shadow:
+    0 4px 24px -8px rgb(0 0 0 / 0.5),
+    0 0 0 1px color-mix(in oklch, var(--color-primary) 18%, transparent),
+    0 0 36px -10px color-mix(in oklch, var(--color-primary) 35%, transparent);
+}
+
+/* ── Shimmer text — for live "thinking…" previews ────────────────────────── */
+@keyframes shimmer {
+  from { background-position: 200% 0; }
+  to   { background-position: -200% 0; }
+}
+.shimmer-text {
+  background: linear-gradient(
+    90deg,
+    color-mix(in oklch, var(--color-base-content) 38%, transparent) 35%,
+    color-mix(in oklch, var(--color-base-content) 85%, transparent) 50%,
+    color-mix(in oklch, var(--color-base-content) 38%, transparent) 65%
+  );
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: shimmer 2.4s linear infinite;
+}
+
+/* ── Gradient hairline — fading horizontal rule ──────────────────────────── */
+.hairline-x {
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    color-mix(in oklch, var(--color-base-content) 14%, transparent) 50%,
+    transparent
+  );
+}
+
+/* ── Glow dot — status indicator with halo ───────────────────────────────── */
+.glow-success { box-shadow: 0 0 8px 1px color-mix(in oklch, var(--color-success) 55%, transparent); }
+.glow-primary { box-shadow: 0 0 8px 1px color-mix(in oklch, var(--color-primary) 45%, transparent); }
+
 /* ── Prose — assistant markdown output ────────────────────────────────────── */
 .prose {
-  line-height: 1.5;
+  line-height: 1.55;
   overflow-wrap: break-word;
   word-break: break-words;
 }
@@ -111,11 +287,16 @@ button, a, input, textarea, select, [role="button"] {
   font-weight: 700;
   margin-top: 1.2em;
   margin-bottom: 0.4em;
+  letter-spacing: -0.01em;
   color: color-mix(in oklch, var(--color-base-content) 95%, transparent);
 }
 .prose h1 { font-size: 1.15em; }
 .prose h2 { font-size: 1.08em; }
 .prose h3, .prose h4 { font-size: 1em; }
+
+.prose h1:first-child, .prose h2:first-child, .prose h3:first-child, .prose h4:first-child {
+  margin-top: 0.2em;
+}
 
 .prose ul, .prose ol {
   margin: 0.4em 0 0.75em 1.4em;
@@ -123,18 +304,19 @@ button, a, input, textarea, select, [role="button"] {
 .prose ul { list-style-type: disc; }
 .prose ol { list-style-type: decimal; }
 .prose li { margin-bottom: 0.3em; }
+.prose li::marker { color: color-mix(in oklch, var(--color-base-content) 35%, transparent); }
 
 .prose strong { font-weight: 600; color: color-mix(in oklch, var(--color-base-content) 92%, transparent); }
 .prose em     { font-style: italic; color: color-mix(in oklch, var(--color-base-content) 75%, transparent); }
 
-/* Inline code — subtle pill like ChatGPT */
+/* Inline code — subtle pill */
 .prose code {
   font-size: 0.85em;
-  background: color-mix(in oklch, var(--color-base-content) 9%, transparent);
-  border: 1px solid color-mix(in oklch, var(--color-base-content) 9%, transparent);
-  border-radius: 4px;
+  background: color-mix(in oklch, var(--color-primary) 9%, transparent);
+  border: 1px solid color-mix(in oklch, var(--color-primary) 10%, transparent);
+  border-radius: 5px;
   padding: 0.1em 0.4em;
-  color: color-mix(in oklch, var(--color-base-content) 88%, transparent);
+  color: color-mix(in oklch, var(--color-base-content) 90%, var(--color-primary) 10%);
 }
 
 /* Inline code inside a code-block — reset */
@@ -149,47 +331,65 @@ button, a, input, textarea, select, [role="button"] {
 
 /* Block quotes */
 .prose blockquote {
-  border-left: 3px solid color-mix(in oklch, var(--color-base-content) 18%, transparent);
+  border-left: 3px solid color-mix(in oklch, var(--color-primary) 38%, transparent);
   padding-left: 0.8em;
-  color: color-mix(in oklch, var(--color-base-content) 50%, transparent);
+  color: color-mix(in oklch, var(--color-base-content) 55%, transparent);
   margin: 0.6em 0;
 }
 
 /* Horizontal rule */
 .prose hr {
   border: none;
-  border-top: 1px solid color-mix(in oklch, var(--color-base-content) 10%, transparent);
-  margin: 0.75em 0;
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    color-mix(in oklch, var(--color-base-content) 14%, transparent) 50%,
+    transparent
+  );
+  margin: 0.9em 0;
 }
 
 /* Links */
 .prose a {
-  color: color-mix(in oklch, var(--color-primary) 80%, transparent);
+  color: color-mix(in oklch, var(--color-primary) 85%, transparent);
   text-decoration: underline;
   text-underline-offset: 2px;
+  text-decoration-color: color-mix(in oklch, var(--color-primary) 40%, transparent);
+  transition: color 0.15s ease, text-decoration-color 0.15s ease;
 }
-.prose a:hover { color: var(--color-primary); }
+.prose a:hover { color: var(--color-primary); text-decoration-color: var(--color-primary); }
 
 /* Tables */
 .prose table {
   border-collapse: collapse;
   font-size: 0.85em;
-  margin: 0.5em 0;
+  margin: 0.6em 0;
   width: 100%;
+  border-radius: 0.5rem;
+  overflow: hidden;
 }
 .prose th, .prose td {
   border: 1px solid color-mix(in oklch, var(--color-base-content) 10%, transparent);
-  padding: 0.35em 0.65em;
+  padding: 0.4em 0.7em;
   text-align: left;
 }
-.prose th { color: color-mix(in oklch, var(--color-base-content) 60%, transparent); font-weight: 600; }
+.prose th {
+  color: color-mix(in oklch, var(--color-base-content) 65%, transparent);
+  font-weight: 600;
+  background: color-mix(in oklch, var(--color-base-content) 4%, transparent);
+}
+.prose tbody tr:nth-child(even) td {
+  background: color-mix(in oklch, var(--color-base-content) 2.5%, transparent);
+}
 
-/* ── Code block — ChatGPT-style ───────────────────────────────────────────── */
+/* ── Code block — elevated card with hairline header ─────────────────────── */
 .code-block {
-  border-radius: 0.5rem;
+  border-radius: 0.65rem;
   overflow: hidden;
   margin: 0.8em 0;
-  background: color-mix(in oklch, var(--color-base-content) 5.5%, transparent);
+  background: color-mix(in oklch, var(--color-base-300) 75%, transparent);
+  border: 1px solid color-mix(in oklch, var(--color-base-content) 8%, transparent);
 }
 
 .code-block-header {
@@ -197,12 +397,14 @@ button, a, input, textarea, select, [role="button"] {
   align-items: center;
   justify-content: space-between;
   padding: 0.45rem 0.85rem;
-  background: color-mix(in oklch, var(--color-base-content) 7.5%, transparent);
+  background: color-mix(in oklch, var(--color-base-content) 4.5%, transparent);
+  border-bottom: 1px solid color-mix(in oklch, var(--color-base-content) 7%, transparent);
 }
 
 .code-block-lang {
   font-size: 0.72rem;
   font-family: ui-monospace, monospace;
+  letter-spacing: 0.06em;
   color: color-mix(in oklch, var(--color-base-content) 50%, transparent);
   user-select: none;
 }
@@ -241,7 +443,7 @@ button, a, input, textarea, select, [role="button"] {
   font-family: ui-monospace, 'Cascadia Code', 'Fira Code', monospace;
 }
 
-/* ── highlight.js syntax colour palette (neutral dark, works on night theme) */
+/* ── highlight.js syntax colour palette (neutral dark, works on dark themes) */
 .hljs                  { color: color-mix(in oklch, var(--color-base-content) 78%, transparent); }
 .hljs-keyword,
 .hljs-selector-tag     { color: #c792ea; }          /* purple — keywords */
@@ -277,8 +479,8 @@ button, a, input, textarea, select, [role="button"] {
 
 /* ── Typing / waiting indicator ──────────────────────────────────────────── */
 @keyframes typing-dot {
-  0%, 60%, 100% { opacity: 0.2; transform: translateY(0); }
-  30%           { opacity: 0.8; transform: translateY(-3px); }
+  0%, 60%, 100% { opacity: 0.25; transform: translateY(0); }
+  30%           { opacity: 1; transform: translateY(-3px); }
 }
 
 .typing-dot {
@@ -286,7 +488,7 @@ button, a, input, textarea, select, [role="button"] {
   width: 5px;
   height: 5px;
   border-radius: 50%;
-  background-color: color-mix(in oklch, var(--color-base-content) 40%, transparent);
+  background: linear-gradient(135deg, var(--color-primary), var(--color-secondary));
   animation: typing-dot 1.2s ease-in-out infinite;
 }
 .typing-dot:nth-child(2) { animation-delay: 0.2s; }

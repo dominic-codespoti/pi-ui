@@ -17,15 +17,23 @@ import type * as PiSDKNS from '@earendil-works/pi-coding-agent';
 import type { AgentSession, ExtensionUIContext } from '@earendil-works/pi-coding-agent';
 import type { Model } from '@earendil-works/pi-ai';
 import { rm, mkdir, writeFile } from 'node:fs/promises';
-import { join, resolve, basename } from 'node:path';
+import { join, resolve, basename, sep, dirname } from 'node:path';
 import { homedir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { initPassword, isValidSessionCookie } from './src/lib/auth/password.ts';
-import type { ClientMessage, HistoryWindow, ModelInfo, ProviderInfo, SessionSummary, SkillSummary, PromptSummary, ExtensionSummary } from './src/lib/ws/protocol.ts';
+import { listProjects, touchProject, removeProject, setProjectPinned, renameProject } from './src/lib/server/project-registry.ts';
+import type { ClientMessage, HistoryWindow, ModelInfo, ProjectInfo, ProviderInfo, SessionSummary, SkillSummary, PromptSummary, ExtensionSummary, UpdatePackageStatus, UpdateStatus, UpdateTarget } from './src/lib/ws/protocol.ts';
 import { callFactoryAndParse, stubTui, stubTheme, stripAnsi } from './src/lib/tui-stubs.ts';
 import ownPkgJson from './package.json' with { type: 'json' };
 
+const APP_ROOT = dirname(fileURLToPath(import.meta.url));
+
 /** pi-ui version baked in at startup. */
 const UI_VERSION: string = (ownPkgJson as { version: string }).version;
+
+const UI_PACKAGE_NAME: string = (ownPkgJson as { name?: string }).name ?? '@thed24/pi-ui';
+const PI_SDK_PACKAGE_NAME = '@earendil-works/pi-coding-agent';
+const PI_AI_PACKAGE_NAME = '@earendil-works/pi-ai';
 
 /** pi SDK version — resolved after lazy SDK load. */
 let PI_SDK_VERSION = 'unknown';
@@ -70,6 +78,24 @@ if (!existsSync(cwd)) {
   console.error(`[pifrontier] Error: working directory does not exist: ${cwd}`);
   console.error('[pifrontier] Set PI_CWD to a valid directory or run from the target project.');
   process.exit(1);
+}
+
+/**
+ * Working directory of the active session — falls back to the startup cwd
+ * before the first session exists. Switching projects moves this boundary.
+ */
+function activeCwd(): string {
+  return session?.sessionManager.getCwd() || cwd;
+}
+
+/**
+ * True when an already-resolved absolute path is inside the ACTIVE project
+ * root (the current session's cwd). Separator-suffixed comparison prevents
+ * sibling-prefix bypasses (e.g. `/home/x/proj-evil` matching `/home/x/proj`).
+ */
+function isInsideWorkspace(resolvedPath: string): boolean {
+  const root = resolve(activeCwd());
+  return resolvedPath === root || resolvedPath.startsWith(root + sep);
 }
 
 function expandTilde(p: string): string {
@@ -136,6 +162,183 @@ function sendSlashResult(
   ws.send(JSON.stringify({ type: 'slash_result', command, message, level }));
 }
 
+async function fetchNpmLatestVersion(packageName: string): Promise<{ version?: string; error?: string }> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8_000);
+  try {
+    const encoded = encodeURIComponent(packageName);
+    const res = await fetch(`https://registry.npmjs.org/${encoded}/latest`, {
+      signal: controller.signal,
+      headers: { accept: 'application/json' },
+    });
+    if (!res.ok) return { error: `registry returned HTTP ${res.status}` };
+    const data = await res.json() as { version?: string };
+    return data.version ? { version: data.version } : { error: 'registry response did not include a version' };
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function compareSemver(a: string, b: string): number {
+  const parse = (v: string) => v.replace(/^v/, '').split(/[.-]/).slice(0, 3).map((part) => Number.parseInt(part, 10) || 0);
+  const pa = parse(a);
+  const pb = parse(b);
+  for (let i = 0; i < 3; i += 1) {
+    if (pa[i] !== pb[i]) return pa[i] > pb[i] ? 1 : -1;
+  }
+  return 0;
+}
+
+function packageStatus(name: string, current: string, latest: { version?: string; error?: string }): UpdatePackageStatus {
+  return {
+    name,
+    current,
+    latest: latest.version,
+    updateAvailable: Boolean(latest.version && current !== 'unknown' && compareSemver(latest.version, current) > 0),
+    error: latest.error,
+  };
+}
+
+function ephemeralUpdateHint(root: string): string | null {
+  const normalized = root.replaceAll('\\', '/');
+  if (normalized.includes('/.bun/install/cache/')) return `bunx ${UI_PACKAGE_NAME}@latest --password ...`;
+  if (normalized.includes('/.npm/_npx/') || normalized.includes('/_npx/')) return `npx -y ${UI_PACKAGE_NAME}@latest --password ...`;
+  if (normalized.includes('/pnpm/dlx/') || normalized.includes('/.pnpm/dlx/')) return `pnpm dlx ${UI_PACKAGE_NAME}@latest --password ...`;
+  if (normalized.includes('/yarn/dlx/')) return `yarn dlx ${UI_PACKAGE_NAME}@latest --password ...`;
+  return null;
+}
+
+function piUiUpdateStep(): string[] {
+  const cliTs = join(APP_ROOT, 'bin', 'pifrontier.ts');
+  if (existsSync(cliTs)) return [process.execPath, cliTs, 'update'];
+  const cliShim = join(APP_ROOT, 'bin', 'pifrontier');
+  if (existsSync(cliShim)) return [cliShim, 'update'];
+  const entry = process.argv[1];
+  if (entry && existsSync(entry)) return [process.execPath, entry, 'update'];
+  return ['pi-ui', 'update'];
+}
+
+async function getUpdateStatus(): Promise<UpdateStatus> {
+  const [uiLatest, sdkLatest, gitExists, packageJsonExists] = await Promise.all([
+    fetchNpmLatestVersion(UI_PACKAGE_NAME),
+    fetchNpmLatestVersion(PI_SDK_PACKAGE_NAME),
+    Bun.file(join(APP_ROOT, '.git')).exists(),
+    Bun.file(join(APP_ROOT, 'package.json')).exists(),
+  ]);
+  const ephemeralHint = gitExists ? null : ephemeralUpdateHint(APP_ROOT);
+  const mode: UpdateStatus['mode'] = gitExists ? 'source' : ephemeralHint ? 'ephemeral' : 'package';
+
+  const notes: string[] = [];
+  if (mode === 'source') notes.push('pi-ui update runs git pull, bun install, and rebuilds the app.');
+  if (mode === 'package') notes.push('pi-ui update runs the detected package-manager update for the installed pi-ui package.');
+  if (mode === 'ephemeral') notes.push(`This run looks ephemeral. Restart with: ${ephemeralHint}`);
+  if (!gitExists) notes.push('SDK-only updates are disabled for package installs; update pi-ui to get the supported SDK version.');
+  if (!packageJsonExists) notes.push('Package metadata is not writable in this install location.');
+  notes.push('After updating, the server restarts and the page reloads to load the new UI.');
+
+  return {
+    appRoot: APP_ROOT,
+    mode,
+    updateCommand: mode === 'ephemeral' ? ephemeralHint ?? undefined : 'pi-ui update',
+    busy: updateInProgress,
+    canUpdateUi: mode !== 'ephemeral',
+    canUpdateSdk: gitExists && packageJsonExists,
+    ui: packageStatus(UI_PACKAGE_NAME, UI_VERSION, uiLatest),
+    sdk: packageStatus(PI_SDK_PACKAGE_NAME, PI_SDK_VERSION, sdkLatest),
+    notes,
+  };
+}
+
+function formatCommand(args: string[]): string {
+  return args.map((arg) => (/\s/.test(arg) ? JSON.stringify(arg) : arg)).join(' ');
+}
+
+async function runUpdateCommand(args: string[]): Promise<{ command: string; exitCode: number; output: string }> {
+  const proc = Bun.spawn(args, {
+    cwd: APP_ROOT,
+    env: process.env as Record<string, string>,
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  return {
+    command: formatCommand(args),
+    exitCode,
+    output: [stdout, stderr].filter(Boolean).join('\n').trim(),
+  };
+}
+
+function updateSteps(target: UpdateTarget): string[][] {
+  if (target === 'ui') {
+    return [piUiUpdateStep()];
+  }
+
+  const pkg = ownPkgJson as { devDependencies?: Record<string, string> };
+  const steps = [['bun', 'add', `${PI_SDK_PACKAGE_NAME}@latest`]];
+  if (pkg.devDependencies?.[PI_AI_PACKAGE_NAME]) {
+    steps.push(['bun', 'add', '--dev', `${PI_AI_PACKAGE_NAME}@latest`]);
+  }
+  return steps;
+}
+
+async function runUpdate(target: UpdateTarget, ws: { send(data: string): void }): Promise<void> {
+  if (updateInProgress) {
+    ws.send(JSON.stringify({ type: 'update_result', target, success: false, message: 'Another update is already running.' }));
+    return;
+  }
+
+  updateInProgress = true;
+  const chunks: string[] = [];
+  try {
+    const isSourceCheckout = await Bun.file(join(APP_ROOT, '.git')).exists();
+    if (target === 'ui' && !isSourceCheckout) {
+      const hint = ephemeralUpdateHint(APP_ROOT);
+      if (hint) throw new Error(`This pi-ui run looks ephemeral. Restart with: ${hint}`);
+    }
+    if (target === 'sdk' && !isSourceCheckout) {
+      throw new Error('SDK-only updates are only available from a source checkout. Update pi-ui to get the supported SDK version.');
+    }
+
+    for (const args of updateSteps(target)) {
+      const command = formatCommand(args);
+      ws.send(JSON.stringify({ type: 'update_progress', target, command, message: `Running ${command}` }));
+      const result = await runUpdateCommand(args);
+      chunks.push(`$ ${result.command}`);
+      if (result.output) chunks.push(result.output);
+      chunks.push(`exit code: ${result.exitCode}`);
+      if (result.exitCode !== 0) {
+        throw new Error(`${result.command} failed with exit code ${result.exitCode}`);
+      }
+    }
+
+    ws.send(JSON.stringify({
+      type: 'update_result',
+      target,
+      success: true,
+      message: target === 'ui' ? 'pi-ui update completed. Restarting will load the new UI.' : 'pi SDK package updated. Restart the server to load it.',
+      output: chunks.join('\n\n'),
+      restartRequired: true,
+      reloadRequired: target === 'ui',
+    }));
+  } catch (err) {
+    ws.send(JSON.stringify({
+      type: 'update_result',
+      target,
+      success: false,
+      message: err instanceof Error ? err.message : String(err),
+      output: chunks.join('\n\n'),
+    }));
+  } finally {
+    updateInProgress = false;
+  }
+}
+
 function formatTreeNode(node: { entry: { id: string; type: string; message?: unknown }; children: unknown[]; label?: string }, depth = 0): string[] {
   const indent = '  '.repeat(depth);
   const entry = node.entry;
@@ -154,6 +357,29 @@ function formatTreeNode(node: { entry: { id: string; type: string; message?: unk
     lines.push(...formatTreeNode(child, depth + 1));
   }
   return lines;
+}
+
+/** Serialize a raw SDK tree node into the protocol TreeNode format for visual display. */
+function serializeTreeNode(node: { entry: { id: string; type: string; message?: unknown }; children: unknown[]; label?: string }): import('./src/lib/ws/protocol.ts').TreeNode {
+  const entry = node.entry;
+  const msg = entry.message as { role?: string; content?: unknown } | undefined;
+  let role: string | undefined;
+  let text: string | undefined;
+  if (msg?.role) role = msg.role;
+  if (Array.isArray(msg?.content)) {
+    const t = msg.content.find((c) => typeof c === 'object' && c && 'text' in c) as { text?: string } | undefined;
+    if (t?.text) text = t.text.replace(/\s+/g, ' ').slice(0, 64);
+  } else if (typeof msg?.content === 'string') {
+    text = msg.content.replace(/\s+/g, ' ').slice(0, 64);
+  }
+  return {
+    entryId: entry.id,
+    type: entry.type,
+    role,
+    text,
+    label: node.label,
+    children: (node.children as typeof node[]).map(serializeTreeNode),
+  };
 }
 
 /** Pi config directory name — same as CONFIG_DIR_NAME in the SDK. */
@@ -199,6 +425,75 @@ function serializeSession(s: Record<string, any>): SessionSummary {
   };
 }
 
+/**
+ * Merge the persisted project registry with directories discovered from
+ * session files into the wire-format project list.
+ * Sort: pinned first, then most recent activity.
+ */
+async function buildProjectsList(): Promise<ProjectInfo[]> {
+  const byCwd = new Map<string, { count: number; lastModified: number }>();
+  try {
+    const sessions = await _sdk!.SessionManager.listAll();
+    for (const s of sessions) {
+      const key = (s as { cwd?: string }).cwd ?? '';
+      if (!key) continue;
+      const modified = s.modified instanceof Date ? s.modified.getTime() : Number(s.modified) || 0;
+      const agg = byCwd.get(key);
+      if (agg) {
+        agg.count += 1;
+        agg.lastModified = Math.max(agg.lastModified, modified);
+      } else {
+        byCwd.set(key, { count: 1, lastModified: modified });
+      }
+    }
+  } catch (err) {
+    console.error('[pifrontier] buildProjectsList: listAll failed:', err);
+  }
+
+  const map = new Map<string, ProjectInfo>();
+  for (const rec of listProjects()) {
+    map.set(rec.path, {
+      cwd: rec.path,
+      name: rec.name ?? basename(rec.path),
+      pinned: rec.pinned,
+      exists: existsSync(rec.path),
+      registered: true,
+      sessionCount: 0,
+      lastActivity: rec.lastOpened,
+    });
+  }
+  for (const [dir, agg] of byCwd) {
+    const entry = map.get(dir);
+    if (entry) {
+      entry.sessionCount = agg.count;
+      entry.lastActivity = Math.max(entry.lastActivity, agg.lastModified);
+    } else {
+      map.set(dir, {
+        cwd: dir,
+        name: basename(dir) || dir,
+        pinned: false,
+        exists: existsSync(dir),
+        registered: false,
+        sessionCount: agg.count,
+        lastActivity: agg.lastModified,
+      });
+    }
+  }
+
+  return [...map.values()].sort((a, b) =>
+    a.pinned !== b.pinned ? (a.pinned ? -1 : 1) : b.lastActivity - a.lastActivity
+  );
+}
+
+/** Broadcast the merged project list to all connected tabs. */
+async function broadcastProjects(): Promise<void> {
+  try {
+    broadcast({ type: 'projects_list', projects: await buildProjectsList() });
+  } catch (err) {
+    console.error('[pifrontier] broadcastProjects failed:', err);
+  }
+}
+
 /** Build a SessionSummary for the current session. */
 function currentSessionSummary(): SessionSummary | null {
   if (!session) return null;
@@ -209,7 +504,7 @@ function currentSessionSummary(): SessionSummary | null {
   return {
     id: session.sessionId,
     path: session.sessionManager.getSessionFile() ?? '(in-memory)',
-    cwd,
+    cwd: session.sessionManager.getCwd() || cwd,
     name: session.sessionManager.getSessionName() || undefined,
     created: Date.now(),
     modified: Date.now(),
@@ -245,6 +540,9 @@ function getHistoryPage(
 // explicitly confirmed the restart via a request_restart → restart_server flow.
 let pendingRestartNonce: string | null = null;
 
+// Only one package update may run at a time; update commands mutate package files.
+let updateInProgress = false;
+
 // ── 4. Extension UI — pending request map ─────────────────────────────────────
 
 type PendingRequest = { resolve: (response: Record<string, unknown>) => void };
@@ -270,6 +568,9 @@ function createDialogPromise<T>(
   });
 }
 
+/** Number of currently-connected WS clients (browser tabs). */
+let connectedClients = 0;
+
 function cancelAllPendingExtensionRequests() {
   for (const [, entry] of pendingExtensionRequests) {
     entry.resolve({ cancelled: true });
@@ -284,7 +585,7 @@ function cancelAllPendingExtensionRequests() {
 // Server-side state for extension UI context
 let toolsExpanded = false;
 
-const uiContext: ExtensionUIContext = {
+const uiContext: Omit<ExtensionUIContext, 'getEditorText'> & { getEditorText(): Promise<string> } = {
   select(title, options) {
     const id = crypto.randomUUID();
     return createDialogPromise<string | undefined>(
@@ -452,8 +753,28 @@ const uiContext: ExtensionUIContext = {
     }
   },
 
-  setFooter() {},
-  setHeader() {},
+  setFooter(factory) {
+    if (!factory) {
+      broadcast({ type: 'extension_ui_request', id: crypto.randomUUID(), method: 'set_footer', content: '' });
+      return;
+    }
+    void callFactoryAndParse(factory, '', undefined)
+      .then((parsed) => {
+        broadcast({ type: 'extension_ui_request', id: crypto.randomUUID(), method: 'set_footer', content: parsed?.kind === 'text' ? parsed.content : '' });
+      })
+      .catch(() => { /* factory may fail without real TUI */ });
+  },
+  setHeader(factory) {
+    if (!factory) {
+      broadcast({ type: 'extension_ui_request', id: crypto.randomUUID(), method: 'set_header', content: '' });
+      return;
+    }
+    void callFactoryAndParse(factory, '', undefined)
+      .then((parsed) => {
+        broadcast({ type: 'extension_ui_request', id: crypto.randomUUID(), method: 'set_header', content: parsed?.kind === 'text' ? parsed.content : '' });
+      })
+      .catch(() => { /* factory may fail without real TUI */ });
+  },
 
   setTitle(title) {
     broadcast({ type: 'extension_ui_request', id: crypto.randomUUID(), method: 'setTitle', title });
@@ -482,9 +803,25 @@ const uiContext: ExtensionUIContext = {
     });
   },
 
-  addAutocompleteProvider() {},
-  setEditorComponent() {},
+  addAutocompleteProvider(factory) {
+    if (factory) {
+      autocompleteProviderWrappers.push(factory);
+      chainAutocompleteProviders();
+    }
+  },
+  setEditorComponent(factory) {
+    if (!factory) {
+      broadcast({ type: 'extension_ui_request', id: crypto.randomUUID(), method: 'set_editor_component', parsed: null });
+      return;
+    }
+    void callFactoryAndParse(factory, '', undefined)
+      .then((parsed) => {
+        broadcast({ type: 'extension_ui_request', id: crypto.randomUUID(), method: 'set_editor_component', parsed });
+      })
+      .catch(() => { /* factory may fail without real TUI */ });
+  },
   getEditorComponent() {
+    // Web doesn't have a custom editor; return undefined so extensions fall back to default.
     return undefined;
   },
 
@@ -511,6 +848,27 @@ const uiContext: ExtensionUIContext = {
 // (bare Bun + auth). First connection may wait ~10 s during SDK + session init.
 
 let _sdk: typeof PiSDKNS | null = null;
+
+// ── Autocomplete provider wrappers (extension-registered) ─────────────────
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type AutocompleteProviderFactory = (current: any) => any;
+const autocompleteProviderWrappers: AutocompleteProviderFactory[] = [];
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let chainedAutocompleteProvider: any = null;
+
+function chainAutocompleteProviders() {
+  // Start with a no-op base provider
+  let provider = {
+    async getSuggestions() { return null; },
+    applyCompletion(lines: string[], cursorLine: number, cursorCol: number) {
+      return { lines, cursorLine, cursorCol };
+    },
+  };
+  for (const wrap of autocompleteProviderWrappers) {
+    try { provider = wrap(provider); } catch { /* ignore broken providers */ }
+  }
+  chainedAutocompleteProvider = provider;
+}
 async function getSDK(): Promise<typeof PiSDKNS> {
   if (!_sdk) {
     console.log('[pifrontier] Loading pi SDK (first connection)…');
@@ -598,8 +956,9 @@ async function ensureSession(): Promise<AgentSession> {
         thinkingLevel: DEFAULT_THINKING_LEVEL,
       });
       session = result.session;
+      touchProject(session.sessionManager.getCwd() || cwd);
       console.log(`[pifrontier] Pi session ready: ${session.sessionId} (${sm.isPersisted() ? 'persisted' : 'in-memory'})`);
-      await session.bindExtensions({ uiContext });
+      await session.bindExtensions({ uiContext: uiContext as unknown as ExtensionUIContext });
       console.log('[pifrontier] Extension UI context bound.');
       unsubscribePi = session.subscribe((event) => {
         // Enrich message_end with real context usage from the SDK
@@ -631,9 +990,13 @@ async function setActiveSession(newSession: AgentSession) {
     oldSession.dispose();
   }
 
+  // Clear extension autocomplete providers (extensions re-register via bindExtensions)
+  autocompleteProviderWrappers.length = 0;
+  chainedAutocompleteProvider = null;
+
   session = newSession;
 
-  await session.bindExtensions({ uiContext });
+  await session.bindExtensions({ uiContext: uiContext as unknown as ExtensionUIContext });
 
   unsubscribePi = session.subscribe((event) => {
     // Enrich message_end with real context usage from the SDK
@@ -669,6 +1032,23 @@ async function setActiveSession(newSession: AgentSession) {
     sessionMode: session.sessionManager.isPersisted() ? 'persisted' : 'in-memory',
     contextUsage: session.getContextUsage(),
   });
+
+  // Register/touch the project for the session's directory.
+  touchProject(session.sessionManager.getCwd() || cwd);
+
+  // Refresh sidebar session + project lists so all connected tabs see the change
+  try {
+    const all = await _sdk!.SessionManager.listAll();
+    const sessions = all.map(serializeSession);
+    const current = currentSessionSummary();
+    if (current && !sessions.some((s) => s.id === current.id)) {
+      sessions.unshift(current);
+    }
+    broadcast({ type: 'all_sessions_list', sessions });
+  } catch (err) {
+    console.error('[pifrontier] setActiveSession: failed to broadcast session list:', err);
+  }
+  await broadcastProjects();
 }
 
 // ── 5. TTS summarisation helper ───────────────────────────────────────────────
@@ -771,6 +1151,7 @@ try {
   websocket: {
     async open(ws) {
       ws.subscribe(WS_TOPIC);
+      connectedClients++;
 
       // Load SDK + session on first connection; subsequent calls return instantly.
       const sess = await ensureSession();
@@ -807,10 +1188,10 @@ try {
         const { extensions } = loader.getExtensions();
         const allCommands: { name: string; description?: string; source: string }[] = [];
         for (const ext of extensions) {
-          for (const [key] of ext.commands) {
+          for (const [name, cmd] of ext.commands) {
             allCommands.push({
-              name: String(key?.name ?? ''),
-              description: typeof key?.description === 'string' ? key.description : undefined,
+              name,
+              description: cmd.description,
               source: ext.sourceInfo.source,
             });
           }
@@ -892,9 +1273,13 @@ try {
           try {
             const list = await _sdk!.SessionManager.list(cwd);
             const sessions = list.slice(0, 30).map(serializeSession);
-            // Prepend the current session as the first entry
+            // Prepend the current session — deduplicate if it already appears in the list
             const current = currentSessionSummary();
-            ws.send(JSON.stringify({ type: 'sessions_list', sessions: current ? [current, ...sessions] : sessions }));
+            if (current) {
+              const alreadyListed = sessions.some((s) => s.id === current.id);
+              if (!alreadyListed) sessions.unshift(current);
+            }
+            ws.send(JSON.stringify({ type: 'sessions_list', sessions }));
           } catch (err) {
             console.error('[pifrontier] list_sessions error:', err);
             ws.send(JSON.stringify({ type: 'sessions_list', sessions: [] }));
@@ -927,9 +1312,15 @@ try {
         case 'switch_session': {
           try {
             // If the user selects the current session path, just ignore it.
-            const resolvedPath = resolve(expandTilde(msg.path));
+            const resolvedPath = resolve(cwd, expandTilde(msg.path));
             if (session?.sessionManager.getSessionFile() === resolvedPath) {
               ws.send(JSON.stringify({ type: 'sessions_error', message: 'Already on this session.' }));
+              break;
+            }
+            // Security: only open known session files — never raw client paths.
+            const knownSessions = await _sdk!.SessionManager.listAll();
+            if (!knownSessions.some((s) => s.path === resolvedPath)) {
+              ws.send(JSON.stringify({ type: 'sessions_error', message: 'Session not found.' }));
               break;
             }
             const sm = _sdk!.SessionManager.open(resolvedPath);
@@ -1023,21 +1414,24 @@ try {
 
         case 'rename_session': {
           try {
-            // Security: validate path is inside cwd.
-            const resolvedPath = resolve(msg.path);
-            if (!resolvedPath.startsWith(resolve(cwd))) {
-              ws.send(JSON.stringify({ type: 'sessions_error', message: 'Path escapes workspace.' }));
+            // Security: only accept paths of known sessions — never trust raw user paths.
+            // (Session files live under ~/.pi, outside cwd, so containment checks don't apply.)
+            const known = await _sdk!.SessionManager.listAll();
+            const target = known.find((s) => s.path === msg.path);
+            if (!target) {
+              ws.send(JSON.stringify({ type: 'sessions_error', message: 'Session not found.' }));
               break;
             }
-            const sm = _sdk!.SessionManager.open(msg.path);
+            const sm = _sdk!.SessionManager.open(target.path);
             sm.appendSessionInfo(msg.name);
             // If renaming the active session, also fire the SDK event so all
             // connected browsers see the name change via session_info_changed.
             if (msg.path === session!.sessionFile) {
               session!.setSessionName(msg.name);
             }
-            const list = await _sdk!.SessionManager.list(cwd);
-            ws.send(JSON.stringify({ type: 'sessions_list', sessions: list.slice(0, 30).map(serializeSession) }));
+            const all = await _sdk!.SessionManager.listAll();
+            broadcast({ type: 'all_sessions_list', sessions: all.map(serializeSession) });
+            ws.send(JSON.stringify({ type: 'sessions_list', sessions: [] }));
           } catch (err) {
             console.error('[pifrontier] rename_session error:', err);
             ws.send(JSON.stringify({ type: 'sessions_error', message: String(err) }));
@@ -1063,7 +1457,8 @@ try {
         case 'delete_session': {
           try {
             // Validate the path is a known session file — never trust raw user paths.
-            const list = await _sdk!.SessionManager.list(cwd);
+            // listAll() because the sidebar offers deletion across all projects.
+            const list = await _sdk!.SessionManager.listAll();
             const target = list.find((s) => s.path === msg.path);
             if (!target) {
               ws.send(JSON.stringify({ type: 'sessions_error', message: 'Session not found.' }));
@@ -1073,15 +1468,12 @@ try {
               ws.send(JSON.stringify({ type: 'sessions_error', message: 'Cannot delete the active session.' }));
               break;
             }
-            // Double-check: resolved path must be inside the resolved cwd.
-            const resolvedPath = resolve(target.path);
-            if (!resolvedPath.startsWith(resolve(cwd))) {
-              ws.send(JSON.stringify({ type: 'sessions_error', message: 'Path escapes workspace.' }));
-              break;
-            }
-            await rm(resolvedPath);
-            const updated = await _sdk!.SessionManager.list(cwd);
-            ws.send(JSON.stringify({ type: 'sessions_list', sessions: updated.slice(0, 30).map(serializeSession) }));
+            // Path came from SessionManager.listAll() — already validated by SDK.
+            await rm(target.path);
+            const all = await _sdk!.SessionManager.listAll();
+            broadcast({ type: 'all_sessions_list', sessions: all.map(serializeSession) });
+            await broadcastProjects();
+            ws.send(JSON.stringify({ type: 'sessions_list', sessions: [] }));
           } catch (err) {
             console.error('[pifrontier] delete_session error:', err);
             ws.send(JSON.stringify({ type: 'sessions_error', message: String(err) }));
@@ -1092,10 +1484,68 @@ try {
         case 'get_all_sessions': {
           try {
             const all = await _sdk!.SessionManager.listAll();
-            ws.send(JSON.stringify({ type: 'all_sessions_list', sessions: all.map(serializeSession) }));
+            const sessions = all.map(serializeSession);
+            const current = currentSessionSummary();
+            if (current && !sessions.some((s) => s.id === current.id)) {
+              sessions.unshift(current);
+            }
+            ws.send(JSON.stringify({ type: 'all_sessions_list', sessions }));
           } catch (err) {
             console.error('[pifrontier] get_all_sessions error:', err);
             ws.send(JSON.stringify({ type: 'all_sessions_list', sessions: [] }));
+          }
+          break;
+        }
+
+        case 'get_projects': {
+          ws.send(JSON.stringify({ type: 'projects_list', projects: await buildProjectsList() }));
+          break;
+        }
+
+        case 'add_project': {
+          try {
+            const raw = (msg as { type: 'add_project'; path: string }).path ?? '';
+            if (!raw.trim() || raw.includes('\0')) {
+              ws.send(JSON.stringify({ type: 'sessions_error', message: 'Invalid project path.' }));
+              break;
+            }
+            const target = resolve(expandTilde(raw.trim()));
+            // Same trust level as new_session: create the folder if it's brand new.
+            await mkdir(target, { recursive: true });
+            touchProject(target);
+            await broadcastProjects();
+          } catch (err) {
+            console.error('[pifrontier] add_project error:', err);
+            ws.send(JSON.stringify({ type: 'sessions_error', message: String(err) }));
+          }
+          break;
+        }
+
+        case 'remove_project': {
+          const target = (msg as { type: 'remove_project'; cwd: string }).cwd ?? '';
+          if (target === (session?.sessionManager.getCwd() || cwd)) {
+            ws.send(JSON.stringify({ type: 'sessions_error', message: 'Cannot forget the active project.' }));
+            break;
+          }
+          removeProject(target);
+          await broadcastProjects();
+          break;
+        }
+
+        case 'pin_project': {
+          const { cwd: target, pinned } = msg as { type: 'pin_project'; cwd: string; pinned: boolean };
+          if (typeof target === 'string' && target.trim()) {
+            setProjectPinned(target, Boolean(pinned));
+            await broadcastProjects();
+          }
+          break;
+        }
+
+        case 'rename_project': {
+          const { cwd: target, name } = msg as { type: 'rename_project'; cwd: string; name: string };
+          if (typeof target === 'string' && target.trim()) {
+            renameProject(target, typeof name === 'string' ? name : '');
+            await broadcastProjects();
           }
           break;
         }
@@ -1163,6 +1613,34 @@ try {
           } catch (err) {
             console.error('[pifrontier] file_complete error:', err);
             ws.send(JSON.stringify({ type: 'file_completions', query: '', entries: [] }));
+          }
+          break;
+        }
+
+        case 'get_extension_autocomplete': {
+          try {
+            const { trigger, query } = msg as { type: 'get_extension_autocomplete'; trigger: string; query: string };
+            if (!chainedAutocompleteProvider) {
+              ws.send(JSON.stringify({ type: 'extension_completions', trigger, query, items: [] }));
+              break;
+            }
+            // Synthesize lines/cursor from the trigger + query
+            const inputText = `${trigger}${query ?? ''}`;
+            const lines = [inputText];
+            const cursorLine = 0;
+            const cursorCol = inputText.length;
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 2000);
+            const result = await chainedAutocompleteProvider.getSuggestions(lines, cursorLine, cursorCol, {
+              signal: controller.signal,
+            });
+            clearTimeout(timeoutId);
+            const items = result?.items ?? [];
+            ws.send(JSON.stringify({ type: 'extension_completions', trigger, query, items }));
+          } catch (err) {
+            console.error('[pifrontier] get_extension_autocomplete error:', err);
+            const { trigger: fallbackTrigger = '', query: fallbackQuery = '' } = msg as { trigger?: string; query?: string };
+            ws.send(JSON.stringify({ type: 'extension_completions', trigger: fallbackTrigger, query: fallbackQuery, items: [] }));
           }
           break;
         }
@@ -1299,6 +1777,23 @@ try {
                 sendSlashResult(ws, command, `Session renamed to ${args}.`);
                 break;
               }
+              case 'shell': {
+                if (!args) {
+                  sendSlashResult(ws, command, 'Usage: ! <command>', 'warning');
+                  break;
+                }
+                const shellResult = Bun.spawnSync(['bash', '-c', args], {
+                  cwd: session?.sessionManager.getCwd() || cwd,
+                  env: { ...process.env as Record<string, string>, PI_CWD: cwd },
+                });
+                const shellOutput = [
+                  ...(shellResult.stdout?.length ? [new TextDecoder().decode(shellResult.stdout)] : []),
+                  ...(shellResult.stderr?.length ? [new TextDecoder().decode(shellResult.stderr)] : []),
+                  ...(shellResult.exitCode !== 0 ? [`\nexit code: ${shellResult.exitCode}`] : []),
+                ].join('').trim();
+                sendSlashResult(ws, command, shellOutput || '(no output)', shellResult.exitCode === 0 ? 'info' : 'error');
+                break;
+              }
               default:
                 sendSlashResult(ws, command, `Unsupported built-in command: /${command}`, 'warning');
                 break;
@@ -1306,6 +1801,18 @@ try {
           } catch (err) {
             console.error(`[pifrontier] run_builtin ${command} error:`, err);
             sendSlashResult(ws, command, String(err), 'error');
+          }
+          break;
+        }
+
+        case 'get_session_tree': {
+          try {
+            const tree = session!.sessionManager.getTree();
+            const serialized = tree.map((node) => serializeTreeNode(node as Parameters<typeof serializeTreeNode>[0]));
+            ws.send(JSON.stringify({ type: 'session_tree', tree: serialized }));
+          } catch (err) {
+            console.error('[pifrontier] get_session_tree error:', err);
+            ws.send(JSON.stringify({ type: 'session_tree', tree: [] }));
           }
           break;
         }
@@ -1419,10 +1926,10 @@ try {
             const { extensions } = loader.getExtensions();
             const allCommands: { name: string; description?: string; source: string }[] = [];
             for (const ext of extensions) {
-              for (const [key] of ext.commands) {
+              for (const [name, cmd] of ext.commands) {
                 allCommands.push({
-                  name: String(key?.name ?? ''),
-                  description: typeof key?.description === 'string' ? key.description : undefined,
+                  name,
+                  description: cmd.description,
                   source: ext.sourceInfo.source,
                 });
               }
@@ -1450,7 +1957,9 @@ try {
               ws.send(JSON.stringify({ type: 'skill_install_result', success: false, error: 'Invalid URL.' }));
               break;
             }
-            const res = await fetch(rawUrl);
+            // redirect:'error' — the host whitelist above is checked pre-fetch only,
+            // so following redirects could smuggle content from arbitrary hosts.
+            const res = await fetch(rawUrl, { redirect: 'error' });
             if (!res.ok) {
               ws.send(JSON.stringify({ type: 'skill_install_result', success: false, error: `HTTP ${res.status}: ${res.statusText}` }));
               break;
@@ -1510,14 +2019,20 @@ try {
               ws.send(JSON.stringify({ type: 'file_content', path: filePath, content: '', error: 'Invalid path' }));
               break;
             }
-            // Security: resolve relative to cwd and ensure it doesn't escape
-            const resolved = resolve(cwd, filePath);
-            if (!resolved.startsWith(resolve(cwd))) {
+            // Security: resolve relative to the active project root and ensure it doesn't escape
+            const resolved = resolve(activeCwd(), filePath);
+            if (!isInsideWorkspace(resolved)) {
               ws.send(JSON.stringify({ type: 'file_content', path: filePath, content: '', error: 'Path escapes workspace root' }));
               break;
             }
             const file = Bun.file(resolved);
             if (await file.exists()) {
+              // Cap reads — loading huge logs/binaries into memory would hurt the Pi.
+              const MAX_READ_BYTES = 2 * 1024 * 1024;
+              if (file.size > MAX_READ_BYTES) {
+                ws.send(JSON.stringify({ type: 'file_content', path: filePath, content: '', error: `File too large to view (${(file.size / 1024 / 1024).toFixed(1)} MB > 2 MB)` }));
+                break;
+              }
               const content = await file.text();
               ws.send(JSON.stringify({ type: 'file_content', path: filePath, content }));
             } else {
@@ -1527,6 +2042,53 @@ try {
             console.error('[pifrontier] read_file error:', err);
             ws.send(JSON.stringify({ type: 'file_content', path: (msg as { type: 'read_file'; path: string }).path, content: '', error: String(err) }));
           }
+          break;
+        }
+
+        case 'write_file': {
+          try {
+            const { path: filePath, content: fileContent } = msg as { type: 'write_file'; path: string; content: string };
+            if (filePath.includes('\0')) {
+              ws.send(JSON.stringify({ type: 'file_saved', path: filePath, error: 'Invalid path' }));
+              break;
+            }
+            const resolved = resolve(activeCwd(), filePath);
+            if (!isInsideWorkspace(resolved)) {
+              ws.send(JSON.stringify({ type: 'file_saved', path: filePath, error: 'Path escapes workspace root' }));
+              break;
+            }
+            await Bun.write(resolved, fileContent);
+            ws.send(JSON.stringify({ type: 'file_saved', path: filePath }));
+          } catch (err) {
+            console.error('[pifrontier] write_file error:', err);
+            ws.send(JSON.stringify({ type: 'file_saved', path: (msg as { type: 'write_file'; path: string }).path, error: String(err) }));
+          }
+          break;
+        }
+
+        case 'get_update_status': {
+          try {
+            const status = await getUpdateStatus();
+            ws.send(JSON.stringify({ type: 'update_status', ...status }));
+          } catch (err) {
+            console.error('[pifrontier] get_update_status error:', err);
+            ws.send(JSON.stringify({
+              type: 'update_status',
+              appRoot: APP_ROOT,
+              mode: 'package',
+              busy: updateInProgress,
+              canUpdateUi: false,
+              canUpdateSdk: false,
+              ui: { name: UI_PACKAGE_NAME, current: UI_VERSION, error: String(err) },
+              sdk: { name: PI_SDK_PACKAGE_NAME, current: PI_SDK_VERSION, error: String(err) },
+              notes: ['Unable to check for updates.'],
+            }));
+          }
+          break;
+        }
+
+        case 'run_update': {
+          await runUpdate((msg as { type: 'run_update'; target: UpdateTarget }).target, ws);
           break;
         }
 
@@ -1566,7 +2128,12 @@ try {
 
     close(ws) {
       ws.unsubscribe(WS_TOPIC);
-      cancelAllPendingExtensionRequests();
+      connectedClients = Math.max(0, connectedClients - 1);
+      // Only cancel pending extension dialogs when the LAST client disconnects —
+      // other open tabs may still answer them.
+      if (connectedClients === 0) {
+        cancelAllPendingExtensionRequests();
+      }
     },
 
     idleTimeout: 120,
