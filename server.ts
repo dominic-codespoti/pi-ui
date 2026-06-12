@@ -1046,6 +1046,7 @@ async function ensureSession(): Promise<AgentSession> {
       console.log(`[pifrontier] Pi session ready: ${sess.sessionId} (${sm.isPersisted() ? 'persisted' : 'in-memory'})`);
       await sess.bindExtensions({ uiContext: uiContext as unknown as ExtensionUIContext });
       console.log('[pifrontier] Extension UI context bound.');
+      patchHasUI(sess);
 
       // Store in pool and mark active
       const sid = sess.sessionId;
@@ -1110,9 +1111,28 @@ function registerSession(sid: string, sess: AgentSession, cwdV: string, bindExt:
   entry.forwardingUnsub = fwdUnsub;
 
   if (bindExt) {
+    // Bind with our uiContext so ctx.ui.select() etc. still work for extension fallbacks
     sess.bindExtensions({ uiContext: uiContext as unknown as ExtensionUIContext }).catch((err) => {
       console.error('[pifrontier] bindExtensions (non-fatal):', err);
     });
+    // Patch hasUI to false so extensions use the fallback ui.select/ui.input path
+    // instead of the TUI custom() path which doesn't render well in the browser.
+    patchHasUI(sess);
+  }
+}
+
+/** Patch the extension runner's hasUI() to return false, so extensions use native browser dialogs. */
+function patchHasUI(sess: AgentSession) {
+  try {
+    const runner = (sess as unknown as { _extensionRunner?: { hasUI: () => boolean } })._extensionRunner;
+    if (runner) {
+      const orig = runner.hasUI.bind(runner);
+      runner.hasUI = () => false;
+      // If the runner exposes createContext, the context's hasUI getter reads from runner.hasUI,
+      // so this patch propagates to all future contexts.
+    }
+  } catch {
+    // Non-fatal — some SDK versions may structure internals differently
   }
 }
 
@@ -1163,6 +1183,7 @@ async function setActiveSession(newSession: AgentSession, newCwd?: string) {
   if (!alreadyPooled) {
     try {
       await newSession.bindExtensions({ uiContext: uiContext as unknown as ExtensionUIContext });
+      patchHasUI(newSession);
     } catch (err) {
       console.error('[pifrontier] bindExtensions (non-fatal):', err);
       broadcast({ type: 'agent_error', error: `Extension install failed: ${err instanceof Error ? err.message : String(err)}` });
