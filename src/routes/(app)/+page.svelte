@@ -616,9 +616,13 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
 
   // ── Panel state ──────────────────────────────────────────────────────────────
 
-  let showRightPanel = $state(false);
-  let rightPanelTab = $state<'models' | 'tools' | 'skills'>('models');
-  let showSessionPanel = $state(false);
+  let showRightPanel = $state(urlParam('rp', '') === '1');
+  let rightPanelTab = $state<'models' | 'tools' | 'skills'>(
+    (['models', 'tools', 'skills'] as const).includes(urlParam('rpt', '') as 'models' | 'tools' | 'skills')
+      ? (urlParam('rpt', '') as 'models' | 'tools' | 'skills')
+      : 'models'
+  );
+  let showSessionPanel = $state(urlParam('sp', '') === '1');
 
   // ── Sidebar resize ────────────────────────────────────────────────────────────
 
@@ -716,7 +720,24 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
   let notificationPrefs = $state<NotificationPrefs>(loadNotificationPrefs());
   $effect(() => { const p = notificationPrefs; try { localStorage.setItem('pifrontier:notifications', JSON.stringify(p)); } catch { /* ignore */ } });
 
-  let settingsSection = $state<'session' | 'notifications' | 'shortcuts' | 'extensions' | 'updates' | 'about'>('session');
+  // Sync panel layout state to URL params so refreshes restore the same view.
+  $effect(() => {
+    const entries: Record<string, string | null> = {
+      sp: showSessionPanel ? '1' : null,
+      rp: showRightPanel ? '1' : null,
+      rpt: showRightPanel ? rightPanelTab : null,
+      mt: modelTab !== 'models' ? modelTab : null,
+      ss: settingsSection !== 'session' ? settingsSection : null,
+    };
+    setUrlParams(entries);
+  });
+
+  function initSettingsSection(): 'session' | 'notifications' | 'shortcuts' | 'extensions' | 'updates' | 'about' {
+    const v = urlParam('ss', 'session');
+    const valid = ['session', 'notifications', 'shortcuts', 'extensions', 'updates', 'about'] as const;
+    return (valid as readonly string[]).includes(v) ? v as typeof valid[number] : 'session';
+  }
+  let settingsSection = $state(initSettingsSection());
   /** Skills returned by the server */
   let resourcesSkills = $state<SkillSummary[]>([]);
   /** Prompt templates returned by the server */
@@ -745,7 +766,7 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
   let skillInstallFeedback = $state<{ success: boolean; message: string } | null>(null);
 
   /** Which tab is active inside the model picker panel */
-  let modelTab = $state<'models' | 'providers'>('models');
+  let modelTab = $state<'models' | 'providers'>(urlParam('mt', 'models') === 'providers' ? 'providers' : 'models');
   let providers = $state<ProviderInfo[]>([]);
   /** Staged key text per provider id — cleared on successful save */
   let providerKeyInputs = $state<Record<string, string>>({});
@@ -974,11 +995,9 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
 
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     ws = new WebSocket(`${proto}//${location.host}/ws`);
-    wsState = 'connecting';
 
     ws.onopen = () => {
       wsState = 'open';
-      isRestarting = false;
       _reconnectAttempt = 0;
       cancelReconnect();
       if (reloadAfterRestart) {
@@ -992,7 +1011,8 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
 
     ws.onmessage = ({ data }: MessageEvent<string>) => {
       try {
-        handleServer(JSON.parse(data) as ServerMessage);
+        const parsed = JSON.parse(data) as ServerMessage & Record<string, unknown>;
+        handleServer(parsed);
       } catch (e) {
         console.warn('[pi-ui] Failed to parse WS message:', e);
       }
@@ -1000,16 +1020,45 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
 
     ws.onclose = () => {
       if (_intentionalClose) return;
-      // Set connecting immediately to avoid brief "disconnected" flicker
       wsState = 'connecting';
       scheduleReconnect();
     };
 
     ws.onerror = () => {
-      // WebSocket fires error then close — let onclose handle the reconnect.
-      // Close the socket so onclose fires reliably.
       try { ws?.close(); } catch { /* ignore */ }
     };
+  }
+
+  /** Read the persisted session path from URL params (?session=). */
+  function getSessionParam(): string | null {
+    const p = new URLSearchParams(window.location.search).get('session');
+    return p ? decodeURIComponent(p) : null;
+  }
+
+  /** Persist the active session path to URL params without navigation. */
+  function setSessionParam(path: string): void {
+    const url = new URL(window.location.href);
+    url.searchParams.set('session', encodeURIComponent(path));
+    history.replaceState(null, '', url.pathname + url.search);
+  }
+
+  /** Read a URL param with a default fallback. */
+  function urlParam(key: string, fallback: string): string {
+    try {
+      return new URLSearchParams(window.location.search).get(key) ?? fallback;
+    } catch {
+      return fallback;
+    }
+  }
+
+  /** Set one or more URL params without navigation. */
+  function setUrlParams(entries: Record<string, string | null>): void {
+    const url = new URL(window.location.href);
+    for (const [key, value] of Object.entries(entries)) {
+      if (value == null) url.searchParams.delete(key);
+      else url.searchParams.set(key, value);
+    }
+    history.replaceState(null, '', url.pathname + url.search);
   }
 
   /** Gracefully close the WS without reconnecting. */
@@ -1069,34 +1118,48 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
   // ── Server event handling ────────────────────────────────────────────────────
 
   function applySessionState(payload: Record<string, unknown>) {
-    sessionId = payload.sessionId as string;
+    sessionId = payload.sessionId as string ?? sessionId;
     isStreaming = payload.isStreaming as boolean;
-    thinkingLevel = payload.thinkingLevel as string;
-    model = payload.model as ModelInfo | null;
-    availableModels = (payload.availableModels as ModelInfo[]) ?? [];
-    messages = rawMessagesToUI(payload.messages as unknown[] ?? []);
+    thinkingLevel = payload.thinkingLevel as string ?? thinkingLevel;
+    const newModel = payload.model as ModelInfo | null | undefined;
+    if (newModel !== undefined) model = newModel;
+    if (payload.availableModels !== undefined) {
+      availableModels = (payload.availableModels as ModelInfo[]) ?? [];
+    }
     if (payload.cwd) cwd = payload.cwd as string;
-    sessionName = payload.sessionName as string | undefined;
+    if ('sessionName' in payload) sessionName = payload.sessionName as string | undefined;
+    if ('messages' in payload) {
+      messages = rawMessagesToUI(payload.messages as unknown[] ?? []);
+    }
     // Sync the shared projects store with the active session.
     projectsState.cwd = cwd;
-    projectsState.activeSessionId = payload.sessionId as string;
+    if ('sessionId' in payload) projectsState.activeSessionId = payload.sessionId as string;
     projectsState.isStreaming = isStreaming;
     // Restore queue state from payload (present on connected/session_loaded)
     if ('queuedSteering' in payload || 'queuedFollowUp' in payload) {
       queuedSteering = (payload.queuedSteering as string[]) ?? [];
       queuedFollowUp = (payload.queuedFollowUp as string[]) ?? [];
-    } else {
+    } else if ('sessionId' in payload) {
+      // Full session reset — clear queues
       queuedSteering = [];
       queuedFollowUp = [];
     }
-    // Use real contextUsage from the server if available
+    // Context usage and window — keep in sync with model's contextWindow.
+    // Server may provide real-time contextUsage on connected / session_loaded / message_end.
+    // When only the model changes, fall back to the new model's contextWindow.
+    let newWindow: number | undefined;
     if ('contextUsage' in payload) {
       const cu = payload.contextUsage as { tokens?: number | null; contextWindow?: number } | undefined;
       if (cu) {
         contextUsageTokens = cu.tokens ?? null;
-        contextUsageWindow = cu.contextWindow ?? 0;
+        if (cu.contextWindow) newWindow = cu.contextWindow;
       }
     }
+    if (newWindow == null) {
+      const m = newModel ?? model;
+      if (m?.contextWindow) newWindow = m.contextWindow;
+    }
+    if (newWindow != null) contextUsageWindow = newWindow;
     // Session-level settings (optional — present on connected/session_loaded)
     if ('isCompacting' in payload) isCompacting = Boolean(payload.isCompacting);
     if ('autoCompactionEnabled' in payload) autoCompactionEnabled = Boolean(payload.autoCompactionEnabled ?? true);
@@ -1115,6 +1178,12 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
         // Warm the project/session lists so pickers have data immediately.
         projectsState.refresh();
         updateAppBadge();
+        // Restore persisted session from URL param
+        const savedPath = getSessionParam();
+        if (savedPath) {
+          projectsState.pendingSwitchPath = savedPath;
+          send({ type: 'switch_session', path: savedPath });
+        }
         break;
       }
 
@@ -1127,16 +1196,21 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
         if (sl.sessionMode) sessionMode = sl.sessionMode as string;
         if (projectsState.onSessionLoaded()) showSessionPanel = false;
         projectPickerOpen = false;
+        // Persist session path to URL param
+        if (projectsState.pendingSwitchPath) {
+          setSessionParam(projectsState.pendingSwitchPath);
+          projectsState.pendingSwitchPath = null;
+        }
         break;
       }
 
       case 'model_changed': {
-        model = (msg as { type: string; model: ModelInfo | null }).model ?? null;
+        applySessionState({ model: (msg as { type: string; model: ModelInfo | null }).model ?? null });
         break;
       }
 
       case 'thinking_level_changed': {
-        thinkingLevel = (msg as { type: string; level: string }).level ?? thinkingLevel;
+        applySessionState({ thinkingLevel: (msg as { type: string; level: string }).level ?? 'off' });
         break;
       }
 
@@ -1165,7 +1239,7 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
       }
 
       case 'available_models_changed': {
-        availableModels = (msg as { type: string; availableModels: ModelInfo[] }).availableModels ?? [];
+        applySessionState({ availableModels: (msg as { type: string; availableModels: ModelInfo[] }).availableModels ?? [] });
         break;
       }
 
@@ -1259,8 +1333,7 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
         // Use real context usage from the SDK (server enriches message_end with this)
         const cu = (msg as Record<string, unknown>).contextUsage as { tokens?: number | null; contextWindow?: number } | undefined;
         if (cu) {
-          contextUsageTokens = cu.tokens ?? null;
-          contextUsageWindow = cu.contextWindow ?? 0;
+          applySessionState({ contextUsage: cu });
         }
         break;
       }
@@ -1399,7 +1472,99 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
           }
         }
 
-        // Non-blocking extension methods are handled below outside the switch.
+        // Non-blocking extension methods (fire-and-forget, no modal response needed):
+        if (method === 'notify') {
+          addToast(
+            (msg.message as string | undefined) ?? '',
+            (msg.notifyType as Toast['type'] | undefined) ?? 'info'
+          );
+        } else if (method === 'setStatus') {
+          const key = msg.statusKey as string | undefined;
+          const text = msg.statusText as string | undefined;
+          if (key) {
+            if (text == null) {
+              delete extensionStatuses[key];
+            } else {
+              extensionStatuses[key] = text;
+            }
+          }
+        } else if (method === 'setWidget') {
+          const key = msg.widgetKey as string | undefined;
+          if (key) {
+            const widgetType = (msg.widgetType as string | undefined) ?? 'text';
+            const widgetLines = msg.widgetLines as string[] | undefined;
+            const widgetData = msg.widgetData as Record<string, unknown> | undefined;
+            const widgetPlacement = msg.widgetPlacement as string | undefined;
+            if (widgetType === 'text' && (!widgetLines || widgetLines.length === 0)) {
+              delete extensionWidgets[key];
+            } else if (widgetType === 'table') {
+              const headers = (widgetData?.headers as string[]) ?? [];
+              const rows = (widgetData?.rows as string[][]) ?? [];
+              extensionWidgets[key] = { type: 'table', headers, rows };
+            } else if (widgetType === 'badge') {
+              const text = (widgetData?.text as string) ?? '';
+              const variant = (widgetData?.variant as WidgetContent extends { variant: infer V } ? V : never) ?? 'info';
+              extensionWidgets[key] = { type: 'badge', text, variant };
+            } else {
+              extensionWidgets[key] = { type: 'text', lines: widgetLines ?? [] };
+            }
+            if (widgetPlacement) {
+              extensionWidgetPlacement[key] = widgetPlacement;
+            } else {
+              delete extensionWidgetPlacement[key];
+            }
+          }
+        } else if (method === 'setTitle') {
+          document.title = (msg.title as string | undefined) ?? 'pi UI';
+        } else if (method === 'set_editor_text') {
+          input = (msg.text as string | undefined) ?? '';
+          tick().then(() => { autoResizeTextarea(); inputEl?.focus(); });
+        } else if (method === 'paste_to_editor') {
+          const textToInsert = (msg.text as string | undefined) ?? '';
+          if (inputEl) {
+            const start = inputEl.selectionStart ?? input.length;
+            const end = inputEl.selectionEnd ?? input.length;
+            input = input.slice(0, start) + textToInsert + input.slice(end);
+            tick().then(() => {
+              if (inputEl) {
+                inputEl.selectionStart = inputEl.selectionEnd = start + textToInsert.length;
+                autoResizeTextarea();
+                inputEl.focus();
+              }
+            });
+          } else {
+            input += textToInsert;
+          }
+        } else if (method === 'request_editor_text') {
+          const requestId = msg.id as string | undefined;
+          if (requestId) {
+            send({ type: 'editor_text_response', id: requestId, text: input });
+          }
+        } else if (method === 'setWorkingMessage') {
+          workingMessage = (msg.message as string | undefined) ?? undefined;
+        } else if (method === 'setWorkingVisible') {
+          workingVisible = (msg.visible as boolean | undefined) ?? true;
+        } else if (method === 'setWorkingIndicator') {
+          const frames = (msg.frames as string[] | undefined) ?? [];
+          workingIndicatorFrames = frames;
+          workingIndicatorMs = (msg.intervalMs as number | undefined) ?? 80;
+          workingFrameIndex = 0;
+        } else if (method === 'setHiddenThinkingLabel') {
+          hiddenThinkingLabel = (msg.label as string | undefined) ?? 'thinking';
+        } else if (method === 'setToolsExpanded') {
+          const exp = (msg.expanded as boolean | undefined) ?? false;
+          toolsExpandedGlobal = exp;
+          for (const m of messages) {
+            if (m.role === 'tool' && !m.streaming) m.expanded = exp;
+          }
+        } else if (method === 'set_header') {
+          extensionHeader = (msg.content as string | undefined) ?? '';
+        } else if (method === 'set_footer') {
+          extensionFooter = (msg.content as string | undefined) ?? '';
+        } else if (method === 'set_editor_component') {
+          editorComponentPanel = (msg.parsed as ParsedComponent | null) ?? null;
+        }
+
         break;
       }
 
@@ -1418,141 +1583,6 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
             title: 'Pending Request',
             placeholder: 'Reconnect — please respond to continue',
           }];
-        }
-        break;
-      }
-            break;
-          }
-
-          case 'notify':
-            addToast(
-              (msg.message as string | undefined) ?? '',
-              (msg.notifyType as Toast['type'] | undefined) ?? 'info'
-            );
-            break;
-
-          case 'setStatus': {
-            const key = msg.statusKey as string | undefined;
-            const text = msg.statusText as string | undefined;
-            if (key) {
-              if (text == null) {
-                delete extensionStatuses[key];
-              } else {
-                extensionStatuses[key] = text;
-              }
-            }
-            break;
-          }
-
-          case 'setWidget': {
-            const key = msg.widgetKey as string | undefined;
-            if (key) {
-              const widgetType = (msg.widgetType as string | undefined) ?? 'text';
-              const widgetLines = msg.widgetLines as string[] | undefined;
-              const widgetData = msg.widgetData as Record<string, unknown> | undefined;
-              const widgetPlacement = msg.widgetPlacement as string | undefined;
-              if (widgetType === 'text' && (!widgetLines || widgetLines.length === 0)) {
-                delete extensionWidgets[key];
-              } else if (widgetType === 'table') {
-                const headers = (widgetData?.headers as string[]) ?? [];
-                const rows = (widgetData?.rows as string[][]) ?? [];
-                extensionWidgets[key] = { type: 'table', headers, rows };
-              } else if (widgetType === 'badge') {
-                const text = (widgetData?.text as string) ?? '';
-                const variant = (widgetData?.variant as WidgetContent extends { variant: infer V } ? V : never) ?? 'info';
-                extensionWidgets[key] = { type: 'badge', text, variant };
-              } else {
-                // Default: text widget
-                extensionWidgets[key] = { type: 'text', lines: widgetLines ?? [] };
-              }
-              // Store placement for rendering order
-              if (widgetPlacement) {
-                extensionWidgetPlacement[key] = widgetPlacement;
-              }
-            }
-            break;
-          }
-
-          case 'setTitle':
-            document.title = (msg.title as string | undefined) ?? 'pi UI';
-            break;
-
-          case 'set_editor_text':
-            input = (msg.text as string | undefined) ?? '';
-            tick().then(() => { autoResizeTextarea(); inputEl?.focus(); });
-            break;
-
-          case 'paste_to_editor': {
-            const textToInsert = (msg.text as string | undefined) ?? '';
-            if (inputEl) {
-              const start = inputEl.selectionStart ?? input.length;
-              const end = inputEl.selectionEnd ?? input.length;
-              input = input.slice(0, start) + textToInsert + input.slice(end);
-              tick().then(() => {
-                if (inputEl) {
-                  inputEl.selectionStart = inputEl.selectionEnd = start + textToInsert.length;
-                  autoResizeTextarea();
-                  inputEl.focus();
-                }
-              });
-            } else {
-              input += textToInsert;
-            }
-            break;
-          }
-
-          case 'request_editor_text': {
-            const requestId = msg.id as string | undefined;
-            if (requestId) {
-              send({ type: 'editor_text_response', id: requestId, text: input });
-            }
-            break;
-          }
-
-          case 'setWorkingMessage':
-            workingMessage = (msg.message as string | undefined) ?? undefined;
-            break;
-
-          case 'setWorkingVisible':
-            workingVisible = (msg.visible as boolean | undefined) ?? true;
-            break;
-
-          case 'setWorkingIndicator': {
-            const frames = (msg.frames as string[] | undefined) ?? [];
-            workingIndicatorFrames = frames;
-            workingIndicatorMs = (msg.intervalMs as number | undefined) ?? 80;
-            workingFrameIndex = 0;
-            break;
-          }
-
-          case 'setHiddenThinkingLabel':
-            hiddenThinkingLabel = (msg.label as string | undefined) ?? 'thinking';
-            break;
-
-          case 'setToolsExpanded': {
-            const exp = (msg.expanded as boolean | undefined) ?? false;
-            toolsExpandedGlobal = exp;
-            // Apply retroactively to all existing tool messages.
-            for (const m of messages) {
-              if (m.role === 'tool' && !m.streaming) m.expanded = exp;
-            }
-            break;
-          }
-
-          case 'set_header':
-            extensionHeader = (msg.content as string | undefined) ?? '';
-            break;
-
-          case 'set_footer':
-            extensionFooter = (msg.content as string | undefined) ?? '';
-            break;
-
-          case 'set_editor_component':
-            editorComponentPanel = (msg.parsed as ParsedComponent | null) ?? null;
-            break;
-
-          default:
-            break;
         }
         break;
       }

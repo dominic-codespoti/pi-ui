@@ -65,7 +65,8 @@ class ProjectsState {
   uncheckedSessions = new SvelteSet<string>();
   /** Session ids that are currently generating (agent_start … agent_end). */
   runningSessions = new SvelteSet<string>();
-  /** Collapsed project cwds in the sidebar — persisted across reloads. */
+  /** Session path from the most recent switch_session — consumed by the page for URL sync. */
+  pendingSwitchPath: string | null = null;
   collapsed = new SvelteSet<string>(loadCollapsed());
   /** Projects whose full session list is expanded past the preview limit. */
   expandedGroups = new SvelteSet<string>();
@@ -138,6 +139,20 @@ class ProjectsState {
 
   // ── Server message intake ────────────────────────────────────────────────
 
+  /**
+   * Apply a partial state update atomically.
+   * `groups` is derived from both `projects` and `allSessions` — updating them
+   * through this single method makes the relationship explicit and ensures any
+   * future cross-field invariants are enforced in one place.
+   */
+  applyState(payload: {
+    projects?: ProjectInfo[];
+    sessions?: SessionSummary[];
+  }): void {
+    if (payload.projects !== undefined) this.projects = payload.projects;
+    if (payload.sessions !== undefined) this.allSessions = payload.sessions;
+  }
+
   /** Refresh both lists — called on connect and when the sidebar opens. */
   refresh(): void {
     this.send({ type: 'get_projects' });
@@ -151,10 +166,10 @@ class ProjectsState {
   handleMessage(msg: { type: string } & Record<string, unknown>): boolean {
     switch (msg.type) {
       case 'projects_list':
-        this.projects = (msg.projects as ProjectInfo[]) ?? [];
+        this.applyState({ projects: (msg.projects as ProjectInfo[]) ?? [] });
         return true;
       case 'all_sessions_list':
-        this.allSessions = (msg.sessions as SessionSummary[]) ?? [];
+        this.applyState({ sessions: (msg.sessions as SessionSummary[]) ?? [] });
         return true;
       case 'sessions_list':
         // all_sessions_list is the source of truth — just clear transient state.
@@ -185,6 +200,7 @@ class ProjectsState {
   // ── Actions ──────────────────────────────────────────────────────────────
 
   switchSession(path: string): void {
+    this.pendingSwitchPath = path;
     this.send({ type: 'switch_session', path });
     const s = this.allSessions.find((s) => s.path === path);
     if (s) this.uncheckedSessions.delete(s.id);
@@ -207,7 +223,9 @@ class ProjectsState {
 
   setPinned(cwd: string, pinned: boolean): void {
     // Optimistic — server broadcast confirms.
-    this.projects = this.projects.map((p) => (p.cwd === cwd ? { ...p, pinned } : p));
+    this.applyState({
+      projects: this.projects.map((p) => (p.cwd === cwd ? { ...p, pinned } : p)),
+    });
     this.send({ type: 'pin_project', cwd, pinned });
   }
 
