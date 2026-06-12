@@ -38,17 +38,22 @@ function normalizeIp(ip: string): string {
 }
 
 /**
- * Extract the real client IP, preferring Cloudflare's header over the raw
- * connection address (which is Cloudflare's edge IP behind a tunnel).
+ * Extract the real client IP.
+ *
+ * Proxy headers (x-forwarded-for etc.) are only trusted when `trustProxy` is
+ * true. This prevents IP spoofing when the server is directly reachable.
  */
-export function getClientIp(request: Request, fallbackIp: string): string {
-  return (
-    request.headers.get('cf-connecting-ip') ??
-    request.headers.get('x-real-ip') ??
-    // X-Forwarded-For may be comma-separated — take the leftmost (client) IP.
-    request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ??
-    fallbackIp
-  );
+export function getClientIp(request: Request, fallbackIp: string, trustProxy = false): string {
+  if (trustProxy) {
+    return (
+      request.headers.get('cf-connecting-ip') ??
+      request.headers.get('x-real-ip') ??
+      // X-Forwarded-For may be comma-separated — take the leftmost (client) IP.
+      request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ??
+      fallbackIp
+    );
+  }
+  return fallbackIp;
 }
 
 /** Read the current rate-limit status without recording anything. */

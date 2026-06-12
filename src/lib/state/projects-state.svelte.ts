@@ -38,8 +38,8 @@ export function pathBasename(p: string): string {
 }
 
 class ProjectsState {
-  /** Wired by the page to the live WebSocket sender. */
-  send: (msg: ClientMessage) => void = () => {};
+  /** Wired by the page to the live WebSocket sender. Returns true if the message was sent. */
+  send: (msg: ClientMessage) => boolean = () => false;
 
   /** Merged project list from the server (registry + session dirs). */
   projects = $state<ProjectInfo[]>([]);
@@ -191,8 +191,8 @@ class ProjectsState {
   }
 
   newSession(targetCwd?: string): void {
-    this.send(targetCwd ? { type: 'new_session', targetCwd } : { type: 'new_session' });
-    this.pendingNewSession = true;
+    const sent = this.send(targetCwd ? { type: 'new_session', targetCwd } : { type: 'new_session' });
+    if (sent) this.pendingNewSession = true;
     this.dirCompletions = [];
   }
 

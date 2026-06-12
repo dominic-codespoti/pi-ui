@@ -20,7 +20,7 @@ import { rm, mkdir, writeFile } from 'node:fs/promises';
 import { join, resolve, basename, sep, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { initPassword, isValidSessionCookie } from './src/lib/auth/password.ts';
+import { initPassword, isValidSessionCookie, extractTokenExp, getTokenFromCookies } from './src/lib/auth/password.ts';
 import { listProjects, touchProject, removeProject, setProjectPinned, renameProject } from './src/lib/server/project-registry.ts';
 import type { ClientMessage, ModelInfo, ProjectInfo, ProviderInfo, SessionSummary, SkillSummary, PromptSummary, ExtensionSummary, UpdatePackageStatus, UpdateStatus, UpdateTarget } from './src/lib/ws/protocol.ts';
 import { callFactoryAndParse, StubTui, stubTui, stubTheme, stripAnsi } from './src/lib/tui-stubs.ts';
@@ -71,7 +71,7 @@ console.log('[pifrontier] Password initialised.');
 
 // ── 2. Helpers ────────────────────────────────────────────────────────────────
 
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 
 const cwd = Bun.env.PI_CWD ?? process.cwd();
 if (!existsSync(cwd)) {
@@ -94,8 +94,21 @@ function activeCwd(): string {
  * sibling-prefix bypasses (e.g. `/home/x/proj-evil` matching `/home/x/proj`).
  */
 function isInsideWorkspace(resolvedPath: string): boolean {
+  // Resolve symlinks so a symlink inside the workspace pointing outside is caught.
+  let realPath: string;
+  try {
+    realPath = realpathSync(resolvedPath);
+  } catch {
+    // File may not exist yet (e.g. write_file creating a new file) — use dirname.
+    try {
+      realPath = realpathSync(dirname(resolvedPath)) + sep + basename(resolvedPath);
+    } catch {
+      realPath = resolve(resolvedPath);
+    }
+  }
   const root = resolve(activeCwd());
-  return resolvedPath === root || resolvedPath.startsWith(root + sep);
+  const realRoot = realpathSync(root);
+  return realPath === realRoot || realPath.startsWith(realRoot + sep);
 }
 
 function expandTilde(p: string): string {
@@ -247,10 +260,25 @@ function formatCommand(args: string[]): string {
   return args.map((arg) => (/\s/.test(arg) ? JSON.stringify(arg) : arg)).join(' ');
 }
 
+function sanitizeEnv(): Record<string, string> {
+  // Only pass through safe env vars — exclude secrets like PI_PASSWORD and
+  // provider API keys that could be exfiltrated by package lifecycle scripts.
+  const safe = ['PATH', 'HOME', 'USER', 'BUN_INSTALL', 'NPM_CONFIG_USERCONFIG',
+    'npm_config_user_agent', 'PI_UI_PACKAGE_MANAGER',
+    'http_proxy', 'https_proxy', 'no_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY',
+    'npm_config_registry'];
+  const env: Record<string, string> = {};
+  for (const key of safe) {
+    const val = process.env[key];
+    if (val !== undefined) env[key] = val;
+  }
+  return env;
+}
+
 async function runUpdateCommand(args: string[]): Promise<{ command: string; exitCode: number; output: string }> {
   const proc = Bun.spawn(args, {
     cwd: APP_ROOT,
-    env: process.env as Record<string, string>,
+    env: sanitizeEnv(),
     stdout: 'pipe',
     stderr: 'pipe',
   });
@@ -540,13 +568,28 @@ function createDialogPromise<T>(
       },
     });
     broadcast({ type: 'extension_ui_request', id, ...requestPayload });
+    // Timeout — prevents the agent from hanging forever if the browser
+    // never responds (e.g. tab was closed without notifying the server).
+    setTimeout(() => {
+      const pending = pendingExtensionRequests.get(id);
+      if (pending) {
+        pendingExtensionRequests.delete(id);
+        resolve(parseResponse({ cancelled: true }));
+      }
+    }, EXTENSION_DIALOG_TIMEOUT_MS);
   });
 }
 
 /** Number of currently-connected WS clients (browser tabs). */
 let connectedClients = 0;
+/** Timer that fires when the grace period for pending extension UI requests expires. */
+let _pendingRequestsTimeout: Timer | null = null;
+const PENDING_REQUESTS_GRACE_MS = 15_000;
+/** Max time a blocking extension dialog can wait for a browser response. */
+const EXTENSION_DIALOG_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 
 function cancelAllPendingExtensionRequests() {
+  if (_pendingRequestsTimeout) { clearTimeout(_pendingRequestsTimeout); _pendingRequestsTimeout = null; }
   for (const [, entry] of pendingExtensionRequests) {
     entry.resolve({ cancelled: true });
   }
@@ -992,6 +1035,35 @@ let activeSessionId: string | null = null;
 // Promise lock — prevents concurrent first-connection races from creating duplicate sessions.
 let _sessionInitPromise: Promise<string> | null = null;
 
+// ── LRU idle session cleanup ──────────────────────────────────────────────────
+// Dispose inactive pooled sessions after 30 min of inactivity so the Pi doesn't
+// run out of memory over time. The active session and any still-running session
+// are exempt.
+
+const IDLE_SESSION_TIMEOUT_MS = 30 * 60 * 1000;
+let _idleCleanupTimer: Timer | null = null;
+
+function startIdleCleanup(): void {
+  if (_idleCleanupTimer) return;
+  _idleCleanupTimer = setInterval(() => {
+    const now = Date.now();
+    for (const [sid, entry] of sessionPool) {
+      if (sid === activeSessionId) continue;
+      if (entry.isRunning) continue;
+      if (now - entry.lastActivity < IDLE_SESSION_TIMEOUT_MS) continue;
+      // Dispose — unsubscribe and remove from pool.
+      try {
+        entry.forwardingUnsub?.();
+        entry.runtimeUnsub?.();
+        entry.session.dispose();
+      } catch (err) {
+        console.error(`[pifrontier] Error disposing idle session ${sid}:`, err);
+      }
+      sessionPool.delete(sid);
+    }
+  }, 60_000); // check every 60s
+}
+
 /** The currently-active AgentSession (throws if none). */
 function activeSession(): AgentSession {
   const m = activeSessionId ? sessionPool.get(activeSessionId) : undefined;
@@ -1221,6 +1293,8 @@ async function setActiveSession(newSession: AgentSession, newCwd?: string) {
     isCompacting: newSession.isCompacting,
     autoCompactionEnabled: newSession.autoCompactionEnabled,
     autoRetryEnabled: newSession.autoRetryEnabled,
+    queuedSteering: newSession.getSteeringMessages(),
+    queuedFollowUp: newSession.getFollowUpMessages(),
     piVersion: PI_SDK_VERSION,
     uiVersion: UI_VERSION,
     sessionMode: newSession.sessionManager.isPersisted() ? 'persisted' : 'in-memory',
@@ -1255,6 +1329,8 @@ const WS_TOPIC = 'pi';
 /** Per-connection WebSocket data. */
 interface WSData {
   connectedAt: number;
+  /** JWT expiry (seconds since epoch) — checked periodically to close expired sockets. */
+  tokenExp: number;
 }
 
 let server: ReturnType<typeof Bun.serve>;
@@ -1270,7 +1346,23 @@ try {
       if (!(await isValidSessionCookie(cookieHeader))) {
         return new Response('Unauthorized', { status: 401 });
       }
-      const ok = server.upgrade(req, { data: { connectedAt: Date.now() } });
+      // Origin validation — prevent cross-origin WebSocket hijacking.
+      const origin = req.headers.get('origin');
+      if (origin) {
+        try {
+          const originHost = new URL(origin).host;
+          const host = req.headers.get('host');
+          if (host && originHost !== host) {
+            return new Response('Origin mismatch', { status: 403 });
+          }
+        } catch {
+          return new Response('Invalid origin', { status: 400 });
+        }
+      }
+      // Extract token expiry for periodic revalidation.
+      const token = getTokenFromCookies(cookieHeader) ?? '';
+      const tokenExp = extractTokenExp(token) ?? Infinity;
+      const ok = server.upgrade(req, { data: { connectedAt: Date.now(), tokenExp } });
       if (ok) return undefined as unknown as Response;
       return new Response('WebSocket upgrade failed', { status: 400 });
     }
@@ -1284,6 +1376,12 @@ try {
     async open(ws) {
       ws.subscribe(WS_TOPIC);
       connectedClients++;
+      // A client reconnected — cancel the pending-request grace timer so existing
+      // extension UI requests survive the disconnect.
+      if (_pendingRequestsTimeout) {
+        clearTimeout(_pendingRequestsTimeout);
+        _pendingRequestsTimeout = null;
+      }
 
       try {
         // Load SDK + session on first connection; subsequent calls return instantly.
@@ -1303,6 +1401,8 @@ try {
             isCompacting: sess.isCompacting,
             autoCompactionEnabled: sess.autoCompactionEnabled,
             autoRetryEnabled: sess.autoRetryEnabled,
+            queuedSteering: sess.getSteeringMessages(),
+            queuedFollowUp: sess.getFollowUpMessages(),
             piVersion: PI_SDK_VERSION,
             uiVersion: UI_VERSION,
             sessionMode: sess.sessionManager.isPersisted() ? 'persisted' : 'in-memory',
@@ -1332,6 +1432,19 @@ try {
           console.error('[pifrontier] Failed to send extension commands:', err);
         }
 
+        // Replay any pending extension UI requests so the reconnecting client
+        // can respond to modals that were open before the disconnect.
+        for (const [id] of pendingExtensionRequests) {
+          // We can't reconstruct the full request payload from the resolve map,
+          // but the server-side promise is still live. Broadcast a re-notify
+          // marker so the client shows the modal again.
+          broadcast({ type: 'extension_ui_request_replay', id });
+        }
+        // Same for editor text requests.
+        for (const [id] of pendingEditorTextRequests) {
+          broadcast({ type: 'extension_ui_request_replay', id, method: 'request_editor_text' });
+        }
+
         // Send runtime snapshots for all pooled sessions so reconnecting clients
         // get correct sidebar state (background running, unseen, etc.)
         for (const [sid, entry] of sessionPool) {
@@ -1344,6 +1457,14 @@ try {
     },
 
     async message(ws, raw) {
+      // Periodic auth revalidation — close expired sockets so revoked/logged-out
+      // sessions cannot continue using an established WebSocket.
+      const wsData = ws.data as WSData;
+      if (wsData.tokenExp && Date.now() / 1000 > wsData.tokenExp) {
+        try { ws.close(4001, 'Session expired'); } catch { /* already closed */ }
+        return;
+      }
+
       let msg: ClientMessage;
       try {
         msg = JSON.parse(typeof raw === 'string' ? raw : new TextDecoder().decode(raw));
@@ -1396,9 +1517,24 @@ try {
           }
           break;
 
-        case 'abort':
-          await activeSession().abort();
+        case 'abort': {
+          const s = activeSession();
+          // Clear queued steering/follow-up messages before abort so they
+          // don't continue processing after the abort takes effect.
+          const cleared = s.clearQueue();
+          s.abortBash();
+          await s.abort();
+          // Restore any queued text to the requesting tab's composer so the
+          // user can re-submit it.
+          const allQueued = [...cleared.steering, ...cleared.followUp];
+          if (allQueued.length > 0) {
+            ws.send(JSON.stringify({
+              type: 'queue_restored',
+              text: allQueued.join('\n\n'),
+            }));
+          }
           break;
+        }
 
         case 'set_thinking_level':
           activeSession().setThinkingLevel(msg.level as Parameters<AgentSession['setThinkingLevel']>[0]);
@@ -2339,9 +2475,11 @@ try {
           pendingRestartNonce = null; // consume the nonce — single use
           console.log('[pifrontier] Restart confirmed — broadcasting and re-execing…');
           broadcast({ type: 'server_restarting' });
+          // Cleanup idle cleanup timer
+          if (_idleCleanupTimer) { clearInterval(_idleCleanupTimer); _idleCleanupTimer = null; }
           setTimeout(() => {
             Bun.spawn([process.execPath, ...process.argv.slice(1)], {
-              env: process.env as Record<string, string>,
+              env: sanitizeEnv(),
               detached: true,
               stdio: ['inherit', 'inherit', 'inherit'],
             });
@@ -2359,12 +2497,17 @@ try {
     close(ws) {
       ws.unsubscribe(WS_TOPIC);
       connectedClients = Math.max(0, connectedClients - 1);
-      // Only cancel pending extension dialogs when the LAST client disconnects —
-      // other open tabs may still answer them.
+      // When the last client disconnects, give a 15s grace period before
+      // cancelling pending extension dialogs. This prevents transient PWA
+      // reconnects (tab hidden, mobile wake) from dropping active prompts.
       // We do NOT dispose or clear pooled sessions — background agent work must
       // continue running even when no browser client is connected.
       if (connectedClients === 0) {
-        cancelAllPendingExtensionRequests();
+        if (_pendingRequestsTimeout) clearTimeout(_pendingRequestsTimeout);
+        _pendingRequestsTimeout = setTimeout(() => {
+          _pendingRequestsTimeout = null;
+          cancelAllPendingExtensionRequests();
+        }, PENDING_REQUESTS_GRACE_MS);
       }
     },
 
@@ -2388,5 +2531,6 @@ try {
 // Session subscription is set up inside ensureSession() on first WS connection.
 
 broadcast = (payload) => server.publish(WS_TOPIC, JSON.stringify(payload));
+startIdleCleanup();
 
 console.log(`[pifrontier] Listening on http://localhost:${PORT}`);

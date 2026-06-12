@@ -7,6 +7,7 @@
   import { renderMarkdown, highlightCode } from '$lib/markdown';
   import { formatRelativeDate as formatDate } from '$lib/utils';
   import { projectsState } from '$lib/state/projects-state.svelte';
+  import { rawMessagesToUI, uid, formatToolInput, extractTextContent, reconnectDelay, type UIMessage, type MsgUsage } from '$lib/client-messages';
   import * as Tooltip from '$lib/components/ui/tooltip';
   import { Switch } from '$lib/components/ui/switch';
   import * as Dialog from '$lib/components/ui/dialog';
@@ -269,56 +270,7 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
   ] as const;
 
   // ── UI message model ────────────────────────────────────────────────────────
-
-  type MsgUsage = {
-    input: number;
-    output: number;
-    totalTokens: number;
-    cost: { total: number };
-  };
-
-  type UIMessage = {
-    id: string;
-    role: 'user' | 'assistant' | 'tool' | 'notice';
-    content: string;
-    /** Data-URL images attached to a user message */
-    images?: string[];
-    /** Brief label shown while streaming or collapsed (e.g. "$ git status") */
-    toolInput?: string;
-    /** Raw args object from tool_execution_start — used for unknown tool heuristics */
-    toolArgs?: Record<string, unknown>;
-    /** SDK toolCallId — used to match start/update/end events */
-    toolCallId?: string;
-    toolName?: string;
-    isError?: boolean;
-    streaming: boolean;
-    /** Whether the tool output block is expanded (collapsed by default) */
-    expanded?: boolean;
-    /** Unified diff string (edit tool only) — rendered with coloring when expanded */
-    diff?: string;
-    /** Number of output lines — shown in collapsed header */
-    lineCount?: number;
-    /** Token/cost usage attached when message_end fires */
-    usage?: MsgUsage;
-    /** Accumulated thinking text (assistant messages only) */
-    thinking?: string;
-    /** Whether the thinking block is expanded */
-    thinkingExpanded?: boolean;
-    /** Unix ms when message_start fired (live streaming only) */
-    startMs?: number;
-    /** Unix ms when message_end fired (live streaming only) */
-    endMs?: number;
-    /** Unix ms when first thinking_delta arrived (live streaming only) */
-    thinkingStartMs?: number;
-    /** Whether the per-message detail panel (tokens / cost / latency) is expanded */
-    detailExpanded?: boolean;
-    /** Category of inline system notice */
-    noticeKind?: 'compaction' | 'retry' | 'custom';
-    /** Extension custom message type (e.g. pi-mermaid, btw-note, scheduled_prompt) */
-    customType?: string;
-    /** Unix ms when this UI message was created */
-    createdAt: number;
-  };
+  // (MsgUsage and UIMessage types imported from $lib/client-messages)
 
   // ── Extension UI modal state ─────────────────────────────────────────────────
 
@@ -337,7 +289,8 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
     | { method: 'editor'; id: string; title: string; prefill?: string }
     | { method: 'custom'; id: string; title: string; parsed?: ParsedComponent; lines?: string[]; interactive?: true };
 
-  let modal = $state<ModalState | null>(null);
+  let modalQueue = $state<ModalState[]>([]);
+  let modal = $derived(modalQueue[0] ?? null);
   let modalInput = $state('');
   let modalFocusEl = $state<HTMLElement | undefined>(undefined);
 
@@ -973,8 +926,51 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
 
   // ── WebSocket ───────────────────────────────────────────────────────────────
 
+  let _intentionalClose = false;
+  let _reconnectAttempt = 0;
+  /** Set to true when server_restarting is received — cleared and reloaded on next successful connect. */
+  let _reloadPending = false;
+  /** When the page was last hidden (we stop reconnecting while hidden). */
+  let _pageHiddenAt = 0;
+
+  function getReconnectDelay(): number {
+    return reconnectDelay(_reconnectAttempt);
+  }
+
+  function cancelReconnect() {
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    if (reconnectInterval) { clearInterval(reconnectInterval); reconnectInterval = null; }
+    reconnectCountdown = 0;
+  }
+
+  function scheduleReconnect() {
+    if (_intentionalClose) return;
+    if (document.hidden) {
+      _pageHiddenAt = Date.now();
+      return; // pause reconnection while page is hidden
+    }
+    if (!navigator.onLine) return; // wait for online event
+    cancelReconnect();
+    const delay = getReconnectDelay();
+    _reconnectAttempt++;
+    wsState = 'connecting';
+    reconnectCountdown = Math.ceil(delay / 1000);
+    reconnectInterval = setInterval(() => {
+      reconnectCountdown = Math.max(0, reconnectCountdown - 1);
+    }, 1000);
+    reconnectTimer = setTimeout(() => {
+      if (reconnectInterval) { clearInterval(reconnectInterval); reconnectInterval = null; }
+      connect();
+    }, delay);
+  }
+
   function connect() {
-    if (ws && ws.readyState === WebSocket.OPEN) return;
+    if (document.hidden) return;
+    if (ws) {
+      try { ws.onclose = null; ws.onerror = null; ws.close(); } catch { /* ignore */ }
+      ws = null;
+    }
+    cancelReconnect();
 
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     ws = new WebSocket(`${proto}//${location.host}/ws`);
@@ -983,10 +979,15 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
     ws.onopen = () => {
       wsState = 'open';
       isRestarting = false;
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      if (reconnectInterval) { clearInterval(reconnectInterval); reconnectInterval = null; }
-      reconnectCountdown = 0;
-      if (reloadAfterRestart) location.reload();
+      _reconnectAttempt = 0;
+      cancelReconnect();
+      if (reloadAfterRestart) {
+        reloadAfterRestart = false;
+        if (_reloadPending) {
+          _reloadPending = false;
+          location.reload();
+        }
+      }
     };
 
     ws.onmessage = ({ data }: MessageEvent<string>) => {
@@ -998,23 +999,34 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
     };
 
     ws.onclose = () => {
-      wsState = 'closed';
-      reconnectCountdown = 3;
-      if (reconnectInterval) clearInterval(reconnectInterval);
-      reconnectInterval = setInterval(() => { reconnectCountdown = Math.max(0, reconnectCountdown - 1); }, 1000);
-      reconnectTimer = setTimeout(() => {
-        if (reconnectInterval) { clearInterval(reconnectInterval); reconnectInterval = null; }
-        connect();
-      }, 3000);
+      if (_intentionalClose) return;
+      // Set connecting immediately to avoid brief "disconnected" flicker
+      wsState = 'connecting';
+      scheduleReconnect();
     };
 
-    ws.onerror = () => ws?.close();
+    ws.onerror = () => {
+      // WebSocket fires error then close — let onclose handle the reconnect.
+      // Close the socket so onclose fires reliably.
+      try { ws?.close(); } catch { /* ignore */ }
+    };
   }
 
-  function send(msg: ClientMessage) {
+  /** Gracefully close the WS without reconnecting. */
+  function disconnect() {
+    _intentionalClose = true;
+    wsState = 'closed';
+    cancelReconnect();
+    try { ws?.close(); } catch { /* ignore */ }
+    ws = null;
+  }
+
+  function send(msg: ClientMessage): boolean {
     if (ws?.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify(msg));
+      return true;
     }
+    return false;
   }
 
   function notifyPiEvent(title: string, body: string, tag: string, data?: Record<string, unknown>) {
@@ -1032,8 +1044,8 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
   function updateAppBadge() {
     if ('setAppBadge' in navigator) {
       const count = projectsState.uncheckedSessions.size;
-      if (count > 0) navigator.setAppBadge(count);
-      else navigator.clearAppBadge();
+      if (count > 0) navigator.setAppBadge(count).catch(() => {});
+      else navigator.clearAppBadge().catch(() => {});
     }
   }
 
@@ -1056,106 +1068,63 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
 
   // ── Server event handling ────────────────────────────────────────────────────
 
-  function rawMessagesToUI(rawMessages: unknown[]): UIMessage[] {
-    // Build a map of toolCallId -> { name, input } from assistant content blocks
-    // so replayed toolResult messages can show their input args.
-    const toolInputMap = new SvelteMap<string, { name: string; input: Record<string, unknown> }>();
-    for (const m of rawMessages) {
-      const raw = m as Record<string, unknown>;
-      if (raw.role === 'assistant' && Array.isArray(raw.content)) {
-        for (const blk of raw.content as { type: string; id?: string; name?: string; input?: Record<string, unknown>; arguments?: Record<string, unknown> }[]) {
-          // pi SDK uses type "toolCall" + "arguments"; Anthropic-style uses "tool_use" + "input"
-          const isToolCall = (blk.type === 'toolCall' || blk.type === 'tool_use') && blk.id && blk.name;
-          if (isToolCall) {
-            toolInputMap.set(blk.id!, { name: blk.name!, input: blk.arguments ?? blk.input ?? {} });
-          }
-        }
-      }
-    }
-
-    return rawMessages.flatMap((m) => agentMsgToUI(m, toolInputMap)).filter(Boolean) as UIMessage[];
-  }
-
-  function applySessionState(payload: {
-    sessionId: string;
-    isStreaming: boolean;
-    thinkingLevel: string;
-    model: ModelInfo | null;
-    availableModels: ModelInfo[];
-    messages: unknown[];
-    cwd?: string;
-    sessionName?: string;
-  }) {
-    sessionId = payload.sessionId;
-    isStreaming = payload.isStreaming;
-    thinkingLevel = payload.thinkingLevel;
-    model = payload.model;
-    availableModels = payload.availableModels ?? [];
-    messages = rawMessagesToUI(payload.messages ?? []);
-    if (payload.cwd) cwd = payload.cwd;
-    sessionName = payload.sessionName;
+  function applySessionState(payload: Record<string, unknown>) {
+    sessionId = payload.sessionId as string;
+    isStreaming = payload.isStreaming as boolean;
+    thinkingLevel = payload.thinkingLevel as string;
+    model = payload.model as ModelInfo | null;
+    availableModels = (payload.availableModels as ModelInfo[]) ?? [];
+    messages = rawMessagesToUI(payload.messages as unknown[] ?? []);
+    if (payload.cwd) cwd = payload.cwd as string;
+    sessionName = payload.sessionName as string | undefined;
     // Sync the shared projects store with the active session.
     projectsState.cwd = cwd;
-    projectsState.activeSessionId = payload.sessionId;
-    projectsState.isStreaming = payload.isStreaming;
-    // Reset queue on session switch
-    queuedSteering = [];
-    queuedFollowUp = [];
+    projectsState.activeSessionId = payload.sessionId as string;
+    projectsState.isStreaming = isStreaming;
+    // Restore queue state from payload (present on connected/session_loaded)
+    if ('queuedSteering' in payload || 'queuedFollowUp' in payload) {
+      queuedSteering = (payload.queuedSteering as string[]) ?? [];
+      queuedFollowUp = (payload.queuedFollowUp as string[]) ?? [];
+    } else {
+      queuedSteering = [];
+      queuedFollowUp = [];
+    }
     // Use real contextUsage from the server if available
     if ('contextUsage' in payload) {
-      const cu = (payload as Record<string, unknown>).contextUsage as { tokens?: number | null; contextWindow?: number } | undefined;
+      const cu = payload.contextUsage as { tokens?: number | null; contextWindow?: number } | undefined;
       if (cu) {
         contextUsageTokens = cu.tokens ?? null;
         contextUsageWindow = cu.contextWindow ?? 0;
       }
     }
     // Session-level settings (optional — present on connected/session_loaded)
-    if ('isCompacting' in payload) isCompacting = Boolean((payload as Record<string, unknown>).isCompacting);
-    if ('autoCompactionEnabled' in payload) autoCompactionEnabled = Boolean((payload as Record<string, unknown>).autoCompactionEnabled ?? true);
-    if ('autoRetryEnabled' in payload) autoRetryEnabled = Boolean((payload as Record<string, unknown>).autoRetryEnabled ?? true);
+    if ('isCompacting' in payload) isCompacting = Boolean(payload.isCompacting);
+    if ('autoCompactionEnabled' in payload) autoCompactionEnabled = Boolean(payload.autoCompactionEnabled ?? true);
+    if ('autoRetryEnabled' in payload) autoRetryEnabled = Boolean(payload.autoRetryEnabled ?? true);
   }
 
   function handleServer(msg: ServerMessage) {
     switch (msg.type) {
       case 'connected': {
         const c = msg as import('$lib/ws/protocol').ConnectedMessage;
-        applySessionState({
-          sessionId: c.sessionId,
-          isStreaming: c.isStreaming,
-          thinkingLevel: c.thinkingLevel,
-          model: c.model,
-          availableModels: c.availableModels,
-          messages: c.messages,
-          cwd: c.cwd,
-          sessionName: c.sessionName,
-        });
+        applySessionState(c as unknown as Record<string, unknown>);
         sessionStartTime = Date.now();
         if (c.piVersion) piVersion = c.piVersion;
         if (c.uiVersion) uiVersion = c.uiVersion;
         if (c.sessionMode) sessionMode = c.sessionMode;
         // Warm the project/session lists so pickers have data immediately.
         projectsState.refresh();
+        updateAppBadge();
         break;
       }
 
       case 'session_loaded': {
-        const sl = msg as {
-          type: string;
-          sessionId: string;
-          isStreaming: boolean;
-          thinkingLevel: string;
-          model: ModelInfo | null;
-          availableModels: ModelInfo[];
-          messages: unknown[];
-          piVersion?: string;
-          uiVersion?: string;
-          sessionMode?: string;
-        };
+        const sl = msg as Record<string, unknown>;
         applySessionState(sl);
         sessionStartTime = Date.now();
-        if (sl.piVersion) piVersion = sl.piVersion;
-        if (sl.uiVersion) uiVersion = sl.uiVersion;
-        if (sl.sessionMode) sessionMode = sl.sessionMode;
+        if (sl.piVersion) piVersion = sl.piVersion as string;
+        if (sl.uiVersion) uiVersion = sl.uiVersion as string;
+        if (sl.sessionMode) sessionMode = sl.sessionMode as string;
         if (projectsState.onSessionLoaded()) showSessionPanel = false;
         projectPickerOpen = false;
         break;
@@ -1261,23 +1230,28 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
       }
 
       case 'message_end': {
-        const endMsg = msg.message as { role?: string; usage?: { input: number; output: number; totalTokens: number; cost: { total: number } }; content?: { type: string; data?: string; mimeType?: string }[] } | undefined;
-        if (endMsg?.role === 'assistant' && endMsg.usage) {
+        const endMsg = msg.message as { role?: string; usage?: { input: number; output: number; totalTokens: number; cost: { total: number } }; content?: { type: string; data?: string; mimeType?: string }[]; stopReason?: string } | undefined;
+        if (endMsg?.role === 'assistant') {
           const a = lastStreaming('assistant');
           if (a) {
-            a.usage = {
-              input: endMsg.usage.input,
-              output: endMsg.usage.output,
-              totalTokens: endMsg.usage.totalTokens,
-              cost: { total: endMsg.usage.cost?.total ?? 0 },
-            };
             a.endMs = Date.now();
             a.streaming = false;
-            // Extract any image blocks from the final message content
-            if (endMsg.content) {
-              const imgBlocks = endMsg.content.filter((b) => b.type === 'image' && b.data && b.mimeType);
-              if (imgBlocks.length > 0) {
-                a.images = imgBlocks.map((b) => `data:${b.mimeType};base64,${b.data}`);
+            if (endMsg.stopReason === 'aborted') {
+              a.aborted = true;
+              a.content = 'Operation aborted';
+            } else if (endMsg.usage) {
+              a.usage = {
+                input: endMsg.usage.input,
+                output: endMsg.usage.output,
+                totalTokens: endMsg.usage.totalTokens,
+                cost: { total: endMsg.usage.cost?.total ?? 0 },
+              };
+              // Extract any image blocks from the final message content
+              if (endMsg.content) {
+                const imgBlocks = endMsg.content.filter((b) => b.type === 'image' && b.data && b.mimeType);
+                if (imgBlocks.length > 0) {
+                  a.images = imgBlocks.map((b) => `data:${b.mimeType};base64,${b.data}`);
+                }
               }
             }
           }
@@ -1362,67 +1336,91 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
       case 'extension_ui_request': {
         const id = msg.id as string;
         const method = msg.method as string;
+        const newModal = (() => {
         switch (method) {
           case 'confirm':
-            modal = {
-              method: 'confirm',
+            return {
+              method: 'confirm' as const,
               id,
               title: (msg.title as string | undefined) ?? 'Confirm',
               message: (msg.message as string | undefined) ?? '',
             };
-            modalInput = '';
-            break;
 
           case 'input':
-            modal = {
-              method: 'input',
+            return {
+              method: 'input' as const,
               id,
               title: (msg.title as string | undefined) ?? 'Input',
               placeholder: msg.placeholder as string | undefined,
             };
-            modalInput = '';
-            break;
 
           case 'select':
-            modal = {
-              method: 'select',
+            return {
+              method: 'select' as const,
               id,
               title: (msg.title as string | undefined) ?? 'Select',
               options: (msg.options as string[] | undefined) ?? [],
             };
-            modalInput = '';
-            break;
 
           case 'editor':
-            modal = {
-              method: 'editor',
+            return {
+              method: 'editor' as const,
               id,
               title: (msg.title as string | undefined) ?? 'Editor',
               prefill: msg.prefill as string | undefined,
             };
-            modalInput = (msg.prefill as string | undefined) ?? '';
-            break;
 
           case 'custom': {
             const parsed = msg.parsed as ParsedComponent | undefined;
             const lines = msg.lines as string[] | undefined;
             const interactive = msg.interactive as boolean | undefined;
-            modal = {
-              method: 'custom',
+            return {
+              method: 'custom' as const,
               id,
               title: (msg.title as string | undefined) ?? 'Extension Request',
               parsed,
               ...(lines ? { lines } : {}),
               ...(interactive ? { interactive: true as const } : {}),
             };
-            if (interactive) {
-              // Interactive custom component — no input needed, just display
-              modalInput = '';
-            } else if (parsed?.kind === 'input') {
-              modalInput = parsed.value ?? '';
-            } else {
-              modalInput = '';
-            }
+          }
+
+          default:
+            return null;
+        }
+        })();
+        if (newModal) {
+          modalQueue = [...modalQueue, newModal];
+          if (newModal.method === 'custom' && newModal.interactive) {
+            modalInput = '';
+          } else if (newModal.method === 'editor') {
+            modalInput = newModal.prefill ?? '';
+          } else if (newModal.method !== 'confirm') {
+            modalInput = '';
+          }
+        }
+
+        // Non-blocking extension methods are handled below outside the switch.
+        break;
+      }
+
+      case 'extension_ui_request_replay': {
+        // Reconnect replay marker — the server still has a pending promise for
+        // this modal. If we already have a modal with this id, it's still visible.
+        // If not, re-create a placeholder so the user can respond.
+        const replayId = msg.id as string;
+        const replayMethod = (msg.method as string | undefined) ?? 'select';
+        if (replayMethod === 'request_editor_text') break; // handled silently
+        const alreadyQueued = modalQueue.some((m) => m.id === replayId);
+        if (!alreadyQueued) {
+          modalQueue = [...modalQueue, {
+            method: 'input' as const,
+            id: replayId,
+            title: 'Pending Request',
+            placeholder: 'Reconnect — please respond to continue',
+          }];
+        }
+        break;
+      }
             break;
           }
 
@@ -1562,6 +1560,17 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
       case 'queue_update': {
         queuedSteering = (msg.steering as string[] | undefined) ?? [];
         queuedFollowUp = (msg.followUp as string[] | undefined) ?? [];
+        break;
+      }
+
+      case 'queue_restored': {
+        const restoredText = (msg.text as string | undefined) ?? '';
+        if (restoredText) {
+          // Append restored queued text to the composer so the user can re-submit it.
+          const prefix = input.trim() ? input + '\n\n' : '';
+          input = prefix + restoredText;
+          tick().then(() => { autoResizeTextarea(); inputEl?.focus(); });
+        }
         break;
       }
 
@@ -1744,8 +1753,8 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
       case 'custom_render': {
         const renderId = msg.id as string | undefined;
         const renderLines = msg.lines as string[] | undefined;
-        if (renderId && modal?.method === 'custom' && modal.id === renderId && modal.interactive && renderLines) {
-          modal = { ...modal, lines: renderLines };
+        if (renderId && modal?.method === 'custom' && modal.id === renderId && modal.interactive && renderLines && modalQueue.length > 0) {
+          modalQueue[0] = { ...modalQueue[0], lines: renderLines };
         }
         break;
       }
@@ -1789,6 +1798,7 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
 
       case 'server_restarting': {
         isRestarting = true;
+        _reloadPending = true;
         break;
       }
 
@@ -1799,10 +1809,13 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
       }
 
       case 'session_runtime': {
-        const rt = (msg as unknown) as { sessionId: string; isRunning: boolean; unseen: boolean; lastActivity: number };
+        const rt = msg as unknown as { sessionId: string; isRunning: boolean; unseen: boolean; lastActivity: number };
+        // Ignore stale updates from a previously-active session after switching
         if (rt.sessionId === sessionId) {
           isStreaming = rt.isRunning;
           projectsState.isStreaming = rt.isRunning;
+          if (rt.isRunning) requestWakeLock();
+          else releaseWakeLock();
         }
         if ((rt.isRunning || rt.unseen) && rt.sessionId !== sessionId) {
           projectsState.markUnchecked(rt.sessionId);
@@ -1825,28 +1838,32 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
 
   function modalConfirm(confirmed: boolean) {
     if (!modal) return;
-    send({ type: 'extension_ui_response', id: modal.id, confirmed });
-    modal = null;
+    if (send({ type: 'extension_ui_response', id: modal.id, confirmed })) {
+      modalQueue = modalQueue.slice(1);
+    }
   }
 
   function modalSubmitValue() {
     if (!modal) return;
-    send({ type: 'extension_ui_response', id: modal.id, value: modalInput });
-    modal = null;
-    modalInput = '';
+    if (send({ type: 'extension_ui_response', id: modal.id, value: modalInput })) {
+      modalQueue = modalQueue.slice(1);
+      modalInput = '';
+    }
   }
 
   function modalSelectOption(value: string) {
     if (!modal) return;
-    send({ type: 'extension_ui_response', id: modal.id, value });
-    modal = null;
+    if (send({ type: 'extension_ui_response', id: modal.id, value })) {
+      modalQueue = modalQueue.slice(1);
+    }
   }
 
   function modalCancel() {
     if (!modal) return;
-    send({ type: 'extension_ui_response', id: modal.id, cancelled: true });
-    modal = null;
-    modalInput = '';
+    if (send({ type: 'extension_ui_response', id: modal.id, cancelled: true })) {
+      modalQueue = modalQueue.slice(1);
+      modalInput = '';
+    }
   }
 
   /** Handles keydown inside the modal (Enter submits, Esc cancels, interactive custom gets forwarded). */
@@ -1973,10 +1990,6 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
 
   // ── Message helpers ──────────────────────────────────────────────────────────
 
-  function uid() {
-    return crypto.randomUUID();
-  }
-
   function freshAssistant(): UIMessage {
     return { id: uid(), role: 'assistant', content: '', thinking: '', thinkingExpanded: false, streaming: true, startMs: Date.now(), createdAt: Date.now() };
   }
@@ -1999,224 +2012,11 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
     }
   }
 
-  function extractTextContent(blocks: { type: string; text?: string }[]): string {
-    return blocks
-      .filter((b) => b.type === 'text')
-      .map((b) => b.text ?? '')
-      .join('');
-  }
-
-  function formatToolInput(toolName: string, details?: Record<string, unknown>): string | undefined {
-    if (!details) return undefined;
-    const str = (v: unknown): string | undefined => typeof v === 'string' ? v : undefined;
-    const num = (v: unknown): number | undefined => typeof v === 'number' ? v : undefined;
-
-    if (toolName === 'bash' || toolName === 'execute_bash') {
-      const cmd = str(details.command);
-      if (cmd) return `$ ${cmd.split('\n')[0].trim()}`;
-    }
-    if (toolName === 'read' || toolName === 'read_file') {
-      const p = str(details.path ?? details.file_path ?? details.file);
-      if (!p) return undefined;
-      const basename = p.split('/').pop() ?? p;
-      const offset = num(details.offset);
-      const limit = num(details.limit);
-      if (offset !== undefined) {
-        const end = limit !== undefined ? offset + limit - 1 : '';
-        return `${basename}:${offset}${end ? `–${end}` : '+'}`;
-      }
-      return basename;
-    }
-    if (toolName === 'write' || toolName === 'write_file') {
-      const p = str(details.path ?? details.file_path ?? details.file);
-      return p ? p.split('/').pop() ?? p : undefined;
-    }
-    if (toolName === 'edit') {
-      const p = str(details.path ?? details.file_path ?? details.file);
-      const basename = p ? p.split('/').pop() ?? p : undefined;
-      const edits = Array.isArray(details.edits) ? details.edits.length : undefined;
-      if (basename && edits !== undefined && edits > 1) return `${basename} (${edits} edits)`;
-      return basename;
-    }
-    if (toolName === 'grep') {
-      const pattern = str(details.pattern);
-      const path = str(details.path);
-      const glob = str(details.glob);
-      if (!pattern) return undefined;
-      const loc = (path ?? glob ?? '').split('/').pop() ?? '';
-      return loc ? `/${pattern}/ ${loc}` : `/${pattern}/`;
-    }
-    if (toolName === 'find') {
-      const pattern = str(details.pattern);
-      const path = str(details.path);
-      if (!pattern) return undefined;
-      const loc = (path ?? '').split('/').pop() ?? '';
-      return loc ? `${pattern} ${loc}` : pattern;
-    }
-    if (toolName === 'ls') {
-      return str(details.path) ?? '.';
-    }
-    // Generic fallback: first short string value
-    for (const v of Object.values(details)) {
-      if (typeof v === 'string' && v.length < 80) return v;
-    }
-    return undefined;
-  }
-
   function findToolMessage(toolCallId: string): UIMessage | undefined {
     for (let i = messages.length - 1; i >= 0; i--) {
       if (messages[i].role === 'tool' && messages[i].toolCallId === toolCallId) return messages[i];
     }
     return undefined;
-  }
-
-  function agentMsgToUI(m: unknown, toolInputMap?: Map<string, { name: string; input: Record<string, unknown> }>): UIMessage[] {
-    const msg = m as Record<string, unknown>;
-    if (!msg || typeof msg.role !== 'string') return [];
-
-    const role = msg.role.toLowerCase();
-    switch (role) {
-      case 'user':
-      case 'human': {
-        let text: string;
-        let images: string[] | undefined;
-        if (typeof msg.content === 'string') {
-          text = msg.content;
-        } else if (Array.isArray(msg.content)) {
-          const blocks = msg.content as { type: string; text?: string; data?: string; mimeType?: string }[];
-          text = blocks.filter((b) => b.type === 'text').map((b) => b.text ?? '').join('');
-          const imgBlocks = blocks.filter((b) => b.type === 'image' && b.data && b.mimeType);
-          if (imgBlocks.length > 0) {
-            images = imgBlocks.map((b) => `data:${b.mimeType};base64,${b.data}`);
-          }
-          if (!text && imgBlocks.length === 0) text = JSON.stringify(msg.content);
-        } else {
-          text = JSON.stringify(msg.content);
-        }
-        return [{ id: uid(), role: 'user', content: text, images, streaming: false, createdAt: Date.now() }];
-      }
-      case 'assistant':
-      case 'ai': {
-        let text = '';
-        let thinkingText = '';
-        let images: string[] | undefined;
-        let blocks: any[] = [];
-
-        if (typeof msg.content === 'string') {
-          text = msg.content;
-        } else if (Array.isArray(msg.content)) {
-          blocks = msg.content;
-          text = blocks
-            .filter((b) => b.type === 'text')
-            .map((b) => b.text ?? '')
-            .join('');
-          thinkingText = blocks
-            .filter((b) => b.type === 'thinking')
-            .map((b) => b.thinking ?? '')
-            .join('');
-          const imgBlocks = blocks.filter((b): b is { type: 'image'; data: string; mimeType: string } => b.type === 'image' && !!b.data && !!b.mimeType);
-          if (imgBlocks.length > 0) {
-            images = imgBlocks.map((b) => `data:${b.mimeType};base64,${b.data}`);
-          }
-        }
-
-        const rawUsage = msg.usage as { input?: number; output?: number; totalTokens?: number; cost?: { total?: number } } | undefined;
-        const usage: MsgUsage | undefined = rawUsage?.totalTokens
-          ? { input: rawUsage.input ?? 0, output: rawUsage.output ?? 0, totalTokens: rawUsage.totalTokens, cost: { total: rawUsage.cost?.total ?? 0 } }
-          : undefined;
-        
-        // Return assistant message if it has ANY displayable content (text, thinking, or images)
-        // or if it has tool calls (which we'll want to see even if they have no text).
-        // Wait, tool calls are currently handled by toolResult messages.
-        // But if an assistant message has ONLY tool calls and no text, it will be hidden.
-        // This is usually what we want if the tool results provide the visual feedback.
-        return text || thinkingText || images ? [{ id: uid(), role: 'assistant', content: text, images, thinking: thinkingText || undefined, thinkingExpanded: false, streaming: false, usage, createdAt: Date.now() }] : [];
-      }
-      case 'bashexecution':
-      case 'bash_execution':
-      case 'bash': {
-        const cmd = (msg.command as string | undefined) ?? (msg.content as string | undefined);
-        const output = (msg.output as string | undefined) ?? (typeof msg.content === 'string' ? '' : '');
-        return [
-          {
-            id: uid(),
-            role: 'tool',
-            toolName: 'bash',
-            toolInput: cmd ? `$ ${cmd.split('\n')[0].trim()}` : undefined,
-            toolArgs: cmd ? { command: cmd } : undefined,
-            content: output || '',
-            isError: typeof msg.exitCode === 'number' && (msg.exitCode as number) !== 0,
-            streaming: false,
-            createdAt: Date.now(),
-          },
-        ];
-      }
-      case 'toolresult':
-      case 'tool_result': {
-        const toolCallId = (msg.toolCallId as string | undefined) ?? (msg.id as string | undefined);
-        let toolInfo = toolCallId ? toolInputMap?.get(toolCallId) : undefined;
-        if (!toolInfo && toolCallId && toolInputMap && toolInputMap.size > 0) {
-          for (const [id, info] of toolInputMap) {
-            if (id.endsWith(toolCallId) || toolCallId.endsWith(id)) {
-              toolInfo = info;
-              break;
-            }
-          }
-        }
-        const toolName = (msg.toolName as string | undefined) ?? toolInfo?.name ?? 'tool';
-        const toolInput = toolInfo ? formatToolInput(toolName, toolInfo.input) : undefined;
-        
-        let content = '';
-        let images: string[] | undefined;
-        if (typeof msg.content === 'string') {
-          content = msg.content;
-        } else if (Array.isArray(msg.content)) {
-          const blocks = msg.content as { type: string; text?: string; data?: string; mimeType?: string }[];
-          content = extractTextContent(blocks);
-          const imgBlocks = blocks.filter((b): b is { type: 'image'; data: string; mimeType: string } => b.type === 'image' && !!b.data && !!b.mimeType);
-          if (imgBlocks.length > 0) images = imgBlocks.map((b) => `data:${b.mimeType};base64,${b.data}`);
-        }
-
-        return [
-          {
-            id: uid(),
-            role: 'tool',
-            toolName,
-            toolCallId,
-            toolInput,
-            toolArgs: toolInfo?.input,
-            content,
-            images,
-            isError: (msg.isError as boolean | undefined) ?? false,
-            streaming: false,
-            createdAt: Date.now(),
-          },
-        ];
-      }
-      // Custom extension message types (pi-mermaid, btw-note, scheduled_prompt, etc.)
-      default: {
-        const customType = msg.customType as string | undefined;
-        if (customType) {
-          const details = msg.details as Record<string, unknown> | undefined;
-          const display = (msg.display as string | undefined) ?? '';
-          // Render custom type as a formatted notice with details
-          let content = display || `[${customType}]`;
-          if (details) {
-            content += '\n\n' + JSON.stringify(details, null, 2);
-          }
-          return [{
-            id: uid(),
-            role: 'notice',
-            content,
-            noticeKind: 'custom',
-            customType,
-            streaming: false,
-            createdAt: Date.now(),
-          }];
-        }
-        return [];
-      }
-    }
   }
 
   async function scrollBottom() {
@@ -2709,6 +2509,7 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
   }
 
   function requestServerRestart(reloadPage = false) {
+    if (reloadPage) _reloadPending = true;
     reloadAfterRestart = reloadPage;
     send({ type: 'request_restart' });
   }
@@ -2774,6 +2575,11 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
     if (!showSlashMenu) slashMenuIndex = -1;
   });
 
+  let _installPromptHandler: ((e: Event) => void) | null = null;
+  let _appInstalledHandler: (() => void) | null = null;
+  let _onlineHandler: (() => void) | null = null;
+  let _offlineHandler: (() => void) | null = null;
+
   onMount(() => {
     connect();
     inputEl?.focus();
@@ -2786,15 +2592,31 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
       Notification.requestPermission();
     }
     // Listen for the PWA install prompt
-    window.addEventListener('beforeinstallprompt', (e) => {
+    _installPromptHandler = (e: Event) => {
       e.preventDefault();
       deferredInstallPrompt = e;
       installReady = true;
-    });
-    window.addEventListener('appinstalled', () => {
+    };
+    window.addEventListener('beforeinstallprompt', _installPromptHandler);
+    _appInstalledHandler = () => {
       installReady = false;
       deferredInstallPrompt = null;
-    });
+    };
+    window.addEventListener('appinstalled', _appInstalledHandler);
+    // Visibility + online/offline for reconnection resilience
+    document.addEventListener('visibilitychange', _onVisibilityChange);
+    _onlineHandler = () => {
+      if (wsState !== 'open') {
+        cancelReconnect();
+        connect();
+      }
+    };
+    _offlineHandler = () => {
+      // Mark as offline so UI shows disconnected state
+      if (wsState === 'open') wsState = 'connecting';
+    };
+    window.addEventListener('online', _onlineHandler);
+    window.addEventListener('offline', _offlineHandler);
     // Restore persisted sidebar widths
     try {
       const sw = parseInt(localStorage.getItem('pifrontier:session-w') ?? '');
@@ -2810,11 +2632,39 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
 
   onDestroy(() => {
     releaseWakeLock();
-    if (reconnectTimer) clearTimeout(reconnectTimer);
     if (sendHoldTimer) clearTimeout(sendHoldTimer);
-    ws?.close();
+    disconnect();
+    document.removeEventListener('visibilitychange', _onVisibilityChange);
+    if (_installPromptHandler) window.removeEventListener('beforeinstallprompt', _installPromptHandler);
+    if (_appInstalledHandler) window.removeEventListener('appinstalled', _appInstalledHandler);
+    if (_onlineHandler) window.removeEventListener('online', _onlineHandler);
+    if (_offlineHandler) window.removeEventListener('offline', _offlineHandler);
     if (_mq && _mqHandler) _mq.removeEventListener('change', _mqHandler);
   });
+
+  /** Single visibility-change handler: pause reconnection + manage wake lock. */
+  function _onVisibilityChange() {
+    if (document.hidden) {
+      _pageHiddenAt = Date.now();
+      releaseWakeLock();
+    } else {
+      // Wake lock: re-acquire if still streaming
+      if (isStreaming) requestWakeLock();
+      // Reconnection: resume if WS is down
+      if (_pageHiddenAt > 0) {
+        const wasHidden = Date.now() - _pageHiddenAt;
+        _pageHiddenAt = 0;
+        if (wsState === 'connecting' && wasHidden > 5000) {
+          // Server likely timed us out — reset and connect immediately
+          _intentionalClose = false;
+          cancelReconnect();
+          connect();
+        } else if (wsState === 'connecting') {
+          scheduleReconnect();
+        }
+      }
+    }
+  }
 </script>
 
 <svelte:head>
@@ -3325,6 +3175,11 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
                           {/if}
                         </span>
                       {/if}
+                    {:else if msg.aborted}
+                      <div class="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg bg-warning/10 text-warning text-sm font-medium">
+                        <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+                        {msg.content}
+                      </div>
                     {:else}
                       <div class="prose text-base-content/90">{@html renderMarkdown(msg.content)}</div>
                       {#if msg.images?.length}
@@ -3660,7 +3515,7 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
                     <button {...props} onclick={steerAgent} class="w-9 h-9 flex items-center justify-center text-warning/80 hover:text-warning hover:bg-warning/10 rounded-full transition-colors" aria-label="Steer pi"><svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M12 5l7 7-7 7"/></svg></button>
                   {/snippet}
                 </Tooltip.Trigger>
-                <Tooltip.Content>Steer (Enter)</Tooltip.Content>
+                <Tooltip.Content>Queue steer (Enter)</Tooltip.Content>
               </Tooltip.Root>
             {/if}
             <Tooltip.Root>

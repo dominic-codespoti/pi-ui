@@ -72,6 +72,7 @@ bun run start --password your-secret
 
 ```
 pi-ui [options]
+pi-ui update
 
 Options:
   -p, --password <password>  Password to protect the UI
@@ -81,8 +82,12 @@ Options:
       --cwd <dir>            Working directory for the pi session
                              (defaults to current working directory)
   -o, --open                 Open http://localhost:<port> in the browser
+  -d, --daemon               Run as a background daemon (detached from terminal)
   -h, --help                 Show this help message
   -V, --version              Print version and exit
+
+Commands:
+  update                     Update pi-ui using the detected install method
 ```
 
 ### Examples
@@ -99,6 +104,12 @@ pi-ui -p secret --cwd /path/to/my-project
 
 # Password from environment variable
 PI_PASSWORD=secret PORT=4000 pi-ui
+
+# Run as a background daemon
+pi-ui -p secret --daemon
+
+# Update pi-ui to the latest version
+pi-ui update
 ```
 
 ---
@@ -224,13 +235,22 @@ bun run format
 ## Publishing
 
 ```bash
-# Builds and publishes to npm
+# Validate packaging before publishing
+bun run build && bun run build:server
+npm pack --dry-run   # inspect the file list
+
+# Builds and publishes to npm (runs prepublishOnly which builds first)
 npm publish
 ```
 
 The `prepublishOnly` hook runs `bun run build && bun run build:server`, so the
 pre-built SvelteKit assets and minified Bun server bundle are included in the
 package. Consumers get a zero-build install through the `pi-ui` CLI.
+
+> **Note:** `@thed24/pi-ui` is a scoped package. The first publish requires
+> `--access public`. Subsequent publishes default to the same access level.
+> The `publishConfig.access: "public"` field in `package.json` handles this
+> automatically.
 
 ---
 

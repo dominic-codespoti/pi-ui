@@ -38,7 +38,7 @@ export const load: PageServerLoad = async ({ cookies }) => {
 
 export const actions: Actions = {
   default: async ({ request, cookies, getClientAddress }) => {
-    const ip = getClientIp(request, getClientAddress());
+    const ip = getClientIp(request, getClientAddress(), isBehindProxy(request));
 
     // ── CSRF origin check ─────────────────────────────────────────────────
     const origin = request.headers.get('origin');

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'bun:test';
+import { describe, it, expect, beforeEach } from 'vitest';
 import { checkRateLimit, recordFailure, clearRecord } from './rate-limiter';
 
 const IP = '1.2.3.4';

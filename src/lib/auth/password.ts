@@ -169,6 +169,18 @@ export async function extractJti(token: string): Promise<string | undefined> {
   }
 }
 
+/** Extract the expiry timestamp (seconds since epoch) from a token WITHOUT verification. */
+export function extractTokenExp(token: string): number | undefined {
+  try {
+    const payloadB64 = token.split('.')[1];
+    if (!payloadB64) return undefined;
+    const payload = JSON.parse(new TextDecoder().decode(b64urlDecode(payloadB64)));
+    return payload.exp as number | undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 // ── Cookie helpers ────────────────────────────────────────────────────────────
 
 export function getTokenFromCookies(cookieHeader: string): string | null {
