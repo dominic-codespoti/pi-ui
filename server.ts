@@ -85,7 +85,7 @@ if (!existsSync(cwd)) {
  * before the first session exists. Switching projects moves this boundary.
  */
 function activeCwd(): string {
-  return session?.sessionManager.getCwd() || cwd;
+  return activeSessionOrNull()?.sessionManager.getCwd() || cwd;
 }
 
 /**
@@ -120,7 +120,7 @@ function serializeModel(model: Model<any> | undefined | null): ModelInfo | null 
 }
 
 function getProviders(): ProviderInfo[] {
-  const allModels = session!.modelRegistry.getAll();
+  const allModels = activeSession().modelRegistry.getAll();
   const providerCount = new Map<string, number>();
   for (const m of allModels) {
     providerCount.set(m.provider, (providerCount.get(m.provider) ?? 0) + 1);
@@ -128,10 +128,10 @@ function getProviders(): ProviderInfo[] {
 
   const providers: ProviderInfo[] = [];
   for (const [providerId, modelCount] of providerCount) {
-    const status = session!.modelRegistry.getProviderAuthStatus(providerId);
+    const status = activeSession().modelRegistry.getProviderAuthStatus(providerId);
     providers.push({
       id: providerId,
-      name: session!.modelRegistry.getProviderDisplayName(providerId),
+      name: activeSession().modelRegistry.getProviderDisplayName(providerId),
       configured: status.configured,
       source: status.source,
       modelCount,
@@ -486,21 +486,22 @@ async function broadcastProjects(): Promise<void> {
   }
 }
 
-/** Build a SessionSummary for the current session. */
+/** Build a SessionSummary for the active session. */
 function currentSessionSummary(): SessionSummary | null {
-  if (!session) return null;
-  const msg = session.messages[0] as { content?: string | Array<unknown> } | undefined;
+  const s = activeSessionOrNull();
+  if (!s) return null;
+  const msg = s.messages[0] as { content?: string | Array<unknown> } | undefined;
   const firstMsg = msg?.content
     ? (typeof msg.content === 'string' ? msg.content.slice(0, 120) : '(complex)')
     : '';
   return {
-    id: session.sessionId,
-    path: session.sessionManager.getSessionFile() ?? '(in-memory)',
-    cwd: session.sessionManager.getCwd() || cwd,
-    name: session.sessionManager.getSessionName() || undefined,
+    id: s.sessionId,
+    path: s.sessionManager.getSessionFile() ?? '(in-memory)',
+    cwd: s.sessionManager.getCwd() || cwd,
+    name: s.sessionManager.getSessionName() || undefined,
     created: Date.now(),
     modified: Date.now(),
-    messageCount: session.messages.length,
+    messageCount: s.messages.length,
     firstMessage: firstMsg,
   };
 }
@@ -527,6 +528,10 @@ function createDialogPromise<T>(
   requestPayload: Record<string, unknown>,
   parseResponse: (r: Record<string, unknown>) => T
 ): Promise<T> {
+  // No browser client connected — resolve immediately so the agent doesn't hang.
+  if (connectedClients === 0) {
+    return Promise.resolve(parseResponse({ cancelled: true }));
+  }
   return new Promise<T>((resolve) => {
     pendingExtensionRequests.set(id, {
       resolve: (response) => {
@@ -550,10 +555,50 @@ function cancelAllPendingExtensionRequests() {
     entry.resolve('');
   }
   pendingEditorTextRequests.clear();
+  // Clean up interactive custom components
+  for (const [, component] of interactiveCustomComponents) {
+    try { component.dispose?.(); } catch { /* ignore */ }
+  }
+  interactiveCustomComponents.clear();
+  for (const [, interval] of interactiveRenderIntervals) {
+    clearInterval(interval);
+  }
+  interactiveRenderIntervals.clear();
+  // Clean up widget refresh intervals
+  for (const [, entry] of widgetFactories) {
+    clearInterval(entry.intervalId);
+  }
+  widgetFactories.clear();
 }
 
 // Server-side state for extension UI context
 let toolsExpanded = false;
+
+// Interactive custom component instances (keyed by dialog ID)
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const interactiveCustomComponents = new Map<string, any>();
+// Render-polling intervals for interactive components (keyed by same dialog ID)
+const interactiveRenderIntervals = new Map<string, Timer>();
+
+function broadcastCustomRender(id: string, component: { render(w: number): unknown }) {
+  try {
+    const rawLines = component.render(80) as string[];
+    const cleanLines = Array.isArray(rawLines) ? rawLines.map((l: string) => stripAnsi(l)) : [];
+    broadcast({ type: 'custom_render', id, lines: cleanLines });
+  } catch { /* component may have disposed */ }
+}
+
+// Widget factories with refresh intervals
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const widgetFactories = new Map<string, { factory: (...args: any[]) => any; intervalId: Timer; placement?: string }>();
+
+function clearWidgetInterval(key: string) {
+  const existing = widgetFactories.get(key);
+  if (existing) {
+    clearInterval(existing.intervalId);
+    widgetFactories.delete(key);
+  }
+}
 
 const uiContext: Omit<ExtensionUIContext, 'getEditorText'> & { getEditorText(): Promise<string> } = {
   select(title, options) {
@@ -594,8 +639,6 @@ const uiContext: Omit<ExtensionUIContext, 'getEditorText'> & { getEditorText(): 
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   async custom(...args: any[]): Promise<any> {
-    // Extensions call: ctx.ui.custom(factory, { overlay, overlayOptions, onHandle })
-    // Parse arguments: first arg might be factory (function) or title (string)
     const id = crypto.randomUUID();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     let factory: ((...a: any[]) => any) | null = null;
@@ -618,10 +661,54 @@ const uiContext: Omit<ExtensionUIContext, 'getEditorText'> & { getEditorText(): 
       }
     }
 
-    // Try to call the factory and parse the component tree
+    // Try to detect interactive components (render + handleInput)
     let parsed = null;
     if (factory) {
-      parsed = await callFactoryAndParse(factory, title, options);
+      try {
+        const component = await factory(stubTui, stubTheme, stubKeybindings, () => {});
+        if (component && typeof component === 'object') {
+          if (typeof component.render === 'function' && typeof component.handleInput === 'function') {
+            // Interactive component — store and bridge keystrokes
+            if (connectedClients === 0) {
+              // No browser to interact with — dispose and resolve immediately
+              try { component.dispose?.(); } catch { /* ignore */ }
+              return undefined;
+            }
+            interactiveCustomComponents.set(id, component);
+            // Poll render every 200ms so sub-session events (streaming text etc) update the display
+            const pollId = setInterval(() => broadcastCustomRender(id, component), 200);
+            interactiveRenderIntervals.set(id, pollId);
+            const rawLines = component.render(80) as string[];
+            const cleanLines = Array.isArray(rawLines) ? rawLines.map((l: string) => stripAnsi(l)) : [];
+
+            return new Promise<string | undefined>((resolve) => {
+              pendingExtensionRequests.set(id, {
+                resolve: (r) => {
+                  interactiveCustomComponents.delete(id);
+                  const pi = interactiveRenderIntervals.get(id);
+                  if (pi) { clearInterval(pi); interactiveRenderIntervals.delete(id); }
+                  try { component.dispose?.(); } catch { /* ignore */ }
+                  pendingExtensionRequests.delete(id);
+                  resolve('cancelled' in r && r.cancelled ? undefined : 'value' in r ? (r.value as string) : undefined);
+                },
+              });
+              broadcast({
+                type: 'extension_ui_request',
+                id,
+                method: 'custom',
+                title,
+                lines: cleanLines,
+                interactive: true,
+              });
+            });
+          }
+          // Not interactive — parse as component tree
+          parsed = parseComponentTree(component, 80);
+        }
+      } catch {
+        // Factory failed with stubs — try callFactoryAndParse as alternate
+        parsed = await callFactoryAndParse(factory, title, options);
+      }
     }
 
     return createDialogPromise<string | undefined>(
@@ -663,6 +750,7 @@ const uiContext: Omit<ExtensionUIContext, 'getEditorText'> & { getEditorText(): 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   setWidget(key: string, content: any, options?: { placement?: string }) {
     if (content === undefined) {
+      clearWidgetInterval(key);
       broadcast({
         type: 'extension_ui_request',
         id: crypto.randomUUID(),
@@ -673,6 +761,7 @@ const uiContext: Omit<ExtensionUIContext, 'getEditorText'> & { getEditorText(): 
         widgetPlacement: options?.placement,
       });
     } else if (Array.isArray(content)) {
+      clearWidgetInterval(key);
       broadcast({
         type: 'extension_ui_request',
         id: crypto.randomUUID(),
@@ -683,16 +772,15 @@ const uiContext: Omit<ExtensionUIContext, 'getEditorText'> & { getEditorText(): 
         widgetPlacement: options?.placement,
       });
     } else if (typeof content === 'function') {
-      // Factory function — call it with stubs and try to get string[] content.
-      // Extensions pass: (tui, theme) => ({ render(width): string[], invalidate() })
-      try {
-        const result = content(stubTui, stubTheme);
-        if (result && typeof result === 'object' && typeof result.render === 'function') {
-          // { render(width): string[] } pattern — call render to get lines
-          const lines = result.render(80) as string[];
-          if (Array.isArray(lines) && lines.length > 0) {
-            // Strip ANSI escape codes
-            const cleanLines = lines.map((l) => stripAnsi(l));
+      // Factory function — store and poll for live updates
+      clearWidgetInterval(key);
+      const tick = () => {
+        try {
+          const result = content(stubTui, stubTheme);
+          if (result && typeof result === 'object' && typeof result.render === 'function') {
+            const rawLines = result.render(80) as string[];
+            if (!Array.isArray(rawLines)) return;
+            const cleanLines = rawLines.map((l: string) => stripAnsi(l));
             broadcast({
               type: 'extension_ui_request',
               id: crypto.randomUUID(),
@@ -702,24 +790,22 @@ const uiContext: Omit<ExtensionUIContext, 'getEditorText'> & { getEditorText(): 
               widgetLines: cleanLines,
               widgetPlacement: options?.placement,
             });
+          } else if (Array.isArray(result)) {
+            broadcast({
+              type: 'extension_ui_request',
+              id: crypto.randomUUID(),
+              method: 'setWidget',
+              widgetKey: key,
+              widgetType: 'text',
+              widgetLines: result,
+              widgetPlacement: options?.placement,
+            });
           }
-        } else if (Array.isArray(result)) {
-          // Factory returned string[] directly
-          broadcast({
-            type: 'extension_ui_request',
-            id: crypto.randomUUID(),
-            method: 'setWidget',
-            widgetKey: key,
-            widgetType: 'text',
-            widgetLines: result,
-            widgetPlacement: options?.placement,
-          });
-        }
-        // If result is a Component (Container/Box), we can't render it without a real TUI.
-        // The component's render() output is ANSI terminal text — not useful for web.
-      } catch {
-        // Factory failed — ignore silently (extension may need real TUI)
-      }
+        } catch { /* factory may fail */ }
+      };
+      tick(); // initial render
+      const intervalId = setInterval(tick, 80);
+      widgetFactories.set(key, { factory: content, intervalId, placement: options?.placement });
     }
   },
 
@@ -860,22 +946,75 @@ async function getSDK(): Promise<typeof PiSDKNS> {
   return _sdk!;
 }
 
-// Mutable session singleton — null until ensureSession() is first called.
-let session: AgentSession | null = null;
-let unsubscribePi: (() => void) | null = null;
+// ── Multi-session pool ──────────────────────────────────────────────────────────
+//
+// Sessions are created and kept alive in the pool. Only the "active" session
+// forwards events to the browser. Inactive sessions remain live (and their
+// agent continues running if mid-stream). Switching back broadcasts a fresh
+// snapshot from the live in-memory session.
+
+interface ManagedSession {
+  session: AgentSession;
+  /** Unsubscribe from the active-event-forwarding subscription (null when inactive). */
+  forwardingUnsub: (() => void) | null;
+  /** Unsubscribe from the runtime-status subscription (always active). */
+  runtimeUnsub: (() => void) | null;
+  cwd: string;
+  path: string | null;
+  createdAt: number;
+  /** True while the agent is generating (agent_start … agent_end). */
+  isRunning: boolean;
+  /** True if the session has new result(s) since the user last looked at it. */
+  unseen: boolean;
+  /** Unix ms of the most recent agent_end / message_end. */
+  lastActivity: number;
+}
+
+const sessionPool = new Map<string, ManagedSession>();
+let activeSessionId: string | null = null;
 // Promise lock — prevents concurrent first-connection races from creating duplicate sessions.
-let _sessionInitPromise: Promise<AgentSession> | null = null;
+let _sessionInitPromise: Promise<string> | null = null;
+
+/** The currently-active AgentSession (throws if none). */
+function activeSession(): AgentSession {
+  const m = activeSessionId ? sessionPool.get(activeSessionId) : undefined;
+  if (!m) throw new Error('No active session');
+  return m.session;
+}
+/** The currently-active AgentSession or null. */
+function activeSessionOrNull(): AgentSession | null {
+  const m = activeSessionId ? sessionPool.get(activeSessionId) : undefined;
+  return m?.session ?? null;
+}
+
+/** Look up a managed session by its session-file path. */
+function findManagedSessionByPath(path: string): ManagedSession | undefined {
+  for (const m of sessionPool.values()) {
+    if (m.path === path) return m;
+  }
+  return undefined;
+}
 
 /**
- * Initialise (or return) the pi session. Loads the SDK and creates a session
- * on demand. Concurrent calls share the same initialisation promise.
+ * Initialise (or return) the active pi session. Loads the SDK and creates a
+ * session on demand. Concurrent calls share the same initialisation promise.
  *
  * Uses SessionManager.continueRecent() to resume the most recent persisted
  * session, or create a new one. Sessions are saved to disk as .jsonl files
  * under ~/.pi/agent/sessions/.
  */
 async function ensureSession(): Promise<AgentSession> {
-  if (session) return session;
+  // If the promise resolved to an id that's been cleaned up, reset it
+  if (_sessionInitPromise) {
+    const sid = await Promise.resolve(_sessionInitPromise).then(
+      (id) => (sessionPool.has(id) ? id : null),
+      () => null,
+    );
+    if (sid) return sessionPool.get(sid)!.session;
+    // Stale promise — reset and fall through to create a new session
+    _sessionInitPromise = null;
+  }
+  if (activeSessionId && sessionPool.has(activeSessionId)) return activeSession();
   if (!_sessionInitPromise) {
     _sessionInitPromise = (async () => {
       const sdk = await getSDK();
@@ -885,74 +1024,173 @@ async function ensureSession(): Promise<AgentSession> {
         cwd,
         sessionManager: sm,
       });
-      session = result.session;
-      touchProject(session.sessionManager.getCwd() || cwd);
-      console.log(`[pifrontier] Pi session ready: ${session.sessionId} (${sm.isPersisted() ? 'persisted' : 'in-memory'})`);
-      await session.bindExtensions({ uiContext: uiContext as unknown as ExtensionUIContext });
+      const sess = result.session;
+      touchProject(sess.sessionManager.getCwd() || cwd);
+      console.log(`[pifrontier] Pi session ready: ${sess.sessionId} (${sm.isPersisted() ? 'persisted' : 'in-memory'})`);
+      await sess.bindExtensions({ uiContext: uiContext as unknown as ExtensionUIContext });
       console.log('[pifrontier] Extension UI context bound.');
-      unsubscribePi = session.subscribe((event) => {
-        broadcast(event);
-      });
-      return session;
+
+      // Store in pool and mark active
+      const sid = sess.sessionId;
+      const cwdV = sess.sessionManager.getCwd() || cwd;
+      registerSession(sid, sess, cwdV, false);
+      activeSessionId = sid;
+
+      return sid;
     })();
   }
-  return _sessionInitPromise;
+  const sid = await _sessionInitPromise;
+  return sessionPool.get(sid)!.session;
+}
+
+/** Register a session in the pool, subscribe runtime tracking, and optionally bind extensions. */
+function registerSession(sid: string, sess: AgentSession, cwdV: string, bindExt: boolean) {
+  const path = sess.sessionManager.getSessionFile() ?? null;
+  const entry: ManagedSession = {
+    session: sess,
+    forwardingUnsub: null,
+    runtimeUnsub: null,
+    cwd: cwdV,
+    path,
+    createdAt: Date.now(),
+    isRunning: sess.isStreaming,
+    unseen: false,
+    lastActivity: Date.now(),
+  };
+  sessionPool.set(sid, entry);
+
+  // Subscribe runtime-status tracking for ALL pooled sessions (always on)
+  entry.runtimeUnsub = sess.subscribe((event) => {
+    switch (event.type) {
+      case 'agent_start':
+        entry.isRunning = true;
+        entry.unseen = activeSessionId !== sid;
+        break;
+      case 'agent_end':
+        entry.isRunning = false;
+        if (activeSessionId !== sid) entry.unseen = true;
+        entry.lastActivity = Date.now();
+        break;
+      case 'message_end':
+        entry.lastActivity = Date.now();
+        if (activeSessionId !== sid) entry.unseen = true;
+        break;
+    }
+    // Broadcast runtime-status snapshot so sidebar can show live dots
+    broadcastSessionRuntime(sid, entry);
+  });
+
+  // Subscribe event-forwarding (only active session gets this)
+  const fwdUnsub = sess.subscribe((event) => {
+    if (activeSessionId !== sid) return; // not active — skip forwarding
+    if (event.type === 'message_end') {
+      try { broadcast({ ...event, contextUsage: sess.getContextUsage() }); }
+      catch { broadcast(event); }
+    } else {
+      broadcast(event);
+    }
+  });
+  entry.forwardingUnsub = fwdUnsub;
+
+  if (bindExt) {
+    sess.bindExtensions({ uiContext: uiContext as unknown as ExtensionUIContext }).catch((err) => {
+      console.error('[pifrontier] bindExtensions (non-fatal):', err);
+    });
+  }
+}
+
+/** Broadcast a runtime-status update for a single pooled session. */
+function broadcastSessionRuntime(sid: string, entry: ManagedSession) {
+  broadcast({
+    type: 'session_runtime',
+    sessionId: sid,
+    isRunning: entry.isRunning,
+    unseen: entry.unseen,
+    lastActivity: entry.lastActivity,
+  });
 }
 
 /**
- * Switch the active session, rebind extensions, resubscribe, and broadcast state.
- * Called for both new-session and switch-session commands.
+ * Switch the active session. The old session stays alive in the pool (its
+ * agent continues running if mid-stream). The new session gets event-forwarding
+ * to the browser and a session_loaded broadcast.
+ *
+ * If the session is already in the pool (previously active) it is reused
+ * without re-creating from disk. This preserves in-progress state.
  */
-async function setActiveSession(newSession: AgentSession) {
-  // Detach from the old session and dispose it to free memory
-  if (unsubscribePi) {
-    unsubscribePi();
-    unsubscribePi = null;
+async function setActiveSession(newSession: AgentSession, newCwd?: string) {
+  const newId = newSession.sessionId;
+
+  // Stop forwarding for the previously-active session
+  if (activeSessionId) {
+    const prev = sessionPool.get(activeSessionId);
+    if (prev?.forwardingUnsub) {
+      prev.forwardingUnsub();
+      prev.forwardingUnsub = null;
+    }
   }
-  const oldSession = session;
-  if (oldSession && oldSession !== newSession) {
-    oldSession.dispose();
+
+  // Register if first time seeing this session
+  const alreadyPooled = sessionPool.has(newId);
+  if (!alreadyPooled) {
+    registerSession(newId, newSession, newCwd || newSession.sessionManager.getCwd() || cwd, true);
   }
 
   // Clear extension autocomplete providers (extensions re-register via bindExtensions)
   autocompleteProviderWrappers.length = 0;
   chainedAutocompleteProvider = null;
 
-  session = newSession;
+  activeSessionId = newId;
 
-  try {
-    await session.bindExtensions({ uiContext: uiContext as unknown as ExtensionUIContext });
-  } catch (err) {
-    console.error('[pifrontier] bindExtensions (non-fatal):', err);
-    broadcast({ type: 'agent_error', error: `Extension install failed: ${err instanceof Error ? err.message : String(err)}` });
+  // Re-bind extensions only for newly-created sessions (to avoid duplicate handlers)
+  if (!alreadyPooled) {
+    try {
+      await newSession.bindExtensions({ uiContext: uiContext as unknown as ExtensionUIContext });
+    } catch (err) {
+      console.error('[pifrontier] bindExtensions (non-fatal):', err);
+      broadcast({ type: 'agent_error', error: `Extension install failed: ${err instanceof Error ? err.message : String(err)}` });
+    }
   }
 
-  unsubscribePi = session.subscribe((event) => {
-    broadcast(event);
-  });
+  // Re-enable forwarding for the now-active session
+  const entry = sessionPool.get(newId)!;
+  if (!entry.forwardingUnsub) {
+    const fwdUnsub = newSession.subscribe((event) => {
+      if (activeSessionId !== newId) return; // no longer active — skip
+      if (event.type === 'message_end') {
+        try { broadcast({ ...event, contextUsage: newSession.getContextUsage() }); }
+        catch { broadcast(event); }
+      } else {
+        broadcast(event);
+      }
+    });
+    entry.forwardingUnsub = fwdUnsub;
+  }
+
+  // Clear unseen when switching to this session
+  entry.unseen = false;
 
   broadcast({
     type: 'session_loaded',
-    sessionId: session.sessionId,
-    isStreaming: session.isStreaming,
-    thinkingLevel: session.thinkingLevel,
-    model: serializeModel(session.model),
-    availableModels: session.modelRegistry.getAvailable().map(serializeModel),
-    messages: session.messages,
-    cwd: session.sessionManager.getCwd() || cwd,
-    sessionName: session.sessionManager.getSessionName(),
-    isCompacting: session.isCompacting,
-    autoCompactionEnabled: session.autoCompactionEnabled,
-    autoRetryEnabled: session.autoRetryEnabled,
+    sessionId: newSession.sessionId,
+    isStreaming: newSession.isStreaming,
+    thinkingLevel: newSession.thinkingLevel,
+    model: serializeModel(newSession.model),
+    availableModels: newSession.modelRegistry.getAvailable().map(serializeModel),
+    messages: newSession.messages,
+    cwd: newSession.sessionManager.getCwd() || cwd,
+    sessionName: newSession.sessionManager.getSessionName(),
+    isCompacting: newSession.isCompacting,
+    autoCompactionEnabled: newSession.autoCompactionEnabled,
+    autoRetryEnabled: newSession.autoRetryEnabled,
     piVersion: PI_SDK_VERSION,
     uiVersion: UI_VERSION,
-    // Flag on session_loaded so UI shows the session mode
-    sessionMode: session.sessionManager.isPersisted() ? 'persisted' : 'in-memory',
-    contextUsage: session.getContextUsage(),
+    sessionMode: newSession.sessionManager.isPersisted() ? 'persisted' : 'in-memory',
+    contextUsage: newSession.getContextUsage(),
   });
 
   // Register/touch the project for the session's directory.
-  touchProject(session.sessionManager.getCwd() || cwd);
+  touchProject(newSession.sessionManager.getCwd() || cwd);
 
   // Refresh sidebar session + project lists so all connected tabs see the change
   try {
@@ -1009,50 +1247,61 @@ try {
       ws.subscribe(WS_TOPIC);
       connectedClients++;
 
-      // Load SDK + session on first connection; subsequent calls return instantly.
-      const sess = await ensureSession();
-
-      ws.send(
-        JSON.stringify({
-          type: 'connected',
-          sessionId: sess.sessionId,
-          isStreaming: sess.isStreaming,
-          thinkingLevel: sess.thinkingLevel,
-          model: serializeModel(sess.model),
-          availableModels: sess.modelRegistry.getAvailable().map(serializeModel),
-          messages: sess.messages,
-          cwd: sess.sessionManager.getCwd() || cwd,
-          sessionName: sess.sessionManager.getSessionName(),
-          isCompacting: sess.isCompacting,
-          autoCompactionEnabled: sess.autoCompactionEnabled,
-          autoRetryEnabled: sess.autoRetryEnabled,
-          piVersion: PI_SDK_VERSION,
-          uiVersion: UI_VERSION,
-          sessionMode: sess.sessionManager.isPersisted() ? 'persisted' : 'in-memory',
-          contextUsage: sess.getContextUsage(),
-        })
-      );
-
-      // Send extension commands immediately after connected
       try {
-        const sessionCwd = sess.sessionManager.getCwd() || cwd;
-        const agentDir = _sdk!.getAgentDir();
-        const loader = new _sdk!.DefaultResourceLoader({ cwd: sessionCwd, agentDir });
-        await loader.reload();
-        const { extensions } = loader.getExtensions();
-        const allCommands: { name: string; description?: string; source: string }[] = [];
-        for (const ext of extensions) {
-          for (const [name, cmd] of ext.commands) {
-            allCommands.push({
-              name,
-              description: cmd.description,
-              source: ext.sourceInfo.source,
-            });
+        // Load SDK + session on first connection; subsequent calls return instantly.
+        const sess = await ensureSession();
+
+        ws.send(
+          JSON.stringify({
+            type: 'connected',
+            sessionId: sess.sessionId,
+            isStreaming: sess.isStreaming,
+            thinkingLevel: sess.thinkingLevel,
+            model: serializeModel(sess.model),
+            availableModels: sess.modelRegistry.getAvailable().map(serializeModel),
+            messages: sess.messages,
+            cwd: sess.sessionManager.getCwd() || cwd,
+            sessionName: sess.sessionManager.getSessionName(),
+            isCompacting: sess.isCompacting,
+            autoCompactionEnabled: sess.autoCompactionEnabled,
+            autoRetryEnabled: sess.autoRetryEnabled,
+            piVersion: PI_SDK_VERSION,
+            uiVersion: UI_VERSION,
+            sessionMode: sess.sessionManager.isPersisted() ? 'persisted' : 'in-memory',
+            contextUsage: sess.getContextUsage(),
+          })
+        );
+
+        // Send extension commands immediately after connected
+        try {
+          const sessionCwd = sess.sessionManager.getCwd() || cwd;
+          const agentDir = _sdk!.getAgentDir();
+          const loader = new _sdk!.DefaultResourceLoader({ cwd: sessionCwd, agentDir });
+          await loader.reload();
+          const { extensions } = loader.getExtensions();
+          const allCommands: { name: string; description?: string; source: string }[] = [];
+          for (const ext of extensions) {
+            for (const [name, cmd] of ext.commands) {
+              allCommands.push({
+                name,
+                description: cmd.description,
+                source: ext.sourceInfo.source,
+              });
+            }
           }
+          ws.send(JSON.stringify({ type: 'commands_list', commands: allCommands }));
+        } catch (err) {
+          console.error('[pifrontier] Failed to send extension commands:', err);
         }
-        ws.send(JSON.stringify({ type: 'commands_list', commands: allCommands }));
+
+        // Send runtime snapshots for all pooled sessions so reconnecting clients
+        // get correct sidebar state (background running, unseen, etc.)
+        for (const [sid, entry] of sessionPool) {
+          broadcastSessionRuntime(sid, entry);
+        }
       } catch (err) {
-        console.error('[pifrontier] Failed to send extension commands:', err);
+        console.error('[pifrontier] Failed to initialise session for new client:', err);
+        try { ws.close(1011, 'Session initialisation failed'); } catch { /* ws may already be closed */ }
       }
     },
 
@@ -1064,17 +1313,26 @@ try {
         return;
       }
 
-      // Ensure SDK + session are loaded before dispatching any command.
-      await ensureSession();
-
       try {
+        // Ensure SDK + session are loaded before dispatching any command.
+        await ensureSession();
       switch (msg.type) {
         case 'prompt': {
           try {
-            const imageContent = msg.images?.length
-              ? msg.images.map((img) => ({ type: 'image' as const, data: img.data, mimeType: img.mimeType }))
-              : undefined;
-            await session!.prompt(msg.message, imageContent ? { images: imageContent } : undefined);
+            const s = activeSession();
+            if (s.isStreaming) {
+              // Agent is busy — route as steer/followUp instead of throwing
+              if (msg.images?.length) {
+                ws.send(JSON.stringify({ type: 'agent_error', error: 'Cannot send images while the agent is already processing. Wait for it to finish.' }));
+                break;
+              }
+              await s.steer(msg.message);
+            } else {
+              const imageContent = msg.images?.length
+                ? msg.images.map((img) => ({ type: 'image' as const, data: img.data, mimeType: img.mimeType }))
+                : undefined;
+              await s.prompt(msg.message, imageContent ? { images: imageContent } : undefined);
+            }
           } catch (err) {
             console.error('[pifrontier] prompt error:', err);
             ws.send(JSON.stringify({ type: 'agent_error', error: String(err) }));
@@ -1084,7 +1342,7 @@ try {
 
         case 'steer':
           try {
-            await session!.steer(msg.message);
+            await activeSession().steer(msg.message);
           } catch (err) {
             console.error('[pifrontier] steer error:', err);
             ws.send(JSON.stringify({ type: 'agent_error', error: String(err) }));
@@ -1093,7 +1351,7 @@ try {
 
         case 'follow_up':
           try {
-            await session!.followUp(msg.message);
+            await activeSession().followUp(msg.message);
           } catch (err) {
             console.error('[pifrontier] followUp error:', err);
             ws.send(JSON.stringify({ type: 'agent_error', error: String(err) }));
@@ -1101,21 +1359,21 @@ try {
           break;
 
         case 'abort':
-          await session!.abort();
+          await activeSession().abort();
           break;
 
         case 'set_thinking_level':
-          session!.setThinkingLevel(msg.level as Parameters<AgentSession['setThinkingLevel']>[0]);
+          activeSession().setThinkingLevel(msg.level as Parameters<AgentSession['setThinkingLevel']>[0]);
           break;
 
         case 'set_model': {
-          const model = session!.modelRegistry.find(msg.provider, msg.modelId);
+          const model = activeSession().modelRegistry.find(msg.provider, msg.modelId);
           if (!model) {
             console.warn(`[pifrontier] set_model: model not found: ${msg.provider}/${msg.modelId}`);
             break;
           }
           try {
-            await session!.setModel(model);
+            await activeSession().setModel(model);
             broadcast({ type: 'model_changed', model: serializeModel(model) });
           } catch (err) {
             console.error('[pifrontier] set_model error:', err);
@@ -1148,11 +1406,12 @@ try {
             // Create the directory if it doesn't exist (brand new folder).
             await mkdir(targetCwd, { recursive: true });
             const sm = _sdk!.SessionManager.create(targetCwd);
+            const src = activeSessionOrNull();
             const { session: newSession } = await _sdk!.createAgentSession({
               cwd: targetCwd,
               sessionManager: sm,
-              modelRegistry: session!.modelRegistry,
-              model: session!.model,
+              modelRegistry: src?.modelRegistry ?? (await ensureSession()).modelRegistry,
+              model: src?.model ?? (await ensureSession()).model,
             });
             await setActiveSession(newSession);
           } catch (err) {
@@ -1164,10 +1423,12 @@ try {
 
         case 'switch_session': {
           try {
-            // If the user selects the current session path, just ignore it.
+            // If the user selects the current session path, we proceed anyway to refresh client state.
             const resolvedPath = resolve(cwd, expandTilde(msg.path));
-            if (session?.sessionManager.getSessionFile() === resolvedPath) {
-              ws.send(JSON.stringify({ type: 'sessions_error', message: 'Already on this session.' }));
+            // Check pool first — reuse live session if already loaded
+            const existing = findManagedSessionByPath(resolvedPath);
+            if (existing) {
+              await setActiveSession(existing.session, existing.cwd);
               break;
             }
             // Security: only open known session files — never raw client paths.
@@ -1177,11 +1438,12 @@ try {
               break;
             }
             const sm = _sdk!.SessionManager.open(resolvedPath);
+            const src = activeSessionOrNull();
             const { session: newSession } = await _sdk!.createAgentSession({
               cwd: sm.getCwd() || cwd,
               sessionManager: sm,
-              modelRegistry: session!.modelRegistry,
-              model: session!.model,
+              modelRegistry: src?.modelRegistry ?? (await ensureSession()).modelRegistry,
+              model: src?.model ?? (await ensureSession()).model,
             });
             await setActiveSession(newSession);
           } catch (err) {
@@ -1196,6 +1458,28 @@ try {
           if (pending) {
             pending.resolve(msg as unknown as Record<string, unknown>);
           }
+          break;
+        }
+
+        case 'extension_custom_input': {
+          const customId = msg.id as string | undefined;
+          if (!customId) break;
+          const component = interactiveCustomComponents.get(customId);
+          if (!component) break;
+          try {
+            const keystroke = {
+              key: msg.key as string,
+              alt: !!msg.alt,
+              ctrl: !!msg.ctrl,
+              meta: !!msg.meta,
+              shift: !!msg.shift,
+            };
+            component.handleInput(keystroke);
+            // Re-render and broadcast updated lines
+            const rawLines = component.render(80) as string[];
+            const cleanLines = Array.isArray(rawLines) ? rawLines.map((l: string) => stripAnsi(l)) : [];
+            broadcast({ type: 'custom_render', id: customId, lines: cleanLines });
+          } catch { /* component may have disposed or errored */ }
           break;
         }
 
@@ -1215,12 +1499,12 @@ try {
 
         case 'set_provider_key': {
           try {
-            session!.modelRegistry.authStorage.set(msg.provider, { type: 'api_key', key: msg.key });
-            session!.modelRegistry.refresh();
+            activeSession().modelRegistry.authStorage.set(msg.provider, { type: 'api_key', key: msg.key });
+            activeSession().modelRegistry.refresh();
             ws.send(JSON.stringify({ type: 'providers_list', providers: getProviders() }));
             broadcast({
               type: 'available_models_changed',
-              availableModels: session!.modelRegistry.getAvailable().map(serializeModel),
+              availableModels: activeSession().modelRegistry.getAvailable().map(serializeModel),
             });
           } catch (err) {
             console.error('[pifrontier] set_provider_key error:', err);
@@ -1231,12 +1515,12 @@ try {
 
         case 'remove_provider_key': {
           try {
-            session!.modelRegistry.authStorage.remove(msg.provider);
-            session!.modelRegistry.refresh();
+            activeSession().modelRegistry.authStorage.remove(msg.provider);
+            activeSession().modelRegistry.refresh();
             ws.send(JSON.stringify({ type: 'providers_list', providers: getProviders() }));
             broadcast({
               type: 'available_models_changed',
-              availableModels: session!.modelRegistry.getAvailable().map(serializeModel),
+              availableModels: activeSession().modelRegistry.getAvailable().map(serializeModel),
             });
           } catch (err) {
             console.error('[pifrontier] remove_provider_key error:', err);
@@ -1259,8 +1543,8 @@ try {
             sm.appendSessionInfo(msg.name);
             // If renaming the active session, also fire the SDK event so all
             // connected browsers see the name change via session_info_changed.
-            if (msg.path === session!.sessionFile) {
-              session!.setSessionName(msg.name);
+            if (msg.path === activeSession().sessionFile) {
+              activeSession().setSessionName(msg.name);
             }
             const all = await _sdk!.SessionManager.listAll();
             broadcast({ type: 'all_sessions_list', sessions: all.map(serializeSession) });
@@ -1275,10 +1559,10 @@ try {
         case 'rename_current_session': {
           try {
             // Set the name on the live session (emits session_info_changed to all browsers)
-            session!.setSessionName(msg.name);
+            activeSession().setSessionName(msg.name);
             // Also persist it to the session file if available
-            if (session!.sessionFile) {
-              const sm = _sdk!.SessionManager.open(session!.sessionFile);
+            if (activeSession().sessionFile) {
+              const sm = _sdk!.SessionManager.open(activeSession().sessionFile);
               sm.appendSessionInfo(msg.name);
             }
           } catch (err) {
@@ -1297,7 +1581,7 @@ try {
               ws.send(JSON.stringify({ type: 'sessions_error', message: 'Session not found.' }));
               break;
             }
-            if (target.id === session!.sessionId) {
+            if (target.id === activeSession().sessionId) {
               ws.send(JSON.stringify({ type: 'sessions_error', message: 'Cannot delete the active session.' }));
               break;
             }
@@ -1356,7 +1640,7 @@ try {
 
         case 'remove_project': {
           const target = (msg as { type: 'remove_project'; cwd: string }).cwd ?? '';
-          if (target === (session?.sessionManager.getCwd() || cwd)) {
+          if (target === (activeSessionOrNull()?.sessionManager.getCwd() || cwd)) {
             ws.send(JSON.stringify({ type: 'sessions_error', message: 'Cannot forget the active project.' }));
             break;
           }
@@ -1414,7 +1698,7 @@ try {
             const query = ((msg as { type: 'file_complete'; query: string }).query ?? '').toLowerCase();
             const { readdir } = await import('node:fs/promises');
             const { join, relative } = await import('node:path');
-            const root = session!.sessionManager.getCwd() || cwd;
+            const root = activeSession().sessionManager.getCwd() || cwd;
             const skip = new Set(['.git', 'node_modules', '.svelte-kit', 'build', 'dist', '.cache']);
             const entries: string[] = [];
             const queue: Array<{ dir: string; depth: number }> = [{ dir: root, depth: 0 }];
@@ -1479,19 +1763,19 @@ try {
         }
 
         case 'compact': {
-          session!.compact().catch((err) => {
+          activeSession().compact().catch((err) => {
             console.error('[pifrontier] compact error:', err);
           });
           break;
         }
 
         case 'set_auto_compaction': {
-          session!.setAutoCompactionEnabled(msg.enabled);
+          activeSession().setAutoCompactionEnabled(msg.enabled);
           break;
         }
 
         case 'set_auto_retry': {
-          session!.setAutoRetryEnabled(msg.enabled);
+          activeSession().setAutoRetryEnabled(msg.enabled);
           break;
         }
 
@@ -1501,50 +1785,50 @@ try {
           try {
             switch (command) {
               case 'reload': {
-                await session!.reload();
+                await activeSession().reload();
                 sendSlashResult(ws, command, 'Reloaded extensions, skills, prompts, and tools.');
                 ws.send(JSON.stringify({
                   type: 'tools_list',
-                  tools: session!.getAllTools().map((t) => ({
+                  tools: activeSession().getAllTools().map((t) => ({
                     name: t.name,
                     description: t.description,
                     isBuiltin: t.sourceInfo.origin === 'package',
                   })),
-                  activeToolNames: session!.getActiveToolNames(),
+                  activeToolNames: activeSession().getActiveToolNames(),
                 }));
                 break;
               }
               case 'logout': {
-                const provider = args || session!.model?.provider;
+                const provider = args || activeSession().model?.provider;
                 if (!provider) {
                   sendSlashResult(ws, command, 'No provider selected. Pass a provider name, e.g. /logout openai.', 'warning');
                   break;
                 }
-                session!.modelRegistry.authStorage.remove(provider);
-                session!.modelRegistry.refresh();
+                activeSession().modelRegistry.authStorage.remove(provider);
+                activeSession().modelRegistry.refresh();
                 ws.send(JSON.stringify({ type: 'providers_list', providers: getProviders() }));
                 broadcast({
                   type: 'available_models_changed',
-                  availableModels: session!.modelRegistry.getAvailable().map(serializeModel),
+                  availableModels: activeSession().modelRegistry.getAvailable().map(serializeModel),
                 });
                 sendSlashResult(ws, command, `Removed stored credentials for ${provider}.`);
                 break;
               }
               case 'clone': {
-                const leafId = session!.sessionManager.getLeafId();
+                const leafId = activeSession().sessionManager.getLeafId();
                 if (!leafId) {
                   sendSlashResult(ws, command, 'No session branch to clone yet.', 'warning');
                   break;
                 }
-                const newPath = session!.sessionManager.createBranchedSession(leafId);
+                const newPath = activeSession().sessionManager.createBranchedSession(leafId);
                 if (!newPath) {
                   // Fallback — create a fresh persisted session
                   const clonedSm = _sdk!.SessionManager.create(cwd);
                   const { session: clonedSession } = await _sdk!.createAgentSession({
                     cwd,
                     sessionManager: clonedSm,
-                    modelRegistry: session!.modelRegistry,
-                    model: session!.model,
+                    modelRegistry: activeSession().modelRegistry,
+                    model: activeSession().model,
                         });
                   await setActiveSession(clonedSession);
                   sendSlashResult(ws, command, 'Cloned to a fresh session.');
@@ -1554,22 +1838,22 @@ try {
                 const { session: clonedSession } = await _sdk!.createAgentSession({
                   cwd: clonedSm.getCwd() || cwd,
                   sessionManager: clonedSm,
-                  modelRegistry: session!.modelRegistry,
-                  model: session!.model,
+                  modelRegistry: activeSession().modelRegistry,
+                  model: activeSession().model,
                     });
                 await setActiveSession(clonedSession);
                 sendSlashResult(ws, command, `Cloned current branch to ${newPath}.`);
                 break;
               }
               case 'tree': {
-                const tree = session!.sessionManager.getTree();
+                const tree = activeSession().sessionManager.getTree();
                 const lines = tree.flatMap((node) => formatTreeNode(node as Parameters<typeof formatTreeNode>[0]));
                 sendSlashResult(ws, command, lines.length ? `Session tree:\n${lines.join('\n')}` : 'Session tree is empty.');
                 break;
               }
               case 'session': {
-                const stats = session!.getSessionStats();
-                const context = session!.getContextUsage();
+                const stats = activeSession().getSessionStats();
+                const context = activeSession().getContextUsage();
                 const lines = [
                   `Session: ${stats.sessionId}`,
                   `File: ${stats.sessionFile ?? '(not persisted)'}`,
@@ -1584,12 +1868,12 @@ try {
               }
               case 'export': {
                 const format = args.toLowerCase().includes('json') ? 'jsonl' : 'html';
-                const out = format === 'jsonl' ? session!.exportToJsonl() : await session!.exportToHtml();
+                const out = format === 'jsonl' ? activeSession().exportToJsonl() : await activeSession().exportToHtml();
                 sendSlashResult(ws, command, `Exported current session to ${out}.`);
                 break;
               }
               case 'share': {
-                const out = await session!.exportToHtml();
+                const out = await activeSession().exportToHtml();
                 sendSlashResult(ws, command, `Created a local share/export at ${out}. GitHub gist sharing is not configured in pi-ui.`);
                 break;
               }
@@ -1601,10 +1885,10 @@ try {
               }
               case 'name': {
                 if (!args) {
-                  sendSlashResult(ws, command, session!.sessionName ? `Session name: ${session!.sessionName}` : 'No session name set.');
+                  sendSlashResult(ws, command, activeSession().sessionName ? `Session name: ${activeSession().sessionName}` : 'No session name set.');
                   break;
                 }
-                session!.setSessionName(args);
+                activeSession().setSessionName(args);
                 sendSlashResult(ws, command, `Session renamed to ${args}.`);
                 break;
               }
@@ -1614,7 +1898,7 @@ try {
                   break;
                 }
                 const shellResult = Bun.spawnSync(['bash', '-c', args], {
-                  cwd: session?.sessionManager.getCwd() || cwd,
+                  cwd: activeSessionOrNull()?.sessionManager.getCwd() || cwd,
                   env: { ...process.env as Record<string, string>, PI_CWD: cwd },
                 });
                 const shellOutput = [
@@ -1625,6 +1909,13 @@ try {
                 sendSlashResult(ws, command, shellOutput || '(no output)', shellResult.exitCode === 0 ? 'info' : 'error');
                 break;
               }
+              case 'extension':
+                // Extension commands — route through prompt() which handles them via _tryExecuteExtensionCommand
+                // Use prompt() even during streaming (SDK handles extension commands during streaming)
+                try { await activeSession().prompt(args); } catch (e) {
+                  sendSlashResult(ws, command, String(e), 'error');
+                }
+                break;
               default:
                 sendSlashResult(ws, command, `Unsupported built-in command: /${command}`, 'warning');
                 break;
@@ -1638,7 +1929,7 @@ try {
 
         case 'get_session_tree': {
           try {
-            const tree = session!.sessionManager.getTree();
+            const tree = activeSession().sessionManager.getTree();
             const serialized = tree.map((node) => serializeTreeNode(node as Parameters<typeof serializeTreeNode>[0]));
             ws.send(JSON.stringify({ type: 'session_tree', tree: serialized }));
           } catch (err) {
@@ -1650,7 +1941,7 @@ try {
 
         case 'get_fork_points': {
           try {
-            const entries = session!.getUserMessagesForForking();
+            const entries = activeSession().getUserMessagesForForking();
             ws.send(JSON.stringify({ type: 'fork_points', entries }));
           } catch (err) {
             console.error('[pifrontier] get_fork_points error:', err);
@@ -1661,8 +1952,8 @@ try {
 
         case 'get_tools': {
           try {
-            const allTools = session!.getAllTools();
-            const activeNames = session!.getActiveToolNames();
+            const allTools = activeSession().getAllTools();
+            const activeNames = activeSession().getActiveToolNames();
             ws.send(JSON.stringify({
               type: 'tools_list',
               tools: allTools.map((t) => ({
@@ -1680,7 +1971,7 @@ try {
 
         case 'set_active_tools': {
           try {
-            session!.setActiveToolsByName(msg.toolNames as string[]);
+            activeSession().setActiveToolsByName(msg.toolNames as string[]);
           } catch (err) {
             console.error('[pifrontier] set_active_tools error:', err);
           }
@@ -1689,7 +1980,7 @@ try {
 
         case 'get_resources': {
           try {
-            const sessionCwd = session!.sessionManager.getCwd() || cwd;
+            const sessionCwd = activeSession().sessionManager.getCwd() || cwd;
             const agentDir = _sdk!.getAgentDir();
             const loader = new _sdk!.DefaultResourceLoader({ cwd: sessionCwd, agentDir });
             await loader.reload();
@@ -1718,9 +2009,33 @@ try {
           break;
         }
 
+        case 'get_command_completions': {
+          try {
+            const { command, prefix } = msg as { type: string; command: string; prefix: string };
+            const sessionCwd = activeSession().sessionManager.getCwd() || cwd;
+            const agentDir = _sdk!.getAgentDir();
+            const loader = new _sdk!.DefaultResourceLoader({ cwd: sessionCwd, agentDir });
+            await loader.reload();
+            const { extensions } = loader.getExtensions();
+            for (const ext of extensions) {
+              const cmd = ext.commands.get(command);
+              if (cmd?.getArgumentCompletions) {
+                const items = await cmd.getArgumentCompletions(prefix);
+                ws.send(JSON.stringify({ type: 'command_completions', command, prefix, items: items ?? [] }));
+                return;
+              }
+            }
+            ws.send(JSON.stringify({ type: 'command_completions', command, prefix, items: [] }));
+          } catch (err) {
+            console.error('[pifrontier] get_command_completions error:', err);
+            ws.send(JSON.stringify({ type: 'command_completions', command: '', prefix: '', items: [] }));
+          }
+          break;
+        }
+
         case 'get_extensions': {
           try {
-            const sessionCwd = session!.sessionManager.getCwd() || cwd;
+            const sessionCwd = activeSession().sessionManager.getCwd() || cwd;
             const agentDir = _sdk!.getAgentDir();
             const loader = new _sdk!.DefaultResourceLoader({ cwd: sessionCwd, agentDir });
             await loader.reload();
@@ -1750,7 +2065,7 @@ try {
 
         case 'get_commands': {
           try {
-            const sessionCwd = session!.sessionManager.getCwd() || cwd;
+            const sessionCwd = activeSession().sessionManager.getCwd() || cwd;
             const agentDir = _sdk!.getAgentDir();
             const loader = new _sdk!.DefaultResourceLoader({ cwd: sessionCwd, agentDir });
             await loader.reload();
@@ -1798,7 +2113,7 @@ try {
             const content = await res.text();
             const fileName = basename(rawUrl.split('?')[0]);
             const safeFileName = fileName.endsWith('.md') ? fileName : `${fileName}.md`;
-            const sessionCwd = session!.sessionManager.getCwd() || cwd;
+            const sessionCwd = activeSession().sessionManager.getCwd() || cwd;
             const destDir = (msg.scope as string) === 'user'
               ? join(_sdk!.getAgentDir(), 'skills')
               : resolve(sessionCwd, PI_CONFIG_DIR, 'skills');
@@ -1819,15 +2134,15 @@ try {
         case 'fork_session': {
           try {
             const entryId = (msg as { type: 'fork_session'; entryId: string }).entryId;
-            if (!session!.sessionFile) throw new Error('Active session is not persisted');
-            const sm = _sdk!.SessionManager.open(session!.sessionFile);
+            if (!activeSession().sessionFile) throw new Error('Active session is not persisted');
+            const sm = _sdk!.SessionManager.open(activeSession().sessionFile);
             const forkPath = sm.createBranchedSession(entryId);
             const sm2 = _sdk!.SessionManager.open(forkPath);
             const { session: forkedSession } = await _sdk!.createAgentSession({
               cwd,
               sessionManager: sm2,
-              modelRegistry: session!.modelRegistry,
-              model: session!.model,
+              modelRegistry: activeSession().modelRegistry,
+              model: activeSession().model,
             });
             await setActiveSession(forkedSession);
           } catch (err) {
@@ -1958,6 +2273,8 @@ try {
       connectedClients = Math.max(0, connectedClients - 1);
       // Only cancel pending extension dialogs when the LAST client disconnects —
       // other open tabs may still answer them.
+      // We do NOT dispose or clear pooled sessions — background agent work must
+      // continue running even when no browser client is connected.
       if (connectedClients === 0) {
         cancelAllPendingExtensionRequests();
       }

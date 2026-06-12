@@ -222,12 +222,25 @@ export interface ConnectedMessage {
  *   { type: "auto_retry_end" }
  *   { type: "extension_ui_request",    id, method, title?, message?, options?, placeholder?, prefill? }
  *
+ *   Custom extension events (forwarded from pi.events — lifecycle, state changes):
+ *   { type: "extension_event",         source: string, event: string, data?: Record<string, unknown> }
+ *
+ *   Custom component update (re-rendered lines for interactive custom() components):
+ *   { type: "custom_render",           id: string, lines: string[] }
+ *
+ *   Session runtime status (lightweight — no message content, just metadata):
+ *   { type: "session_runtime",         sessionId: string, isRunning: boolean, unseen: boolean, lastActivity: number }
+ *
  *   Supported extension_ui_request methods:
  *     confirm    – dialog with confirm/cancel (title, message)
  *     input      – dialog with text input (title, placeholder)
  *     select     – dialog with option buttons (title, options)
  *     editor     – dialog with textarea (title, prefill)
- *     custom     – generic overlay dialog (title) — promise resolves with user input
+ *     custom     – generic overlay dialog (title) — promise resolves with user input.
+ *                  When the factory returns a component with render() + handleInput(),
+ *                  the server stores the instance and forwards keyboard events from
+ *                  the browser via extension_custom_input messages. Rendered output
+ *                  is broadcast as custom_render messages.
  *     notify     – toast notification (message, notifyType)
  *     setStatus  – update status text (statusKey, statusText)
  *     setWidget  – register/update widget panel (widgetKey, widgetType?, widgetData?, widgetLines?, widgetPlacement?)
@@ -279,6 +292,8 @@ export type ClientMessage =
   | { type: 'file_complete'; query: string }
   /** Request extension-registered autocomplete items for a trigger character. */
   | { type: 'get_extension_autocomplete'; trigger: string; query: string }
+  /** Forward a keyboard event to an interactive custom component (ConversationViewer etc). */
+  | { type: 'extension_custom_input'; id: string; key: string; alt?: boolean; ctrl?: boolean; meta?: boolean; shift?: boolean }
   /** Response to a blocking extension_ui_request (select / confirm / input / editor / custom). */
   | { type: 'extension_ui_response'; id: string; value?: string; confirmed?: boolean; cancelled?: true }
   /** Editor text content response to a request_editor_text extension_ui_request. */
@@ -336,4 +351,6 @@ export type ClientMessage =
   /** Request file contents for the file viewer modal. */
   | { type: 'read_file'; path: string }
   /** Write file content from the file viewer modal's edit mode. */
-  | { type: 'write_file'; path: string; content: string };
+  | { type: 'write_file'; path: string; content: string }
+  /** Request argument completions for an extension slash command. Server replies with command_completions. */
+  | { type: 'get_command_completions'; command: string; prefix: string };

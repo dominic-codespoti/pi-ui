@@ -199,6 +199,7 @@
           {@const isActiveSession = ps.activeSessionId === s.id}
           {@const isRenamingSession = renamingSession === s.path}
           {@const hasUnchecked = ps.uncheckedSessions.has(s.id)}
+          {@const isBgRunning = ps.runningSessions.has(s.id) && !isActiveSession}
           <div class="group rounded-2xl transition-colors duration-150 {isActiveSession ? 'bg-primary/[0.07] border border-primary/[0.08]' : 'border border-transparent hover:bg-base-content/[0.035]'}">
             {#if isRenamingSession}
               <div class="px-3 py-2 flex items-center gap-2">
@@ -225,6 +226,8 @@
                   <div class="flex items-center gap-2">
                     {#if ps.isStreaming && isActiveSession}
                       <span class="w-2 h-2 rounded-full bg-success shrink-0 animate-pulse glow-success" aria-label="Streaming"></span>
+                    {:else if isBgRunning}
+                      <span class="w-2 h-2 rounded-full bg-success shrink-0 animate-pulse glow-success" aria-label="Running in background"></span>
                     {:else if hasUnchecked}
                       <span class="w-2 h-2 rounded-full bg-primary shrink-0 glow-primary" aria-label="Unchecked result"></span>
                     {:else}

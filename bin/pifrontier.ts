@@ -17,7 +17,7 @@
 
 import { parseArgs } from 'util';
 import { dirname, resolve } from 'node:path';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 // ── Version ───────────────────────────────────────────────────────────────────
@@ -119,6 +119,7 @@ const { values, positionals } = parseArgs({
     port:     { type: 'string',  short: 'P' },
     cwd:      { type: 'string' },
     open:     { type: 'boolean', short: 'o', default: false },
+    daemon:   { type: 'boolean', short: 'd', default: false },
     help:     { type: 'boolean', short: 'h', default: false },
     version:  { type: 'boolean', short: 'V', default: false },
   },
@@ -153,6 +154,7 @@ Options:
       --cwd <dir>            Working directory for the pi session
                              (defaults to current directory)
   -o, --open                 Open http://localhost:<port> in the browser
+  -d, --daemon               Run as a background daemon (detached from terminal)
   -h, --help                 Show this help message
   -V, --version              Print version and exit
 
@@ -217,6 +219,27 @@ process.env.PI_PASSWORD = password;
 if (values.port) process.env.PORT = values.port;
 
 if (values.cwd) process.env.PI_CWD = resolve(values.cwd);
+
+// ── Daemon mode ────────────────────────────────────────────────────────────────
+
+if (values.daemon && !process.env.PI_DAEMONIZED) {
+  const pidFile = '/tmp/pi-ui.pid';
+  const child = Bun.spawn([process.execPath, ...process.argv.slice(1)], {
+    env: { ...process.env, PI_DAEMONIZED: '1' },
+    stdio: ['ignore', 'ignore', 'ignore'],
+    detached: true,
+  });
+  child.unref();
+  writeFileSync(pidFile, String(child.pid));
+  console.log(`pi-ui daemon started (PID: ${child.pid})`);
+  console.log(`PID file: ${pidFile}`);
+  process.exit(0);
+}
+
+if (process.env.PI_DAEMONIZED) {
+  // Ignore SIGHUP so SSH disconnect doesn't kill the daemonized process.
+  process.on('SIGHUP', () => {});
+}
 
 // ── Start server ──────────────────────────────────────────────────────────────
 

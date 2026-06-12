@@ -44,6 +44,7 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
   import PiIcon from '@lucide/svelte/icons/pi';
   import CornerDownLeft from '@lucide/svelte/icons/corner-down-left';
   import RefreshCw from '@lucide/svelte/icons/refresh-cw';
+  import Bell from '@lucide/svelte/icons/bell';
 
   // ── Provider colour chips ────────────────────────────────────────────────────
 
@@ -334,7 +335,7 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
     | { method: 'input'; id: string; title: string; placeholder?: string }
     | { method: 'select'; id: string; title: string; options: string[] }
     | { method: 'editor'; id: string; title: string; prefill?: string }
-    | { method: 'custom'; id: string; title: string; parsed?: ParsedComponent };
+    | { method: 'custom'; id: string; title: string; parsed?: ParsedComponent; lines?: string[]; interactive?: true };
 
   let modal = $state<ModalState | null>(null);
   let modalInput = $state('');
@@ -483,6 +484,17 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
   let hiddenThinkingLabel = $state('thinking');
   /** Global tool output expansion state (setToolsExpanded). */
   let toolsExpandedGlobal = $state(false);
+  /** Argument completions for the current extension command (subcommands). */
+  let commandArgCompletions = $state<{ value: string; label: string; description?: string }[]>([]);
+  let commandArgCommand = $state('');
+  let commandArgPrefix = $state('');
+  let commandCompletionsPending = $state(false);
+  /** Live elapsed-seconds tick for streaming tool timers. */
+  let now = $state(Date.now());
+  $effect(() => {
+    const id = setInterval(() => { now = Date.now(); }, 1000);
+    return () => clearInterval(id);
+  });
   /** Extension-injected header content (setHeader). */
   let extensionHeader = $state('');
   /** Extension-injected footer content (setFooter). */
@@ -501,12 +513,35 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
     if (!shortcutTrigger) return '';
     return input.slice(1).trimStart().toLowerCase();
   });
+  /** When query has a space, detect if it's an extension command with subcommand arg prefix. */
+  const commandArgMode = $derived.by<{ command: string; prefix: string } | null>(() => {
+    if (shortcutTrigger !== '/') return null;
+    const trimmed = input.slice(1).trimStart();
+    const parts = trimmed.split(/\s+/);
+    if (parts.length < 2) return null;
+    const cmdName = parts[0].toLowerCase();
+    const extCmd = extensionCommands.find((c) => c.name.toLowerCase() === cmdName);
+    if (!extCmd) return null;
+    return { command: cmdName, prefix: parts.slice(1).join(' ') };
+  });
   const filteredSlashCommands = $derived.by<ComposerShortcut[]>(() => {
     if (!shortcutTrigger) return [];
     const q = shortcutQuery;
     const match = (value: string) => value.toLowerCase().includes(q);
 
     if (shortcutTrigger === '/') {
+      // Show subcommand completions when typing past an extension command
+      if (commandArgMode && commandArgCompletions.length > 0) {
+        const cmdName = commandArgMode.command;
+        return commandArgCompletions
+          .filter((c) => !commandArgMode.prefix || c.value.toLowerCase().startsWith(commandArgMode.prefix))
+          .map((c) => ({
+            trigger: '/' as const,
+            label: `/${cmdName} ${c.value}`,
+            description: c.description ?? '',
+            insert: `/${cmdName} ${c.value} `,
+          })).slice(0, 14);
+      }
       const commands = SLASH_COMMANDS
         .filter((c) => !q || c.name.startsWith(q))
         .map((c) => ({ trigger: '/' as const, label: `/${c.name}`, description: c.description, insert: `/${c.name} ` }));
@@ -659,6 +694,7 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
 
   const SETTINGS_SECTIONS = [
     { id: 'session', label: 'Session', icon: SlidersHorizontal },
+    { id: 'notifications', label: 'Notifications', icon: Bell },
     { id: 'shortcuts', label: 'Shortcuts', icon: Keyboard },
     { id: 'extensions', label: 'Extensions', icon: Blocks },
     { id: 'updates', label: 'Updates', icon: RefreshCw },
@@ -702,9 +738,32 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
   /** Registered slash commands from extensions */
   let extensionCommands = $state<{ name: string; description?: string; source: string }[]>([]);
 
+  /** PWA install prompt (beforeinstallprompt event). Non-reactive — event fires once. */
+  let deferredInstallPrompt: Event | null = null;
+  let installReady = $state(false);
+
+  async function handleInstallClick() {
+    if (!deferredInstallPrompt) return;
+    const e = deferredInstallPrompt as Event & { prompt(): Promise<void>; userChoice: Promise<{ outcome: 'accepted' | 'dismissed' }> };
+    e.preventDefault();
+    await e.prompt();
+    const result = await e.userChoice;
+    if (result.outcome === 'accepted') installReady = false;
+    deferredInstallPrompt = null;
+  }
+
   /** Whether the settings modal is open */
   let showSettingsPanel = $state(false);
-  let settingsSection = $state<'session' | 'shortcuts' | 'extensions' | 'updates' | 'about'>('session');
+  interface NotificationPrefs { enabled: boolean; onComplete: boolean; onSessionFinish: boolean }
+  const DEFAULT_NOTIFICATION_PREFS: NotificationPrefs = { enabled: true, onComplete: true, onSessionFinish: true };
+  function loadNotificationPrefs(): NotificationPrefs {
+    try { const raw = localStorage.getItem('pifrontier:notifications'); if (raw) return { ...DEFAULT_NOTIFICATION_PREFS, ...JSON.parse(raw) }; } catch { /* ignore */ }
+    return { ...DEFAULT_NOTIFICATION_PREFS };
+  }
+  let notificationPrefs = $state<NotificationPrefs>(loadNotificationPrefs());
+  $effect(() => { const p = notificationPrefs; try { localStorage.setItem('pifrontier:notifications', JSON.stringify(p)); } catch { /* ignore */ } });
+
+  let settingsSection = $state<'session' | 'notifications' | 'shortcuts' | 'extensions' | 'updates' | 'about'>('session');
   /** Skills returned by the server */
   let resourcesSkills = $state<SkillSummary[]>([]);
   /** Prompt templates returned by the server */
@@ -958,6 +1017,40 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
     }
   }
 
+  function notifyPiEvent(title: string, body: string, tag: string, data?: Record<string, unknown>) {
+    if (!notificationPrefs.enabled) return;
+    if (!('Notification' in window) || Notification.permission !== 'granted') return;
+    const msg = { type: 'show_notification' as const, title, body, tag, data };
+    if (navigator.serviceWorker?.controller) {
+      navigator.serviceWorker.controller.postMessage(msg);
+    } else {
+      try { new Notification(title, { body, tag, icon: '/pwa-192x192.png' }); } catch { /* fail silently */ }
+    }
+  }
+
+  /** PWA app badge for unseen session count. */
+  function updateAppBadge() {
+    if ('setAppBadge' in navigator) {
+      const count = projectsState.uncheckedSessions.size;
+      if (count > 0) navigator.setAppBadge(count);
+      else navigator.clearAppBadge();
+    }
+  }
+
+  /** Screen Wake Lock — keeps the display on during agent responses. */
+  let wakeLock: WakeLockSentinel | null = null;
+  async function requestWakeLock() {
+    try {
+      if ('wakeLock' in navigator && !wakeLock) {
+        wakeLock = await navigator.wakeLock.request('screen');
+        wakeLock.addEventListener('release', () => { wakeLock = null; });
+      }
+    } catch { /* wake lock unavailable */ }
+  }
+  function releaseWakeLock() {
+    if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+  }
+
   // Give the shared projects store access to the live socket.
   projectsState.send = send;
 
@@ -1110,6 +1203,7 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
       case 'agent_start':
         isStreaming = true;
         projectsState.isStreaming = true;
+        requestWakeLock();
         break;
 
       case 'message_start':
@@ -1129,6 +1223,11 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
         if (conversationMode && !willRetry && wsState === 'open') {
           toggleSTT();
         }
+        releaseWakeLock();
+        updateAppBadge();
+        if (notificationPrefs.onComplete && document.hidden && !willRetry) {
+          notifyPiEvent('Response Complete', 'pi finished responding.', 'pi-agent-end');
+        }
         break;
       }
 
@@ -1137,6 +1236,7 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
         isStreaming = false;
         projectsState.isStreaming = false;
         sealStreaming();
+        releaseWakeLock();
         const errMsg = (msg as { error?: string }).error ?? 'Unknown error';
         addToast(`Agent error: ${errMsg}`, 'error');
         break;
@@ -1205,6 +1305,7 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
           toolArgs: details,
           streaming: true,
           expanded: toolsExpandedGlobal,
+          startMs: Date.now(),
           createdAt: Date.now(),
         });
         break;
@@ -1304,14 +1405,20 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
 
           case 'custom': {
             const parsed = msg.parsed as ParsedComponent | undefined;
+            const lines = msg.lines as string[] | undefined;
+            const interactive = msg.interactive as boolean | undefined;
             modal = {
               method: 'custom',
               id,
               title: (msg.title as string | undefined) ?? 'Extension Request',
               parsed,
+              ...(lines ? { lines } : {}),
+              ...(interactive ? { interactive: true as const } : {}),
             };
-            // Set initial input value from parsed data
-            if (parsed?.kind === 'input') {
+            if (interactive) {
+              // Interactive custom component — no input needed, just display
+              modalInput = '';
+            } else if (parsed?.kind === 'input') {
               modalInput = parsed.value ?? '';
             } else {
               modalInput = '';
@@ -1625,6 +1732,24 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
         break;
       }
 
+      case 'command_completions': {
+        const cc = msg as unknown as { command: string; prefix: string; items: { value: string; label: string; description?: string }[] };
+        if (cc.command === commandArgCommand && cc.prefix === commandArgPrefix) {
+          commandArgCompletions = cc.items ?? [];
+          commandCompletionsPending = false;
+        }
+        break;
+      }
+
+      case 'custom_render': {
+        const renderId = msg.id as string | undefined;
+        const renderLines = msg.lines as string[] | undefined;
+        if (renderId && modal?.method === 'custom' && modal.id === renderId && modal.interactive && renderLines) {
+          modal = { ...modal, lines: renderLines };
+        }
+        break;
+      }
+
       case 'slash_result': {
         const result = msg as { type: 'slash_result'; command: string; message: string; level?: 'info' | 'warning' | 'error' };
         messages.push({
@@ -1673,6 +1798,24 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
         break;
       }
 
+      case 'session_runtime': {
+        const rt = (msg as unknown) as { sessionId: string; isRunning: boolean; unseen: boolean; lastActivity: number };
+        if (rt.sessionId === sessionId) {
+          isStreaming = rt.isRunning;
+          projectsState.isStreaming = rt.isRunning;
+        }
+        if ((rt.isRunning || rt.unseen) && rt.sessionId !== sessionId) {
+          projectsState.markUnchecked(rt.sessionId);
+        }
+        if (rt.isRunning) projectsState.runningSessions.add(rt.sessionId);
+        else projectsState.runningSessions.delete(rt.sessionId);
+        if (notificationPrefs.onSessionFinish && !rt.isRunning && rt.unseen && rt.sessionId !== sessionId && document.hidden) {
+          notifyPiEvent('Session Finished', `Session ${rt.sessionId.slice(0, 8)} has new results.`, `pi-session-${rt.sessionId}`);
+        }
+        updateAppBadge();
+        break;
+      }
+
     }
 
     scrollBottom();
@@ -1706,8 +1849,38 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
     modalInput = '';
   }
 
-  /** Handles Enter key inside the shadcn Dialog content (Escape is handled by onOpenChange). */
+  /** Handles keydown inside the modal (Enter submits, Esc cancels, interactive custom gets forwarded). */
   function modalContentKeydown(e: KeyboardEvent) {
+    if (modal?.method === 'custom' && modal.interactive) {
+      // Forward ALL key events to the server for the interactive component
+      e.preventDefault();
+      const keyMap: Record<string, string> = {
+        ArrowUp: 'up',
+        ArrowDown: 'down',
+        ArrowLeft: 'left',
+        ArrowRight: 'right',
+        PageUp: 'pageup',
+        PageDown: 'pagedown',
+        Home: 'home',
+        End: 'end',
+        Escape: 'escape',
+        Enter: 'enter',
+        ' ': 'space',
+      };
+      send({
+        type: 'extension_custom_input',
+        id: modal.id,
+        key: keyMap[e.key] || e.key,
+        alt: e.altKey,
+        ctrl: e.ctrlKey,
+        meta: e.metaKey,
+        shift: e.shiftKey,
+      });
+      if (e.key === 'Escape') {
+        modalCancel();
+      }
+      return;
+    }
     if (e.key === 'Enter' && !e.shiftKey && modal?.method !== 'editor') {
       e.preventDefault();
       if (modal?.method === 'confirm') modalConfirm(true);
@@ -1901,8 +2074,10 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
     const msg = m as Record<string, unknown>;
     if (!msg || typeof msg.role !== 'string') return [];
 
-    switch (msg.role) {
-      case 'user': {
+    const role = msg.role.toLowerCase();
+    switch (role) {
+      case 'user':
+      case 'human': {
         let text: string;
         let images: string[] | undefined;
         if (typeof msg.content === 'string') {
@@ -1920,27 +2095,48 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
         }
         return [{ id: uid(), role: 'user', content: text, images, streaming: false, createdAt: Date.now() }];
       }
-      case 'assistant': {
-        const blocks = (msg.content as { type: string; text?: string; thinking?: string; data?: string; mimeType?: string }[]) ?? [];
-        const text = blocks
-          .filter((b) => b.type === 'text')
-          .map((b) => b.text ?? '')
-          .join('');
-        const thinkingText = blocks
-          .filter((b) => b.type === 'thinking')
-          .map((b) => b.thinking ?? '')
-          .join('');
-        const imgBlocks = blocks.filter((b): b is { type: 'image'; data: string; mimeType: string } => b.type === 'image' && !!b.data && !!b.mimeType);
-        const images = imgBlocks.length > 0 ? imgBlocks.map((b) => `data:${b.mimeType};base64,${b.data}`) : undefined;
+      case 'assistant':
+      case 'ai': {
+        let text = '';
+        let thinkingText = '';
+        let images: string[] | undefined;
+        let blocks: any[] = [];
+
+        if (typeof msg.content === 'string') {
+          text = msg.content;
+        } else if (Array.isArray(msg.content)) {
+          blocks = msg.content;
+          text = blocks
+            .filter((b) => b.type === 'text')
+            .map((b) => b.text ?? '')
+            .join('');
+          thinkingText = blocks
+            .filter((b) => b.type === 'thinking')
+            .map((b) => b.thinking ?? '')
+            .join('');
+          const imgBlocks = blocks.filter((b): b is { type: 'image'; data: string; mimeType: string } => b.type === 'image' && !!b.data && !!b.mimeType);
+          if (imgBlocks.length > 0) {
+            images = imgBlocks.map((b) => `data:${b.mimeType};base64,${b.data}`);
+          }
+        }
+
         const rawUsage = msg.usage as { input?: number; output?: number; totalTokens?: number; cost?: { total?: number } } | undefined;
         const usage: MsgUsage | undefined = rawUsage?.totalTokens
           ? { input: rawUsage.input ?? 0, output: rawUsage.output ?? 0, totalTokens: rawUsage.totalTokens, cost: { total: rawUsage.cost?.total ?? 0 } }
           : undefined;
+        
+        // Return assistant message if it has ANY displayable content (text, thinking, or images)
+        // or if it has tool calls (which we'll want to see even if they have no text).
+        // Wait, tool calls are currently handled by toolResult messages.
+        // But if an assistant message has ONLY tool calls and no text, it will be hidden.
+        // This is usually what we want if the tool results provide the visual feedback.
         return text || thinkingText || images ? [{ id: uid(), role: 'assistant', content: text, images, thinking: thinkingText || undefined, thinkingExpanded: false, streaming: false, usage, createdAt: Date.now() }] : [];
       }
-      case 'bashExecution': {
-        const cmd = msg.command as string | undefined;
-        const output = (msg.output as string | undefined) ?? '';
+      case 'bashexecution':
+      case 'bash_execution':
+      case 'bash': {
+        const cmd = (msg.command as string | undefined) ?? (msg.content as string | undefined);
+        const output = (msg.output as string | undefined) ?? (typeof msg.content === 'string' ? '' : '');
         return [
           {
             id: uid(),
@@ -1948,15 +2144,16 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
             toolName: 'bash',
             toolInput: cmd ? `$ ${cmd.split('\n')[0].trim()}` : undefined,
             toolArgs: cmd ? { command: cmd } : undefined,
-            content: output,
+            content: output || '',
             isError: typeof msg.exitCode === 'number' && (msg.exitCode as number) !== 0,
             streaming: false,
             createdAt: Date.now(),
           },
         ];
       }
-      case 'toolResult': {
-        const toolCallId = msg.toolCallId as string | undefined;
+      case 'toolresult':
+      case 'tool_result': {
+        const toolCallId = (msg.toolCallId as string | undefined) ?? (msg.id as string | undefined);
         let toolInfo = toolCallId ? toolInputMap?.get(toolCallId) : undefined;
         if (!toolInfo && toolCallId && toolInputMap && toolInputMap.size > 0) {
           for (const [id, info] of toolInputMap) {
@@ -1968,9 +2165,18 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
         }
         const toolName = (msg.toolName as string | undefined) ?? toolInfo?.name ?? 'tool';
         const toolInput = toolInfo ? formatToolInput(toolName, toolInfo.input) : undefined;
-        const blocks = (msg.content as { type: string; text?: string; data?: string; mimeType?: string }[]) ?? [];
-        const imgBlocks = blocks.filter((b): b is { type: 'image'; data: string; mimeType: string } => b.type === 'image' && !!b.data && !!b.mimeType);
-        const images = imgBlocks.length > 0 ? imgBlocks.map((b) => `data:${b.mimeType};base64,${b.data}`) : undefined;
+        
+        let content = '';
+        let images: string[] | undefined;
+        if (typeof msg.content === 'string') {
+          content = msg.content;
+        } else if (Array.isArray(msg.content)) {
+          const blocks = msg.content as { type: string; text?: string; data?: string; mimeType?: string }[];
+          content = extractTextContent(blocks);
+          const imgBlocks = blocks.filter((b): b is { type: 'image'; data: string; mimeType: string } => b.type === 'image' && !!b.data && !!b.mimeType);
+          if (imgBlocks.length > 0) images = imgBlocks.map((b) => `data:${b.mimeType};base64,${b.data}`);
+        }
+
         return [
           {
             id: uid(),
@@ -1979,7 +2185,7 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
             toolCallId,
             toolInput,
             toolArgs: toolInfo?.input,
-            content: extractTextContent(blocks),
+            content,
             images,
             isError: (msg.isError as boolean | undefined) ?? false,
             streaming: false,
@@ -2359,8 +2565,15 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
         send({ type: 'get_session_tree' });
         showTreeModal = true;
         return true;
-      default:
+      default: {
+        // Check if it's an extension command — route through the server
+        const extCmd = extensionCommands.find((c) => c.name.toLowerCase() === command);
+        if (extCmd) {
+          send({ type: 'run_builtin', command: 'extension', args: text });
+          return true;
+        }
         return false;
+      }
     }
   }
 
@@ -2545,6 +2758,21 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
       lastExtensionTrigger = '';
       extensionCompletions = [];
     }
+    // Request command argument completions when user continues past a command name
+    if (commandArgMode) {
+      const needsFetch = commandArgMode.command !== commandArgCommand || commandArgMode.prefix !== commandArgPrefix;
+      if (needsFetch && !commandCompletionsPending) {
+        commandArgCommand = commandArgMode.command;
+        commandArgPrefix = commandArgMode.prefix;
+        commandCompletionsPending = true;
+        send({ type: 'get_command_completions', command: commandArgMode.command, prefix: commandArgMode.prefix });
+      }
+    } else {
+      commandArgCompletions = [];
+      commandArgCommand = '';
+      commandArgPrefix = '';
+      commandCompletionsPending = false;
+    }
   });
 
   $effect(() => {
@@ -2558,6 +2786,20 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
     isMobile = _mq.matches;
     _mqHandler = (e: MediaQueryListEvent) => { isMobile = e.matches; };
     _mq.addEventListener('change', _mqHandler);
+    // Request notification permission (PWA push notifications)
+    if ('Notification' in window && Notification.permission === 'default') {
+      Notification.requestPermission();
+    }
+    // Listen for the PWA install prompt
+    window.addEventListener('beforeinstallprompt', (e) => {
+      e.preventDefault();
+      deferredInstallPrompt = e;
+      installReady = true;
+    });
+    window.addEventListener('appinstalled', () => {
+      installReady = false;
+      deferredInstallPrompt = null;
+    });
     // Restore persisted sidebar widths
     try {
       const sw = parseInt(localStorage.getItem('pifrontier:session-w') ?? '');
@@ -2572,6 +2814,7 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
   });
 
   onDestroy(() => {
+    releaseWakeLock();
     if (reconnectTimer) clearTimeout(reconnectTimer);
     if (sendHoldTimer) clearTimeout(sendHoldTimer);
     ws?.close();
@@ -2809,6 +3052,21 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
           </Tooltip.Trigger>
           <Tooltip.Content side="bottom">Tools</Tooltip.Content>
         </Tooltip.Root>
+        {#if installReady}
+          <Tooltip.Root>
+            <Tooltip.Trigger>
+              {#snippet child({ props })}
+                <button
+                  {...props}
+                  onclick={handleInstallClick}
+                  class="h-9 w-9 flex items-center justify-center rounded-lg transition-colors text-base-content/45 hover:text-primary hover:bg-primary/12"
+                  aria-label="Install app"
+                ><svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v13"/><path d="m5 13 7 7 7-7"/><path d="M5 21h14"/></svg></button>
+              {/snippet}
+            </Tooltip.Trigger>
+            <Tooltip.Content side="bottom">Install App</Tooltip.Content>
+          </Tooltip.Root>
+        {/if}
         <Tooltip.Root>
           <Tooltip.Trigger>
             {#snippet child({ props })}
@@ -3126,7 +3384,9 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
                   <span class="trace-row-label">{meta.label}</span>
                   <span class="trace-row-detail">{#if detail}{detail}{/if}</span>
                   <span class="trace-row-meta">
-                    {#if msg.streaming}
+                    {#if msg.streaming && msg.startMs}
+                      <span class="text-base-content/55 tabular-nums text-[10px]">{Math.floor((now - msg.startMs) / 1000)}s</span>
+                    {:else if msg.streaming}
                       <Loader class="w-3 h-3 text-base-content/55 animate-spin" />
                     {:else if msg.isError}
                       <CircleX class="w-3 h-3 text-destructive" />
@@ -4068,7 +4328,7 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
                 {SETTINGS_SECTIONS.find((s) => s.id === settingsSection)?.label ?? 'Settings'}
               </Dialog.Title>
               <Dialog.Description class="text-xs text-base-content/38 mt-0.5">
-                {#if settingsSection === 'session'}Defaults and behavior for session runs{:else if settingsSection === 'shortcuts'}Keyboard shortcuts available in the chat UI{:else if settingsSection === 'extensions'}Loaded extensions and their tools/commands{:else if settingsSection === 'updates'}Check and apply pi-ui or SDK updates{:else}Runtime information and server controls{/if}
+                {#if settingsSection === 'session'}Defaults and behavior for session runs{:else if settingsSection === 'notifications'}Configure PWA push and page notifications{:else if settingsSection === 'shortcuts'}Keyboard shortcuts available in the chat UI{:else if settingsSection === 'extensions'}Loaded extensions and their tools/commands{:else if settingsSection === 'updates'}Check and apply pi-ui or SDK updates{:else}Runtime information and server controls{/if}
               </Dialog.Description>
             </div>
             <button
@@ -4096,6 +4356,32 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
                         <p class="text-xs text-base-content/35 mt-0.5">Retry transient model errors automatically.</p>
                       </div>
                       <Switch checked={autoRetryEnabled} onCheckedChange={(v) => { autoRetryEnabled = v; send({ type: 'set_auto_retry', enabled: v }); }} disabled={wsState !== 'open'} aria-label="Toggle auto-retry" />
+                    </div>
+                  </div>
+                </Card.Root>
+              {:else if settingsSection === 'notifications'}
+                <Card.Root size="sm" class="py-0 overflow-hidden bg-base-100/60 border-base-content/10">
+                  <div class="divide-y divide-base-content/8">
+                    <div class="flex items-center gap-3 px-4 py-3">
+                      <div class="flex-1 min-w-0">
+                        <p class="text-sm text-base-content/75">Notifications</p>
+                        <p class="text-xs text-base-content/35 mt-0.5">Global toggle for all push and page notifications.</p>
+                      </div>
+                      <Switch checked={notificationPrefs.enabled} onCheckedChange={(v) => { notificationPrefs.enabled = v; }} aria-label="Toggle all notifications" />
+                    </div>
+                    <div class="flex items-center gap-3 px-4 py-3 {notificationPrefs.enabled ? '' : 'opacity-40 pointer-events-none'}">
+                      <div class="flex-1 min-w-0">
+                        <p class="text-sm text-base-content/75">Response Complete</p>
+                        <p class="text-xs text-base-content/35 mt-0.5">Notify when the active session's agent finishes responding.</p>
+                      </div>
+                      <Switch checked={notificationPrefs.onComplete} onCheckedChange={(v) => { notificationPrefs.onComplete = v; }} disabled={!notificationPrefs.enabled} aria-label="Toggle response complete notification" />
+                    </div>
+                    <div class="flex items-center gap-3 px-4 py-3 {notificationPrefs.enabled ? '' : 'opacity-40 pointer-events-none'}">
+                      <div class="flex-1 min-w-0">
+                        <p class="text-sm text-base-content/75">Background Session Finished</p>
+                        <p class="text-xs text-base-content/35 mt-0.5">Notify when a session you're not watching finishes.</p>
+                      </div>
+                      <Switch checked={notificationPrefs.onSessionFinish} onCheckedChange={(v) => { notificationPrefs.onSessionFinish = v; }} disabled={!notificationPrefs.enabled} aria-label="Toggle background session notification" />
                     </div>
                   </div>
                 </Card.Root>
@@ -4357,7 +4643,40 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
         </div>
       </div>
     </Dialog.Content>
-  </Dialog.Root>
+</Dialog.Root>
+
+<!-- ── Interactive custom component full overlay (ConversationViewer etc.) ── -->
+{#if modal?.method === 'custom' && modal.interactive}
+  <div
+    class="fixed inset-0 z-[60] flex flex-col bg-base-100/95 backdrop-blur-sm"
+    role="dialog"
+    aria-label={modal.title}
+    tabindex="-1"
+    onkeydown={modalContentKeydown}
+    bind:this={modalFocusEl}
+  >
+    <!-- Header -->
+    <div class="flex items-center justify-between px-4 py-3 border-b border-base-content/10 shrink-0">
+      <h2 class="text-sm font-semibold text-base-content/80 truncate">{modal.title}</h2>
+      <button onclick={modalCancel} class="text-base-content/40 hover:text-base-content transition-colors p-1" aria-label="Close">
+        <X class="w-4 h-4" />
+      </button>
+    </div>
+    <!-- Scrollable content -->
+    <div class="flex-1 overflow-y-auto px-4 py-3">
+      <pre class="text-xs text-base-content/65 whitespace-pre-wrap leading-relaxed font-mono select-text">
+            {#each modal.lines ?? [] as line, i (i)}
+{line}
+        {/each}
+      </pre>
+    </div>
+    <!-- Footer hints -->
+    <div class="shrink-0 px-4 py-2 border-t border-base-content/10 flex items-center justify-between text-[10px] text-muted-foreground/40">
+      <span>↑↓ scroll · ↑↓ PgUp/Dn · Esc close</span>
+      <span>{modal.lines?.length ?? 0} lines</span>
+    </div>
+  </div>
+{/if}
 
 
 </div>
@@ -4391,7 +4710,7 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
 {/if}
 
 <!-- ── Extension UI modal ─────────────────────────────────────────────────────── -->
-<Dialog.Root open={!!modal} onOpenChange={(v) => { if (!v && modal) modalCancel(); }}>
+<Dialog.Root open={!!modal && !(modal.method === 'custom' && modal.interactive)} onOpenChange={(v) => { if (!v && modal) modalCancel(); }}>
   <Dialog.Content class="font-mono" showCloseButton={false} onkeydown={modalContentKeydown}>
     <Dialog.Header>
       <Dialog.Title>{modal?.title}</Dialog.Title>
@@ -4410,6 +4729,18 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
       </div>
     {:else if modal?.method === 'editor'}
       <textarea bind:this={modalFocusEl} bind:value={modalInput} rows={8} class="w-full bg-transparent border border-border focus:border-foreground/60 outline-none p-3 text-sm leading-relaxed resize-none rounded-lg transition-colors"></textarea>
+      {:else if modal?.method === 'custom' && modal.interactive}
+        <!-- Interactive custom component (ConversationViewer etc.) — scrollable text overlay -->
+        <div class="relative flex-1 min-h-0" role="region" aria-label="Interactive component content">
+          <pre class="text-xs text-muted-foreground whitespace-pre-wrap leading-relaxed bg-base-content/5 rounded p-3 mb-2 max-h-[50vh] overflow-y-auto select-text font-mono" bind:this={modalFocusEl}>
+        {#each modal.lines ?? [] as line, i (i)}
+{line}
+{/each}
+          </pre>
+          <p class="text-[10px] text-muted-foreground/40 text-center py-1">
+            ↑↓ scroll · Esc close
+          </p>
+        </div>
       {:else if modal?.method === 'custom'}
       {#if modal.parsed?.kind === 'container'}
         {#snippet renderParsed(comp: ParsedComponent)}
@@ -4487,7 +4818,7 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
         <Button size="sm" onclick={() => modalConfirm(true)}>confirm</Button>
       {:else if modal?.method === 'input' || modal?.method === 'editor'}
         <Button size="sm" onclick={modalSubmitValue}>submit</Button>
-      {:else if modal?.method === 'custom' && modal.parsed?.kind !== 'select'}
+      {:else if modal?.method === 'custom' && modal.parsed?.kind !== 'select' && !modal.interactive}
         <Button size="sm" onclick={modalSubmitValue}>submit</Button>
       {/if}
     </Dialog.Footer>

@@ -63,6 +63,8 @@ class ProjectsState {
 
   /** Session ids with unseen results since the last switch (ephemeral). */
   uncheckedSessions = new SvelteSet<string>();
+  /** Session ids that are currently generating (agent_start … agent_end). */
+  runningSessions = new SvelteSet<string>();
   /** Collapsed project cwds in the sidebar — persisted across reloads. */
   collapsed = new SvelteSet<string>(loadCollapsed());
   /** Projects whose full session list is expanded past the preview limit. */
