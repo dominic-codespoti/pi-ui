@@ -23,7 +23,7 @@ import { fileURLToPath } from 'node:url';
 import { initPassword, isValidSessionCookie } from './src/lib/auth/password.ts';
 import { listProjects, touchProject, removeProject, setProjectPinned, renameProject } from './src/lib/server/project-registry.ts';
 import type { ClientMessage, ModelInfo, ProjectInfo, ProviderInfo, SessionSummary, SkillSummary, PromptSummary, ExtensionSummary, UpdatePackageStatus, UpdateStatus, UpdateTarget } from './src/lib/ws/protocol.ts';
-import { callFactoryAndParse, stubTui, stubTheme, stripAnsi } from './src/lib/tui-stubs.ts';
+import { callFactoryAndParse, StubTui, stubTui, stubTheme, stripAnsi } from './src/lib/tui-stubs.ts';
 import ownPkgJson from './package.json' with { type: 'json' };
 
 const APP_ROOT = dirname(fileURLToPath(import.meta.url));
@@ -661,24 +661,40 @@ const uiContext: Omit<ExtensionUIContext, 'getEditorText'> & { getEditorText(): 
       }
     }
 
+    const tui = new StubTui() as any;
+    const done = (val: any) => {
+      const pending = pendingExtensionRequests.get(id);
+      if (pending) pending.resolve({ value: val });
+    };
+
     // Try to detect interactive components (render + handleInput)
     let parsed = null;
     if (factory) {
       try {
-        const component = await factory(stubTui, stubTheme, stubKeybindings, () => {});
+        const component = await factory(tui, stubTheme, stubKeybindings, done);
         if (component && typeof component === 'object') {
-          if (typeof component.render === 'function' && typeof component.handleInput === 'function') {
-            // Interactive component — store and bridge keystrokes
+          // If factory returns a component, it's the root of our TUI tree
+          tui.addChild(component);
+
+          // We treat any component with a render() function as potentially interactive
+          if (typeof component.render === 'function') {
             if (connectedClients === 0) {
-              // No browser to interact with — dispose and resolve immediately
               try { component.dispose?.(); } catch { /* ignore */ }
               return undefined;
             }
-            interactiveCustomComponents.set(id, component);
-            // Poll render every 200ms so sub-session events (streaming text etc) update the display
-            const pollId = setInterval(() => broadcastCustomRender(id, component), 200);
+            interactiveCustomComponents.set(id, tui); // Store the TUI wrapper so we can route keys
+            
+            // Poll render every 200ms so sub-session events update the display
+            const pollId = setInterval(() => {
+              try {
+                const rawLines = tui.render();
+                const cleanLines = Array.isArray(rawLines) ? rawLines.map((l: string) => stripAnsi(l)) : [];
+                broadcast({ type: 'custom_render', id, lines: cleanLines });
+              } catch { /* disposed */ }
+            }, 200);
             interactiveRenderIntervals.set(id, pollId);
-            const rawLines = component.render(80) as string[];
+
+            const rawLines = tui.render();
             const cleanLines = Array.isArray(rawLines) ? rawLines.map((l: string) => stripAnsi(l)) : [];
 
             return new Promise<string | undefined>((resolve) => {
@@ -705,8 +721,9 @@ const uiContext: Omit<ExtensionUIContext, 'getEditorText'> & { getEditorText(): 
           // Not interactive — parse as component tree
           parsed = parseComponentTree(component, 80);
         }
-      } catch {
-        // Factory failed with stubs — try callFactoryAndParse as alternate
+      } catch (err) {
+        console.error('[pifrontier] custom factory error:', err);
+        // Fallback to static parsing
         parsed = await callFactoryAndParse(factory, title, options);
       }
     }
@@ -1474,12 +1491,17 @@ try {
               meta: !!msg.meta,
               shift: !!msg.shift,
             };
-            component.handleInput(keystroke);
+            // If it's our StubTui wrapper, it has the routing logic
+            if (typeof component.handleInput === 'function') {
+              component.handleInput(keystroke);
+            }
             // Re-render and broadcast updated lines
-            const rawLines = component.render(80) as string[];
+            const rawLines = typeof component.render === 'function' ? component.render(80) : [];
             const cleanLines = Array.isArray(rawLines) ? rawLines.map((l: string) => stripAnsi(l)) : [];
             broadcast({ type: 'custom_render', id: customId, lines: cleanLines });
-          } catch { /* component may have disposed or errored */ }
+          } catch (err) {
+            console.error('[pifrontier] extension_custom_input error:', err);
+          }
           break;
         }
 
@@ -1796,6 +1818,51 @@ try {
                   })),
                   activeToolNames: activeSession().getActiveToolNames(),
                 }));
+                break;
+              }
+              case 'login': {
+                if (args) {
+                  // If a specific provider was passed, try prompt so extensions can handle it
+                  try { await activeSession().prompt(`/login ${args}`); } catch (e) {
+                    // If prompt fails (e.g. no extension handles it), fall through to built-in flow
+                    console.error('[pifrontier] login prompt error:', e);
+                  }
+                  break;
+                }
+                // Built-in login flow: show provider selector
+                const loginProviders = getProviders().filter(p => !p.configured);
+                if (loginProviders.length === 0) {
+                  sendSlashResult(ws, command, 'All providers are already configured.', 'info');
+                  break;
+                }
+                const loginLabels = loginProviders.map(p => `${p.name} (${p.id})`);
+                const selectedLogin = await uiContext.select('Select a provider to log in', loginLabels);
+                if (!selectedLogin) break;
+                const loginIdx = loginLabels.indexOf(selectedLogin);
+                if (loginIdx === -1) break;
+                const loginProvider = loginProviders[loginIdx];
+
+                // Check if provider uses OAuth
+                const all = activeSession().modelRegistry.getAll();
+                const oauthModel = all.find(m => m.provider === loginProvider.id && activeSession().modelRegistry.isUsingOAuth(m));
+                if (oauthModel) {
+                  // OAuth flow — trigger via prompt() which routes through the extension UI
+                  try { await activeSession().prompt(`/login ${loginProvider.id}`); } catch (e) {
+                    sendSlashResult(ws, command, String(e), 'error');
+                  }
+                } else {
+                  // API key — prompt for key
+                  const key = await uiContext.input(`API key for ${loginProvider.name}`, 'Paste your API key…');
+                  if (!key) break;
+                  activeSession().modelRegistry.authStorage.set(loginProvider.id, { type: 'api_key', key });
+                  activeSession().modelRegistry.refresh();
+                  ws.send(JSON.stringify({ type: 'providers_list', providers: getProviders() }));
+                  broadcast({
+                    type: 'available_models_changed',
+                    availableModels: activeSession().modelRegistry.getAvailable().map(serializeModel),
+                  });
+                  sendSlashResult(ws, command, `Logged in to ${loginProvider.name}.`);
+                }
                 break;
               }
               case 'logout': {

@@ -2536,13 +2536,6 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
       case 'model':
         openTab('models');
         return true;
-      case 'login':
-        openTab('models');
-        modelTab = 'providers';
-        return true;
-      case 'session':
-        send({ type: 'run_builtin', command, args });
-        return true;
       case 'copy': {
         const last = [...messages].reverse().find((m) => m.role === 'assistant' && m.content);
         if (last) copyMessage(last);
@@ -2553,7 +2546,9 @@ import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
         addToast('Shortcuts: Enter sends, Shift+Enter newline, Cmd/Ctrl+B opens sessions, Cmd/Ctrl+K opens model picker.', 'info');
         return true;
       case 'reload':
+      case 'login':
       case 'logout':
+      case 'session':
       case 'clone':
       case 'export':
       case 'share':

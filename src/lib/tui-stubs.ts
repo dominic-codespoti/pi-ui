@@ -29,18 +29,73 @@ export const stubTheme = new Proxy({} as Record<string, unknown>, {
 });
 
 /** Minimal TUI stub — satisfies `tui` parameter of extension factories. */
-export const stubTui = {
-  requestRender() {},
-  showOverlay() { return { hide() {}, setHidden() {}, isHidden() { return false; }, focus() {}, unfocus() {}, isFocused() { return false; } }; },
-  hideOverlay() {},
-  hasOverlay() { return false; },
-  addChild() {},
-  removeChild() {},
-  clear() {},
-  children: [] as unknown[],
-  render() { return []; },
-  invalidate() {},
-};
+export class StubTui {
+  children: any[] = [];
+  private focused: any = null;
+
+  requestRender() {}
+  showOverlay() { return { hide() {}, setHidden() {}, isHidden() { return false; }, focus() {}, unfocus() {}, isFocused() { return false; } }; }
+  hideOverlay() {}
+  hasOverlay() { return false; }
+  addChild(child: any) {
+    if (child && !this.children.includes(child)) {
+      this.children.push(child);
+      child.tui = this;
+      if (!this.focused) this.focus(child);
+    }
+  }
+  removeChild(child: any) {
+    const idx = this.children.indexOf(child);
+    if (idx !== -1) {
+      this.children.splice(idx, 1);
+      if (this.focused === child) this.focused = this.children[0] || null;
+    }
+  }
+  clear() {
+    this.children = [];
+    this.focused = null;
+  }
+  render() {
+    return this.children.flatMap(c => c.render?.(80) || []);
+  }
+  invalidate() {}
+  focus(child: any) {
+    if (this.focused === child) return;
+    this.focused?.unfocus?.();
+    this.focused = child;
+    child.focus?.();
+  }
+  unfocus(child: any) {
+    if (this.focused === child) {
+      child.unfocus?.();
+      this.focused = null;
+    }
+  }
+  isFocused(child: any) {
+    return this.focused === child;
+  }
+  handleInput(keyData: any) {
+    if (this.focused?.handleInput) {
+      this.focused.handleInput(keyData);
+    } else {
+      // Fallback: try to find something focused in the tree
+      const target = this.findFocused(this.children);
+      target?.handleInput?.(keyData);
+    }
+  }
+  private findFocused(children: any[]): any {
+    for (const child of children) {
+      if (child.isFocused?.() || child._focused) return child;
+      if (child.children) {
+        const f = this.findFocused(child.children);
+        if (f) return f;
+      }
+    }
+    return null;
+  }
+}
+
+export const stubTui = new StubTui() as any;
 
 /** Minimal keybindings stub. */
 export const stubKeybindings = new Proxy({} as Record<string, unknown>, {
