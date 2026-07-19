@@ -32,6 +32,7 @@
     open,
     canFork = false,
     onFork,
+    onRequestConfirm = () => {},
   }: {
     /** Whether the panel is visible — gates tab order. */
     open: boolean;
@@ -39,6 +40,8 @@
     canFork?: boolean;
     /** Opens the fork dialog (page-level). */
     onFork: () => void;
+    /** Show a confirmation dialog before destructive actions. */
+    onRequestConfirm: (message: string, onConfirm: () => void, opts?: { title?: string; confirmLabel?: string; variant?: 'error' | 'warning' | 'info' }) => void;
   } = $props();
 
   const ps = projectsState;
@@ -95,13 +98,11 @@
 
   function confirmDeleteSession(s: SessionSummary) {
     const label = s.name || s.firstMessage || s.path.split('/').pop()?.replace('.jsonl', '') || s.path;
-    if (!window.confirm(`Delete session "${label}"?`)) return;
-    ps.deleteSession(s.path);
+    onRequestConfirm(`Delete session "${label}"? This cannot be undone.`, () => ps.deleteSession(s.path));
   }
 
   function confirmForgetProject(g: ProjectGroup) {
-    if (!window.confirm(`Forget project "${g.name}"? Files on disk are untouched.`)) return;
-    ps.removeProject(g.cwd);
+    onRequestConfirm(`Forget project "${g.name}"? Sessions and pinned state will be removed, but files on disk are untouched.`, () => ps.removeProject(g.cwd));
   }
 
   function openNewProject(path: string) {
@@ -161,7 +162,7 @@
           <span class="text-[11px] text-base-content/28 shrink-0 tabular-nums group-hover/dir:hidden">{g.sessions.length}</span>
         </button>
         <!-- Hover actions -->
-        <div class="hidden group-hover/dir:flex items-center gap-0.5 pr-1.5 shrink-0">
+        <div class="touch-reveal hidden group-hover/dir:flex group-focus-within/dir:flex items-center gap-0.5 pr-1.5 shrink-0">
           <button
             onclick={() => startProjectRename(g)}
             class="w-7 h-7 flex items-center justify-center text-base-content/35 hover:text-base-content/70 hover:bg-base-content/8 rounded-xl transition-colors"
@@ -242,14 +243,18 @@
                   {/if}
                   <p class="text-xs text-base-content/24 mt-0.5 pl-4 flex items-center gap-1.5">
                     <span>{formatRelativeDate(s.modified)}</span>
-                    {#if s.messageCount > 0}
+                    {#if (s.turns ?? s.messageCount) > 0}
                       <span class="text-base-content/18">·</span>
-                      <span>{s.messageCount} msg{s.messageCount === 1 ? '' : 's'}</span>
+                      {#if s.turns !== undefined}
+                        <span>{s.turns} {s.turns === 1 ? 'exchange' : 'exchanges'}</span>
+                      {:else}
+                        <span>{s.messageCount} {s.messageCount === 1 ? 'msg' : 'msgs'}</span>
+                      {/if}
                     {/if}
                   </p>
                 </button>
                 <!-- Session actions — visible on row hover -->
-                <div class="flex flex-col justify-center gap-0.5 pr-1.5 opacity-0 group-hover:opacity-100 transition-opacity">
+                <div class="touch-reveal flex flex-col justify-center gap-0.5 pr-1.5 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity">
                   <button onclick={() => startSessionRename(s)} class="w-7 h-7 flex items-center justify-center text-base-content/40 hover:text-base-content/70 hover:bg-base-content/8 rounded-lg transition-colors" title="Rename" aria-label="Rename session" tabindex={open ? 0 : -1}><Pencil class="w-3 h-3" /></button>
                   {#if isActiveSession && canFork}
                     <button onclick={onFork} class="w-7 h-7 flex items-center justify-center text-base-content/35 hover:text-primary hover:bg-primary/8 rounded-lg transition-colors" title="Fork session" aria-label="Fork session" tabindex={open ? 0 : -1}><GitBranch class="w-3 h-3" /></button>
@@ -279,17 +284,28 @@
 
 <!-- Search capsule -->
 <div class="shrink-0 px-3 py-3">
-  <div class="flex items-center gap-2 bg-base-content/[0.055] border border-base-content/[0.04] rounded-2xl px-3 py-2.5 shadow-inner shadow-black/5">
-    <Search class="w-4 h-4 shrink-0 text-base-content/30" />
+  <div class="flex items-center gap-2 rounded-[1.35rem] border border-base-content/10 bg-base-content/[0.045] px-3 py-2.5 shadow-inner shadow-black/10 transition-colors focus-within:border-base-content/45 focus-within:bg-base-content/[0.055]">
+    <Search class="w-4 h-4 shrink-0 text-base-content/35" />
     <input
       type="search"
-      placeholder="search projects &amp; sessions…"
+      placeholder="Search projects, paths, sessions…"
       bind:value={ps.filter}
-      class="flex-1 bg-transparent outline-none text-sm placeholder-base-content/30 text-base-content/80 min-w-0"
+      class="focus-ring flex-1 bg-transparent outline-none text-sm placeholder-base-content/30 text-base-content/82 min-w-0"
       aria-label="Filter projects and sessions"
       tabindex={open ? 0 : -1}
     />
+    {#if ps.filter}
+      <button
+        onclick={() => (ps.filter = '')}
+        class="rounded-full p-1.5 text-base-content/35 transition-colors hover:bg-base-content/8 hover:text-base-content/70"
+        aria-label="Clear project search"
+        tabindex={open ? 0 : -1}
+      ><X class="w-3.5 h-3.5" /></button>
+    {/if}
   </div>
+  {#if ps.filter}
+    <p class="px-2 pt-1.5 text-[10px] text-base-content/32">{ps.filteredGroups.length} project{ps.filteredGroups.length === 1 ? '' : 's'} matched</p>
+  {/if}
 </div>
 
 <!-- Error banner -->

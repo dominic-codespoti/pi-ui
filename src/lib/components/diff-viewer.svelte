@@ -9,15 +9,20 @@
   const totalAdditions = $derived(parsed.reduce((s, f) => s + f.additions, 0));
   const totalDeletions = $derived(parsed.reduce((s, f) => s + f.deletions, 0));
 
-  /** Set of expanded file paths (all expanded by default). */
+  /** Set of expanded file paths (all collapsed by default). */
   const expandedFiles = new SvelteSet<string>();
   /** Copy feedback state. */
   let copied = $state(false);
 
-  // Reset expanded state when diff changes
+  /** Max lines per file before highlighting is skipped (perf safeguard). */
+  const HIGHLIGHT_LINE_LIMIT = 200;
+  /** Max lines rendered per file before truncation kicks in. */
+  const VISIBLE_LINE_LIMIT = 1000;
+
+  // Reset expanded state when diff changes — keep collapsed
   $effect(() => {
     expandedFiles.clear();
-    for (const file of parsed) expandedFiles.add(file.newPath);
+    resetHighlightCounters();
   });
 
   function toggleFile(path: string) {
@@ -41,14 +46,24 @@
     return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 
-  function highlightLine(content: string, lang: string): string {
+  /** Track total highlighted lines per-file to cap highlighting cost. */
+  let highlightCounters = $state<Record<string, number>>({});
+
+  function highlightLine(content: string, lang: string, filePath: string): string {
     if (!lang) return escapeHtml(content);
+    const count = highlightCounters[filePath] ?? 0;
+    if (count > HIGHLIGHT_LINE_LIMIT) return escapeHtml(content);
     try {
-      // Highlight just this one line — wrap in the lang so hljs picks it up
-      return highlightCode(content, lang);
+      const result = highlightCode(content, lang);
+      highlightCounters[filePath] = count + 1;
+      return result;
     } catch {
       return escapeHtml(content);
     }
+  }
+
+  function resetHighlightCounters() {
+    highlightCounters = {};
   }
 
   function copyDiff() {
@@ -121,19 +136,26 @@
               <div class="hunk-separator"></div>
             {/if}
             <div class="hunk-header">{hunk.header}</div>
-            {#each hunk.lines as line (line.oldLineNumber ?? line.newLineNumber ?? Math.random())}
-              <div
-                class="diff-line"
-                class:line-add={line.type === 'add'}
-                class:line-del={line.type === 'delete'}
-                class:line-ctx={line.type === 'context'}
-              >
-                <span class="line-num">{line.oldLineNumber ?? ''}</span>
-                <span class="line-num">{line.newLineNumber ?? ''}</span>
-                <span class="line-sign">{line.type === 'add' ? '+' : line.type === 'delete' ? '-' : ' '}</span>
-                <span class="line-content">{@html highlightLine(line.content, detectLang(file.newPath))}</span>
-              </div>
+            {#each hunk.lines as line, li (`${hunk.header}:${li}:${line.oldLineNumber ?? ''}:${line.newLineNumber ?? ''}`)}
+              {#if li < VISIBLE_LINE_LIMIT}
+                <div
+                  class="diff-line"
+                  class:line-add={line.type === 'add'}
+                  class:line-del={line.type === 'delete'}
+                  class:line-ctx={line.type === 'context'}
+                >
+                  <span class="line-num">{line.oldLineNumber ?? ''}</span>
+                  <span class="line-num">{line.newLineNumber ?? ''}</span>
+                  <span class="line-sign">{line.type === 'add' ? '+' : line.type === 'delete' ? '-' : ' '}</span>
+                  <span class="line-content">{@html highlightLine(line.content, detectLang(file.newPath), file.newPath)}</span>
+                </div>
+              {/if}
             {/each}
+            {#if file.hunks.reduce((sum, h) => sum + h.lines.length, 0) > VISIBLE_LINE_LIMIT}
+              <div class="px-2.5 py-2 text-[10px] text-base-content/40 italic">
+                File exceeds {VISIBLE_LINE_LIMIT} lines — only the first {VISIBLE_LINE_LIMIT} are shown.
+              </div>
+            {/if}
           {/each}
         </div>
       {/if}

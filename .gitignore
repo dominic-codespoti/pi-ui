@@ -30,3 +30,8 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+
+# Playwright test artifacts
+test-results/
+e2e/screenshots/
+e2e/visual-test-helper.js

@@ -46,6 +46,7 @@
   --radius-selector: 0.75rem;
   --radius-field: 0.75rem;
   --radius-box: 1rem;
+  --radius-md: 0.5rem;
   --size-selector: 0.25rem;
   --size-field: 0.25rem;
   --border: 1px;
@@ -81,6 +82,17 @@ body { display: flex; flex-direction: row; height: 100dvh; overflow: hidden; }
   }
   *::-webkit-scrollbar-thumb:hover {
     background: color-mix(in oklch, var(--color-base-content) 28%, transparent);
+  }
+}
+
+/* ── Reveal hover-only row actions on touch and keyboard-only devices ───── */
+@media (hover: none), (pointer: coarse) {
+  .touch-reveal {
+    opacity: 1 !important;
+  }
+
+  .touch-reveal.hidden {
+    display: flex !important;
   }
 }
 
@@ -200,13 +212,18 @@ button, a, input, textarea, select, [role="button"] {
 .aurora::before {
   content: "";
   position: absolute;
-  inset: 0;
+  inset: -10%;
   z-index: -1;
   pointer-events: none;
   background:
-    radial-gradient(ellipse 50% 38% at 18% 8%,  color-mix(in oklch, var(--color-primary) 10%, transparent), transparent 70%),
-    radial-gradient(ellipse 44% 34% at 85% 18%, color-mix(in oklch, var(--color-secondary) 7%, transparent), transparent 70%),
-    radial-gradient(ellipse 56% 40% at 50% 100%, color-mix(in oklch, var(--color-accent) 5%, transparent), transparent 70%);
+    radial-gradient(ellipse 50% 38% at 18% 8%,  color-mix(in oklch, var(--color-primary) 16%, transparent), transparent 70%),
+    radial-gradient(ellipse 44% 34% at 85% 18%, color-mix(in oklch, var(--color-secondary) 12%, transparent), transparent 70%),
+    radial-gradient(ellipse 56% 40% at 50% 100%, color-mix(in oklch, var(--color-accent) 9%, transparent), transparent 70%);
+  animation: aurora-drift 26s ease-in-out infinite alternate;
+}
+@keyframes aurora-drift {
+  from { transform: translate3d(0, 0, 0) scale(1); }
+  to   { transform: translate3d(-2%, 2%, 0) scale(1.08); }
 }
 
 /* ── Message entrance — gentle rise & fade ───────────────────────────────── */
@@ -215,7 +232,7 @@ button, a, input, textarea, select, [role="button"] {
   to   { opacity: 1; transform: translateY(0); }
 }
 .msg-in {
-  animation: msg-in 260ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  animation: msg-in 250ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
 /* ── Composer — focus-charged input surface ──────────────────────────────── */
@@ -225,7 +242,7 @@ button, a, input, textarea, select, [role="button"] {
   box-shadow:
     0 4px 20px -8px rgb(0 0 0 / 0.45),
     0 0 0 1px color-mix(in oklch, var(--color-primary) 8%, transparent);
-  transition: border-color 200ms ease, box-shadow 260ms ease;
+  transition: border-color 150ms ease, box-shadow 250ms ease;
 }
 .composer:focus-within {
   border-color: color-mix(in oklch, var(--color-primary) 42%, transparent);
@@ -254,6 +271,26 @@ button, a, input, textarea, select, [role="button"] {
   animation: shimmer 2.4s linear infinite;
 }
 
+/* ── Skeleton shimmer — for loading placeholders ────────────────────────── */
+.skeleton-shimmer {
+  position: relative;
+  overflow: hidden;
+}
+.skeleton-shimmer::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    90deg,
+    transparent 30%,
+    color-mix(in oklch, var(--color-base-content) 10%, transparent) 50%,
+    transparent 70%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 2.4s ease-in-out infinite;
+  pointer-events: none;
+}
+
 /* ── Gradient hairline — fading horizontal rule ──────────────────────────── */
 .hairline-x {
   height: 1px;
@@ -271,6 +308,7 @@ button, a, input, textarea, select, [role="button"] {
 
 /* ── Prose — assistant markdown output ────────────────────────────────────── */
 .prose {
+  font-family: var(--font-sans, ui-sans-serif, system-ui, sans-serif);
   line-height: 1.55;
   overflow-wrap: break-word;
   word-break: break-words;
@@ -511,4 +549,107 @@ button, a, input, textarea, select, [role="button"] {
   outline: 2px solid color-mix(in oklch, var(--color-info) 65%, transparent);
   outline-offset: 2px;
   border-radius: 2px;
+}
+
+/* ── Skip link — accessible keyboard navigation, hidden until focused ────── */
+.skip-link {
+  position: absolute;
+  top: -100%;
+  left: 0;
+  z-index: 9999;
+  padding: 0.5rem 1rem;
+  background: var(--color-primary);
+  color: var(--color-primary-content);
+  font-size: 0.875rem;
+  font-weight: 600;
+  text-decoration: none;
+  border-radius: 0 0 0.5rem 0;
+  transition: top 0.15s ease;
+}
+.skip-link:focus {
+  top: 0;
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+ *  TRACE — compact terminal-style message rows (thinking, tools, output)
+ * ════════════════════════════════════════════════════════════════════════ */
+
+/* Step — a single assistant or tool message container */
+.trace-step {
+  padding: 0.35rem 0 0 0;
+}
+
+/* Row — flat horizontal flex for thinking/tool summaries */
+.trace-row {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  padding: 0.3rem 0.5rem 0 0.5rem;
+  border-radius: 0.4rem;
+  font-size: 0.75rem;
+  line-height: 1.5;
+  color: color-mix(in oklch, var(--color-base-content) 50%, transparent);
+}
+
+/* Row toggle — clickable row with hover state */
+.trace-row-toggle {
+  cursor: pointer;
+  border: none;
+  background: transparent;
+  text-align: left;
+  width: 100%;
+  font: inherit;
+  transition: background-color 0.12s ease;
+}
+.trace-row-toggle:hover {
+  background: color-mix(in oklch, var(--color-base-content) 5%, transparent);
+}
+
+@media (pointer: coarse) {
+  .trace-row-toggle {
+    min-height: 2.5rem;
+  }
+}
+
+/* Row label — section name ("thinking", "Shell", etc.) */
+.trace-row-label {
+  white-space: nowrap;
+  color: color-mix(in oklch, var(--color-base-content) 55%, transparent);
+  flex-shrink: 0;
+}
+
+/* Row detail — truncated preview text */
+.trace-row-detail {
+  color: color-mix(in oklch, var(--color-base-content) 55%, transparent);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1;
+}
+
+/* Row time — right-aligned timing info */
+.trace-row-time {
+  color: color-mix(in oklch, var(--color-base-content) 45%, transparent);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+/* Body — main prose content of a message */
+.trace-body {
+  padding: 0.35rem 0;
+}
+
+/* Output — expanded content panel (thinking details, tool output) */
+.trace-output {
+  border-left: 2px solid color-mix(in oklch, var(--color-base-content) 10%, transparent);
+  padding-left: 0.75rem;
+  margin-left: 0.15rem;
+}
+
+/* Meta — bottom action bar (copy, metrics) */
+.trace-meta {
+  font-size: 0.65rem;
 }

@@ -5,6 +5,7 @@ import {
   textDeltaPayload,
   assistantMessageEndPayload,
   agentEndPayload,
+  thinkingDeltaPayload,
 } from './mocks/payloads';
 
 test.describe('Chat / prompt streaming', () => {
@@ -29,12 +30,9 @@ test.describe('Chat / prompt streaming', () => {
     });
 
     await page.goto('/');
-    await page.fill('input[name="password"]', 'test-password');
-    await page.click('button[type="submit"]');
-    await page.waitForURL('/');
 
     await page.fill('textarea', 'Hello pi');
-    await page.press('textarea', 'Enter');
+    await page.getByLabel('Send message').click();
 
     const hasPrompt = wsMessages.some((m) => {
       try { const p = JSON.parse(m); return p.type === 'prompt' && p.message === 'Hello pi'; }
@@ -44,21 +42,6 @@ test.describe('Chat / prompt streaming', () => {
   });
 
   test('renders streaming text deltas', async ({ page }) => {
-    await page.routeWebSocket('/ws', (ws) => {
-      ws.onMessage(() => {
-        // Only respond to prompt after it's sent
-      });
-      ws.send(JSON.stringify({ type: 'connected', sessionId: 's1', isStreaming: false, thinkingLevel: 'medium', model: null, availableModels: [], messages: [] }));
-      ws.send(JSON.stringify({ type: 'projects_list', projects: [] }));
-      ws.send(JSON.stringify({ type: 'all_sessions_list', sessions: [] }));
-    });
-
-    await page.goto('/');
-    await page.fill('input[name="password"]', 'test-password');
-    await page.click('button[type="submit"]');
-    await page.waitForURL('/');
-
-    // Re-setup WS with streaming responses
     await page.routeWebSocket('/ws', (ws) => {
       let streaming = false;
       ws.onMessage((data) => {
@@ -79,11 +62,11 @@ test.describe('Chat / prompt streaming', () => {
       ws.send(JSON.stringify({ type: 'projects_list', projects: [] }));
       ws.send(JSON.stringify({ type: 'all_sessions_list', sessions: [] }));
     });
+    await page.goto('/');
 
     await page.fill('textarea', 'Say hi');
-    await page.press('textarea', 'Enter');
+    await page.getByLabel('Send message').click();
 
-    // Wait for streaming text to appear
     await expect(page.getByText('Hello world')).toBeVisible({ timeout: 5000 });
   });
 
@@ -104,16 +87,11 @@ test.describe('Chat / prompt streaming', () => {
     });
 
     await page.goto('/');
-    await page.fill('input[name="password"]', 'test-password');
-    await page.click('button[type="submit"]');
-    await page.waitForURL('/');
 
     await expect(page.getByText('Hi there!')).toBeVisible({ timeout: 3000 });
   });
 
   test('shows thinking deltas', async ({ page }) => {
-    const { thinkingDeltaPayload } = await import('./mocks/payloads');
-
     await page.routeWebSocket('/ws', (ws) => {
       let streaming = false;
       ws.onMessage((data) => {
@@ -134,15 +112,42 @@ test.describe('Chat / prompt streaming', () => {
       ws.send(JSON.stringify({ type: 'projects_list', projects: [] }));
       ws.send(JSON.stringify({ type: 'all_sessions_list', sessions: [] }));
     });
-
     await page.goto('/');
-    await page.fill('input[name="password"]', 'test-password');
-    await page.click('button[type="submit"]');
-    await page.waitForURL('/');
 
     await page.fill('textarea', 'Think');
-    await page.press('textarea', 'Enter');
+    await page.getByLabel('Send message').click();
 
     await expect(page.getByText('Here is my answer.')).toBeVisible({ timeout: 5000 });
+  });
+
+  test('shows extension subcommands after slash command space', async ({ page }) => {
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.onMessage((data) => {
+        const msg = JSON.parse(String(data));
+        if (msg.type === 'get_command_completions' && msg.command === 'ag') {
+          ws.send(JSON.stringify({
+            type: 'command_completions',
+            command: 'ag',
+            prefix: msg.prefix,
+            items: [
+              { value: 'start', label: 'start', description: 'Start an agent' },
+              { value: 'status', label: 'status', description: 'Show agent status' },
+            ],
+          }));
+        }
+      });
+      ws.send(JSON.stringify({ type: 'connected', sessionId: 's1', isStreaming: false, thinkingLevel: 'medium', model: null, availableModels: [], messages: [] }));
+      ws.send(JSON.stringify({ type: 'commands_list', commands: [{ name: 'ag', description: 'Agent commands', source: 'test' }] }));
+      ws.send(JSON.stringify({ type: 'projects_list', projects: [] }));
+      ws.send(JSON.stringify({ type: 'all_sessions_list', sessions: [] }));
+    });
+
+    await page.goto('/');
+    await page.fill('textarea', '/ag ');
+
+    await expect(page.getByText('/ag subcommands')).toBeVisible({ timeout: 3000 });
+    await expect(page.getByText('Start an agent')).toBeVisible();
+    await page.getByRole('option', { name: /start Start an agent/ }).click();
+    await expect(page.locator('textarea')).toHaveValue('/ag start ');
   });
 });

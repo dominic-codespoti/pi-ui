@@ -1,5 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { redirect } from '@sveltejs/kit';
+import type { RequestEvent } from '@sveltejs/kit';
+import type { Mock } from 'vitest';
+
+/** RequestEvent plus the mocked `resolve` the tests pass to `handle`. */
+type MockRequestEvent = RequestEvent & { resolve: Mock };
 
 // Mock the password module before importing hooks
 vi.mock('$lib/auth/password', () => ({
@@ -15,7 +19,7 @@ async function getHandle() {
   return mod.handle;
 }
 
-function mockEvent(pathname: string, cookieHeader?: string) {
+function mockEvent(pathname: string, cookieHeader?: string): MockRequestEvent {
   return {
     url: new URL(`http://localhost${pathname}`),
     request: {
@@ -26,7 +30,16 @@ function mockEvent(pathname: string, cookieHeader?: string) {
       ),
     },
     resolve: vi.fn().mockResolvedValue(new Response('ok')),
-  };
+    cookies: { get: vi.fn(), set: vi.fn() },
+    fetch: vi.fn(),
+    locals: {},
+    params: {},
+    platform: undefined,
+    isDataRequest: false,
+    isSubRequest: false,
+    route: { id: '/(app)' },
+    getClientAddress: () => '127.0.0.1',
+  } as unknown as MockRequestEvent;
 }
 
 describe('hooks.server handle', () => {

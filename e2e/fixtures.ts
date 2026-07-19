@@ -46,4 +46,14 @@ export const test = base.extend<{
   },
 });
 
+/**
+ * Fill the composer and submit via the send button.
+ * Works on both desktop and mobile projects — on mobile, plain Enter inserts
+ * a newline by design, so keyboard submission is not portable.
+ */
+export async function submitPrompt(page: Page, text: string): Promise<void> {
+  await page.fill('textarea', text);
+  await page.click('button[aria-label="Send message"]');
+}
+
 export { expect } from '@playwright/test';

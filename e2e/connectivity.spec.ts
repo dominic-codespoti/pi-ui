@@ -16,7 +16,7 @@ test.describe('Reconnect / connectivity', () => {
     await expect(page.locator('textarea')).toBeEnabled({ timeout: 3000 });
   });
 
-  test('shows disconnected banner when WS closes', async ({ page, login }) => {
+  test('shows reconnecting banner and disables composer when WS drops', async ({ page, login }) => {
     let closeSocket: (() => void) | undefined;
     await page.routeWebSocket('/ws', (ws) => {
       closeSocket = () => ws.close();
@@ -28,31 +28,42 @@ test.describe('Reconnect / connectivity', () => {
     await login(page, 'test-password');
     await expect(page.locator('textarea')).toBeEnabled({ timeout: 3000 });
 
-    // Close the WebSocket
+    // Pin the browser offline so the automatic reconnect cannot race the assertions —
+    // scheduleReconnect() waits for the 'online' event while navigator.onLine is false.
+    await page.evaluate(() => {
+      Object.defineProperty(navigator, 'onLine', { configurable: true, get: () => false });
+      window.dispatchEvent(new Event('offline'));
+    });
     if (closeSocket) closeSocket();
 
-    // Should show disconnected banner
-    await expect(page.getByText('disconnected')).toBeVisible({ timeout: 3000 });
-    // Textarea should be disabled
+    // The status banner announces the reconnecting state and the composer locks
+    await expect(page.getByRole('status').filter({ hasText: /reconnecting/ })).toBeVisible({ timeout: 3000 });
     await expect(page.locator('textarea')).toBeDisabled();
   });
 
-  test('shows reconnecting countdown after disconnect', async ({ page, login }) => {
+  test('shows reconnecting countdown while retries back off', async ({ page, login }) => {
     let closeSocket: (() => void) | undefined;
+    let first = true;
     await page.routeWebSocket('/ws', (ws) => {
-      closeSocket = () => ws.close();
-      ws.send(JSON.stringify({
-        type: 'connected', sessionId: 's1', isStreaming: false, thinkingLevel: 'medium',
-        model: null, availableModels: [], messages: [],
-      }));
+      if (first) {
+        first = false;
+        closeSocket = () => ws.close();
+        ws.send(JSON.stringify({
+          type: 'connected', sessionId: 's1', isStreaming: false, thinkingLevel: 'medium',
+          model: null, availableModels: [], messages: [],
+        }));
+        return;
+      }
+      // Fail every reconnect attempt so the backoff countdown stays on screen
+      ws.close();
     });
     await login(page, 'test-password');
     await expect(page.locator('textarea')).toBeEnabled({ timeout: 3000 });
 
     if (closeSocket) closeSocket();
 
-    // Countdown should appear within a second
-    await expect(page.getByText(/reconnecting in \d+s/)).toBeVisible({ timeout: 3000 });
+    // Countdown renders inside the reconnecting banner, e.g. "reconnecting (2s)"
+    await expect(page.getByRole('status').filter({ hasText: /\(\d+s\)/ })).toBeVisible({ timeout: 10_000 });
   });
 
   test('reconnects automatically after disconnect', async ({ page, login }) => {
@@ -73,17 +84,16 @@ test.describe('Reconnect / connectivity', () => {
     // Close to trigger reconnect — the routeWebSocket handler creates a NEW connection
     // (Since we use page.routeWebSocket, closing the mock only affects that instance)
     // Reload the page to trigger a fresh connection
+    // Reload the page to trigger a fresh connection (auth cookie persists)
     await page.reload();
-    await page.fill('input[name="password"]', 'test-password');
-    await page.click('button[type="submit"]');
-    await page.waitForURL('/');
 
     await expect(page.locator('textarea')).toBeEnabled({ timeout: 5000 });
     // A new routeWebSocket connection was established
     expect(connectionCount).toBeGreaterThanOrEqual(2);
   });
 
-  test('shows connection status in tooltip', async ({ page, login }) => {
+  test('shows connection status in tooltip', async ({ page, login, isMobile }) => {
+    test.skip(isMobile, 'Tooltips are hover-only and intentionally disabled on touch devices');
     await page.routeWebSocket('/ws', (ws) => {
       ws.send(JSON.stringify({
         type: 'connected', sessionId: 's1', isStreaming: false, thinkingLevel: 'medium',
@@ -104,22 +114,22 @@ test.describe('Reconnect / connectivity', () => {
 
   test('shows connecting state after page reload', async ({ page, login }) => {
     await page.routeWebSocket('/ws', (ws) => {
-      // Don't send connected — keep it in limbo
+      // Refuse every connection — the app stays in the connecting state
+      // (a mock that merely stays silent still completes the WS handshake,
+      // which flips the app to the connected/open state).
+      ws.close();
     });
 
     await login(page, 'test-password');
 
-    // Should show connecting state
+    // The empty-chat connecting screen should be visible
     await expect(page.getByText('connecting\u2026')).toBeVisible({ timeout: 5000 });
-
-    // The full-screen connecting message should be visible
-    await expect(page.locator('text=connecting\u2026').first()).toBeVisible();
   });
 
   test('textarea placeholder reflects connection state', async ({ page }) => {
-    // Initially without WS, check connecting state placeholder
     await page.routeWebSocket('/ws', (ws) => {
-      // Don't respond — keep connecting
+      // Refuse every connection so the composer stays in the reconnecting state
+      ws.close();
     });
 
     await page.goto('/');
@@ -127,17 +137,16 @@ test.describe('Reconnect / connectivity', () => {
     await page.click('button[type="submit"]');
     await page.waitForURL('/');
 
-    // Textarea should be disabled with connecting placeholder
+    // Textarea should be disabled with the reconnecting placeholder
     const textarea = page.locator('textarea');
+    await expect(textarea).toHaveAttribute('placeholder', /Reconnecting/, { timeout: 5000 });
     await expect(textarea).toBeDisabled();
-    // The placeholder should start with "connecting" (Svelte renders it as the wsState)
-    await expect(textarea).toHaveAttribute('placeholder', /connecting/);
   });
 
-  test('server_restarting overlay appears and then reconnects', async ({ page, login }) => {
-    let closeAfterRestart: (() => void) | undefined;
+  test('recovers automatically after an unexpected socket close', async ({ page, login }) => {
+    let closeSocket: (() => void) | undefined;
     await page.routeWebSocket('/ws', (ws) => {
-      closeAfterRestart = () => ws.close();
+      closeSocket = () => ws.close();
       ws.send(JSON.stringify({
         type: 'connected', sessionId: 's1', isStreaming: false, thinkingLevel: 'medium',
         model: null, availableModels: [], messages: [],
@@ -147,18 +156,10 @@ test.describe('Reconnect / connectivity', () => {
     await login(page, 'test-password');
     await expect(page.locator('textarea')).toBeEnabled({ timeout: 3000 });
 
-    // Simulate server_restarting — this can't come through the mocked WS since
-    // routeWebSocket intercepts it. Instead we force it via evaluate.
-    await page.evaluate(() => {
-      // Dispatch a custom event or directly set state
-      window.dispatchEvent(new CustomEvent('server-restarting'));
-    });
-
-    // Send server_restarting through the WebSocket
-    // Actually, routeWebSocket intercepts WS, so we need a different approach.
-    // Instead, just close the socket — the reconnect cycle demonstrates resilience.
-    if (closeAfterRestart) closeAfterRestart();
-    await expect(page.getByText('disconnected')).toBeVisible({ timeout: 3000 });
+    // Drop the socket — the app schedules a reconnect, the mock accepts the
+    // new connection, and the composer comes back to life.
+    if (closeSocket) closeSocket();
+    await expect(page.locator('textarea')).toBeEnabled({ timeout: 10_000 });
   });
 
   test('recovers from page visibility change during reconnect', async ({ page, login }) => {
@@ -178,29 +179,21 @@ test.describe('Reconnect / connectivity', () => {
     await expect(page.locator('textarea')).toBeEnabled({ timeout: 3000 });
     expect(wsOpened).toBe(true);
 
-    // Close to trigger reconnect
-    if (closeSocket) closeSocket();
-    await expect(page.getByText('disconnected')).toBeVisible({ timeout: 3000 });
-
-    // Simulate page hidden — this pauses reconnection
+    // Hide the page first — reconnection is paused while hidden
     await page.evaluate(() => {
       Object.defineProperty(document, 'hidden', { configurable: true, get: () => true });
       document.dispatchEvent(new Event('visibilitychange'));
     });
-    await page.waitForTimeout(200);
+    if (closeSocket) closeSocket();
+    await expect(page.locator('textarea')).toBeDisabled({ timeout: 3000 });
 
-    // Restore visibility — reconnection should resume
+    // Restore visibility — reconnection resumes, the mock accepts the new
+    // connection, and the composer unlocks again.
     await page.evaluate(() => {
       Object.defineProperty(document, 'hidden', { configurable: true, get: () => false });
       document.dispatchEvent(new Event('visibilitychange'));
     });
-
-    // After becoming visible, the app should try reconnecting.
-    // Since we used routeWebSocket, a new connection is attempted.
-    // The app should no longer show disconnected once it reconnects.
-    // With a plain routeWebSocket, reopening requires a page reload.
-    // Instead, verify the app is still functional after visibility change.
-    await expect(page.getByText('disconnected')).toBeVisible();
+    await expect(page.locator('textarea')).toBeEnabled({ timeout: 10_000 });
   });
 
   test('send button is disabled when disconnected', async ({ page, login }) => {
@@ -215,12 +208,15 @@ test.describe('Reconnect / connectivity', () => {
     await login(page, 'test-password');
     await expect(page.locator('textarea')).toBeEnabled({ timeout: 3000 });
 
-    // Close the socket
+    // Pin offline so the reconnect cannot race, then drop the socket
+    await page.evaluate(() => {
+      Object.defineProperty(navigator, 'onLine', { configurable: true, get: () => false });
+      window.dispatchEvent(new Event('offline'));
+    });
     if (closeSocket) closeSocket();
-    await expect(page.getByText('disconnected')).toBeVisible({ timeout: 3000 });
+    await expect(page.getByRole('status').filter({ hasText: /reconnecting/ })).toBeVisible({ timeout: 3000 });
 
-    // Send button should be disabled
-    const sendButton = page.locator('button[type="submit"], button[aria-label*="send"], button:has(svg)').last();
-    await expect(sendButton).toBeDisabled();
+    // Send button should be disabled while the socket is down
+    await expect(page.getByRole('button', { name: 'Send message' })).toBeDisabled();
   });
 });

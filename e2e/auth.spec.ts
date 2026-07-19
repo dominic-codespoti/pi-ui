@@ -4,7 +4,7 @@ test.describe('Auth flow', () => {
   test('unauthenticated user is redirected to /login', async ({ page }) => {
     await page.goto('/');
     await expect(page).toHaveURL(/\/login/);
-    await expect(page.locator('text=password')).toBeVisible();
+    await expect(page.getByText('password', { exact: true })).toBeVisible();
   });
 
   test('wrong password shows error message', async ({ page }) => {

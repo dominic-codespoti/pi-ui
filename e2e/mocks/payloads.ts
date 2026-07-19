@@ -170,3 +170,56 @@ export const RESOURCES_LIST_PAYLOAD = {
     { name: 'review', description: 'Code review prompt', scope: 'project', isBuiltin: false, source: '.pi/prompts/review.md' },
   ],
 };
+
+// ── New payloads for extension component rendering ──────────────────────────
+
+/** Simulate a setWidget message with a component tree (ProgressBar, Loader, etc.) */
+export function extensionSetWidgetPayload(
+  key: string,
+  component: Record<string, unknown>,
+  placement?: string,
+) {
+  return {
+    type: 'extension_ui_request',
+    id: crypto.randomUUID(),
+    method: 'setWidget',
+    widgetKey: key,
+    widgetType: 'component',
+    widgetComponent: component,
+    ...(placement ? { widgetPlacement: placement } : {}),
+  };
+}
+
+/** Simulate a setWidget message with plain text lines. */
+export function extensionSetWidgetTextPayload(key: string, lines: string[]) {
+  return {
+    type: 'extension_ui_request',
+    id: crypto.randomUUID(),
+    method: 'setWidget',
+    widgetKey: key,
+    widgetType: 'text',
+    widgetLines: lines,
+  };
+}
+
+/** Simulate a custom modal with a parsed component tree. */
+export function extensionCustomPayload(id: string, title: string, parsed: Record<string, unknown>) {
+  return {
+    type: 'extension_ui_request',
+    id,
+    method: 'custom',
+    title,
+    parsed,
+  };
+}
+
+/** Simulate an extension_event with a level. */
+export function extensionEventPayload(source: string, event: string, level: string, message?: string) {
+  return {
+    type: 'extension_event',
+    source,
+    event,
+    level,
+    ...(message ? { message } : {}),
+  };
+}

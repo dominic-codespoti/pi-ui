@@ -1,4 +1,4 @@
-import { test, expect } from './fixtures';
+import { test, expect, submitPrompt } from './fixtures';
 import {
   toolExecutionStartPayload,
   toolExecutionUpdatePayload,
@@ -32,8 +32,7 @@ test.describe('Tool rendering', () => {
       ws.send(JSON.stringify({ type: 'all_sessions_list', sessions: [] }));
     });
 
-    await page.fill('textarea', 'Run ls');
-    await page.press('textarea', 'Enter');
+    await submitPrompt(page, 'Run ls');
     await expect(page.getByText('file.txt')).toBeVisible({ timeout: 5000 });
   });
 
@@ -57,8 +56,7 @@ test.describe('Tool rendering', () => {
       ws.send(JSON.stringify({ type: 'all_sessions_list', sessions: [] }));
     });
 
-    await page.fill('textarea', 'Run bad cmd');
-    await page.press('textarea', 'Enter');
+    await submitPrompt(page, 'Run bad cmd');
     await expect(page.getByText('command not found')).toBeVisible({ timeout: 5000 });
   });
 
@@ -92,8 +90,7 @@ test.describe('Tool rendering', () => {
       ws.send(JSON.stringify({ type: 'all_sessions_list', sessions: [] }));
     });
 
-    await page.fill('textarea', 'Fix file');
-    await page.press('textarea', 'Enter');
+    await submitPrompt(page, 'Fix file');
     await expect(page.getByText('src/index.ts')).toBeVisible({ timeout: 5000 });
   });
 });

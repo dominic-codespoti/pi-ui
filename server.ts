@@ -21,9 +21,14 @@ import { join, resolve, basename, sep, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { initPassword, isValidSessionCookie, extractTokenExp, getTokenFromCookies } from './src/lib/auth/password.ts';
+import { getWebhookUrl, setWebhookUrl, sendWebhookNotification } from './src/lib/server/notification-webhook.ts';
 import { listProjects, touchProject, removeProject, setProjectPinned, renameProject } from './src/lib/server/project-registry.ts';
+import { readSettings, updateSettings } from './src/lib/server/ui-settings.ts';
+import { log } from './src/lib/server/logger.ts';
+import { trimMessagesForWire } from './src/lib/server/wire-messages.ts';
+import { initSessionScanCache, scanAllSessions, scanSessionsForCwd, type SessionFileInfo } from './src/lib/server/session-scan.ts';
 import type { ClientMessage, ModelInfo, ProjectInfo, ProviderInfo, SessionSummary, SkillSummary, PromptSummary, ExtensionSummary, UpdatePackageStatus, UpdateStatus, UpdateTarget } from './src/lib/ws/protocol.ts';
-import { callFactoryAndParse, StubTui, stubTui, stubTheme, stripAnsi } from './src/lib/tui-stubs.ts';
+import { callFactoryAndParse, parseComponentTree, StubTui, stubKeybindings, stubTui, stubTheme, stripAnsi, ansiToHtml, type ParsedComponent } from './src/lib/tui-stubs.ts';
 import ownPkgJson from './package.json' with { type: 'json' };
 
 const APP_ROOT = dirname(fileURLToPath(import.meta.url));
@@ -61,22 +66,34 @@ async function getSvelteHandler(): Promise<SvelteHandler> {
 
 const PI_PASSWORD = Bun.env.PI_PASSWORD;
 if (!PI_PASSWORD) {
-  console.error('[pifrontier] Error: PI_PASSWORD environment variable is required.');
-  console.error('[pifrontier] Usage: PI_PASSWORD=your-password bun run start');
+  log.error('[pifrontier] Error: PI_PASSWORD environment variable is required.');
+  log.error('[pifrontier] Usage: PI_PASSWORD=your-password bun run start');
   process.exit(1);
 }
 
 await initPassword(PI_PASSWORD);
-console.log('[pifrontier] Password initialised.');
+log.info('[pifrontier] Password initialised.');
 
 // ── 2. Helpers ────────────────────────────────────────────────────────────────
 
 import { existsSync, realpathSync } from 'node:fs';
 
+/** Max messages sent on initial connect/session-switch. Older messages can be
+ *  loaded on demand. Keeps the WS payload small and the client render fast. */
+const MAX_INITIAL_MESSAGES = 100;
+
+/** Truncate messages for initial payload — keeps the WS + client render fast.
+ *  Oversized text/thinking blocks are additionally size-capped for transfer. */
+function initialMessages(messages: unknown[]): { msgs: unknown[]; total: number; truncated: boolean } {
+  const total = messages.length;
+  const tail = total <= MAX_INITIAL_MESSAGES ? messages : messages.slice(-MAX_INITIAL_MESSAGES);
+  return { msgs: trimMessagesForWire(tail), total, truncated: total > MAX_INITIAL_MESSAGES };
+}
+
 const cwd = Bun.env.PI_CWD ?? process.cwd();
 if (!existsSync(cwd)) {
-  console.error(`[pifrontier] Error: working directory does not exist: ${cwd}`);
-  console.error('[pifrontier] Set PI_CWD to a valid directory or run from the target project.');
+  log.error(`[pifrontier] Error: working directory does not exist: ${cwd}`);
+  log.error('[pifrontier] Set PI_CWD to a valid directory or run from the target project.');
   process.exit(1);
 }
 
@@ -133,18 +150,20 @@ function serializeModel(model: Model<any> | undefined | null): ModelInfo | null 
 }
 
 function getProviders(): ProviderInfo[] {
-  const allModels = activeSession().modelRegistry.getAll();
-  const providerCount = new Map<string, number>();
-  for (const m of allModels) {
-    providerCount.set(m.provider, (providerCount.get(m.provider) ?? 0) + 1);
+  const runtime = activeSession().modelRuntime;
+  const modelCounts = new Map<string, number>();
+  for (const model of runtime.getModels()) {
+    modelCounts.set(model.provider, (modelCounts.get(model.provider) ?? 0) + 1);
   }
 
   const providers: ProviderInfo[] = [];
-  for (const [providerId, modelCount] of providerCount) {
-    const status = activeSession().modelRegistry.getProviderAuthStatus(providerId);
+  for (const provider of runtime.getProviders()) {
+    const modelCount = modelCounts.get(provider.id);
+    if (!modelCount) continue;
+    const status = runtime.getProviderAuthStatus(provider.id);
     providers.push({
-      id: providerId,
-      name: activeSession().modelRegistry.getProviderDisplayName(providerId),
+      id: provider.id,
+      name: provider.name,
       configured: status.configured,
       source: status.source,
       modelCount,
@@ -441,6 +460,7 @@ function serializeSession(s: Record<string, any>): SessionSummary {
     created: s.created instanceof Date ? s.created.getTime() : s.created,
     modified: s.modified instanceof Date ? s.modified.getTime() : s.modified,
     messageCount: s.messageCount,
+    turns: s.turns,
     firstMessage: s.firstMessage,
   };
 }
@@ -453,7 +473,7 @@ function serializeSession(s: Record<string, any>): SessionSummary {
 async function buildProjectsList(): Promise<ProjectInfo[]> {
   const byCwd = new Map<string, { count: number; lastModified: number }>();
   try {
-    const sessions = await _sdk!.SessionManager.listAll();
+    const sessions = await listAllSessions();
     for (const s of sessions) {
       const key = (s as { cwd?: string }).cwd ?? '';
       if (!key) continue;
@@ -467,7 +487,7 @@ async function buildProjectsList(): Promise<ProjectInfo[]> {
       }
     }
   } catch (err) {
-    console.error('[pifrontier] buildProjectsList: listAll failed:', err);
+    log.error('[pifrontier] buildProjectsList: listAll failed:', err);
   }
 
   const map = new Map<string, ProjectInfo>();
@@ -510,7 +530,7 @@ async function broadcastProjects(): Promise<void> {
   try {
     broadcast({ type: 'projects_list', projects: await buildProjectsList() });
   } catch (err) {
-    console.error('[pifrontier] broadcastProjects failed:', err);
+    log.error('[pifrontier] broadcastProjects failed:', err);
   }
 }
 
@@ -542,11 +562,58 @@ let pendingRestartNonce: string | null = null;
 // Only one package update may run at a time; update commands mutate package files.
 let updateInProgress = false;
 
+/**
+ * Session ids with a prompt() call in flight. The SDK forbids concurrent
+ * prompt() calls on the SAME AgentSession (two tabs racing), but different
+ * sessions run independently — a per-process flag would wrongly reroute a
+ * prompt for an idle session as a steer while another session is generating.
+ */
+const _promptsInFlight = new Set<string>();
+
 // ── 4. Extension UI — pending request map ─────────────────────────────────────
 
-type PendingRequest = { resolve: (response: Record<string, unknown>) => void };
+type PendingRequest = { requestPayload: Record<string, unknown>; resolve: (response: Record<string, unknown>) => void };
 const pendingExtensionRequests = new Map<string, PendingRequest>();
 const pendingEditorTextRequests = new Map<string, { resolve: (text: string) => void }>();
+
+/**
+ * Live component tree for an open custom() dialog, keyed by dialog id.
+ * `nodeMap` maps a path (e.g. "0.2") to the LIVE pi-tui component instance at
+ * that position, so `extension_component_event` can invoke the extension's
+ * real callback (onSelect/onClick/onToggle/...) instead of just returning a
+ * value — and `pollId` re-parses + diffs the tree so loaders/progress/live
+ * state changes reach the browser without the extension re-prompting.
+ */
+interface ActiveCustomDialog {
+  root: Record<string, unknown>;
+  nodeMap: Map<string, Record<string, unknown>>;
+  lastParsedJson: string;
+  pollId: Timer;
+}
+const activeCustomDialogs = new Map<string, ActiveCustomDialog>();
+
+/** Releases everything tracked for a resolved/dismissed extension UI request. */
+function cleanupCustomDialog(id: string): void {
+  const dlg = activeCustomDialogs.get(id);
+  if (dlg) {
+    clearInterval(dlg.pollId);
+    activeCustomDialogs.delete(id);
+  }
+  interactiveCustomComponents.delete(id);
+  const pollId = interactiveRenderIntervals.get(id);
+  if (pollId) { clearInterval(pollId); interactiveRenderIntervals.delete(id); }
+}
+
+/**
+ * Single choke point for "this extension UI request is over, for any
+ * reason" — user responded, the extension self-resolved via done(), it
+ * timed out, or all clients disconnected. Closes the dialog in EVERY
+ * connected tab, not just the one that answered.
+ */
+function finalizeExtensionResponse(id: string): void {
+  cleanupCustomDialog(id);
+  broadcast({ type: 'extension_ui_dismiss', id });
+}
 
 // broadcast is a thin wrapper; reassigned once the Bun server is live.
 let broadcast: (payload: unknown) => void = () => {};
@@ -556,24 +623,24 @@ function createDialogPromise<T>(
   requestPayload: Record<string, unknown>,
   parseResponse: (r: Record<string, unknown>) => T
 ): Promise<T> {
-  // No browser client connected — resolve immediately so the agent doesn't hang.
-  if (connectedClients === 0) {
-    return Promise.resolve(parseResponse({ cancelled: true }));
-  }
   return new Promise<T>((resolve) => {
     pendingExtensionRequests.set(id, {
+      requestPayload,
       resolve: (response) => {
         pendingExtensionRequests.delete(id);
+        finalizeExtensionResponse(id);
         resolve(parseResponse(response));
       },
     });
     broadcast({ type: 'extension_ui_request', id, ...requestPayload });
     // Timeout — prevents the agent from hanging forever if the browser
     // never responds (e.g. tab was closed without notifying the server).
+    // The 15s grace timer (close handler) may cancel it earlier.
     setTimeout(() => {
       const pending = pendingExtensionRequests.get(id);
       if (pending) {
         pendingExtensionRequests.delete(id);
+        finalizeExtensionResponse(id);
         resolve(parseResponse({ cancelled: true }));
       }
     }, EXTENSION_DIALOG_TIMEOUT_MS);
@@ -623,17 +690,10 @@ const interactiveCustomComponents = new Map<string, any>();
 // Render-polling intervals for interactive components (keyed by same dialog ID)
 const interactiveRenderIntervals = new Map<string, Timer>();
 
-function broadcastCustomRender(id: string, component: { render(w: number): unknown }) {
-  try {
-    const rawLines = component.render(80) as string[];
-    const cleanLines = Array.isArray(rawLines) ? rawLines.map((l: string) => stripAnsi(l)) : [];
-    broadcast({ type: 'custom_render', id, lines: cleanLines });
-  } catch { /* component may have disposed */ }
-}
 
 // Widget factories with refresh intervals
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-const widgetFactories = new Map<string, { factory: (...args: any[]) => any; intervalId: Timer; placement?: string }>();
+const widgetFactories = new Map<string, { factory: (...args: any[]) => any; intervalId: Timer; placement?: string; lastPayloadJson?: string }>();
 
 function clearWidgetInterval(key: string) {
   const existing = widgetFactories.get(key);
@@ -643,7 +703,23 @@ function clearWidgetInterval(key: string) {
   }
 }
 
-const uiContext: Omit<ExtensionUIContext, 'getEditorText'> & { getEditorText(): Promise<string> } = {
+/**
+ * Flatten a parsed component tree to plain text for footer/header display
+ * (a single-line/short-block bar, not a rich interactive surface). Text and
+ * markdown content pass through; containers join their children's text with
+ * newlines; everything else (select/button/checkbox/progress/...) has no
+ * textual representation and contributes nothing.
+ */
+function flattenParsedText(parsed: ParsedComponent | null): string {
+  if (!parsed) return '';
+  if (parsed.kind === 'text' || parsed.kind === 'markdown') return parsed.content;
+  if (parsed.kind === 'container') {
+    return parsed.children.map(flattenParsedText).filter(Boolean).join('\n');
+  }
+  return '';
+}
+
+const uiContext: Omit<ExtensionUIContext, 'getEditorText'> & { getEditorText(): Promise<string>; diagnostic(message: string, level?: string, details?: string, source?: string): void } = {
   select(title, options) {
     const id = crypto.randomUUID();
     return createDialogPromise<string | undefined>(
@@ -704,14 +780,16 @@ const uiContext: Omit<ExtensionUIContext, 'getEditorText'> & { getEditorText(): 
       }
     }
 
-    const tui = new StubTui() as any;
-    const done = (val: any) => {
+    const tui = new StubTui();
+    const done = (val: unknown) => {
       const pending = pendingExtensionRequests.get(id);
       if (pending) pending.resolve({ value: val });
     };
 
-    // Try to detect interactive components (render + handleInput)
-    let parsed = null;
+    // Try to parse as a static component tree for rich web rendering;
+    // only fall back to interactive terminal emulation for genuinely
+    // keyboard-driven components that cannot be statically parsed.
+    let parsed: ParsedComponent | null = null;
     if (factory) {
       try {
         const component = await factory(tui, stubTheme, stubKeybindings, done);
@@ -719,53 +797,95 @@ const uiContext: Omit<ExtensionUIContext, 'getEditorText'> & { getEditorText(): 
           // If factory returns a component, it's the root of our TUI tree
           tui.addChild(component);
 
-          // We treat any component with a render() function as potentially interactive
-          if (typeof component.render === 'function') {
-            if (connectedClients === 0) {
-              try { component.dispose?.(); } catch { /* ignore */ }
-              return undefined;
-            }
+          // First, attempt static parse for rich web UI. nodeMap records
+          // path -> live component so extension_component_event can invoke
+          // the extension's REAL callback later instead of just returning a
+          // value (see server-side switch case below).
+          const nodeMap = new Map<string, Record<string, unknown>>();
+          try {
+            parsed = parseComponentTree(component, 80, [], nodeMap);
+          } catch { /* parsing may fail for non-standard layouts */ }
+
+          const parsedMeaningful = parsed && !(
+            parsed.kind === 'text' && !parsed.content
+          );
+
+          // Interactive terminal emulation — only when component is keyboard-driven
+          // and static parsing couldn't produce meaningful content
+          if (typeof component.handleInput === 'function' && !parsedMeaningful) {
             interactiveCustomComponents.set(id, tui); // Store the TUI wrapper so we can route keys
-            
+
             // Poll render every 200ms so sub-session events update the display
             const pollId = setInterval(() => {
               try {
                 const rawLines = tui.render();
                 const cleanLines = Array.isArray(rawLines) ? rawLines.map((l: string) => stripAnsi(l)) : [];
-                broadcast({ type: 'custom_render', id, lines: cleanLines });
+                const htmlLines = Array.isArray(rawLines) ? rawLines.map((l: string) => ansiToHtml(l)) : [];
+                broadcast({ type: 'custom_render', id, lines: cleanLines, htmlLines });
+                const pending = pendingExtensionRequests.get(id);
+                if (pending) { pending.requestPayload.lines = cleanLines; pending.requestPayload.htmlLines = htmlLines; }
               } catch { /* disposed */ }
             }, 200);
             interactiveRenderIntervals.set(id, pollId);
 
             const rawLines = tui.render();
             const cleanLines = Array.isArray(rawLines) ? rawLines.map((l: string) => stripAnsi(l)) : [];
+            const htmlLines = Array.isArray(rawLines) ? rawLines.map((l: string) => ansiToHtml(l)) : [];
 
             return new Promise<string | undefined>((resolve) => {
-              pendingExtensionRequests.set(id, {
-                resolve: (r) => {
-                  interactiveCustomComponents.delete(id);
-                  const pi = interactiveRenderIntervals.get(id);
-                  if (pi) { clearInterval(pi); interactiveRenderIntervals.delete(id); }
-                  try { component.dispose?.(); } catch { /* ignore */ }
-                  pendingExtensionRequests.delete(id);
-                  resolve('cancelled' in r && r.cancelled ? undefined : 'value' in r ? (r.value as string) : undefined);
-                },
-              });
-              broadcast({
-                type: 'extension_ui_request',
-                id,
+              const requestPayload = {
                 method: 'custom',
                 title,
                 lines: cleanLines,
+                htmlLines,
                 interactive: true,
+                ...(parsed ? { parsed } : {}),
+              };
+              pendingExtensionRequests.set(id, {
+                requestPayload,
+                resolve: (r) => {
+                  try { component.dispose?.(); } catch { /* ignore */ }
+                  pendingExtensionRequests.delete(id);
+                  finalizeExtensionResponse(id);
+                  resolve('cancelled' in r && r.cancelled ? undefined : 'value' in r ? (r.value as string) : undefined);
+                },
               });
+              broadcast({ type: 'extension_ui_request', id, ...requestPayload });
+              // Timeout parity with createDialogPromise — prevents the agent
+              // hanging forever if no browser ever responds (e.g. dialog was
+              // created while no client was connected and none reconnects).
+              setTimeout(() => {
+                const pending = pendingExtensionRequests.get(id);
+                if (pending) pending.resolve({ cancelled: true });
+              }, EXTENSION_DIALOG_TIMEOUT_MS);
             });
           }
-          // Not interactive — parse as component tree
-          parsed = parseComponentTree(component, 80);
+
+          // Component parsed into a meaningful, non-keyboard-driven tree —
+          // register it as a live dialog: extension_component_event can
+          // invoke its real callbacks, and a 200ms poll re-parses + diffs
+          // so loaders/progress/live state reach the browser without the
+          // extension having to re-prompt.
+          if (parsedMeaningful) {
+            const pollId = setInterval(() => {
+              const dlg = activeCustomDialogs.get(id);
+              if (!dlg) return;
+              try {
+                const reparsed = parseComponentTree(dlg.root, 80, [], dlg.nodeMap);
+                const json = JSON.stringify(reparsed);
+                if (json !== dlg.lastParsedJson) {
+                  dlg.lastParsedJson = json;
+                  broadcast({ type: 'extension_ui_update', id, parsed: reparsed });
+                  const pending = pendingExtensionRequests.get(id);
+                  if (pending) pending.requestPayload.parsed = reparsed;
+                }
+              } catch { /* component may be disposed */ }
+            }, 200);
+            activeCustomDialogs.set(id, { root: component, nodeMap, lastParsedJson: JSON.stringify(parsed), pollId });
+          }
         }
       } catch (err) {
-        console.error('[pifrontier] custom factory error:', err);
+        log.error('[pifrontier] custom factory error:', err);
         // Fallback to static parsing
         parsed = await callFactoryAndParse(factory, title, options);
       }
@@ -784,6 +904,12 @@ const uiContext: Omit<ExtensionUIContext, 'getEditorText'> & { getEditorText(): 
 
   notify(message, type) {
     broadcast({ type: 'extension_ui_request', id: crypto.randomUUID(), method: 'notify', message, notifyType: type });
+    // When no browser tab is connected, fire the webhook instead of the
+    // in-app notification (which would go nowhere). This avoids double
+    // notifications when the PWA is open.
+    if (connectedClients === 0) {
+      sendWebhookNotification(type === 'error' ? 'pi Error' : 'pi', message);
+    }
   },
 
   onTerminalInput() {
@@ -805,6 +931,26 @@ const uiContext: Omit<ExtensionUIContext, 'getEditorText'> & { getEditorText(): 
   },
   setHiddenThinkingLabel(label) {
     broadcast({ type: 'extension_ui_request', id: crypto.randomUUID(), method: 'setHiddenThinkingLabel', label });
+  },
+
+  diagnostic(message: string, level?: string, details?: string, source?: string) {
+    // Persist to session so the message survives reconnects
+    try {
+      const sess = activeSession();
+      if (sess) {
+        sess.sessionManager.appendCustomMessageEntry('pi-ui:diagnostic', message, true, { level, details, source });
+      }
+    } catch { /* session may not be ready — still broadcast to live clients */ }
+    broadcast({
+      type: 'extension_ui_request',
+      id: crypto.randomUUID(),
+      method: 'diagnostic',
+      message,
+      level: level ?? 'info',
+      details,
+      source,
+      timestamp: Date.now(),
+    });
   },
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -837,34 +983,47 @@ const uiContext: Omit<ExtensionUIContext, 'getEditorText'> & { getEditorText(): 
       const tick = () => {
         try {
           const result = content(stubTui, stubTheme);
+          let payload: Record<string, unknown> | null = null;
           if (result && typeof result === 'object' && typeof result.render === 'function') {
-            const rawLines = result.render(80) as string[];
-            if (!Array.isArray(rawLines)) return;
-            const cleanLines = rawLines.map((l: string) => stripAnsi(l));
-            broadcast({
-              type: 'extension_ui_request',
-              id: crypto.randomUUID(),
-              method: 'setWidget',
-              widgetKey: key,
-              widgetType: 'text',
-              widgetLines: cleanLines,
-              widgetPlacement: options?.placement,
-            });
+            // Try to parse as a structured component tree first
+            const parsed = parseComponentTree(result, 80);
+            const isRich = parsed.kind === 'container' || parsed.kind === 'select' ||
+              parsed.kind === 'input' || parsed.kind === 'button' ||
+              parsed.kind === 'checkbox' || parsed.kind === 'progress' ||
+              parsed.kind === 'loader' ||
+              (parsed.kind === 'text' && parsed.label && parsed.content);
+            if (isRich) {
+              payload = { widgetType: 'component', widgetComponent: parsed };
+            } else {
+              // Fallback: render as plain text lines
+              const rawLines = result.render(80) as string[];
+              if (!Array.isArray(rawLines)) return;
+              payload = { widgetType: 'text', widgetLines: rawLines.map((l: string) => stripAnsi(l)) };
+            }
           } else if (Array.isArray(result)) {
-            broadcast({
-              type: 'extension_ui_request',
-              id: crypto.randomUUID(),
-              method: 'setWidget',
-              widgetKey: key,
-              widgetType: 'text',
-              widgetLines: result,
-              widgetPlacement: options?.placement,
-            });
+            payload = { widgetType: 'text', widgetLines: result };
           }
+          if (!payload) return;
+          // Skip the broadcast entirely when nothing actually changed —
+          // factories are polled continuously, but most ticks produce
+          // identical output (e.g. a status line that only updates every
+          // few seconds).
+          const json = JSON.stringify(payload);
+          const entry = widgetFactories.get(key);
+          if (entry?.lastPayloadJson === json) return;
+          if (entry) entry.lastPayloadJson = json;
+          broadcast({
+            type: 'extension_ui_request',
+            id: crypto.randomUUID(),
+            method: 'setWidget',
+            widgetKey: key,
+            widgetPlacement: options?.placement,
+            ...payload,
+          });
         } catch { /* factory may fail */ }
       };
       tick(); // initial render
-      const intervalId = setInterval(tick, 80);
+      const intervalId = setInterval(tick, 250);
       widgetFactories.set(key, { factory: content, intervalId, placement: options?.placement });
     }
   },
@@ -876,7 +1035,7 @@ const uiContext: Omit<ExtensionUIContext, 'getEditorText'> & { getEditorText(): 
     }
     void callFactoryAndParse(factory, '', undefined)
       .then((parsed) => {
-        broadcast({ type: 'extension_ui_request', id: crypto.randomUUID(), method: 'set_footer', content: parsed?.kind === 'text' ? parsed.content : '' });
+        broadcast({ type: 'extension_ui_request', id: crypto.randomUUID(), method: 'set_footer', content: flattenParsedText(parsed) });
       })
       .catch(() => { /* factory may fail without real TUI */ });
   },
@@ -887,7 +1046,7 @@ const uiContext: Omit<ExtensionUIContext, 'getEditorText'> & { getEditorText(): 
     }
     void callFactoryAndParse(factory, '', undefined)
       .then((parsed) => {
-        broadcast({ type: 'extension_ui_request', id: crypto.randomUUID(), method: 'set_header', content: parsed?.kind === 'text' ? parsed.content : '' });
+        broadcast({ type: 'extension_ui_request', id: crypto.randomUUID(), method: 'set_header', content: flattenParsedText(parsed) });
       })
       .catch(() => { /* factory may fail without real TUI */ });
   },
@@ -987,10 +1146,10 @@ function chainAutocompleteProviders() {
 }
 async function getSDK(): Promise<typeof PiSDKNS> {
   if (!_sdk) {
-    console.log('[pifrontier] Loading pi SDK (first connection)…');
+    log.info('[pifrontier] Loading pi SDK (first connection)…');
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     _sdk = await import('@earendil-works/pi-coding-agent') as any;
-    console.log('[pifrontier] Pi SDK loaded.');
+    log.info('[pifrontier] Pi SDK loaded.');
     // Resolve SDK version from its package.json (best-effort)
     try {
       const piPkgSpecifier = '@earendil-works/pi-coding-agent/package.json';
@@ -1028,12 +1187,110 @@ interface ManagedSession {
   unseen: boolean;
   /** Unix ms of the most recent agent_end / message_end. */
   lastActivity: number;
+  /** Pending navigated-away disposal timer (null when none scheduled). */
+  disposeTimer: Timer | null;
+}
+
+/** Grace before a navigated-away idle session is dropped from memory. Long
+ *  enough that quick A↔B switching never re-reads from disk; short enough
+ *  that a whale session doesn't sit in RAM for the 30-min LRU window. */
+const NAV_OUT_DISPOSE_GRACE_MS = 2 * 60 * 1000;
+
+/**
+ * Schedule disposal of a session the user navigated away from. Sessions are
+ * exempt while they can't be safely or cheaply recreated from disk:
+ * still running, holding queued steering/follow-up, carrying unseen results,
+ * or not persisted at all (in-memory sessions would lose data). The disk file
+ * is the source of truth for everything else — switching back re-opens it.
+ */
+function scheduleNavOutDisposal(sid: string): void {
+  const entry = sessionPool.get(sid);
+  if (!entry || entry.disposeTimer) return;
+  if (!entry.path) return; // in-memory session — disposal would lose data
+  entry.disposeTimer = setTimeout(() => {
+    entry.disposeTimer = null;
+    if (activeSessionId === sid || sessionPool.get(sid) !== entry) return;
+    if (entry.isRunning || entry.unseen) return;
+    try {
+      if (entry.session.getSteeringMessages().length || entry.session.getFollowUpMessages().length) return;
+    } catch {
+      return; // session state unreadable — leave it to the LRU sweep
+    }
+    try {
+      entry.forwardingUnsub?.();
+      entry.runtimeUnsub?.();
+      entry.session.dispose();
+    } catch (err) {
+      log.error(`[pifrontier] Error disposing navigated-away session ${sid}:`, err);
+    }
+    sessionPool.delete(sid);
+    log.info(`[pifrontier] Released navigated-away session ${sid} from memory.`);
+  }, NAV_OUT_DISPOSE_GRACE_MS);
+}
+
+/** Cancel a pending nav-out disposal (session became active or started running). */
+function cancelNavOutDisposal(entry: ManagedSession): void {
+  if (entry.disposeTimer) {
+    clearTimeout(entry.disposeTimer);
+    entry.disposeTimer = null;
+  }
 }
 
 const sessionPool = new Map<string, ManagedSession>();
 let activeSessionId: string | null = null;
 // Promise lock — prevents concurrent first-connection races from creating duplicate sessions.
 let _sessionInitPromise: Promise<string> | null = null;
+
+// ── Session-list cache ────────────────────────────────────────────────────────
+// The SDK's SessionManager.list()/listAll() load every session .jsonl fully
+// AND build a concatenated allMessagesText per file — with hundreds of MB of
+// sessions a scan both takes seconds and can OOM the process. Sidebar/project
+// listings use the streaming, per-file-mtime-cached scanner instead
+// (src/lib/server/session-scan.ts). The cache is kept until explicitly
+// invalidated — invalidateSessionLists() is called on every session mutation
+// (new/fork/rename/delete, message_end). No time-based expiry; the stat-based
+// per-file cache inside the scanner handles detecting changed files cheaply.
+
+interface SessionListCacheEntry {
+  promise: Promise<SessionFileInfo[]>;
+}
+
+let _listAllCache: SessionListCacheEntry | null = null;
+const _listByCwdCache = new Map<string, SessionListCacheEntry>();
+
+function invalidateSessionLists(): void {
+  _listAllCache = null;
+  _listByCwdCache.clear();
+}
+
+/** Root directory holding per-project session dirs (~/.pi/agent/sessions). */
+function sessionsRoot(): string {
+  return join(_sdk!.getAgentDir(), 'sessions');
+}
+
+/** Cached all-projects session listing. `fresh` bypasses (and refills) the cache. */
+function listAllSessions(fresh = false): Promise<SessionFileInfo[]> {
+  if (!fresh && _listAllCache) return _listAllCache.promise;
+  const entry: SessionListCacheEntry = { promise: scanAllSessions(sessionsRoot()) };
+  _listAllCache = entry;
+  // Never cache a failed scan.
+  entry.promise.catch(() => {
+    if (_listAllCache === entry) _listAllCache = null;
+  });
+  return entry.promise;
+}
+
+/** Cached per-project session listing. */
+function listSessionsFor(cwdKey: string): Promise<SessionFileInfo[]> {
+  const cached = _listByCwdCache.get(cwdKey);
+  if (cached) return cached.promise;
+  const entry: SessionListCacheEntry = { promise: scanSessionsForCwd(sessionsRoot(), cwdKey) };
+  _listByCwdCache.set(cwdKey, entry);
+  entry.promise.catch(() => {
+    if (_listByCwdCache.get(cwdKey) === entry) _listByCwdCache.delete(cwdKey);
+  });
+  return entry.promise;
+}
 
 // ── LRU idle session cleanup ──────────────────────────────────────────────────
 // Dispose inactive pooled sessions after 30 min of inactivity so the Pi doesn't
@@ -1052,12 +1309,13 @@ function startIdleCleanup(): void {
       if (entry.isRunning) continue;
       if (now - entry.lastActivity < IDLE_SESSION_TIMEOUT_MS) continue;
       // Dispose — unsubscribe and remove from pool.
+      cancelNavOutDisposal(entry);
       try {
         entry.forwardingUnsub?.();
         entry.runtimeUnsub?.();
         entry.session.dispose();
       } catch (err) {
-        console.error(`[pifrontier] Error disposing idle session ${sid}:`, err);
+        log.error(`[pifrontier] Error disposing idle session ${sid}:`, err);
       }
       sessionPool.delete(sid);
     }
@@ -1107,7 +1365,7 @@ async function ensureSession(): Promise<AgentSession> {
   if (!_sessionInitPromise) {
     _sessionInitPromise = (async () => {
       const sdk = await getSDK();
-      console.log(`[pifrontier] Starting pi session in ${cwd} …`);
+      log.info(`[pifrontier] Starting pi session in ${cwd} …`);
       const sm = sdk.SessionManager.continueRecent(cwd);
       const result = await sdk.createAgentSession({
         cwd,
@@ -1115,9 +1373,9 @@ async function ensureSession(): Promise<AgentSession> {
       });
       const sess = result.session;
       touchProject(sess.sessionManager.getCwd() || cwd);
-      console.log(`[pifrontier] Pi session ready: ${sess.sessionId} (${sm.isPersisted() ? 'persisted' : 'in-memory'})`);
+      log.info(`[pifrontier] Pi session ready: ${sess.sessionId} (${sm.isPersisted() ? 'persisted' : 'in-memory'})`);
       await sess.bindExtensions({ uiContext: uiContext as unknown as ExtensionUIContext });
-      console.log('[pifrontier] Extension UI context bound.');
+      log.info('[pifrontier] Extension UI context bound.');
       patchHasUI(sess);
 
       // Store in pool and mark active
@@ -1133,6 +1391,32 @@ async function ensureSession(): Promise<AgentSession> {
   return sessionPool.get(sid)!.session;
 }
 
+/**
+ * Event forwarder for the active session's SDK events → all browser tabs.
+ *
+ * - Tags every event with sessionId so clients can drop late-arriving events
+ *   from a previously-active session after a switch.
+ * - `message_update`: the SDK includes the FULL partial message on every
+ *   delta — on long reasoning turns that is quadratic WS traffic and the
+ *   primary cause of huge-chat meltdowns. The client applies deltas
+ *   incrementally and only needs `assistantMessageEvent`, so the message is
+ *   reduced to its role.
+ * - `message_end`: enriched with live context usage.
+ */
+function makeEventForwarder(sid: string, sess: AgentSession): (event: PiSDKNS.AgentSessionEvent) => void {
+  return (event) => {
+    if (activeSessionId !== sid) return; // not active — skip forwarding
+    if (event.type === 'message_update') {
+      broadcast({ ...event, sessionId: sid, message: { role: event.message.role } });
+    } else if (event.type === 'message_end') {
+      try { broadcast({ ...event, sessionId: sid, contextUsage: sess.getContextUsage() }); }
+      catch { broadcast({ ...event, sessionId: sid }); }
+    } else {
+      broadcast({ ...event, sessionId: sid });
+    }
+  };
+}
+
 /** Register a session in the pool, subscribe runtime tracking, and optionally bind extensions. */
 function registerSession(sid: string, sess: AgentSession, cwdV: string, bindExt: boolean) {
   const path = sess.sessionManager.getSessionFile() ?? null;
@@ -1146,8 +1430,12 @@ function registerSession(sid: string, sess: AgentSession, cwdV: string, bindExt:
     isRunning: sess.isStreaming,
     unseen: false,
     lastActivity: Date.now(),
+    disposeTimer: null,
   };
   sessionPool.set(sid, entry);
+  // A registered session means a session file exists (or will imminently) that
+  // cached list scans haven't seen.
+  invalidateSessionLists();
 
   // Subscribe runtime-status tracking for ALL pooled sessions (always on)
   entry.runtimeUnsub = sess.subscribe((event) => {
@@ -1155,6 +1443,8 @@ function registerSession(sid: string, sess: AgentSession, cwdV: string, bindExt:
       case 'agent_start':
         entry.isRunning = true;
         entry.unseen = activeSessionId !== sid;
+        // A run started (e.g. queued follow-up) — keep the session in memory.
+        cancelNavOutDisposal(entry);
         break;
       case 'agent_end':
         entry.isRunning = false;
@@ -1164,6 +1454,8 @@ function registerSession(sid: string, sess: AgentSession, cwdV: string, bindExt:
       case 'message_end':
         entry.lastActivity = Date.now();
         if (activeSessionId !== sid) entry.unseen = true;
+        // The session file gained content — cached lists are stale.
+        invalidateSessionLists();
         break;
     }
     // Broadcast runtime-status snapshot so sidebar can show live dots
@@ -1171,21 +1463,12 @@ function registerSession(sid: string, sess: AgentSession, cwdV: string, bindExt:
   });
 
   // Subscribe event-forwarding (only active session gets this)
-  const fwdUnsub = sess.subscribe((event) => {
-    if (activeSessionId !== sid) return; // not active — skip forwarding
-    if (event.type === 'message_end') {
-      try { broadcast({ ...event, contextUsage: sess.getContextUsage() }); }
-      catch { broadcast(event); }
-    } else {
-      broadcast(event);
-    }
-  });
-  entry.forwardingUnsub = fwdUnsub;
+  entry.forwardingUnsub = sess.subscribe(makeEventForwarder(sid, sess));
 
   if (bindExt) {
     // Bind with our uiContext so ctx.ui.select() etc. still work for extension fallbacks
     sess.bindExtensions({ uiContext: uiContext as unknown as ExtensionUIContext }).catch((err) => {
-      console.error('[pifrontier] bindExtensions (non-fatal):', err);
+      log.error('[pifrontier] bindExtensions (non-fatal):', err);
     });
     // Patch hasUI to false so extensions use the fallback ui.select/ui.input path
     // instead of the TUI custom() path which doesn't render well in the browser.
@@ -1198,7 +1481,6 @@ function patchHasUI(sess: AgentSession) {
   try {
     const runner = (sess as unknown as { _extensionRunner?: { hasUI: () => boolean } })._extensionRunner;
     if (runner) {
-      const orig = runner.hasUI.bind(runner);
       runner.hasUI = () => false;
       // If the runner exposes createContext, the context's hasUI getter reads from runner.hasUI,
       // so this patch propagates to all future contexts.
@@ -1230,19 +1512,22 @@ function broadcastSessionRuntime(sid: string, entry: ManagedSession) {
 async function setActiveSession(newSession: AgentSession, newCwd?: string) {
   const newId = newSession.sessionId;
 
-  // Stop forwarding for the previously-active session
-  if (activeSessionId) {
+  // Stop forwarding for the previously-active session and schedule its
+  // release from memory — the disk file is the source of truth; only
+  // running/queued/unseen/in-memory sessions must stay resident.
+  if (activeSessionId && activeSessionId !== newId) {
     const prev = sessionPool.get(activeSessionId);
     if (prev?.forwardingUnsub) {
       prev.forwardingUnsub();
       prev.forwardingUnsub = null;
     }
+    if (prev) scheduleNavOutDisposal(activeSessionId);
   }
 
   // Register if first time seeing this session
   const alreadyPooled = sessionPool.has(newId);
   if (!alreadyPooled) {
-    registerSession(newId, newSession, newCwd || newSession.sessionManager.getCwd() || cwd, true);
+    registerSession(newId, newSession, newCwd || newSession.sessionManager.getCwd() || cwd, false);
   }
 
   // Clear extension autocomplete providers (extensions re-register via bindExtensions)
@@ -1257,37 +1542,33 @@ async function setActiveSession(newSession: AgentSession, newCwd?: string) {
       await newSession.bindExtensions({ uiContext: uiContext as unknown as ExtensionUIContext });
       patchHasUI(newSession);
     } catch (err) {
-      console.error('[pifrontier] bindExtensions (non-fatal):', err);
+      log.error('[pifrontier] bindExtensions (non-fatal):', err);
       broadcast({ type: 'agent_error', error: `Extension install failed: ${err instanceof Error ? err.message : String(err)}` });
     }
   }
 
   // Re-enable forwarding for the now-active session
   const entry = sessionPool.get(newId)!;
+  cancelNavOutDisposal(entry); // switched back within the grace window
   if (!entry.forwardingUnsub) {
-    const fwdUnsub = newSession.subscribe((event) => {
-      if (activeSessionId !== newId) return; // no longer active — skip
-      if (event.type === 'message_end') {
-        try { broadcast({ ...event, contextUsage: newSession.getContextUsage() }); }
-        catch { broadcast(event); }
-      } else {
-        broadcast(event);
-      }
-    });
-    entry.forwardingUnsub = fwdUnsub;
+    entry.forwardingUnsub = newSession.subscribe(makeEventForwarder(newId, newSession));
   }
 
-  // Clear unseen when switching to this session
+  // Clear unseen + update lastActivity when switching to this session
   entry.unseen = false;
+  entry.lastActivity = Date.now();
 
+  const init = initialMessages(newSession.messages);
   broadcast({
     type: 'session_loaded',
     sessionId: newSession.sessionId,
     isStreaming: newSession.isStreaming,
     thinkingLevel: newSession.thinkingLevel,
     model: serializeModel(newSession.model),
-    availableModels: newSession.modelRegistry.getAvailable().map(serializeModel),
-    messages: newSession.messages,
+    availableModels: (await newSession.modelRuntime.getAvailable()).map(serializeModel),
+    messages: init.msgs,
+    totalMessageCount: init.total,
+    messagesTruncated: init.truncated,
     cwd: newSession.sessionManager.getCwd() || cwd,
     sessionName: newSession.sessionManager.getSessionName(),
     isCompacting: newSession.isCompacting,
@@ -1298,6 +1579,7 @@ async function setActiveSession(newSession: AgentSession, newCwd?: string) {
     piVersion: PI_SDK_VERSION,
     uiVersion: UI_VERSION,
     sessionMode: newSession.sessionManager.isPersisted() ? 'persisted' : 'in-memory',
+    sessionPath: newSession.sessionManager.getSessionFile() ?? undefined,
     contextUsage: newSession.getContextUsage(),
   });
 
@@ -1306,7 +1588,7 @@ async function setActiveSession(newSession: AgentSession, newCwd?: string) {
 
   // Refresh sidebar session + project lists so all connected tabs see the change
   try {
-    const all = await _sdk!.SessionManager.listAll();
+    const all = await listAllSessions();
     const sessions = all.map(serializeSession);
     const current = currentSessionSummary();
     if (current && !sessions.some((s) => s.id === current.id)) {
@@ -1314,7 +1596,7 @@ async function setActiveSession(newSession: AgentSession, newCwd?: string) {
     }
     broadcast({ type: 'all_sessions_list', sessions });
   } catch (err) {
-    console.error('[pifrontier] setActiveSession: failed to broadcast session list:', err);
+    log.error('[pifrontier] setActiveSession: failed to broadcast session list:', err);
   }
   await broadcastProjects();
 }
@@ -1331,6 +1613,8 @@ interface WSData {
   connectedAt: number;
   /** JWT expiry (seconds since epoch) — checked periodically to close expired sockets. */
   tokenExp: number;
+  /** Periodic expiry-check interval (60s), cleared on close. */
+  _expTimer?: Timer;
 }
 
 let server: ReturnType<typeof Bun.serve>;
@@ -1350,10 +1634,12 @@ try {
       const origin = req.headers.get('origin');
       if (origin) {
         try {
-          const originHost = new URL(origin).host;
-          const host = req.headers.get('host');
-          if (host && originHost !== host) {
-            return new Response('Origin mismatch', { status: 403 });
+          const originUrl = new URL(origin);
+          if (!['localhost', '127.0.0.1', '::1'].includes(originUrl.hostname)) {
+            const host = req.headers.get('host');
+            if (host && originUrl.host !== host) {
+              return new Response('Origin mismatch', { status: 403 });
+            }
           }
         } catch {
           return new Response('Invalid origin', { status: 400 });
@@ -1386,16 +1672,23 @@ try {
       try {
         // Load SDK + session on first connection; subsequent calls return instantly.
         const sess = await ensureSession();
+        const init = initialMessages(sess.messages);
+        const availableModels = (await sess.modelRuntime.getAvailable()).map(serializeModel);
 
-        ws.send(
+        // Serialization/send of a pathological history must not kill the
+        // connection — closing here would loop the client through reconnects.
+        // Fall back to a payload without history; the client can load more.
+        const sendConnected = (messages: unknown[], truncated: boolean) => ws.send(
           JSON.stringify({
             type: 'connected',
             sessionId: sess.sessionId,
             isStreaming: sess.isStreaming,
             thinkingLevel: sess.thinkingLevel,
             model: serializeModel(sess.model),
-            availableModels: sess.modelRegistry.getAvailable().map(serializeModel),
-            messages: sess.messages,
+            availableModels,
+            messages,
+            totalMessageCount: init.total,
+            messagesTruncated: truncated,
             cwd: sess.sessionManager.getCwd() || cwd,
             sessionName: sess.sessionManager.getSessionName(),
             isCompacting: sess.isCompacting,
@@ -1406,9 +1699,17 @@ try {
             piVersion: PI_SDK_VERSION,
             uiVersion: UI_VERSION,
             sessionMode: sess.sessionManager.isPersisted() ? 'persisted' : 'in-memory',
+            sessionPath: sess.sessionManager.getSessionFile() ?? undefined,
             contextUsage: sess.getContextUsage(),
+            webhookUrl: getWebhookUrl() || undefined,
           })
         );
+        try {
+          sendConnected(init.msgs, init.truncated);
+        } catch (err) {
+          log.error('[pifrontier] connected payload send failed — retrying without history:', err);
+          sendConnected([], true);
+        }
 
         // Send extension commands immediately after connected
         try {
@@ -1429,16 +1730,13 @@ try {
           }
           ws.send(JSON.stringify({ type: 'commands_list', commands: allCommands }));
         } catch (err) {
-          console.error('[pifrontier] Failed to send extension commands:', err);
+          log.error('[pifrontier] Failed to send extension commands:', err);
         }
 
         // Replay any pending extension UI requests so the reconnecting client
         // can respond to modals that were open before the disconnect.
-        for (const [id] of pendingExtensionRequests) {
-          // We can't reconstruct the full request payload from the resolve map,
-          // but the server-side promise is still live. Broadcast a re-notify
-          // marker so the client shows the modal again.
-          broadcast({ type: 'extension_ui_request_replay', id });
+        for (const [id, pending] of pendingExtensionRequests) {
+          broadcast({ type: 'extension_ui_request_replay', id, ...pending.requestPayload });
         }
         // Same for editor text requests.
         for (const [id] of pendingEditorTextRequests) {
@@ -1450,8 +1748,17 @@ try {
         for (const [sid, entry] of sessionPool) {
           broadcastSessionRuntime(sid, entry);
         }
+
+        // Periodic token expiry check (every 60s) — closes expired sockets
+        // even when the client is idle.
+        ws.data._expTimer = setInterval(() => {
+          if (Date.now() / 1000 > ws.data.tokenExp) {
+            clearInterval(ws.data._expTimer!);
+            try { ws.close(4001, 'Session expired'); } catch { /* already closed */ }
+          }
+        }, 60_000);
       } catch (err) {
-        console.error('[pifrontier] Failed to initialise session for new client:', err);
+        log.error('[pifrontier] Failed to initialise session for new client:', err);
         try { ws.close(1011, 'Session initialisation failed'); } catch { /* ws may already be closed */ }
       }
     },
@@ -1473,8 +1780,6 @@ try {
       }
 
       try {
-        // Ensure SDK + session are loaded before dispatching any command.
-        await ensureSession();
       switch (msg.type) {
         case 'prompt': {
           try {
@@ -1486,14 +1791,24 @@ try {
                 break;
               }
               await s.steer(msg.message);
+            } else if (_promptsInFlight.has(s.sessionId)) {
+              // Another tab already started a prompt on THIS session; route as
+              // steer to avoid an SDK concurrency violation.
+              ws.send(JSON.stringify({ type: 'agent_error', error: 'Prompt already in progress on another tab — routing as steer.' }));
+              await s.steer(msg.message);
             } else {
-              const imageContent = msg.images?.length
-                ? msg.images.map((img) => ({ type: 'image' as const, data: img.data, mimeType: img.mimeType }))
-                : undefined;
-              await s.prompt(msg.message, imageContent ? { images: imageContent } : undefined);
+              _promptsInFlight.add(s.sessionId);
+              try {
+                const imageContent = msg.images?.length
+                  ? msg.images.map((img) => ({ type: 'image' as const, data: img.data, mimeType: img.mimeType }))
+                  : undefined;
+                await s.prompt(msg.message, imageContent ? { images: imageContent } : undefined);
+              } finally {
+                _promptsInFlight.delete(s.sessionId);
+              }
             }
           } catch (err) {
-            console.error('[pifrontier] prompt error:', err);
+            log.error('[pifrontier] prompt error:', err);
             ws.send(JSON.stringify({ type: 'agent_error', error: String(err) }));
           }
           break;
@@ -1503,7 +1818,7 @@ try {
           try {
             await activeSession().steer(msg.message);
           } catch (err) {
-            console.error('[pifrontier] steer error:', err);
+            log.error('[pifrontier] steer error:', err);
             ws.send(JSON.stringify({ type: 'agent_error', error: String(err) }));
           }
           break;
@@ -1512,7 +1827,7 @@ try {
           try {
             await activeSession().followUp(msg.message);
           } catch (err) {
-            console.error('[pifrontier] followUp error:', err);
+            log.error('[pifrontier] followUp error:', err);
             ws.send(JSON.stringify({ type: 'agent_error', error: String(err) }));
           }
           break;
@@ -1541,23 +1856,23 @@ try {
           break;
 
         case 'set_model': {
-          const model = activeSession().modelRegistry.find(msg.provider, msg.modelId);
+          const model = activeSession().modelRuntime.getModel(msg.provider, msg.modelId);
           if (!model) {
-            console.warn(`[pifrontier] set_model: model not found: ${msg.provider}/${msg.modelId}`);
+            log.warn(`[pifrontier] set_model: model not found: ${msg.provider}/${msg.modelId}`);
             break;
           }
           try {
             await activeSession().setModel(model);
             broadcast({ type: 'model_changed', model: serializeModel(model) });
           } catch (err) {
-            console.error('[pifrontier] set_model error:', err);
+            log.error('[pifrontier] set_model error:', err);
           }
           break;
         }
 
         case 'list_sessions': {
           try {
-            const list = await _sdk!.SessionManager.list(cwd);
+            const list = await listSessionsFor(activeCwd());
             const sessions = list.slice(0, 30).map(serializeSession);
             // Prepend the current session — deduplicate if it already appears in the list
             const current = currentSessionSummary();
@@ -1567,7 +1882,7 @@ try {
             }
             ws.send(JSON.stringify({ type: 'sessions_list', sessions }));
           } catch (err) {
-            console.error('[pifrontier] list_sessions error:', err);
+            log.error('[pifrontier] list_sessions error:', err);
             ws.send(JSON.stringify({ type: 'sessions_list', sessions: [] }));
           }
           break;
@@ -1584,12 +1899,12 @@ try {
             const { session: newSession } = await _sdk!.createAgentSession({
               cwd: targetCwd,
               sessionManager: sm,
-              modelRegistry: src?.modelRegistry ?? (await ensureSession()).modelRegistry,
+              modelRuntime: src?.modelRuntime ?? (await ensureSession()).modelRuntime,
               model: src?.model ?? (await ensureSession()).model,
             });
             await setActiveSession(newSession);
           } catch (err) {
-            console.error('[pifrontier] new_session error:', err);
+            log.error('[pifrontier] new_session error:', err);
             ws.send(JSON.stringify({ type: 'sessions_error', message: String(err) }));
           }
           break;
@@ -1606,7 +1921,12 @@ try {
               break;
             }
             // Security: only open known session files — never raw client paths.
-            const knownSessions = await _sdk!.SessionManager.listAll();
+            // Cache-miss falls back to a fresh scan — a session created moments
+            // ago (e.g. by the pi TUI) must not be rejected on a stale cache.
+            let knownSessions = await listAllSessions();
+            if (!knownSessions.some((s) => s.path === resolvedPath)) {
+              knownSessions = await listAllSessions(true);
+            }
             if (!knownSessions.some((s) => s.path === resolvedPath)) {
               ws.send(JSON.stringify({ type: 'sessions_error', message: 'Session not found.' }));
               break;
@@ -1616,12 +1936,12 @@ try {
             const { session: newSession } = await _sdk!.createAgentSession({
               cwd: sm.getCwd() || cwd,
               sessionManager: sm,
-              modelRegistry: src?.modelRegistry ?? (await ensureSession()).modelRegistry,
+              modelRuntime: src?.modelRuntime ?? (await ensureSession()).modelRuntime,
               model: src?.model ?? (await ensureSession()).model,
             });
             await setActiveSession(newSession);
           } catch (err) {
-            console.error('[pifrontier] switch_session error:', err);
+            log.error('[pifrontier] switch_session error:', err);
             ws.send(JSON.stringify({ type: 'sessions_error', message: String(err) }));
           }
           break;
@@ -1655,9 +1975,71 @@ try {
             // Re-render and broadcast updated lines
             const rawLines = typeof component.render === 'function' ? component.render(80) : [];
             const cleanLines = Array.isArray(rawLines) ? rawLines.map((l: string) => stripAnsi(l)) : [];
-            broadcast({ type: 'custom_render', id: customId, lines: cleanLines });
+            const htmlLines = Array.isArray(rawLines) ? rawLines.map((l: string) => ansiToHtml(l)) : [];
+            broadcast({ type: 'custom_render', id: customId, lines: cleanLines, htmlLines });
+            const pending = pendingExtensionRequests.get(customId);
+            if (pending) { pending.requestPayload.lines = cleanLines; pending.requestPayload.htmlLines = htmlLines; }
           } catch (err) {
-            console.error('[pifrontier] extension_custom_input error:', err);
+            log.error('[pifrontier] extension_custom_input error:', err);
+          }
+          break;
+        }
+
+        case 'extension_component_event': {
+          const dialogId = msg.id as string | undefined;
+          if (!dialogId) break;
+          const path = (msg.path as number[] | undefined) ?? [];
+          const event = msg.event as string;
+          const value = msg.value as string | undefined;
+          const dlg = activeCustomDialogs.get(dialogId);
+          const node = dlg?.nodeMap.get(path.join('.'));
+          let handled = false;
+          try {
+            if (node) {
+              if (event === 'select' && Array.isArray(node.items) && typeof node.onSelect === 'function') {
+                const item = (node.items as Array<{ value: string }>).find((i) => i.value === value);
+                if (item) { (node.onSelect as (i: unknown) => void)(item); handled = true; }
+              } else if (event === 'click' && typeof node.onClick === 'function') {
+                (node.onClick as () => void)();
+                handled = true;
+              } else if (event === 'toggle' && typeof node.onToggle === 'function') {
+                (node.onToggle as (v: boolean) => void)(!node.checked);
+                handled = true;
+              } else if (event === 'submit') {
+                if (typeof node.setValue === 'function') (node.setValue as (v: string) => void)(value ?? '');
+                if (typeof node.onSubmit === 'function') { (node.onSubmit as (v: string) => void)(value ?? ''); handled = true; }
+              } else if (event === 'setting' && typeof node.updateValue === 'function') {
+                const sepIdx = (value ?? '').indexOf('::');
+                if (sepIdx !== -1) {
+                  (node.updateValue as (settingId: string, v: string) => void)(
+                    (value as string).slice(0, sepIdx),
+                    (value as string).slice(sepIdx + 2),
+                  );
+                  handled = true;
+                }
+              }
+            }
+            if (handled && dlg) {
+              // Re-parse and only broadcast if the tree actually changed —
+              // avoids redundant traffic when the callback is a pure no-op.
+              const reparsed = parseComponentTree(dlg.root, 80, [], dlg.nodeMap);
+              const json = JSON.stringify(reparsed);
+              if (json !== dlg.lastParsedJson) {
+                dlg.lastParsedJson = json;
+                broadcast({ type: 'extension_ui_update', id: dialogId, parsed: reparsed });
+                const pending = pendingExtensionRequests.get(dialogId);
+                if (pending) pending.requestPayload.parsed = reparsed;
+              }
+            } else if (!handled) {
+              // No live callback on this node (static tree, or a component
+              // the extension built without wiring a callback) — fall back
+              // to resolving the dialog directly with the raw value, same
+              // as before callback bridging existed.
+              const pending = pendingExtensionRequests.get(dialogId);
+              if (pending) pending.resolve({ value });
+            }
+          } catch (err) {
+            log.error('[pifrontier] extension_component_event error:', err);
           }
           break;
         }
@@ -1678,15 +2060,14 @@ try {
 
         case 'set_provider_key': {
           try {
-            activeSession().modelRegistry.authStorage.set(msg.provider, { type: 'api_key', key: msg.key });
-            activeSession().modelRegistry.refresh();
+            await activeSession().modelRuntime.setRuntimeApiKey(msg.provider, msg.key);
             ws.send(JSON.stringify({ type: 'providers_list', providers: getProviders() }));
             broadcast({
               type: 'available_models_changed',
-              availableModels: activeSession().modelRegistry.getAvailable().map(serializeModel),
+              availableModels: (await activeSession().modelRuntime.getAvailable()).map(serializeModel),
             });
           } catch (err) {
-            console.error('[pifrontier] set_provider_key error:', err);
+            log.error('[pifrontier] set_provider_key error:', err);
             ws.send(JSON.stringify({ type: 'providers_error', message: String(err) }));
           }
           break;
@@ -1694,15 +2075,14 @@ try {
 
         case 'remove_provider_key': {
           try {
-            activeSession().modelRegistry.authStorage.remove(msg.provider);
-            activeSession().modelRegistry.refresh();
+            await activeSession().modelRuntime.removeRuntimeApiKey(msg.provider);
             ws.send(JSON.stringify({ type: 'providers_list', providers: getProviders() }));
             broadcast({
               type: 'available_models_changed',
-              availableModels: activeSession().modelRegistry.getAvailable().map(serializeModel),
+              availableModels: (await activeSession().modelRuntime.getAvailable()).map(serializeModel),
             });
           } catch (err) {
-            console.error('[pifrontier] remove_provider_key error:', err);
+            log.error('[pifrontier] remove_provider_key error:', err);
             ws.send(JSON.stringify({ type: 'providers_error', message: String(err) }));
           }
           break;
@@ -1712,7 +2092,7 @@ try {
           try {
             // Security: only accept paths of known sessions — never trust raw user paths.
             // (Session files live under ~/.pi, outside cwd, so containment checks don't apply.)
-            const known = await _sdk!.SessionManager.listAll();
+            const known = await listAllSessions();
             const target = known.find((s) => s.path === msg.path);
             if (!target) {
               ws.send(JSON.stringify({ type: 'sessions_error', message: 'Session not found.' }));
@@ -1720,41 +2100,28 @@ try {
             }
             const sm = _sdk!.SessionManager.open(target.path);
             sm.appendSessionInfo(msg.name);
+            invalidateSessionLists();
             // If renaming the active session, also fire the SDK event so all
             // connected browsers see the name change via session_info_changed.
             if (msg.path === activeSession().sessionFile) {
               activeSession().setSessionName(msg.name);
             }
-            const all = await _sdk!.SessionManager.listAll();
+            const all = await listAllSessions();
             broadcast({ type: 'all_sessions_list', sessions: all.map(serializeSession) });
             ws.send(JSON.stringify({ type: 'sessions_list', sessions: [] }));
           } catch (err) {
-            console.error('[pifrontier] rename_session error:', err);
+            log.error('[pifrontier] rename_session error:', err);
             ws.send(JSON.stringify({ type: 'sessions_error', message: String(err) }));
           }
           break;
         }
 
-        case 'rename_current_session': {
-          try {
-            // Set the name on the live session (emits session_info_changed to all browsers)
-            activeSession().setSessionName(msg.name);
-            // Also persist it to the session file if available
-            if (activeSession().sessionFile) {
-              const sm = _sdk!.SessionManager.open(activeSession().sessionFile);
-              sm.appendSessionInfo(msg.name);
-            }
-          } catch (err) {
-            console.error('[pifrontier] rename_current_session error:', err);
-          }
-          break;
-        }
 
         case 'delete_session': {
           try {
             // Validate the path is a known session file — never trust raw user paths.
             // listAll() because the sidebar offers deletion across all projects.
-            const list = await _sdk!.SessionManager.listAll();
+            const list = await listAllSessions();
             const target = list.find((s) => s.path === msg.path);
             if (!target) {
               ws.send(JSON.stringify({ type: 'sessions_error', message: 'Session not found.' }));
@@ -1766,12 +2133,24 @@ try {
             }
             // Path came from SessionManager.listAll() — already validated by SDK.
             await rm(target.path);
-            const all = await _sdk!.SessionManager.listAll();
+            invalidateSessionLists();
+
+            // Clean up pooled session (if still in memory) to prevent leaks
+            const pooled = sessionPool.get(target.id);
+            if (pooled) {
+              cancelNavOutDisposal(pooled);
+              pooled.forwardingUnsub?.();
+              pooled.runtimeUnsub?.();
+              try { pooled.session.dispose(); } catch { /* session may have already been disposed */ }
+              sessionPool.delete(target.id);
+            }
+
+            const all = await listAllSessions();
             broadcast({ type: 'all_sessions_list', sessions: all.map(serializeSession) });
             await broadcastProjects();
             ws.send(JSON.stringify({ type: 'sessions_list', sessions: [] }));
           } catch (err) {
-            console.error('[pifrontier] delete_session error:', err);
+            log.error('[pifrontier] delete_session error:', err);
             ws.send(JSON.stringify({ type: 'sessions_error', message: String(err) }));
           }
           break;
@@ -1779,7 +2158,7 @@ try {
 
         case 'get_all_sessions': {
           try {
-            const all = await _sdk!.SessionManager.listAll();
+            const all = await listAllSessions();
             const sessions = all.map(serializeSession);
             const current = currentSessionSummary();
             if (current && !sessions.some((s) => s.id === current.id)) {
@@ -1787,7 +2166,7 @@ try {
             }
             ws.send(JSON.stringify({ type: 'all_sessions_list', sessions }));
           } catch (err) {
-            console.error('[pifrontier] get_all_sessions error:', err);
+            log.error('[pifrontier] get_all_sessions error:', err);
             ws.send(JSON.stringify({ type: 'all_sessions_list', sessions: [] }));
           }
           break;
@@ -1811,7 +2190,7 @@ try {
             touchProject(target);
             await broadcastProjects();
           } catch (err) {
-            console.error('[pifrontier] add_project error:', err);
+            log.error('[pifrontier] add_project error:', err);
             ws.send(JSON.stringify({ type: 'sessions_error', message: String(err) }));
           }
           break;
@@ -1867,7 +2246,7 @@ try {
             }
             ws.send(JSON.stringify({ type: 'dir_completions', prefix, entries }));
           } catch (err) {
-            console.error('[pifrontier] dir_complete error:', err);
+            log.error('[pifrontier] dir_complete error:', err);
           }
           break;
         }
@@ -1907,7 +2286,7 @@ try {
 
             ws.send(JSON.stringify({ type: 'file_completions', query, entries }));
           } catch (err) {
-            console.error('[pifrontier] file_complete error:', err);
+            log.error('[pifrontier] file_complete error:', err);
             ws.send(JSON.stringify({ type: 'file_completions', query: '', entries: [] }));
           }
           break;
@@ -1934,7 +2313,7 @@ try {
             const items = result?.items ?? [];
             ws.send(JSON.stringify({ type: 'extension_completions', trigger, query, items }));
           } catch (err) {
-            console.error('[pifrontier] get_extension_autocomplete error:', err);
+            log.error('[pifrontier] get_extension_autocomplete error:', err);
             const { trigger: fallbackTrigger = '', query: fallbackQuery = '' } = msg as { trigger?: string; query?: string };
             ws.send(JSON.stringify({ type: 'extension_completions', trigger: fallbackTrigger, query: fallbackQuery, items: [] }));
           }
@@ -1943,7 +2322,7 @@ try {
 
         case 'compact': {
           activeSession().compact().catch((err) => {
-            console.error('[pifrontier] compact error:', err);
+            log.error('[pifrontier] compact error:', err);
           });
           break;
         }
@@ -1971,7 +2350,7 @@ try {
                   tools: activeSession().getAllTools().map((t) => ({
                     name: t.name,
                     description: t.description,
-                    isBuiltin: t.sourceInfo.origin === 'package',
+                    isBuiltin: t.sourceInfo.source === 'builtin',
                   })),
                   activeToolNames: activeSession().getActiveToolNames(),
                 }));
@@ -1982,7 +2361,7 @@ try {
                   // If a specific provider was passed, try prompt so extensions can handle it
                   try { await activeSession().prompt(`/login ${args}`); } catch (e) {
                     // If prompt fails (e.g. no extension handles it), fall through to built-in flow
-                    console.error('[pifrontier] login prompt error:', e);
+                    log.error('[pifrontier] login prompt error:', e);
                   }
                   break;
                 }
@@ -2000,9 +2379,9 @@ try {
                 const loginProvider = loginProviders[loginIdx];
 
                 // Check if provider uses OAuth
-                const all = activeSession().modelRegistry.getAll();
-                const oauthModel = all.find(m => m.provider === loginProvider.id && activeSession().modelRegistry.isUsingOAuth(m));
-                if (oauthModel) {
+                const runtime = activeSession().modelRuntime;
+                const oauthProvider = runtime.getProviders().find((p) => p.id === loginProvider.id);
+                if (oauthProvider && runtime.isUsingOAuth(loginProvider.id)) {
                   // OAuth flow — trigger via prompt() which routes through the extension UI
                   try { await activeSession().prompt(`/login ${loginProvider.id}`); } catch (e) {
                     sendSlashResult(ws, command, String(e), 'error');
@@ -2011,12 +2390,11 @@ try {
                   // API key — prompt for key
                   const key = await uiContext.input(`API key for ${loginProvider.name}`, 'Paste your API key…');
                   if (!key) break;
-                  activeSession().modelRegistry.authStorage.set(loginProvider.id, { type: 'api_key', key });
-                  activeSession().modelRegistry.refresh();
+                  await activeSession().modelRuntime.setRuntimeApiKey(loginProvider.id, key);
                   ws.send(JSON.stringify({ type: 'providers_list', providers: getProviders() }));
                   broadcast({
                     type: 'available_models_changed',
-                    availableModels: activeSession().modelRegistry.getAvailable().map(serializeModel),
+                    availableModels: (await activeSession().modelRuntime.getAvailable()).map(serializeModel),
                   });
                   sendSlashResult(ws, command, `Logged in to ${loginProvider.name}.`);
                 }
@@ -2028,12 +2406,11 @@ try {
                   sendSlashResult(ws, command, 'No provider selected. Pass a provider name, e.g. /logout openai.', 'warning');
                   break;
                 }
-                activeSession().modelRegistry.authStorage.remove(provider);
-                activeSession().modelRegistry.refresh();
+                await activeSession().modelRuntime.removeRuntimeApiKey(provider);
                 ws.send(JSON.stringify({ type: 'providers_list', providers: getProviders() }));
                 broadcast({
                   type: 'available_models_changed',
-                  availableModels: activeSession().modelRegistry.getAvailable().map(serializeModel),
+                  availableModels: (await activeSession().modelRuntime.getAvailable()).map(serializeModel),
                 });
                 sendSlashResult(ws, command, `Removed stored credentials for ${provider}.`);
                 break;
@@ -2051,7 +2428,7 @@ try {
                   const { session: clonedSession } = await _sdk!.createAgentSession({
                     cwd,
                     sessionManager: clonedSm,
-                    modelRegistry: activeSession().modelRegistry,
+                    modelRuntime: activeSession().modelRuntime,
                     model: activeSession().model,
                         });
                   await setActiveSession(clonedSession);
@@ -2062,7 +2439,7 @@ try {
                 const { session: clonedSession } = await _sdk!.createAgentSession({
                   cwd: clonedSm.getCwd() || cwd,
                   sessionManager: clonedSm,
-                  modelRegistry: activeSession().modelRegistry,
+                  modelRuntime: activeSession().modelRuntime,
                   model: activeSession().model,
                     });
                 await setActiveSession(clonedSession);
@@ -2121,16 +2498,54 @@ try {
                   sendSlashResult(ws, command, 'Usage: ! <command>', 'warning');
                   break;
                 }
-                const shellResult = Bun.spawnSync(['bash', '-c', args], {
+                const MAX_SHELL_OUTPUT = 100 * 1024;
+                const SHELL_TIMEOUT_MS = 30_000;
+                const proc = Bun.spawn(['bash', '-c', args], {
                   cwd: activeSessionOrNull()?.sessionManager.getCwd() || cwd,
                   env: { ...process.env as Record<string, string>, PI_CWD: cwd },
                 });
-                const shellOutput = [
-                  ...(shellResult.stdout?.length ? [new TextDecoder().decode(shellResult.stdout)] : []),
-                  ...(shellResult.stderr?.length ? [new TextDecoder().decode(shellResult.stderr)] : []),
-                  ...(shellResult.exitCode !== 0 ? [`\nexit code: ${shellResult.exitCode}`] : []),
-                ].join('').trim();
-                sendSlashResult(ws, command, shellOutput || '(no output)', shellResult.exitCode === 0 ? 'info' : 'error');
+                let wasTimedOut = false;
+                const timeoutId = setTimeout(() => {
+                  wasTimedOut = true;
+                  try { proc.kill(); } catch { /* already exited */ }
+                }, SHELL_TIMEOUT_MS);
+                async function readCapped(stream: ReadableStream<Uint8Array> | undefined): Promise<{ text: string; atLimit: boolean }> {
+                  if (!stream) return { text: '', atLimit: false };
+                  const reader = stream.getReader();
+                  const decoder = new TextDecoder();
+                  let text = '';
+                  let total = 0;
+                  let atLimit = false;
+                  while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    const remaining = MAX_SHELL_OUTPUT - total;
+                    if (remaining <= 0) { atLimit = true; continue; }
+                    const chunk = value.slice(0, remaining);
+                    text += decoder.decode(chunk, { stream: true });
+                    total += chunk.byteLength;
+                  }
+                  decoder.decode();
+                  return { text, atLimit };
+                }
+                const [stdout, stderr] = await Promise.all([
+                  readCapped(proc.stdout),
+                  readCapped(proc.stderr),
+                ]);
+                const exitCode = await proc.exited;
+                clearTimeout(timeoutId);
+                let shellOutput = stdout.text;
+                if (stderr.text) shellOutput += '\n' + stderr.text;
+                if (stdout.atLimit || stderr.atLimit) {
+                  shellOutput += `\n… (output truncated at ${(MAX_SHELL_OUTPUT / 1024).toFixed(0)} KB)`;
+                }
+                if (wasTimedOut) {
+                  shellOutput += `\n(process timed out after ${SHELL_TIMEOUT_MS / 1000}s)`;
+                } else if (exitCode !== 0 && exitCode !== null) {
+                  shellOutput += `\nexit code: ${exitCode}`;
+                }
+                shellOutput = shellOutput.trim() || '(no output)';
+                sendSlashResult(ws, command, shellOutput, exitCode === 0 && !wasTimedOut ? 'info' : 'error');
                 break;
               }
               case 'extension':
@@ -2145,7 +2560,7 @@ try {
                 break;
             }
           } catch (err) {
-            console.error(`[pifrontier] run_builtin ${command} error:`, err);
+            log.error(`[pifrontier] run_builtin ${command} error:`, err);
             sendSlashResult(ws, command, String(err), 'error');
           }
           break;
@@ -2157,7 +2572,7 @@ try {
             const serialized = tree.map((node) => serializeTreeNode(node as Parameters<typeof serializeTreeNode>[0]));
             ws.send(JSON.stringify({ type: 'session_tree', tree: serialized }));
           } catch (err) {
-            console.error('[pifrontier] get_session_tree error:', err);
+            log.error('[pifrontier] get_session_tree error:', err);
             ws.send(JSON.stringify({ type: 'session_tree', tree: [] }));
           }
           break;
@@ -2168,7 +2583,7 @@ try {
             const entries = activeSession().getUserMessagesForForking();
             ws.send(JSON.stringify({ type: 'fork_points', entries }));
           } catch (err) {
-            console.error('[pifrontier] get_fork_points error:', err);
+            log.error('[pifrontier] get_fork_points error:', err);
             ws.send(JSON.stringify({ type: 'fork_points', entries: [] }));
           }
           break;
@@ -2183,12 +2598,12 @@ try {
               tools: allTools.map((t) => ({
                 name: t.name,
                 description: t.description,
-                isBuiltin: t.sourceInfo.origin === 'package',
+                isBuiltin: t.sourceInfo.source === 'builtin',
               })),
               activeToolNames: activeNames,
             }));
           } catch (err) {
-            console.error('[pifrontier] get_tools error:', err);
+            log.error('[pifrontier] get_tools error:', err);
           }
           break;
         }
@@ -2197,7 +2612,7 @@ try {
           try {
             activeSession().setActiveToolsByName(msg.toolNames as string[]);
           } catch (err) {
-            console.error('[pifrontier] set_active_tools error:', err);
+            log.error('[pifrontier] set_active_tools error:', err);
           }
           break;
         }
@@ -2227,7 +2642,7 @@ try {
             }));
             ws.send(JSON.stringify({ type: 'resources_list', skills: skillSummaries, prompts: promptSummaries }));
           } catch (err) {
-            console.error('[pifrontier] get_resources error:', err);
+            log.error('[pifrontier] get_resources error:', err);
             ws.send(JSON.stringify({ type: 'resources_list', skills: [], prompts: [] }));
           }
           break;
@@ -2251,7 +2666,7 @@ try {
             }
             ws.send(JSON.stringify({ type: 'command_completions', command, prefix, items: [] }));
           } catch (err) {
-            console.error('[pifrontier] get_command_completions error:', err);
+            log.error('[pifrontier] get_command_completions error:', err);
             ws.send(JSON.stringify({ type: 'command_completions', command: '', prefix: '', items: [] }));
           }
           break;
@@ -2281,7 +2696,7 @@ try {
             }));
             ws.send(JSON.stringify({ type: 'extensions_list', extensions: summaries, errors }));
           } catch (err) {
-            console.error('[pifrontier] get_extensions error:', err);
+            log.error('[pifrontier] get_extensions error:', err);
             ws.send(JSON.stringify({ type: 'extensions_list', extensions: [], errors: [] }));
           }
           break;
@@ -2306,7 +2721,7 @@ try {
             }
             ws.send(JSON.stringify({ type: 'commands_list', commands: allCommands }));
           } catch (err) {
-            console.error('[pifrontier] get_commands error:', err);
+            log.error('[pifrontier] get_commands error:', err);
             ws.send(JSON.stringify({ type: 'commands_list', commands: [] }));
           }
           break;
@@ -2349,7 +2764,7 @@ try {
             const skillName = nameMatch ? nameMatch[1].trim() : safeFileName.replace(/\.md$/, '');
             ws.send(JSON.stringify({ type: 'skill_install_result', success: true, name: skillName }));
           } catch (err) {
-            console.error('[pifrontier] install_skill error:', err);
+            log.error('[pifrontier] install_skill error:', err);
             ws.send(JSON.stringify({ type: 'skill_install_result', success: false, error: String(err) }));
           }
           break;
@@ -2358,20 +2773,44 @@ try {
         case 'fork_session': {
           try {
             const entryId = (msg as { type: 'fork_session'; entryId: string }).entryId;
-            if (!activeSession().sessionFile) throw new Error('Active session is not persisted');
-            const sm = _sdk!.SessionManager.open(activeSession().sessionFile);
+            const sessionFile = activeSession().sessionFile;
+            if (!sessionFile) throw new Error('Active session is not persisted');
+            const sm = _sdk!.SessionManager.open(sessionFile);
             const forkPath = sm.createBranchedSession(entryId);
+            if (!forkPath) throw new Error('Failed to create branched session');
             const sm2 = _sdk!.SessionManager.open(forkPath);
             const { session: forkedSession } = await _sdk!.createAgentSession({
-              cwd,
+              cwd: activeCwd(),
               sessionManager: sm2,
-              modelRegistry: activeSession().modelRegistry,
+              modelRuntime: activeSession().modelRuntime,
               model: activeSession().model,
             });
             await setActiveSession(forkedSession);
           } catch (err) {
-            console.error('[pifrontier] fork_session error:', err);
+            log.error('[pifrontier] fork_session error:', err);
             ws.send(JSON.stringify({ type: 'sessions_error', message: String(err) }));
+          }
+          break;
+        }
+
+        case 'edit_message': {
+          try {
+            const s = activeSession();
+            if (s.isStreaming) {
+              ws.send(JSON.stringify({ type: 'agent_error', error: 'Cannot edit while the agent is streaming.' }));
+              break;
+            }
+            const { originalMessage, newMessage } = msg as { type: 'edit_message'; originalMessage: string; newMessage: string };
+            if (!s.sessionManager.isPersisted()) throw new Error('Cannot edit in an in-memory session');
+            const userMsgs = s.getUserMessagesForForking();
+            // Find the last matching entry (most recent occurrence of the original text)
+            const match = [...userMsgs].reverse().find((m) => m.text === originalMessage);
+            if (!match) throw new Error('Could not find the original message to edit');
+            await s.navigateTree(match.entryId);
+            await s.prompt(newMessage);
+          } catch (err) {
+            log.error('[pifrontier] edit_message error:', err);
+            ws.send(JSON.stringify({ type: 'agent_error', error: String(err) }));
           }
           break;
         }
@@ -2404,7 +2843,7 @@ try {
               ws.send(JSON.stringify({ type: 'file_content', path: filePath, content: '', error: 'File not found' }));
             }
           } catch (err) {
-            console.error('[pifrontier] read_file error:', err);
+            log.error('[pifrontier] read_file error:', err);
             ws.send(JSON.stringify({ type: 'file_content', path: (msg as { type: 'read_file'; path: string }).path, content: '', error: String(err) }));
           }
           break;
@@ -2425,7 +2864,7 @@ try {
             await Bun.write(resolved, fileContent);
             ws.send(JSON.stringify({ type: 'file_saved', path: filePath }));
           } catch (err) {
-            console.error('[pifrontier] write_file error:', err);
+            log.error('[pifrontier] write_file error:', err);
             ws.send(JSON.stringify({ type: 'file_saved', path: (msg as { type: 'write_file'; path: string }).path, error: String(err) }));
           }
           break;
@@ -2436,7 +2875,7 @@ try {
             const status = await getUpdateStatus();
             ws.send(JSON.stringify({ type: 'update_status', ...status }));
           } catch (err) {
-            console.error('[pifrontier] get_update_status error:', err);
+            log.error('[pifrontier] get_update_status error:', err);
             ws.send(JSON.stringify({
               type: 'update_status',
               appRoot: APP_ROOT,
@@ -2448,6 +2887,30 @@ try {
               sdk: { name: PI_SDK_PACKAGE_NAME, current: PI_SDK_VERSION, error: String(err) },
               notes: ['Unable to check for updates.'],
             }));
+          }
+          break;
+        }
+
+        case 'load_messages': {
+          try {
+            const count = Math.min((msg as { count?: number }).count ?? 50, MAX_INITIAL_MESSAGES);
+            const s = activeSession();
+            const all = s.messages;
+            const total = all.length;
+            const alreadyHasCount = Math.min((msg as { alreadyHasCount?: number }).alreadyHasCount ?? 0, total);
+            // alreadyHasCount is how many messages the client already shows (the tail).
+            // Send `count` messages just before that tail.
+            const end = Math.max(0, total - alreadyHasCount);
+            const start = Math.max(0, end - count);
+            const older = all.slice(start, end);
+            ws.send(JSON.stringify({
+              type: 'older_messages',
+              messages: trimMessagesForWire(older),
+              totalMessageCount: total,
+              messagesTruncated: start > 0,
+            }));
+          } catch (err) {
+            log.error('[pifrontier] load_messages error:', err);
           }
           break;
         }
@@ -2473,7 +2936,7 @@ try {
             break;
           }
           pendingRestartNonce = null; // consume the nonce — single use
-          console.log('[pifrontier] Restart confirmed — broadcasting and re-execing…');
+          log.info('[pifrontier] Restart confirmed — broadcasting and re-execing…');
           broadcast({ type: 'server_restarting' });
           // Cleanup idle cleanup timer
           if (_idleCleanupTimer) { clearInterval(_idleCleanupTimer); _idleCleanupTimer = null; }
@@ -2487,15 +2950,39 @@ try {
           }, 400);
           break;
         }
+        case 'set_notification_webhook_url': {
+          setWebhookUrl(msg.url);
+          broadcast({ type: 'notification_webhook_url', url: getWebhookUrl() });
+          break;
+        }
+
+        case 'ping': {
+          // Client heartbeat — keeps the socket alive past idleTimeout and
+          // lets the client detect zombie (dead-but-open) connections.
+          ws.send('{"type":"pong"}');
+          break;
+        }
+        case 'get_settings': {
+          ws.send(JSON.stringify({ type: 'settings', settings: readSettings() }));
+          break;
+        }
+        case 'set_settings': {
+          const updated = updateSettings(msg.settings as Record<string, unknown>);
+          broadcast({ type: 'settings', settings: updated });
+          break;
+        }
+
       } // end switch
       } catch (err) {
-        console.error('[pifrontier] WS message handler error:', err);
+        log.error('[pifrontier] WS message handler error:', err);
         try { ws.send(JSON.stringify({ type: 'agent_error', error: String(err) })); } catch { /* ws may be closed */ }
       }
     },
 
     close(ws) {
       ws.unsubscribe(WS_TOPIC);
+      // Clear the periodic token expiry check
+      if (ws.data._expTimer) { clearInterval(ws.data._expTimer); ws.data._expTimer = undefined; }
       connectedClients = Math.max(0, connectedClients - 1);
       // When the last client disconnects, give a 15s grace period before
       // cancelling pending extension dialogs. This prevents transient PWA
@@ -2519,10 +3006,10 @@ try {
 } catch (err: unknown) {
   const error = err as { code?: string; message?: string };
   if (error.code === 'EADDRINUSE') {
-    console.error(`[pifrontier] Port ${PORT} is already in use.`);
-    console.error(`[pifrontier] Use a different port: pi-ui --port ${PORT + 1}`);
+    log.error(`[pifrontier] Port ${PORT} is already in use.`);
+    log.error(`[pifrontier] Use a different port: pi-ui --port ${PORT + 1}`);
   } else {
-    console.error('[pifrontier] Failed to start server:', error.message ?? err);
+    log.error('[pifrontier] Failed to start server:', error.message ?? err);
   }
   process.exit(1);
 }
@@ -2532,5 +3019,50 @@ try {
 
 broadcast = (payload) => server.publish(WS_TOPIC, JSON.stringify(payload));
 startIdleCleanup();
+// Hydrate session summaries from the previous run — sidebar loads become
+// stat-calls-only; files are fully read at most once per change.
+initSessionScanCache(join(homedir(), '.pi', 'agent', 'pi-ui-session-scan.json'));
 
-console.log(`[pifrontier] Listening on http://localhost:${PORT}`);
+log.info(`[pifrontier] Listening on http://localhost:${PORT}`);
+
+// ── 7. Graceful shutdown ───────────────────────────────────────────────────────
+// On SIGTERM/SIGINT, give agent runs a chance to complete and let clients know.
+
+const _shutdown = async () => {
+  try { server?.stop(false); } catch { /* ignore */ }
+  // Dispose all pooled sessions so background agent work stops cleanly
+  for (const [, entry] of sessionPool) {
+    try {
+      if (entry.session.isStreaming) {
+        try { entry.session.abort(); } catch { /* agent may already be done */ }
+      }
+      entry.session.dispose();
+    } catch { /* session may already be disposed */ }
+  }
+  sessionPool.clear();
+  process.exit(0);
+};
+
+process.on('SIGTERM', () => _shutdown());
+process.on('SIGINT', () => _shutdown());
+
+// ── 8. Crash containment ──────────────────────────────────────────────────────
+// Without these handlers Bun terminates the process on any uncaught error —
+// one bad SDK event or WS send loops the service under systemd Restart=.
+// Log loudly (journald picks up the <3> priority), tell connected clients,
+// and keep serving; the HTTP/WS server and session pool remain valid.
+
+function reportCrash(kind: string, err: unknown): void {
+  log.error(`${kind}:`, err instanceof Error ? err : new Error(String(err)));
+  try {
+    broadcast({
+      type: 'agent_error',
+      error: `Internal server error (${kind}): ${err instanceof Error ? err.message : String(err)}`,
+    });
+  } catch {
+    /* broadcast unavailable during startup/shutdown */
+  }
+}
+
+process.on('uncaughtException', (err) => reportCrash('uncaughtException', err));
+process.on('unhandledRejection', (reason) => reportCrash('unhandledRejection', reason));

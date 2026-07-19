@@ -1,3 +1,4 @@
+import { dev } from '$app/environment';
 import type { Handle } from '@sveltejs/kit';
 import { redirect } from '@sveltejs/kit';
 import { verifySessionToken, getTokenFromCookies } from '$lib/auth/password';
@@ -5,10 +6,9 @@ import { verifySessionToken, getTokenFromCookies } from '$lib/auth/password';
 const PUBLIC_PATHS = new Set(['/login']);
 
 export const handle: Handle = async ({ event, resolve }) => {
-  const { pathname } = event.url;
+  const { pathname, search } = event.url;
 
-  // Exact match only — prevents /loginXSS or /login-admin from bypassing auth.
-  if (PUBLIC_PATHS.has(pathname)) {
+  if (PUBLIC_PATHS.has(pathname) || (dev && pathname.startsWith('/dev'))) {
     return resolve(event);
   }
 
@@ -16,7 +16,9 @@ export const handle: Handle = async ({ event, resolve }) => {
   const token = getTokenFromCookies(cookie);
 
   if (!token || !(await verifySessionToken(token))) {
-    redirect(302, '/login');
+    // Preserve the original URL so login can redirect back after auth.
+    const redirectTo = pathname + search;
+    redirect(302, `/login?redirect=${encodeURIComponent(redirectTo)}`);
   }
 
   return resolve(event);

@@ -1,6 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdirSync, writeFileSync, rmSync, existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdirSync, rmSync } from 'node:fs';
 
 const TEST_HOME = '/tmp/pi-ui-test-registry-' + Date.now();
 const ORIG_HOME = process.env.HOME;

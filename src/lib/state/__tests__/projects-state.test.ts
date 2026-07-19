@@ -130,22 +130,22 @@ describe('ProjectsState', () => {
 
   describe('handleMessage', () => {
     it('handles projects_list', () => {
-      projectsState.handleMessage({ type: 'projects_list', projects: [{ cwd: '/p', name: 'P' }] } as any);
+      projectsState.handleMessage({ type: 'projects_list', projects: [{ cwd: '/p', name: 'P' }] } as { type: string } & Record<string, unknown>);
       expect(projectsState.projects).toHaveLength(1);
     });
 
     it('handles all_sessions_list', () => {
-      projectsState.handleMessage({ type: 'all_sessions_list', sessions: [{ id: 's1' }] } as any);
+      projectsState.handleMessage({ type: 'all_sessions_list', sessions: [{ id: 's1' }] } as { type: string } & Record<string, unknown>);
       expect(projectsState.allSessions).toHaveLength(1);
     });
 
     it('handles sessions_error', () => {
-      projectsState.handleMessage({ type: 'sessions_error', message: 'oops' } as any);
+      projectsState.handleMessage({ type: 'sessions_error', message: 'oops' } as { type: string } & Record<string, unknown>);
       expect(projectsState.error).toBe('oops');
     });
 
     it('handles dir_completions', () => {
-      projectsState.handleMessage({ type: 'dir_completions', entries: ['/a/', '/b/'] } as any);
+      projectsState.handleMessage({ type: 'dir_completions', entries: ['/a/', '/b/'] } as { type: string } & Record<string, unknown>);
       expect(projectsState.dirCompletions).toEqual(['/a/', '/b/']);
     });
   });

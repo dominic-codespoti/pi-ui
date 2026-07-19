@@ -42,7 +42,7 @@
   const resizeCursorClass = $derived(side === 'left' ? 'cursor-col-resize' : 'cursor-col-resize');
   const panelStyle = $derived(
     isMobile
-      ? `width: min(${width}px, 90vw); transform: translateX(${open ? '0' : translateClosed}); transition: transform 220ms cubic-bezier(0.33,1,0.68,1); padding-top: env(safe-area-inset-top, 0px); padding-bottom: env(safe-area-inset-bottom, 0px);`
+      ? `width: min(${width}px, calc(100vw - 1rem)); transform: translateX(${open ? '0' : translateClosed}); transition: transform 220ms cubic-bezier(0.33,1,0.68,1); padding-top: env(safe-area-inset-top, 0px); padding-bottom: env(safe-area-inset-bottom, 0px);`
       : `width: ${open ? width + 'px' : '0'}; transition: ${resizing ? 'none' : 'width 220ms cubic-bezier(0.33,1,0.68,1)'};`
   );
   const surfaceClass = $derived(
@@ -50,11 +50,12 @@
       ? 'bg-base-300/98 shadow-2xl shadow-black/20'
       : 'bg-[color-mix(in_oklch,var(--color-base-200)_92%,black_8%)] shadow-2xl shadow-black/15'
   );
+  const mobileRoundClass = $derived(side === 'left' ? 'rounded-r-[1.5rem]' : 'rounded-l-[1.5rem]');
 </script>
 
 {#if isMobile && open}
   <div
-    class="fixed inset-0 z-30 bg-base-100/55 backdrop-blur-[3px]"
+    class="fixed inset-0 z-30 bg-base-100/60 backdrop-blur-sm"
     onclick={onClose}
     aria-hidden="true"
     role="presentation"
@@ -62,11 +63,13 @@
 {/if}
 
 <div
+  role="complementary"
+  aria-label={title}
   class={isMobile ? `fixed inset-y-0 ${fixedSideClass} z-40 flex flex-col` : 'relative shrink-0 overflow-hidden'}
   style={panelStyle}
   aria-hidden={!open}
 >
-  <div class="w-full h-full {surfaceClass} {borderClass} flex flex-col overflow-hidden">
+  <div class="w-full h-full {surfaceClass} {borderClass} {isMobile ? mobileRoundClass : ''} flex flex-col overflow-hidden">
     {#if header}
       {@render header()}
     {:else}

@@ -65,7 +65,9 @@ describe('renderMarkdown', () => {
 });
 
 describe('highlightCode', () => {
-  it('highlights TypeScript code', () => {
+  it('highlights TypeScript code', async () => {
+    // Ensure the lazy hljs language import is complete before testing
+    await import('highlight.js/lib/languages/typescript');
     const result = highlightCode('const x: number = 1;', 'ts');
     expect(result).toContain('hljs');
     expect(result).toContain('keyword');

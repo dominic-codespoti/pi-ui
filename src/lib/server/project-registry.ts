@@ -14,6 +14,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
+import { log } from './logger';
 
 export interface ProjectRecord {
   /** Absolute, resolved path of the project directory. */
@@ -48,7 +49,7 @@ function load(): ProjectRecord[] {
       }
     }
   } catch (err) {
-    console.error('[pifrontier] project registry: failed to load, starting empty:', err);
+    log.error('[pifrontier] project registry: failed to load, starting empty:', err);
   }
   records = [];
   return records;
@@ -62,7 +63,7 @@ function save(): void {
     writeFileSync(tmp, JSON.stringify({ projects: records }, null, 2));
     renameSync(tmp, REGISTRY_FILE);
   } catch (err) {
-    console.error('[pifrontier] project registry: failed to save:', err);
+    log.error('[pifrontier] project registry: failed to save:', err);
   }
 }
 

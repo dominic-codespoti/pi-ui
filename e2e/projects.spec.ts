@@ -1,6 +1,21 @@
 import { test, expect } from './fixtures';
 import { PROJECTS_LIST_PAYLOAD, ALL_SESSIONS_LIST_PAYLOAD } from './mocks/payloads';
+import type { Page } from '@playwright/test';
 
+async function openProjectsSidebar(page: Page) {
+  const search = page.locator('input[aria-label="Filter projects and sessions"]:visible');
+  if (await search.count()) return;
+  const sidebarButton = page.locator('[aria-label="Sessions"]').first();
+  if (await sidebarButton.isVisible()) {
+    await sidebarButton.click();
+  }
+  if (!(await search.count())) {
+    await page.evaluate(() => {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: '/', ctrlKey: true, bubbles: true }));
+    });
+  }
+  await expect(search).toBeVisible({ timeout: 3000 });
+}
 test.describe('Projects sidebar', () => {
   test.beforeEach(async ({ page, login, mockWs }) => {
     await mockWs(page);
@@ -21,11 +36,7 @@ test.describe('Projects sidebar', () => {
       ws.send(JSON.stringify({ type: 'connected', sessionId: 's1', isStreaming: false, thinkingLevel: 'medium', model: null, availableModels: [], messages: [] }));
     });
 
-    // Open sidebar
-    const sidebarButton = page.locator('[aria-label="Sessions"]');
-    if (await sidebarButton.isVisible()) {
-      await sidebarButton.click();
-    }
+    await openProjectsSidebar(page);
 
     await expect(page.getByText('project-a')).toBeVisible({ timeout: 3000 });
   });
@@ -44,12 +55,8 @@ test.describe('Projects sidebar', () => {
       ws.send(JSON.stringify({ type: 'connected', sessionId: 's1', isStreaming: false, thinkingLevel: 'medium', model: null, availableModels: [], messages: [] }));
     });
 
-    const sidebarButton = page.locator('[aria-label="Sessions"]');
-    if (await sidebarButton.isVisible()) {
-      await sidebarButton.click();
-    }
-
-    await page.fill('input[type="search"]', 'nonexistent');
+    await openProjectsSidebar(page);
+    await page.locator('input[aria-label="Filter projects and sessions"]:visible').fill('nonexistent');
     await expect(page.getByText('No match')).toBeVisible({ timeout: 3000 });
   });
 
@@ -77,10 +84,7 @@ test.describe('Projects sidebar', () => {
       }, 100);
     });
 
-    const sidebarButton = page.locator('[aria-label="Sessions"]');
-    if (await sidebarButton.isVisible()) {
-      await sidebarButton.click();
-    }
+    await openProjectsSidebar(page);
 
     // Wait for session to appear
     await expect(page.getByText('hello world')).toBeVisible({ timeout: 3000 });

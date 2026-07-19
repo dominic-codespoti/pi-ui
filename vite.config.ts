@@ -5,15 +5,9 @@ import tailwindcss from '@tailwindcss/vite';
 export default defineConfig({
   plugins: [tailwindcss(), sveltekit()],
   server: {
-    // In `dev:full` mode the WS server runs on port 5174 so Vite can proxy /ws
-    // there while the frontend gets HMR from the Vite dev server on 5173.
-    proxy: {
-      '/ws': {
-        target: 'ws://localhost:5174',
-        ws: true,
-        changeOrigin: true,
-      },
-    },
+    // In `dev:full` mode the Bun WS server runs on port 5174. The client
+    // connects directly in dev mode, bypassing Vite's proxy — Bun.serve's
+    // `server.upgrade()` is incompatible with http-proxy's WS forwarding.
   },
   ssr: {
     // Bundle SvelteKit's runtime deps into the SSR output so the package is

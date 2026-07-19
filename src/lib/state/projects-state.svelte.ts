@@ -67,6 +67,8 @@ class ProjectsState {
   runningSessions = new SvelteSet<string>();
   /** Session path from the most recent switch_session — consumed by the page for URL sync. */
   pendingSwitchPath: string | null = null;
+  /** True while a session switch is in flight. Set by switchSession, cleared by session_loaded. */
+  sessionLoading = $state(false);
   collapsed = new SvelteSet<string>(loadCollapsed());
   /** Projects whose full session list is expanded past the preview limit. */
   expandedGroups = new SvelteSet<string>();
@@ -200,10 +202,17 @@ class ProjectsState {
   // ── Actions ──────────────────────────────────────────────────────────────
 
   switchSession(path: string): void {
+    const sent = this.send({ type: 'switch_session', path });
+    if (!sent) return;
     this.pendingSwitchPath = path;
-    this.send({ type: 'switch_session', path });
+    this.sessionLoading = true;
     const s = this.allSessions.find((s) => s.path === path);
     if (s) this.uncheckedSessions.delete(s.id);
+    try {
+      const url = new URL(window.location.href);
+      url.searchParams.set('session', path);
+      history.replaceState(null, '', url.pathname + url.search);
+    } catch { /* window may not be available during SSR */ }
   }
 
   newSession(targetCwd?: string): void {

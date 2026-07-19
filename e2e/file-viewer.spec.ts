@@ -40,16 +40,13 @@ test.describe('File viewer', () => {
     });
 
     await page.goto('/');
-    await page.fill('input[name="password"]', 'test-password');
-    await page.click('button[type="submit"]');
-    await page.waitForURL('/');
 
     // Find the file link and click it
     const fileLink = page.locator('a.file-link').first();
     await expect(fileLink).toBeVisible({ timeout: 3000 });
     await fileLink.click();
 
-    // Wait for the file viewer modal to appear
-    await expect(page.getByText('src/lib/foo.ts')).toBeVisible({ timeout: 3000 });
+    // Wait for the file viewer modal to appear — the path renders as the dialog heading
+    await expect(page.getByRole('heading', { name: 'src/lib/foo.ts' })).toBeVisible({ timeout: 3000 });
   });
 });

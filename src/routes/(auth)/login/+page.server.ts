@@ -23,21 +23,22 @@ function cookieOpts(request: Request): { path: string; httpOnly: boolean; sameSi
     // Secure when behind a TLS-terminating proxy (Cloudflare Tunnel) or when
     // the request itself is HTTPS. Only false for bare-HTTP local dev.
     secure: isBehindProxy(request) || request.url.startsWith('https'),
-    maxAge: 60 * 60 * 24, // 24h — matches JWT expiry
+    maxAge: 30 * 86400, // 30d — matches JWT expiry
   };
 }
 
-export const load: PageServerLoad = async ({ cookies }) => {
+export const load: PageServerLoad = async ({ cookies, url }) => {
   const token = cookies.get(COOKIE_NAME);
+  const redirectTo = url.searchParams.get('redirect') || '/';
   // Only redirect to / if the token is actually valid — avoids infinite redirect
   // loops when a stale/expired cookie exists but hooks rejects it.
   if (token && (await verifySessionToken(token))) {
-    redirect(302, '/');
+    redirect(302, redirectTo);
   }
 };
 
 export const actions: Actions = {
-  default: async ({ request, cookies, getClientAddress }) => {
+  default: async ({ request, cookies, getClientAddress, url }) => {
     const ip = getClientIp(request, getClientAddress(), isBehindProxy(request));
 
     // ── CSRF origin check ─────────────────────────────────────────────────
@@ -88,6 +89,7 @@ export const actions: Actions = {
     const token = await createSessionToken();
     cookies.set(COOKIE_NAME, token, cookieOpts(request));
 
-    redirect(302, '/');
+    const redirectTo = url.searchParams.get('redirect') || '/';
+    redirect(302, redirectTo);
   },
 };

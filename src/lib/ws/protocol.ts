@@ -12,6 +12,8 @@ export interface ModelInfo {
   reasoning: boolean;
   /** Context window size in tokens (from the model definition). */
   contextWindow?: number;
+  /** Map of thinking levels this model supports (keys = level names). */
+  thinkingLevelMap?: Record<string, string | null>;
 }
 
 /** Real-time context window usage — from pi SDK's getContextUsage(). */
@@ -34,7 +36,10 @@ export interface SessionSummary {
   created: number;
   /** Unix ms */
   modified: number;
+  /** SDK's raw message count (includes tool results, bash executions, etc.). */
   messageCount: number;
+  /** User-facing turn count — only user + assistant messages. */
+  turns?: number;
   firstMessage: string;
 }
 
@@ -130,7 +135,8 @@ export type UpdateTarget = 'ui' | 'sdk';
 export type WidgetContent =
   | { type: 'text'; lines: string[] }
   | { type: 'table'; headers: string[]; rows: string[][] }
-  | { type: 'badge'; text: string; variant: 'info' | 'warning' | 'error' | 'success' };
+  | { type: 'badge'; text: string; variant: 'info' | 'warning' | 'error' | 'success' }
+  | { type: 'component'; component: import('$lib/tui-stubs').ParsedComponent };
 
 /** A node in the session tree for visual display. */
 export interface TreeNode {
@@ -154,6 +160,10 @@ export interface ConnectedMessage {
   availableModels: ModelInfo[];
   /** Recent raw SDK message window at connect time. */
   messages: unknown[];
+  /** Total number of messages in the session (may exceed messages.length). */
+  totalMessageCount?: number;
+  /** True when messages were truncated to limit initial payload size. */
+  messagesTruncated?: boolean;
   /** Server working directory. */
   cwd?: string;
   /** Display name of the current session (from session_info entries). */
@@ -170,8 +180,12 @@ export interface ConnectedMessage {
   uiVersion?: string;
   /** 'in-memory' when SessionManager.inMemory() is active; omitted for disk-persisted sessions. */
   sessionMode?: 'in-memory' | 'persisted';
+  /** Session file path on disk — used to persist the active session across page reloads. */
+  sessionPath?: string;
   /** Real-time context window usage from the SDK. */
   contextUsage?: ContextUsage;
+  /** Current notification webhook URL (empty/null = disabled). */
+  webhookUrl?: string;
 }
 
 /**
@@ -198,18 +212,20 @@ export interface ConnectedMessage {
  *   { type: "skill_install_result",    success: boolean; name?: string; error?: string }
  *   { type: "update_status",           ...UpdateStatus }
  *   { type: "update_progress",         target: "ui" | "sdk", command?: string, message: string }
- *   { type: "update_result",           target: "ui" | "sdk", success: boolean, message: string, output?: string, restartRequired?: boolean, reloadRequired?: boolean }
  *   { type: "restart_nonce",           nonce: string }
  *   { type: "server_restarting" }
+ *
+ *   { type: "notification_webhook_url", url: string | null }
 
  *   { type: "slash_result",            command: string, message: string, level?: "info" | "warning" | "error" }
  *   { type: "file_content",            path: string, content: string, error?: string }
+ *   { type: "older_messages",          messages: unknown[], totalMessageCount: number, messagesTruncated: boolean }
  *
  * SDK events the browser must handle:
  *   { type: "agent_start" }
  *   { type: "agent_end",               messages: AgentMessage[], willRetry: boolean }
  *   { type: "message_start" }
- *   { type: "message_update",          event: { type: "text_delta", delta: string, ... } }
+ *   { type: "message_update",          assistantMessageEvent: { type: "text_delta", delta: string, ... } }
  *   { type: "message_end" }
  *   { type: "tool_execution_start",    toolName: string }
  *   { type: "tool_execution_update",   ... }
@@ -227,6 +243,15 @@ export interface ConnectedMessage {
  *
  *   Custom component update (re-rendered lines for interactive custom() components):
  *   { type: "custom_render",           id: string, lines: string[] }
+ *
+ *   Live update to an open custom() dialog's parsed component tree (after a
+ *   real extension callback ran, or on animation tick for loaders/progress):
+ *   { type: "extension_ui_update",     id: string, parsed: ParsedComponent }
+ *
+ *   Sent whenever a pending extension_ui_request resolves for ANY reason
+ *   (user response, extension self-resolved via done(), cancel, timeout) —
+ *   closes the dialog in every connected tab, not just the one that answered:
+ *   { type: "extension_ui_dismiss",    id: string }
  *
  *   Session runtime status (lightweight — no message content, just metadata):
  *   { type: "session_runtime",         sessionId: string, isRunning: boolean, unseen: boolean, lastActivity: number }
@@ -294,6 +319,10 @@ export type ClientMessage =
   | { type: 'get_extension_autocomplete'; trigger: string; query: string }
   /** Forward a keyboard event to an interactive custom component (ConversationViewer etc). */
   | { type: 'extension_custom_input'; id: string; key: string; alt?: boolean; ctrl?: boolean; meta?: boolean; shift?: boolean }
+  /** Interaction with a parsed component inside an open custom() dialog — the
+   * server invokes the corresponding LIVE callback (onSelect/onClick/onToggle/
+   * onSubmit/updateValue) on the component at `path` and re-parses the tree. */
+  | { type: 'extension_component_event'; id: string; path: number[]; event: 'select' | 'click' | 'toggle' | 'submit' | 'setting'; value?: string }
   /** Response to a blocking extension_ui_request (select / confirm / input / editor / custom). */
   | { type: 'extension_ui_response'; id: string; value?: string; confirmed?: boolean; cancelled?: true }
   /** Editor text content response to a request_editor_text extension_ui_request. */
@@ -306,8 +335,6 @@ export type ClientMessage =
   | { type: 'remove_provider_key'; provider: string }
   /** Rename a session (by file path) to a new display name. */
   | { type: 'rename_session'; path: string; name: string }
-  /** Rename the current active session without knowing its file path. */
-  | { type: 'rename_current_session'; name: string }
   /** Permanently delete a session file (cannot delete the active session). */
   | { type: 'delete_session'; path: string }
   /** Manually compact the session context (aborts running agent first). */
@@ -320,6 +347,8 @@ export type ClientMessage =
   | { type: 'get_fork_points' }
   /** Fork the session at the given entry ID, creating a new branched session. */
   | { type: 'fork_session'; entryId: string }
+  /** Edit a user message: server finds the entry, rewinds session, and resends. */
+  | { type: 'edit_message'; originalMessage: string; newMessage: string }
   /** Request the full list of tools and which are active. Server replies with tools_list. */
   | { type: 'get_tools' }
   /** Set the active tool set by name. */
@@ -352,5 +381,16 @@ export type ClientMessage =
   | { type: 'read_file'; path: string }
   /** Write file content from the file viewer modal's edit mode. */
   | { type: 'write_file'; path: string; content: string }
+  /** Request older messages before the current window. Server replies with older_messages. */
+  | { type: 'load_messages'; count: number; alreadyHasCount: number }
   /** Request argument completions for an extension slash command. Server replies with command_completions. */
-  | { type: 'get_command_completions'; command: string; prefix: string };
+  | { type: 'get_command_completions'; command: string; prefix: string }
+  /** Set the notification webhook URL (ntfy.sh, Pushover, Gotify, etc.). Empty string clears. */
+  /** Read persisted UI settings. Server replies with 'settings' event. */
+  | { type: 'get_settings' }
+  /** Persist UI settings to disk. Values are merged shallowly into the stored object. */
+  | { type: 'set_settings'; settings: Record<string, unknown> }
+  /** Heartbeat — server replies with `{ type: 'pong' }`. Keeps the socket alive and detects zombies. */
+  | { type: 'ping' }
+  /** Set the notification webhook URL (ntfy.sh, Pushover, Gotify, etc.). Empty string clears. */
+  | { type: 'set_notification_webhook_url'; url: string };

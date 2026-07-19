@@ -12,7 +12,7 @@ test.describe('Server smoke', () => {
   test('serves the login page at /login', async ({ page }) => {
     const response = await page.goto('/login');
     expect(response?.status()).toBe(200);
-    await expect(page.locator('text=password')).toBeVisible();
+    await expect(page.getByText('password', { exact: true })).toBeVisible();
   });
 
   test('returns 404 for unknown routes (unauth)', async ({ page }) => {
@@ -46,7 +46,8 @@ test.describe('Server smoke', () => {
 
   test('login page has correct HTML structure', async ({ page }) => {
     await page.goto('/login');
-    await expect(page.locator('h1, title, label')).toContainText(['password', 'Password', 'pi'], { ignoreCase: true });
+    await expect(page).toHaveTitle(/pi/i);
+    await expect(page.locator('label[for="password"]')).toContainText(/password/i);
     await expect(page.locator('input[type="password"]')).toBeVisible();
     await expect(page.locator('button[type="submit"]')).toBeVisible();
   });

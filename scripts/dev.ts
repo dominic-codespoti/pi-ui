@@ -6,7 +6,8 @@
  *   1. Vite dev server  (port 5173)  — HMR for the frontend
  *   2. Bun WS server   (port 5174)  — pi session WebSocket
  *
- * Vite proxies /ws → ws://localhost:5174 (configured in vite.config.ts).
+ * The browser connects directly to port 5174 for the WebSocket (/ws path);
+ * Vite serves the frontend on port 5173. No WS proxy needed.
  *
  * Usage:
  *   PI_PASSWORD=dev bun run dev:full

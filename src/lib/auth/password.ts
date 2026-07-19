@@ -107,8 +107,8 @@ async function hmacSign(data: Uint8Array, secret: Uint8Array): Promise<Uint8Arra
 
 // ── Session token ─────────────────────────────────────────────────────────────
 
-/** Session token expiry (24 hours). */
-const TOKEN_EXPIRY_S = 86400;
+/** Session token expiry (30 days). */
+const TOKEN_EXPIRY_S = 30 * 86400;
 
 export async function createSessionToken(): Promise<string> {
   const jti = crypto.randomUUID();

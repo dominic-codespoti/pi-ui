@@ -1,8 +1,7 @@
-import { join, resolve, sep, basename } from 'node:path';
+import { join, resolve, sep } from 'node:path';
 import { homedir } from 'node:os';
-import { existsSync } from 'node:fs';
 import type { ModelInfo, SessionSummary } from '$lib/ws/protocol';
-import type { Model } from '@earendil-works/pi-ai';
+import type { Api, Model } from '@earendil-works/pi-ai';
 import type { AgentSession } from '@earendil-works/pi-coding-agent';
 
 export function expandTilde(p: string): string {
@@ -21,7 +20,7 @@ export function activeCwd(session: AgentSession | null, fallbackCwd: string): st
   return session?.sessionManager.getCwd() || fallbackCwd;
 }
 
-export function serializeModel(model: Model<unknown> | undefined | null): ModelInfo | null {
+export function serializeModel(model: Model<Api> | undefined | null): ModelInfo | null {
   if (!model) return null;
   return {
     provider: model.provider,
@@ -29,10 +28,12 @@ export function serializeModel(model: Model<unknown> | undefined | null): ModelI
     name: model.name,
     reasoning: model.reasoning,
     contextWindow: model.contextWindow,
+    thinkingLevelMap: model.thinkingLevelMap,
   };
 }
 
 export function serializeSession(s: Record<string, unknown>): SessionSummary {
+  const rawCount = s.messageCount as number;
   return {
     id: s.id as string,
     path: s.path as string,
@@ -40,9 +41,40 @@ export function serializeSession(s: Record<string, unknown>): SessionSummary {
     name: s.name as string | undefined,
     created: s.created instanceof Date ? s.created.getTime() : (s.created as number),
     modified: s.modified instanceof Date ? s.modified.getTime() : (s.modified as number),
-    messageCount: s.messageCount as number,
+    messageCount: rawCount,
+    turns: (s.turns as number | undefined) ?? (rawCount > 0 ? undefined : 0),
     firstMessage: s.firstMessage as string,
   };
+}
+
+/**
+ * Count conversational turns in a .jsonl session file.
+ * Only counts entries with role === 'user' or role === 'assistant',
+ * which gives the real exchange count the user sees, not the SDK's
+ * inflated total (which includes bashExecution, toolResult, etc.).
+ */
+export async function countTurnsInFile(path: string): Promise<number> {
+  try {
+    const file = Bun.file(path);
+    const text = await file.text();
+    const lines = text.split('\n');
+    let turns = 0;
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const entry = JSON.parse(line);
+        const msg = entry.message ?? entry;
+        if (!msg || typeof msg.role !== 'string') continue;
+        const role = msg.role.toLowerCase();
+        if (role === 'user' || role === 'assistant') turns++;
+      } catch {
+        // skip malformed lines
+      }
+    }
+    return turns;
+  } catch {
+    return 0;
+  }
 }
 
 export function compareSemver(a: string, b: string): number {
