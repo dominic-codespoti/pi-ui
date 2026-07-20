@@ -13,7 +13,9 @@
   import List from '@lucide/svelte/icons/list';
   import Trash from '@lucide/svelte/icons/trash';
   import Send from '@lucide/svelte/icons/send';
+  import X from '@lucide/svelte/icons/x';
   import * as Tooltip from '$lib/components/ui/tooltip';
+  import { Button } from '$lib/components/ui/button';
   import type { UIMessage } from '$lib/client-messages';
   import { renderMarkdown, highlightCode } from '$lib/markdown';
   import { formatRelativeDate as formatDate } from '$lib/utils';
@@ -73,6 +75,7 @@
     onProjectPickerClose,
     onInsertShortcut,
     onEditMessage,
+    onDismissNotice,
   }: {
     messages: UIMessage[];
     sessionLoading: boolean;
@@ -105,6 +108,7 @@
     onProjectPickerClose: () => void;
     onInsertShortcut: (text: string) => void;
     onEditMessage: (originalText: string, newText: string) => void;
+    onDismissNotice: (id: string) => void;
   } = $props();
   /** ID of message currently being edited, and its draft text */
   let editingId: string | null = $state(null);
@@ -600,7 +604,25 @@
 
       <!-- ── Notice ────────────────────────────────────────────────────── -->
       {:else if msg.role === 'notice'}
-        {#if msg.customType === 'slash_result'}
+        {#if msg.noticeKind === 'toast'}
+          <div class="msg-in my-1.5 flex items-start gap-2.5">
+            <div
+              class="flex-1 rounded-xl border-l-4 px-3.5 py-2.5 text-sm leading-relaxed select-text {(!msg.level || msg.level === 'info') ? 'border-info bg-info/[0.03]' : ''} {msg.level === 'warning' ? 'border-warning bg-warning/[0.04]' : ''} {msg.level === 'error' ? 'border-error bg-error/[0.04]' : ''}"
+            >
+              <div class="flex items-center gap-2">
+                <span class="flex-1 text-base-content/85">{msg.content}</span>
+                <span class="text-[10px] text-base-content/40 shrink-0">{formatDate(msg.createdAt)}</span>
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  class="shrink-0 -my-1"
+                  onclick={() => onDismissNotice(msg.id)}
+                  aria-label="Dismiss"
+                ><X class="w-3.5 h-3.5" /></Button>
+              </div>
+            </div>
+          </div>
+        {:else if msg.customType === 'slash_result'}
           <div class="msg-in my-2 px-4 py-3 bg-base-content/[0.04] border border-base-content/[0.06] rounded-xl font-mono text-[11px] leading-relaxed text-base-content/70 whitespace-pre-wrap break-words overflow-hidden select-text shadow-inner shadow-black/5">{msg.content}</div>
         {:else}
           <div class="msg-in flex items-center gap-2.5 text-[10px] text-base-content/45 select-none py-1">

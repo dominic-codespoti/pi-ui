@@ -632,6 +632,20 @@ export function parseComponentTree(
 }
 
 /**
+ * Keyboard-driven wrapper components often hide their actual controls in closures
+ * and expose only render() + handleInput(). Their parsed text is a terminal snapshot,
+ * not a static web component, so they must retain terminal input forwarding.
+ */
+export function shouldUseInteractiveCustom(
+  component: Record<string, unknown>,
+  parsed: ParsedComponent | null,
+): boolean {
+  if (typeof component.handleInput !== 'function') return false;
+  if (!parsed) return true;
+  return parsed.kind === 'text' && (!parsed.content || parsed.monoPreserve === true);
+}
+
+/**
  * Try to extract a label from a component or its surrounding context.
  * Looks for a `title` property, or extracts the first line of text content.
  */

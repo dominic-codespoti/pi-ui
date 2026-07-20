@@ -160,6 +160,8 @@ export interface ConnectedMessage {
   availableModels: ModelInfo[];
   /** Recent raw SDK message window at connect time. */
   messages: unknown[];
+  /** Partial SDK message currently being streamed; allows a switched session to resume rendering. */
+  streamingMessage?: unknown;
   /** Total number of messages in the session (may exceed messages.length). */
   totalMessageCount?: number;
   /** True when messages were truncated to limit initial payload size. */
@@ -317,8 +319,11 @@ export type ClientMessage =
   | { type: 'file_complete'; query: string }
   /** Request extension-registered autocomplete items for a trigger character. */
   | { type: 'get_extension_autocomplete'; trigger: string; query: string }
-  /** Forward a keyboard event to an interactive custom component (ConversationViewer etc). */
-  | { type: 'extension_custom_input'; id: string; key: string; alt?: boolean; ctrl?: boolean; meta?: boolean; shift?: boolean }
+  /** Forward raw terminal input to an interactive custom component (ConversationViewer
+   * etc). `data` is the exact byte sequence a real terminal would send for the
+   * keystroke/paste — see `$lib/terminal-key-encoder` — and is passed straight to
+   * the component's `handleInput()`. */
+  | { type: 'extension_custom_input'; id: string; data: string }
   /** Interaction with a parsed component inside an open custom() dialog — the
    * server invokes the corresponding LIVE callback (onSelect/onClick/onToggle/
    * onSubmit/updateValue) on the component at `path` and re-parses the tree. */

@@ -110,7 +110,7 @@ test.describe('Extension UI modals', () => {
     await expect(page.getByPlaceholder('Your name...')).toBeVisible();
   });
 
-  test('shows toast notification', async ({ page }) => {
+  test('shows notify() message inline in chat', async ({ page }) => {
     await page.routeWebSocket('/ws', (ws) => {
       ws.onMessage((data) => {
         const msg = JSON.parse(String(data));
@@ -354,7 +354,7 @@ test.describe('Extension event visibility', () => {
     await login(page, 'test-password');
   });
 
-  test('shows a toast for warning extension_event', async ({ page }) => {
+  test('shows a chat notice for warning extension_event', async ({ page }) => {
     await page.routeWebSocket('/ws', (ws) => {
       ws.onMessage((data) => {
         const msg = JSON.parse(String(data));
@@ -371,7 +371,7 @@ test.describe('Extension event visibility', () => {
     await expect(page.getByText('Only 3 requests remaining')).toBeVisible();
   });
 
-  test('shows a toast for error extension_event', async ({ page }) => {
+  test('shows a chat notice for error extension_event', async ({ page }) => {
     await page.routeWebSocket('/ws', (ws) => {
       ws.onMessage((data) => {
         const msg = JSON.parse(String(data));
@@ -388,7 +388,7 @@ test.describe('Extension event visibility', () => {
     await expect(page.getByText('Invalid API key')).toBeVisible();
   });
 
-  test('does NOT show a toast for info extension_event', async ({ page }) => {
+  test('does NOT show a chat notice for info extension_event', async ({ page }) => {
     await page.routeWebSocket('/ws', (ws) => {
       ws.onMessage((data) => {
         const msg = JSON.parse(String(data));
@@ -401,7 +401,7 @@ test.describe('Extension event visibility', () => {
 
     await submitPrompt(page, 'Trigger info');
 
-    // Wait a bit and confirm no toast appears
+    // Wait a bit and confirm no chat notice appears
     await page.waitForTimeout(2000);
     await expect(page.getByText('[ext] omp: heartbeat')).not.toBeVisible();
   });

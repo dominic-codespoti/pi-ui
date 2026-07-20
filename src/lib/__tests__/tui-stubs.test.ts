@@ -6,6 +6,7 @@ import {
   StubTui,
   parseComponentTree,
   callFactoryAndParse,
+  shouldUseInteractiveCustom,
 } from '../tui-stubs';
 import {
   Text,
@@ -298,6 +299,25 @@ describe('parseComponentTree — hand-rolled shapes', () => {
     if (result.kind === 'text') {
       expect(result.monoPreserve).toBe(true);
     }
+  });
+
+  it('keeps keyboard-driven render wrappers interactive', () => {
+    const component = {
+      render: () => ['Paste the redirect URL below', '>'],
+      handleInput: () => {},
+    };
+    const parsed = parseComponentTree(component as unknown as Record<string, unknown>);
+    expect(shouldUseInteractiveCustom(component, parsed)).toBe(true);
+  });
+
+  it('keeps structured inputs in native web rendering', () => {
+    const component = {
+      getValue: () => '',
+      setValue: () => {},
+      handleInput: () => {},
+    };
+    const parsed = parseComponentTree(component as unknown as Record<string, unknown>);
+    expect(shouldUseInteractiveCustom(component, parsed)).toBe(false);
   });
 
   it('accepts base64Data as the Image data field', () => {

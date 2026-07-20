@@ -28,7 +28,7 @@ import { log } from './src/lib/server/logger.ts';
 import { trimMessagesForWire } from './src/lib/server/wire-messages.ts';
 import { initSessionScanCache, scanAllSessions, scanSessionsForCwd, type SessionFileInfo } from './src/lib/server/session-scan.ts';
 import type { ClientMessage, ModelInfo, ProjectInfo, ProviderInfo, SessionSummary, SkillSummary, PromptSummary, ExtensionSummary, UpdatePackageStatus, UpdateStatus, UpdateTarget } from './src/lib/ws/protocol.ts';
-import { callFactoryAndParse, parseComponentTree, StubTui, stubKeybindings, stubTui, stubTheme, stripAnsi, ansiToHtml, type ParsedComponent } from './src/lib/tui-stubs.ts';
+import { callFactoryAndParse, parseComponentTree, shouldUseInteractiveCustom, StubTui, stubKeybindings, stubTui, stubTheme, stripAnsi, ansiToHtml, type ParsedComponent } from './src/lib/tui-stubs.ts';
 import ownPkgJson from './package.json' with { type: 'json' };
 
 const APP_ROOT = dirname(fileURLToPath(import.meta.url));
@@ -88,6 +88,12 @@ function initialMessages(messages: unknown[]): { msgs: unknown[]; total: number;
   const total = messages.length;
   const tail = total <= MAX_INITIAL_MESSAGES ? messages : messages.slice(-MAX_INITIAL_MESSAGES);
   return { msgs: trimMessagesForWire(tail), total, truncated: total > MAX_INITIAL_MESSAGES };
+}
+
+/** Current in-memory partial response, capped like history before it crosses the wire. */
+function streamingMessageForWire(session: AgentSession): unknown {
+  const message = session.agent.state.streamingMessage;
+  return message ? trimMessagesForWire([message])[0] : undefined;
 }
 
 const cwd = Bun.env.PI_CWD ?? process.cwd();
@@ -810,9 +816,9 @@ const uiContext: Omit<ExtensionUIContext, 'getEditorText'> & { getEditorText(): 
             parsed.kind === 'text' && !parsed.content
           );
 
-          // Interactive terminal emulation — only when component is keyboard-driven
-          // and static parsing couldn't produce meaningful content
-          if (typeof component.handleInput === 'function' && !parsedMeaningful) {
+          // Terminal wrappers can render meaningful text while hiding their real
+          // input control in a closure, so structured parsing cannot drive them.
+          if (shouldUseInteractiveCustom(component, parsed)) {
             interactiveCustomComponents.set(id, tui); // Store the TUI wrapper so we can route keys
 
             // Poll render every 200ms so sub-session events update the display
@@ -1567,6 +1573,7 @@ async function setActiveSession(newSession: AgentSession, newCwd?: string) {
     model: serializeModel(newSession.model),
     availableModels: (await newSession.modelRuntime.getAvailable()).map(serializeModel),
     messages: init.msgs,
+    streamingMessage: streamingMessageForWire(newSession),
     totalMessageCount: init.total,
     messagesTruncated: init.truncated,
     cwd: newSession.sessionManager.getCwd() || cwd,
@@ -1687,6 +1694,7 @@ try {
             model: serializeModel(sess.model),
             availableModels,
             messages,
+            streamingMessage: streamingMessageForWire(sess),
             totalMessageCount: init.total,
             messagesTruncated: truncated,
             cwd: sess.sessionManager.getCwd() || cwd,
@@ -1957,20 +1965,16 @@ try {
 
         case 'extension_custom_input': {
           const customId = msg.id as string | undefined;
-          if (!customId) break;
+          const data = msg.data as string | undefined;
+          if (!customId || data === undefined) break;
           const component = interactiveCustomComponents.get(customId);
           if (!component) break;
           try {
-            const keystroke = {
-              key: msg.key as string,
-              alt: !!msg.alt,
-              ctrl: !!msg.ctrl,
-              meta: !!msg.meta,
-              shift: !!msg.shift,
-            };
-            // If it's our StubTui wrapper, it has the routing logic
+            // `data` is the raw terminal byte sequence the browser encoded for
+            // this keystroke/paste (see src/lib/terminal-key-encoder.ts) — pass
+            // it straight through, exactly as real stdin would deliver it.
             if (typeof component.handleInput === 'function') {
-              component.handleInput(keystroke);
+              component.handleInput(data);
             }
             // Re-render and broadcast updated lines
             const rawLines = typeof component.render === 'function' ? component.render(80) : [];

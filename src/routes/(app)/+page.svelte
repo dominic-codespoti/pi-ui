@@ -30,6 +30,7 @@
     type UIMessage,
   } from '$lib/client-messages';
   import { saveSnapshot, loadSnapshot } from '$lib/session-snapshot';
+  import { encodeTerminalKey, wrapBracketedPaste } from '$lib/terminal-key-encoder';
   import * as Tooltip from '$lib/components/ui/tooltip';
   import { Switch } from '$lib/components/ui/switch';
   import * as Dialog from '$lib/components/ui/dialog';
@@ -43,7 +44,6 @@
   import MessageList from '$lib/components/chat/message-list.svelte';
   import RightPanel from '$lib/components/panels/right-panel.svelte';
   import ExtensionComponent from '$lib/components/ui/extension-component.svelte';
-  import ToastContainer from '$lib/components/dialogs/toast-container.svelte';
   import ForkDialog from '$lib/components/dialogs/fork-dialog.svelte';
   import SessionTreeModal from '$lib/components/dialogs/session-tree-modal.svelte';
   import ConfirmDialog from '$lib/components/dialogs/confirm-dialog.svelte';
@@ -56,6 +56,9 @@
   import PiIcon from '@lucide/svelte/icons/pi';
   import RefreshCw from '@lucide/svelte/icons/refresh-cw';
   import Bell from '@lucide/svelte/icons/bell';
+  import Cpu from '@lucide/svelte/icons/cpu';
+  import Wrench from '@lucide/svelte/icons/wrench';
+  import BookOpen from '@lucide/svelte/icons/book-open';
 
   // ── Provider colour chips ────────────────────────────────────────────────────
 
@@ -264,7 +267,6 @@
   let modalInput = $state('');
   let modalFocusEl = $state<HTMLElement | undefined>(undefined);
   let preparedModalId = $state<string | null>(null);
-  let overlayTypingLine = $state('');
   let focusedModalId = $state<string | null>(null);
 
   // Sync modalInput when the active modal changes — avoids overwriting input
@@ -279,7 +281,6 @@
     preparedModalId = m.id;
     if (m.method === 'custom' && m.interactive) {
       modalInput = '';
-      overlayTypingLine = '';
     } else if (m.method === 'editor') {
       modalInput = m.prefill ?? '';
     } else if (m.method !== 'confirm') {
@@ -294,8 +295,13 @@
       return;
     }
     if (focusedModalId === m.id || !modalFocusEl) return;
-    modalFocusEl.focus();
-    focusedModalId = m.id;
+    // A custom overlay replaces the prior modal input. Focus after that DOM
+    // update, otherwise a stale, hidden input can receive focus instead.
+    void tick().then(() => {
+      if (modal?.id !== m.id || focusedModalId === m.id || !modalFocusEl) return;
+      modalFocusEl.focus({ preventScroll: true });
+      focusedModalId = m.id;
+    });
   });
 
   // ── File viewer modal state ──────────────────────────────────────────────
@@ -412,8 +418,6 @@
 
   // ── Extension UI state ───────────────────────────────────────────────────────
 
-  type Toast = { id: string; message: string; type: 'info' | 'warning' | 'error' };
-  let toasts = $state<Toast[]>([]);
   /** Keyed status texts from extension setStatus() calls. */
   let extensionStatuses = $state<Record<string, string>>({});
   /** Keyed widget panels from extension setWidget() calls. */
@@ -1309,7 +1313,7 @@
       stopHeartbeat();
       if (_intentionalClose) return;
       if (!_wsHandshakeComplete && event.code === 1011) {
-        addToast(`Server initialization failed: ${event.reason || 'unknown error'}`, 'error');
+        showChatNotice(`Server initialization failed: ${event.reason || 'unknown error'}`, 'error');
       }
       wsState = 'connecting';
       // Seal any streaming notices (compaction, retry) that would otherwise
@@ -1451,7 +1455,20 @@
     if ('sessionPath' in payload) sessionPath = payload.sessionPath as string | undefined;
     if ('messages' in payload) {
       const raw = (payload.messages as unknown[]) ?? [];
-      messages = rawMessagesToUI(raw);
+      const streamingMessage = payload.streamingMessage;
+      messages = rawMessagesToUI(
+        streamingMessage === undefined ? raw : [...raw, streamingMessage],
+      );
+      activeStreamMsg = null;
+      if (streamingMessage !== undefined && isStreaming) {
+        for (let i = messages.length - 1; i >= 0; i--) {
+          if (messages[i].role === 'assistant') {
+            messages[i].streaming = true;
+            activeStreamMsg = messages[i];
+            break;
+          }
+        }
+      }
       totalRawMessagesLoaded = raw.length;
       if ('totalMessageCount' in payload) totalMessageCount = payload.totalMessageCount as number;
       if ('messagesTruncated' in payload) messagesTruncated = Boolean(payload.messagesTruncated);
@@ -1586,7 +1603,7 @@
 
       case 'sessions_error': {
         const errMsg = (msg as Record<string, unknown>).message ?? 'Unknown session error';
-        addToast(errMsg as string, 'warning');
+        showChatNotice(errMsg as string, 'warning');
         sessionLoading = false;
         projectsState.sessionLoading = false;
         projectsState.handleMessage(msg as PiEvent);
@@ -1655,7 +1672,7 @@
         activeStreamMsg = null;
         releaseWakeLock();
         const errMsg = (msg as { error?: string }).error ?? 'Unknown error';
-        addToast(`Agent error: ${errMsg}`, 'error');
+        showChatNotice(`Agent error: ${errMsg}`, 'error');
         break;
       }
 
@@ -1817,9 +1834,9 @@
 
         // Non-blocking extension methods (fire-and-forget, no modal response needed):
         if (method === 'notify') {
-          addToast(
+          showChatNotice(
             (msg.message as string | undefined) ?? '',
-            (msg.notifyType as Toast['type'] | undefined) ?? 'info'
+            (msg.notifyType as 'info' | 'warning' | 'error' | undefined) ?? 'info'
           );
         } else if (method === 'setStatus') {
           const key = msg.statusKey as string | undefined;
@@ -2228,8 +2245,6 @@
           streaming: false,
           createdAt: Date.now(),
         });
-        if (result.level && result.level !== 'info')
-          addToast(result.message.split('\n')[0], result.level);
         break;
       }
 
@@ -2243,7 +2258,7 @@
         };
         if (ev.level === 'error' || ev.level === 'warning') {
           const body = ev.message ? `: ${ev.message}` : '';
-          addToast(`[ext] ${ev.source}: ${ev.event}${body}`, ev.level);
+          showChatNotice(`[ext] ${ev.source}: ${ev.event}${body}`, ev.level);
         }
         break;
       }
@@ -2277,9 +2292,9 @@
         const fs = msg as { type: 'file_saved'; path: string; error?: string };
         fileSaving = false;
         if (fs.error) {
-          addToast(`Failed to save ${fs.path}: ${fs.error}`, 'error');
+          showChatNotice(`Failed to save ${fs.path}: ${fs.error}`, 'error');
         } else {
-          addToast(`Saved ${fs.path}`, 'info');
+          showChatNotice(`Saved ${fs.path}`, 'info');
           // Re-read only if the saved file is still the one being viewed.
           if (fs.path === fileViewerPath) {
             fileViewerLoading = true;
@@ -2419,40 +2434,10 @@
     }
   }
 
-  /** Handles keydown inside the modal (Enter submits, Esc cancels, interactive custom gets forwarded). */
+  /** Handles keydown inside the modal (Enter submits, Esc cancels). The
+   *  interactive custom overlay is a separate DOM tree (see `overlayKeydown`) —
+   *  this dialog is never open at the same time as that overlay. */
   function modalContentKeydown(e: KeyboardEvent) {
-    if (modal?.method === 'custom' && modal.interactive) {
-      e.preventDefault();
-      if (e.key === 'Escape') {
-        modalCancel();
-        return;
-      }
-      const keyMap: Record<string, string> = {
-        ArrowUp: 'up',
-        ArrowDown: 'down',
-        ArrowLeft: 'left',
-        ArrowRight: 'right',
-        PageUp: 'pageup',
-        PageDown: 'pagedown',
-        Home: 'home',
-        End: 'end',
-        Enter: 'enter',
-        ' ': 'space',
-      };
-      send({
-        type: 'extension_custom_input',
-        id: modal.id,
-        key: keyMap[e.key] || e.key,
-        alt: e.altKey,
-        ctrl: e.ctrlKey,
-        meta: e.metaKey,
-        shift: e.shiftKey,
-      });
-      if (e.key === 'Escape') {
-        modalCancel();
-      }
-      return;
-    }
     if (e.key === 'Enter' && !e.shiftKey && modal?.method !== 'editor') {
       e.preventDefault();
       if (modal?.method === 'confirm') modalConfirm(true);
@@ -2460,70 +2445,48 @@
     }
   }
   /** Handles keydown on the hidden input in the interactive custom overlay.
-   *  Forwards keystrokes to the extension and updates the echo line. */
+   *  Encodes it as a real terminal byte sequence and forwards it to the
+   *  extension's pi-tui component — see `$lib/terminal-key-encoder`. */
   function overlayKeydown(e: KeyboardEvent) {
     if (modal?.method !== 'custom' || !modal.interactive) return;
-    e.preventDefault();
+    // Let the IME finish composing; `overlayCompositionEnd` forwards the
+    // finalized text once composition ends.
+    if (e.isComposing) return;
     if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
       modalCancel();
       return;
     }
-    const keyMap: Record<string, string> = {
-      ArrowUp: 'up',
-      ArrowDown: 'down',
-      ArrowLeft: 'left',
-      ArrowRight: 'right',
-      PageUp: 'pageup',
-      PageDown: 'pagedown',
-      Home: 'home',
-      End: 'end',
-      Enter: 'enter',
-      ' ': 'space',
-      Backspace: 'backspace',
-      Delete: 'delete',
-      Tab: 'tab',
-    };
-    send({
-      type: 'extension_custom_input',
-      id: modal.id,
-      key: keyMap[e.key] || e.key,
-      alt: e.altKey,
-      ctrl: e.ctrlKey,
-      meta: e.metaKey,
-      shift: e.shiftKey,
-    });
-    // Update the echo line to reflect typed/deleted text
-    if (e.key === 'Backspace') {
-      overlayTypingLine = overlayTypingLine.slice(0, -1);
-    } else if (e.key === 'Delete') {
-      // delete does nothing in a single-line echo, server handles it
-    } else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) {
-      overlayTypingLine += e.key;
-    } else if (e.key === 'Enter') {
-      overlayTypingLine = '';
-    }
+    const data = encodeTerminalKey(e);
+    if (data === null) return; // unsupported key — leave default browser behavior alone
+    e.preventDefault();
+    e.stopPropagation();
+    send({ type: 'extension_custom_input', id: modal.id, data });
+    // The hidden input is uncontrolled; clear anything it may have picked up.
+    if (modalFocusEl instanceof HTMLInputElement) modalFocusEl.value = '';
   }
 
-  /** Handles paste in the hidden input — sends each character as a keystroke. */
+  /** Handles paste in the hidden input — forwards the clipboard text as a
+   *  single bracketed paste so multi-line content (and embedded newlines)
+   *  is inserted literally instead of being parsed as separate keystrokes. */
   function overlayPaste(e: ClipboardEvent) {
     if (modal?.method !== 'custom' || !modal.interactive) return;
     e.preventDefault();
     const text = e.clipboardData?.getData('text') ?? '';
     if (!text) return;
-    for (const ch of text) {
-      send({
-        type: 'extension_custom_input',
-        id: modal!.id,
-        key: ch,
-        alt: false,
-        ctrl: false,
-        meta: false,
-        shift: false,
-      });
-    }
-    overlayTypingLine += text;
+    send({ type: 'extension_custom_input', id: modal.id, data: wrapBracketedPaste(text) });
   }
 
+  /** Handles IME composition end (CJK, emoji picker, etc.) in the hidden
+   *  input — forwards the finalized text as a single bracketed paste. */
+  function overlayCompositionEnd(e: CompositionEvent) {
+    if (modal?.method !== 'custom' || !modal.interactive) return;
+    if (modalFocusEl instanceof HTMLInputElement) modalFocusEl.value = '';
+    const text = e.data;
+    if (!text) return;
+    send({ type: 'extension_custom_input', id: modal.id, data: wrapBracketedPaste(text) });
+  }
 
   // ── Model & session actions ──────────────────────────────────────────────────
 
@@ -2759,6 +2722,12 @@
       const el = document.activeElement as HTMLElement | null;
       return el?.tagName === 'TEXTAREA' || el?.tagName === 'INPUT' || el?.isContentEditable;
     };
+    // Preserve custom terminal input even if focus briefly falls through to
+    // the composer while the overlay is mounting.
+    if (modal?.method === 'custom' && modal.interactive) {
+      overlayKeydown(e);
+      return;
+    }
 
     // Escape — dismiss modal or close open panels
     if (e.key === 'Escape') {
@@ -2811,7 +2780,7 @@
       const idx = (availableThinkingLevels as readonly string[]).indexOf(current);
       const next = availableThinkingLevels[(idx + 1) % availableThinkingLevels.length];
       pickThinkingLevel(next);
-      addToast(`Thinking level: ${next}`, 'info');
+      showChatNotice(`Thinking level: ${next}`, 'info');
       return;
     }
 
@@ -2911,14 +2880,14 @@
       } else {
         const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
         if (!TEXT_FILE_EXTENSIONS.has(ext)) {
-          addToast(
+          showChatNotice(
             `Unsupported file type: ${file.name} (only text files and images are supported)`,
             'warning'
           );
           continue;
         }
         if (file.size > 1024 * 1024) {
-          addToast(`File too large: ${file.name} (max 1MB)`, 'warning');
+          showChatNotice(`File too large: ${file.name} (max 1MB)`, 'warning');
           continue;
         }
         const content = await fileToText(file);
@@ -2936,18 +2905,24 @@
     attachedFiles.splice(idx, 1);
   }
 
-  function addToast(message: string, type: Toast['type'] = 'info') {
-    const id = uid();
-    toasts.push({ id, message, type });
-    setTimeout(() => {
-      const idx = toasts.findIndex((t) => t.id === id);
-      if (idx >= 0) toasts.splice(idx, 1);
-    }, 5000);
+  /** Shows a transient status/error message inline in the chat transcript
+   *  instead of a corner toast. Client-only — never sent to the session, so
+   *  it does not persist past a reload. */
+  function showChatNotice(message: string, level: 'info' | 'warning' | 'error' = 'info') {
+    messages.push({
+      id: uid(),
+      role: 'notice',
+      content: message,
+      noticeKind: 'toast',
+      level,
+      streaming: false,
+      createdAt: Date.now(),
+    });
   }
 
-  function dismissToast(id: string) {
-    const idx = toasts.findIndex((t) => t.id === id);
-    if (idx >= 0) toasts.splice(idx, 1);
+  function dismissChatNotice(id: string) {
+    const idx = messages.findIndex((m) => m.id === id);
+    if (idx >= 0) messages.splice(idx, 1);
   }
 
   function dismissWidget(key: string) {
@@ -3092,11 +3067,11 @@
       case 'copy': {
         const last = [...messages].reverse().find((m) => m.role === 'assistant' && m.content);
         if (last) copyMessage(last);
-        else addToast('No assistant message to copy yet.', 'warning');
+        else showChatNotice('No assistant message to copy yet.', 'warning');
         return true;
       }
       case 'hotkeys':
-        addToast(
+        showChatNotice(
           'Shortcuts: Enter sends, Shift+Enter newline, Cmd/Ctrl+B opens sessions, Cmd/Ctrl+K opens model picker.',
           'info'
         );
@@ -3606,16 +3581,7 @@
           >
             <span
               class="w-10 h-full flex items-center justify-center border-r border-base-content/8"
-              ><svg
-                class="w-4 h-4"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="2"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-                ><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /></svg
-              ></span
+              ><Cpu class="w-4 h-4" /></span
             >
             <span class="w-8 h-full flex items-center justify-center"
               ><svg
@@ -3768,18 +3734,7 @@
                     : 'text-base-content/45 hover:text-base-content/75 hover:bg-base-content/8'}"
                   aria-label="Toggle resources panel"
                   aria-expanded={showRightPanel && rightPanelTab === 'skills'}
-                  ><svg
-                    class="w-4 h-4"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="2"
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                    ><path d="M12 3 4 7l8 4 8-4-8-4Z" /><path d="m4 12 8 4 8-4" /><path
-                      d="m4 17 8 4 8-4"
-                    /></svg
-                  ></button
+                  ><BookOpen class="w-4 h-4" /></button
                 >
               {/snippet}
             </Tooltip.Trigger>
@@ -3797,16 +3752,7 @@
                     : 'text-base-content/45 hover:text-base-content/75 hover:bg-base-content/8'}"
                   aria-label="Toggle tools panel"
                   aria-expanded={showRightPanel && rightPanelTab === 'tools'}
-                  ><svg
-                    class="w-4 h-4"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="2"
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                    ><path d="M4 17h16" /><path d="m8 13-4-4 4-4" /><path d="m16 5 4 4-4 4" /></svg
-                  ></button
+                  ><Wrench class="w-4 h-4" /></button
                 >
               {/snippet}
             </Tooltip.Trigger>
@@ -3874,7 +3820,7 @@
               {#snippet child({ props })}
                 <button
                   {...props}
-                  class="h-9 w-9 flex items-center justify-center rounded-lg transition-colors relative {wsState ===
+                  class="h-9 w-9 hidden sm:flex items-center justify-center rounded-lg transition-colors relative {wsState ===
                   'open'
                     ? 'text-base-content/45 hover:text-base-content/75 hover:bg-base-content/8'
                     : wsState === 'connecting'
@@ -4056,6 +4002,7 @@
             tick().then(() => inputEl?.focus());
           }}
           onEditMessage={editMessage}
+          onDismissNotice={dismissChatNotice}
         />
       </main>
 
@@ -5494,55 +5441,52 @@
     <!-- ── Interactive custom component full overlay (ConversationViewer etc.) ── -->
     {#if modal?.method === 'custom' && modal.interactive}
       <div
-        class="fixed inset-0 z-[60] flex flex-col bg-base-100/95 backdrop-blur-sm"
-        role="dialog"
-        aria-label={modal.title}
-        tabindex="-1"
+        class="fixed inset-0 z-[60] flex items-center justify-center bg-base-100/65 px-3 py-4 backdrop-blur-sm"
       >
         <div
-          class="flex items-center justify-between gap-3 px-4 py-3 border-b border-base-content/10 shrink-0"
-        >
-          <div class="min-w-0">
-            <p class="text-[10px] uppercase tracking-[0.18em] text-base-content/35">Extension UI</p>
-            <h2 class="text-sm font-semibold text-base-content/80 truncate">{modal.title}</h2>
-          </div>
-          <Button
-            variant="ghost"
-            size="icon-xs"
-            onclick={modalCancel}
-            aria-label="Close extension overlay"
-          >
-            <X class="w-4 h-4" />
-          </Button>
-        </div>
-        <div class="flex-1 overflow-y-auto px-4 py-3">
-          <pre
-            class="text-xs text-base-content/65 whitespace-pre-wrap leading-relaxed font-mono select-text"
-          >{#if modal.htmlLines}{#each modal.htmlLines as line, i (i)}<div>{@html line || '&nbsp;'}</div>{/each}{:else}{(modal.lines ?? []).join('\n')}{/if}</pre>
-        </div>
-        <!-- Hidden input to capture keystrokes and paste events -->
-        <input
-          type="text"
-          class="sr-only"
-          aria-hidden="true"
+          class="flex w-full max-w-3xl flex-col overflow-hidden rounded-xl border border-base-content/15 bg-base-100 shadow-2xl"
+          role="dialog"
+          aria-label={modal.title}
           tabindex="-1"
-          onkeydown={overlayKeydown}
-          onpaste={overlayPaste}
-          bind:this={modalFocusEl}
-        />
-        {#if overlayTypingLine}
-          <div
-            class="shrink-0 px-4 py-1.5 border-t border-base-content/10 font-mono text-xs text-base-content/70"
-          >
-            <span class="text-primary/60">❯</span> {overlayTypingLine}<span
-              class="inline-block w-2 h-4 bg-primary/50 animate-pulse align-middle ml-px"></span>
-          </div>
-        {/if}
-        <div
-          class="shrink-0 px-4 py-2 border-t border-base-content/10 flex items-center justify-between text-[10px] text-muted-foreground/45"
         >
-          <span>Type or paste text · Arrow keys & Enter sent to extension · Esc closes</span>
-          <span>{modal.lines?.length ?? 0} lines</span>
+          <div
+            class="flex items-center justify-between gap-3 px-4 py-3 border-b border-base-content/10 shrink-0"
+          >
+            <div class="min-w-0">
+              <p class="text-[10px] uppercase tracking-[0.18em] text-base-content/35">Extension UI</p>
+              <h2 class="text-sm font-semibold text-base-content/80 truncate">{modal.title}</h2>
+            </div>
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              onclick={modalCancel}
+              aria-label="Close extension overlay"
+            >
+              <X class="w-4 h-4" />
+            </Button>
+          </div>
+          <div class="max-h-[min(24rem,calc(100dvh-11rem))] overflow-y-auto px-4 py-3">
+            <pre
+              class="text-xs text-base-content/65 whitespace-pre-wrap leading-relaxed font-mono select-text"
+            >{#if modal.htmlLines}{#each modal.htmlLines as line, i (i)}<div>{@html line || '&nbsp;'}</div>{/each}{:else}{(modal.lines ?? []).join('\n')}{/if}</pre>
+          </div>
+          <!-- Hidden input to capture keystrokes, paste, and IME composition. -->
+          <input
+            type="text"
+            class="sr-only"
+            aria-hidden="true"
+            tabindex="-1"
+            onkeydown={overlayKeydown}
+            onpaste={overlayPaste}
+            oncompositionend={overlayCompositionEnd}
+            bind:this={modalFocusEl}
+          />
+          <div
+            class="shrink-0 px-4 py-2 border-t border-base-content/10 flex items-center justify-between text-[10px] text-muted-foreground/45"
+          >
+            <span>Type or paste text · Arrow keys & Enter sent to extension · Esc closes</span>
+            <span>{modal.lines?.length ?? 0} lines</span>
+          </div>
         </div>
       </div>
     {/if}
@@ -5559,10 +5503,6 @@
     <p class="font-mono text-base-content/35 text-xs">reconnecting automatically</p>
   </div>
 {/if}
-
-<!-- ── Toast notifications ─────────────────────────────────────────────────── -->
-<ToastContainer {toasts} {dismissToast} />
-
 <!-- ── Extension UI modal ─────────────────────────────────────────────────────── -->
 <Dialog.Root
   open={!!modal && !(modal.method === 'custom' && modal.interactive)}
@@ -5571,12 +5511,17 @@
   }}
 >
   <Dialog.Content
-    class="max-w-[min(34rem,calc(100vw-1.5rem))]"
+    class="max-w-[min(30rem,calc(100vw-1.5rem))] gap-0 overflow-hidden p-0 shadow-2xl ring-primary/12"
     showCloseButton={false}
     onkeydown={modalContentKeydown}
   >
-    <Dialog.Header>
-      <div class="flex items-center justify-between gap-3">
+    <Dialog.Header class="px-5 pt-5 pb-4">
+      <div class="flex items-center gap-3">
+        <div
+          class="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary/12 text-primary"
+        >
+          <Blocks class="h-4 w-4" />
+        </div>
         <div class="min-w-0">
           <p class="text-[10px] uppercase tracking-[0.18em] text-muted-foreground/60">
             Extension UI
@@ -5597,27 +5542,27 @@
         type="text"
         bind:value={modalInput}
         placeholder={modal.placeholder ?? ''}
-        class="w-full bg-transparent border-b border-border focus:border-foreground/60 outline-none py-2 text-sm placeholder-muted-foreground transition-colors"
+        class="dialog-input mx-5 mb-5 w-[calc(100%-2.5rem)] rounded-xl px-3.5 py-2.5 text-sm outline-none placeholder-muted-foreground transition-colors"
       />
     {:else if modal?.method === 'select'}
       {#if modal.options.length > 0}
-        <div class="space-y-1 max-h-60 overflow-y-auto">
+        <div class="mx-5 mb-5 space-y-1.5 max-h-60 overflow-y-auto">
           {#each modal.options as opt (opt)}
             <button
-              class="w-full text-left px-3 py-2.5 rounded-lg text-sm text-muted-foreground hover:bg-accent hover:text-accent-foreground transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+              class="w-full text-left px-3.5 py-2.5 rounded-xl border border-transparent text-sm text-base-content/75 transition-all duration-150 hover:border-primary/25 hover:bg-primary/8 hover:text-base-content focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
               onclick={() => modalSelectOption(opt)}>{opt}</button
             >
           {/each}
         </div>
       {:else}
-        <p class="text-sm text-muted-foreground">No options were provided.</p>
+        <p class="px-5 pb-5 text-sm text-muted-foreground">No options were provided.</p>
       {/if}
     {:else if modal?.method === 'editor'}
       <textarea
         bind:this={modalFocusEl}
         bind:value={modalInput}
         rows={8}
-        class="w-full bg-transparent border border-border focus:border-foreground/60 outline-none p-3 text-sm leading-relaxed resize-none rounded-lg transition-colors"
+        class="dialog-input mx-5 mb-5 w-[calc(100%-2.5rem)] rounded-xl p-3.5 text-sm leading-relaxed resize-none transition-colors"
       ></textarea>
     {:else if modal?.method === 'custom'}
       {#if modal.parsed}
@@ -5633,23 +5578,23 @@
             type="text"
             bind:value={modalInput}
             placeholder="Type your response…"
-            class="mt-3 w-full bg-transparent border-b border-border focus:border-foreground/60 outline-none py-2 text-sm placeholder-muted-foreground transition-colors"
+            class="dialog-input mx-5 mb-5 w-[calc(100%-2.5rem)] rounded-xl px-3.5 py-2.5 text-sm placeholder-muted-foreground transition-colors"
           />
         {/if}
       {:else}
-        <p class="text-sm text-muted-foreground mb-2">Extension request:</p>
+        <p class="px-5 text-sm text-muted-foreground mb-2">Extension request:</p>
         <input
           bind:this={modalFocusEl}
           type="text"
           bind:value={modalInput}
           placeholder="Type your response…"
-          class="w-full bg-transparent border-b border-border focus:border-foreground/60 outline-none py-2 text-sm placeholder-muted-foreground transition-colors"
+          class="dialog-input mx-5 mb-5 w-[calc(100%-2.5rem)] rounded-xl px-3.5 py-2.5 text-sm placeholder-muted-foreground transition-colors"
         />
       {/if}
     {/if}
 
-    <Dialog.Footer>
-      <Button variant="ghost" size="sm" onclick={modalCancel}>Cancel</Button>
+    <Dialog.Footer class="mt-0">
+      <Button variant="ghost" size="sm" class="text-muted-foreground/80 hover:text-base-content" onclick={modalCancel}>Cancel</Button>
       {#if modal?.method === 'confirm'}
         <Button size="sm" onclick={() => modalConfirm(true)}>Confirm</Button>
       {:else if modal?.method === 'input' || modal?.method === 'editor'}

@@ -91,6 +91,47 @@ test.describe('Chat / prompt streaming', () => {
     await expect(page.getByText('Hi there!')).toBeVisible({ timeout: 3000 });
   });
 
+  test('resumes an in-progress response after switching sessions', async ({ page }) => {
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.onMessage(() => {});
+      ws.send(JSON.stringify({
+        type: 'connected',
+        sessionId: 's1',
+        isStreaming: false,
+        thinkingLevel: 'medium',
+        model: null,
+        availableModels: [],
+        messages: [],
+      }));
+      setTimeout(() => {
+        ws.send(JSON.stringify({
+          type: 'session_loaded',
+          sessionId: 's2',
+          isStreaming: true,
+          thinkingLevel: 'medium',
+          model: null,
+          availableModels: [],
+          messages: [{ role: 'user', content: 'Continue', timestamp: Date.now() }],
+          streamingMessage: {
+            role: 'assistant',
+            content: [{ type: 'text', text: 'Partial' }],
+            timestamp: Date.now(),
+          },
+        }));
+        ws.send(JSON.stringify({
+          type: 'message_update',
+          sessionId: 's2',
+          message: { role: 'assistant' },
+          assistantMessageEvent: { type: 'text_delta', delta: ' response' },
+        }));
+      }, 50);
+    });
+
+    await page.goto('/');
+
+    await expect(page.getByText('Partial response')).toBeVisible({ timeout: 3000 });
+  });
+
   test('shows thinking deltas', async ({ page }) => {
     await page.routeWebSocket('/ws', (ws) => {
       let streaming = false;

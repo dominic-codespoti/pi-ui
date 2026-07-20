@@ -27,7 +27,7 @@ export type UIMessage = {
   endMs?: number;
   thinkingStartMs?: number;
   detailExpanded?: boolean;
-  noticeKind?: 'compaction' | 'retry' | 'custom' | 'abort';
+  noticeKind?: 'compaction' | 'retry' | 'custom' | 'abort' | 'toast';
   customType?: string;
   renderedContent?: string;
   renderedThinking?: string;
