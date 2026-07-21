@@ -6,7 +6,11 @@ const config = {
   preprocess: vitePreprocess(),
   kit: {
     adapter: adapter({ precompress: true }),
-    csrf: { checkOrigin: false, trustedOrigins: [] },
+    // trustedOrigins: ['*'] fully disables CSRF origin checking — same intent
+    // as the removed checkOrigin: false. Bun's URL construction conflicts
+    // with SvelteKit's origin check; the login server action has its own
+    // origin check instead (see hooks.server.ts / login +page.server.ts).
+    csrf: { trustedOrigins: ['*'] },
   },
 };
 

@@ -18,7 +18,7 @@ Bun server bridges pi SDK events to browser over WebSocket. Key flow: CLI → se
 - Lazy SDK load (~136 MB) on first WS connect; lazy SvelteKit handler (~30 MB) on first HTTP
 - Session pool with LRU idle cleanup (30 min); navigated-away idle sessions are additionally released after a 2-min grace (`scheduleNavOutDisposal`) unless running/unseen/queued/in-memory — switching back re-opens from disk
 - Extension UI requests block session until response (5 min timeout)
-- CSRF disabled (`checkOrigin: false`) — Bun URL construction conflicts with SvelteKit's check; server action has own origin check. See `sveltekit-bun-csrf-fix` skill.
+- CSRF disabled (`csrf.trustedOrigins: ['*']` in `svelte.config.js`) — Bun URL construction conflicts with SvelteKit's origin check; login server action has its own origin check.
 - Message editing via `edit_message` — rewinds session via `navigateTree()`, resends. See `pi-sdk-session-manipulation` skill.
 - History payloads (`connected`/`session_loaded`/`older_messages`) are size-bounded: last 100 messages, plus per-block 80 KB cap on text/thinking via `src/lib/server/wire-messages.ts`; a failed `connected` send retries without history instead of closing the socket
 - Session lists never use SDK `SessionManager.list/listAll` (they load every file fully and build `allMessagesText` — OOM risk at multi-hundred-MB stores); `src/lib/server/session-scan.ts` streams line-by-line with a per-file (mtime,size) cache persisted to `~/.pi/agent/pi-ui-session-scan.json` (restarts are stat-only, ≤2 ms warm), fronted by a 15 s TTL cache in server.ts (`listAllSessions`/`listSessionsFor`), invalidated on session mutations
