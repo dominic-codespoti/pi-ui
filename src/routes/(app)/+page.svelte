@@ -3358,6 +3358,23 @@
     }
     connect();
     inputEl?.focus();
+    // Web Share Target (static/manifest.webmanifest → share_target, method GET,
+    // action "/") lands here as ?share_title=&share_text=&share_url= — fold
+    // whatever's present into the composer, then scrub the params so a
+    // refresh doesn't re-populate it.
+    try {
+      const shareParams = new URLSearchParams(window.location.search);
+      const sharedTitle = shareParams.get('share_title');
+      const sharedText = shareParams.get('share_text');
+      const sharedUrl = shareParams.get('share_url');
+      if (sharedTitle || sharedText || sharedUrl) {
+        input = [sharedTitle, sharedText, sharedUrl].filter(Boolean).join('\n');
+        setUrlParams({ share_title: null, share_text: null, share_url: null });
+        tick().then(autoResizeTextarea);
+      }
+    } catch {
+      /* URL unavailable */
+    }
     _mq = window.matchMedia('(max-width: 767px)');
     isMobile = _mq.matches;
     _mqHandler = (e: MediaQueryListEvent) => {
