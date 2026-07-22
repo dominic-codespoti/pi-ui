@@ -1941,11 +1941,15 @@ try {
             await mkdir(targetCwd, { recursive: true });
             const sm = _sdk!.SessionManager.create(targetCwd);
             const src = activeSessionOrNull();
+            // No `model:` override here — createAgentSession() restores the
+            // model from this session's own persisted history (falling back to
+            // the global settings default when there's none), so switching
+            // sessions restores each session's own last-used model instead of
+            // inheriting whatever the previously-active session had selected.
             const { session: newSession } = await _sdk!.createAgentSession({
               cwd: targetCwd,
               sessionManager: sm,
               modelRuntime: src?.modelRuntime ?? (await ensureSession()).modelRuntime,
-              model: src?.model ?? (await ensureSession()).model,
             });
             await setActiveSession(newSession);
           } catch (err) {
@@ -1978,11 +1982,12 @@ try {
             }
             const sm = _sdk!.SessionManager.open(resolvedPath);
             const src = activeSessionOrNull();
+            // No `model:` override here — see the matching comment in
+            // 'new_session' above.
             const { session: newSession } = await _sdk!.createAgentSession({
               cwd: sm.getCwd() || cwd,
               sessionManager: sm,
               modelRuntime: src?.modelRuntime ?? (await ensureSession()).modelRuntime,
-              model: src?.model ?? (await ensureSession()).model,
             });
             await setActiveSession(newSession);
           } catch (err) {
