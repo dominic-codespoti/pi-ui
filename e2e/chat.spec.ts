@@ -91,6 +91,53 @@ test.describe('Chat / prompt streaming', () => {
     await expect(page.getByText('Hi there!')).toBeVisible({ timeout: 3000 });
   });
 
+  test('dispatches a slash command instead of steering while the agent is streaming', async ({ page }) => {
+    const wsMessages: string[] = [];
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.onMessage((data) => {
+        wsMessages.push(String(data));
+      });
+      ws.send(JSON.stringify({ type: 'connected', sessionId: 's1', isStreaming: true, thinkingLevel: 'medium', model: null, availableModels: [], messages: [] }));
+      ws.send(JSON.stringify({ type: 'projects_list', projects: [] }));
+      ws.send(JSON.stringify({ type: 'all_sessions_list', sessions: [] }));
+    });
+
+    await page.goto('/');
+
+    // Composer is in the streaming state (send button becomes steer). Typing
+    // a slash command must still dispatch as a command, not get steered into
+    // the agent's turn as literal text.
+    await page.fill('textarea', '/tree');
+    await page.getByLabel('Steer pi').click();
+
+    const parsed = wsMessages.map((m) => { try { return JSON.parse(m); } catch { return null; } });
+    expect(parsed.some((p) => p?.type === 'get_session_tree')).toBe(true);
+    expect(parsed.some((p) => p?.type === 'steer')).toBe(false);
+  });
+
+  test('blocks a session-mutating slash command while streaming instead of steering or dispatching', async ({ page }) => {
+    const wsMessages: string[] = [];
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.onMessage((data) => {
+        wsMessages.push(String(data));
+      });
+      ws.send(JSON.stringify({ type: 'connected', sessionId: 's1', isStreaming: true, thinkingLevel: 'medium', model: null, availableModels: [], messages: [] }));
+      ws.send(JSON.stringify({ type: 'projects_list', projects: [] }));
+      ws.send(JSON.stringify({ type: 'all_sessions_list', sessions: [] }));
+    });
+
+    await page.goto('/');
+
+    await page.fill('textarea', '/reload');
+    await page.getByLabel('Steer pi').click();
+
+    await expect(page.getByText('Wait for the agent to finish before running this command.')).toBeVisible({ timeout: 3000 });
+
+    const parsed = wsMessages.map((m) => { try { return JSON.parse(m); } catch { return null; } });
+    expect(parsed.some((p) => p?.type === 'steer')).toBe(false);
+    expect(parsed.some((p) => p?.type === 'run_builtin')).toBe(false);
+  });
+
   test('resumes an in-progress response after switching sessions', async ({ page }) => {
     await page.routeWebSocket('/ws', (ws) => {
       ws.onMessage(() => {});

@@ -508,7 +508,7 @@
       {:else if msg.role === 'tool'}
         {@const meta = getToolMeta(msg.toolName)}
         {@const detail = cleanDetail(msg.toolInput ?? '')}
-        {@const hasOutput = !!(msg.content || msg.diff || msg.images?.length)}
+        {@const hasOutput = !!(msg.content || msg.diff || msg.images?.length || msg.renderedResultHtml?.length)}
         <div class="msg-in flex flex-col trace-step tool-step">
           <!-- Flat flex row: [status][icon][label][detail][time] -->
           <button
@@ -528,10 +528,13 @@
             {/if}
             <!-- Tool icon -->
             <meta.icon class="w-3.5 h-3.5 flex-shrink-0" style="color:{meta.color};{msg.streaming ? 'animation:pulse 1.5s ease-in-out infinite' : ''}" />
-            <!-- Label -->
-            <span class="trace-row-label">{meta.label}</span>
-            <!-- Detail (truncated) -->
-            <span class="trace-row-detail">{detail}</span>
+            <!-- Label / detail (extension-rendered if available) -->
+            {#if msg.renderedCallHtml}
+              <span class="trace-row-label font-normal">{#each msg.renderedCallHtml as line, i (i)}{#if i > 0}<br />{/if}{@html line}{/each}</span>
+            {:else}
+              <span class="trace-row-label">{meta.label}</span>
+              <span class="trace-row-detail">{detail}</span>
+            {/if}
             <!-- Time + line count -->
             <span class="trace-row-time">
               {#if msg.streaming && msg.startMs}{Math.floor((now - msg.startMs) / 1000)}s
@@ -541,6 +544,11 @@
             </span>
           </button>
           {#if msg.expanded && !msg.streaming}
+            {#if msg.renderedResultHtml}
+              <div class="trace-output mt-1 text-xs leading-relaxed select-text py-1.5 px-2 bg-base-content/[0.025] rounded-r font-mono">
+                {#each msg.renderedResultHtml as line, i (i)}<div>{@html line || '&nbsp;'}</div>{/each}
+              </div>
+            {:else}
             {#if msg.diff}
               <div class="trace-output mt-1"><DiffViewer diff={msg.diff} /></div>
             {:else if msg.content}
@@ -561,6 +569,7 @@
                 {#each msg.images as src (src)}<img {src} alt="" class="max-h-64 max-w-full rounded-lg object-contain border border-base-content/10" />{/each}
               </div>
             {/if}
+          {/if}
           {/if}
         </div>
 
@@ -624,6 +633,10 @@
           </div>
         {:else if msg.customType === 'slash_result'}
           <div class="msg-in my-2 px-4 py-3 bg-base-content/[0.04] border border-base-content/[0.06] rounded-xl font-mono text-[11px] leading-relaxed text-base-content/70 whitespace-pre-wrap break-words overflow-hidden select-text shadow-inner shadow-black/5">{msg.content}</div>
+        {:else if msg.renderedNoticeHtml}
+          <div class="msg-in my-2 px-4 py-3 bg-base-content/[0.04] border border-base-content/[0.06] rounded-xl font-mono text-[11px] leading-relaxed text-base-content/70 whitespace-pre-wrap break-words overflow-hidden select-text shadow-inner shadow-black/5">
+            {#each msg.renderedNoticeHtml as line, i (i)}<div>{@html line || '&nbsp;'}</div>{/each}
+          </div>
         {:else}
           <div class="msg-in flex items-center gap-2.5 text-[10px] text-base-content/45 select-none py-1">
             <span class="flex-1 h-px bg-gradient-to-r from-transparent to-base-content/15"></span>

@@ -1347,6 +1347,11 @@
   function setSessionParam(path: string): void {
     const url = new URL(window.location.href);
     url.searchParams.set('session', path);
+    // Raw DOM API, deliberately not $app/navigation's replaceState: this
+    // must work at any point (WS message handlers, early effects) with no
+    // dependency on SvelteKit's router having started — replaceState()
+    // throws "Cannot call replaceState(...) before router is initialized"
+    // otherwise. This never navigates; it only keeps the URL bar in sync.
     history.replaceState(null, '', url.pathname + url.search);
   }
 
@@ -1366,6 +1371,7 @@
       if (value == null) url.searchParams.delete(key);
       else url.searchParams.set(key, value);
     }
+    // See setSessionParam() above for why this bypasses $app/navigation.
     history.replaceState(null, '', url.pathname + url.search);
   }
 
@@ -1763,6 +1769,7 @@
           toolCallId,
           toolInput: formatToolInput(toolName, details),
           toolArgs: details,
+          renderedCallHtml: msg.renderedCallHtml as string[] | undefined,
           streaming: true,
           expanded: toolsExpandedGlobal,
           startMs: Date.now(),
@@ -1780,6 +1787,7 @@
           if (partial?.content) {
             t.content = extractTextContent(partial.content);
           }
+          if (msg.renderedResultHtml) t.renderedResultHtml = msg.renderedResultHtml as string[];
         }
         break;
       }
@@ -1788,6 +1796,7 @@
         const endId = msg.toolCallId as string | undefined;
         const t = endId ? findToolMessage(endId) : lastStreaming('tool');
         if (t) {
+          if (msg.renderedResultHtml) t.renderedResultHtml = msg.renderedResultHtml as string[];
           t.streaming = false;
           t.isError = (msg.isError as boolean | undefined) ?? false;
           const result = msg.result as
@@ -1853,6 +1862,7 @@
           if (key) {
             const widgetType = (msg.widgetType as string | undefined) ?? 'text';
             const widgetLines = msg.widgetLines as string[] | undefined;
+            const widgetHtmlLines = msg.widgetHtmlLines as string[] | undefined;
             const widgetPlacement = msg.widgetPlacement as string | undefined;
             const widgetData = msg.widgetData as Record<string, unknown> | undefined;
             const widgetComponent = msg.widgetComponent as ParsedComponent | undefined;
@@ -1871,7 +1881,11 @@
                 'info';
               extensionWidgets[key] = { type: 'badge', text, variant };
             } else {
-              extensionWidgets[key] = { type: 'text', lines: widgetLines ?? [] };
+              extensionWidgets[key] = {
+                type: 'text',
+                lines: widgetLines ?? [],
+                ...(widgetHtmlLines?.length ? { htmlLines: widgetHtmlLines } : {}),
+              };
             }
             if (widgetPlacement) {
               extensionWidgetPlacement[key] = widgetPlacement;
@@ -3029,7 +3043,7 @@
     );
   }
 
-  function runSlashCommand(text: string): boolean {
+  function runSlashCommand(text: string, isStreamingNow = false): boolean {
     // Handle ! shell commands – bypass the AI, execute directly.
     if (text.startsWith('!')) {
       const command = text.slice(1).trim();
@@ -3045,6 +3059,17 @@
     const [rawCommand, ...rest] = text.slice(1).split(/\s+/);
     const command = rawCommand.toLowerCase();
     const args = rest.join(' ').trim();
+
+    // These mutate live session/agent state (context, tools/prompts, model
+    // auth, branch files) in ways that can race an in-flight turn — block
+    // them while the agent is streaming rather than dispatching them (or,
+    // absent this check, letting submitMessage() steer the literal command
+    // text into the conversation as a user message). Mirrors the server-side
+    // guard in the `run_builtin`/`compact` handlers.
+    if (isStreamingNow && ['compact', 'reload', 'login', 'logout', 'clone'].includes(command)) {
+      showChatNotice('Wait for the agent to finish before running this command.', 'warning');
+      return true;
+    }
 
     switch (command) {
       case 'new':
@@ -3107,6 +3132,21 @@
     if (wsState !== 'open') return;
     const text = input.trim();
 
+    // Slash/bang commands are commands, not conversation text — dispatch
+    // them before the streaming check so they run instead of being steered
+    // into the agent's turn as literal text. runSlashCommand() itself blocks
+    // the handful of commands unsafe to run mid-turn.
+    if (
+      attachedImages.length === 0 &&
+      attachedFiles.length === 0 &&
+      !asFollowUp &&
+      runSlashCommand(text, isStreaming)
+    ) {
+      input = '';
+      resetTextareaHeight();
+      return;
+    }
+
     if (isStreaming) {
       if (!text) return;
       steerAgent();
@@ -3114,17 +3154,6 @@
     }
 
     if (!text && attachedImages.length === 0 && attachedFiles.length === 0) return;
-
-    if (
-      attachedImages.length === 0 &&
-      attachedFiles.length === 0 &&
-      !asFollowUp &&
-      runSlashCommand(text)
-    ) {
-      input = '';
-      resetTextareaHeight();
-      return;
-    }
 
     const imgs =
       attachedImages.length > 0
@@ -4146,9 +4175,7 @@
                   {#if widget.type === 'text'}
                     <div
                       class="bg-base-content/5 rounded-xl px-3 py-2 text-xs text-base-content/70 font-mono whitespace-pre overflow-x-auto leading-relaxed"
-                    >
-                      {widget.lines.join('\n')}
-                    </div>
+                    >{#if widget.htmlLines}{#each widget.htmlLines as line, i (i)}<div>{@html line || '&nbsp;'}</div>{/each}{:else}{widget.lines.join('\n')}{/if}</div>
                   {:else if widget.type === 'table'}
                     <div
                       class="bg-base-content/5 rounded-xl px-3 py-2 text-xs text-base-content/70 font-mono overflow-x-auto"
@@ -4349,7 +4376,7 @@
                         {#snippet child({ props })}
                           <button
                             {...props}
-                            onclick={steerAgent}
+                            onclick={() => submitMessage()}
                             class="w-9 h-9 flex items-center justify-center text-warning/80 hover:text-warning hover:bg-warning/10 rounded-full transition-colors"
                             aria-label="Steer pi"
                             ><svg
@@ -5458,33 +5485,33 @@
     <!-- ── Interactive custom component full overlay (ConversationViewer etc.) ── -->
     {#if modal?.method === 'custom' && modal.interactive}
       <div
-        class="fixed inset-0 z-[60] flex items-center justify-center bg-base-100/65 px-3 py-4 backdrop-blur-sm"
+        class="fixed inset-0 z-[60] flex items-center justify-center bg-base-100/70 px-3 py-6 backdrop-blur-sm"
       >
         <div
-          class="flex w-full max-w-3xl flex-col overflow-hidden rounded-xl border border-base-content/15 bg-base-100 shadow-2xl"
+          class="relative w-full max-w-3xl"
           role="dialog"
-          aria-label={modal.title}
+          aria-label="Extension terminal"
           tabindex="-1"
         >
-          <div
-            class="flex items-center justify-between gap-3 px-4 py-3 border-b border-base-content/10 shrink-0"
+          <span class="sr-only">
+            Arrow keys, Page Up/Down, Home, End, and Enter are forwarded to the extension. Press
+            Escape to close.
+          </span>
+          <!-- Floating close — kept outside the extension's own drawn border so it never
+               overlaps its corner glyphs. Matches the floating-dismiss pattern used for
+               widget panels and file attachments elsewhere in this file. -->
+          <button
+            onclick={modalCancel}
+            class="absolute -top-3 -right-3 z-10 w-7 h-7 rounded-full bg-base-content/15 hover:bg-base-content/25 backdrop-blur-sm flex items-center justify-center text-base-content/70 hover:text-base-content transition-colors shadow-md"
+            aria-label="Close extension overlay"
           >
-            <div class="min-w-0">
-              <p class="text-[10px] uppercase tracking-[0.18em] text-base-content/35">Extension UI</p>
-              <h2 class="text-sm font-semibold text-base-content/80 truncate">{modal.title}</h2>
-            </div>
-            <Button
-              variant="ghost"
-              size="icon-xs"
-              onclick={modalCancel}
-              aria-label="Close extension overlay"
-            >
-              <X class="w-4 h-4" />
-            </Button>
-          </div>
-          <div class="max-h-[min(24rem,calc(100dvh-11rem))] overflow-y-auto px-4 py-3">
+            <X class="w-3.5 h-3.5" />
+          </button>
+          <!-- Content: a soft legibility scrim only — no border, no shadow, no title bar.
+               The extension's own rendered box border is the only hard-edged frame. -->
+          <div class="max-h-[min(30rem,calc(100dvh-4rem))] overflow-y-auto rounded-lg bg-base-100/40">
             <pre
-              class="text-xs text-base-content/65 whitespace-pre-wrap leading-relaxed font-mono select-text"
+              class="text-xs text-base-content/80 whitespace-pre-wrap leading-relaxed font-mono select-text p-2"
             >{#if modal.htmlLines}{#each modal.htmlLines as line, i (i)}<div>{@html line || '&nbsp;'}</div>{/each}{:else}{(modal.lines ?? []).join('\n')}{/if}</pre>
           </div>
           <!-- Hidden input to capture keystrokes, paste, and IME composition. -->
@@ -5498,12 +5525,6 @@
             oncompositionend={overlayCompositionEnd}
             bind:this={modalFocusEl}
           />
-          <div
-            class="shrink-0 px-4 py-2 border-t border-base-content/10 flex items-center justify-between text-[10px] text-muted-foreground/45"
-          >
-            <span>Type or paste text · Arrow keys & Enter sent to extension · Esc closes</span>
-            <span>{modal.lines?.length ?? 0} lines</span>
-          </div>
         </div>
       </div>
     {/if}

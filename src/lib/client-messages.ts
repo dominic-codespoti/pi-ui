@@ -31,6 +31,9 @@ export type UIMessage = {
   customType?: string;
   renderedContent?: string;
   renderedThinking?: string;
+  renderedCallHtml?: string[];
+  renderedResultHtml?: string[];
+  renderedNoticeHtml?: string[];
   level?: 'info' | 'warning' | 'error' | 'success';
   source?: string;
   details?: string;
@@ -285,6 +288,8 @@ function stableMsgId(msg: Record<string, unknown>, index?: number): string {
         }];
       }
       if (customType) {
+        // display: false means LLM-context only — skip UI rendering.
+        if (msg.display === false) return [];
         const details = msg.details as Record<string, unknown> | undefined;
         const display = (msg.display as string | undefined) ?? '';
         let content = display || `[${customType}]`;
@@ -297,6 +302,7 @@ function stableMsgId(msg: Record<string, unknown>, index?: number): string {
           content,
           noticeKind: 'custom' as const,
           customType,
+          renderedNoticeHtml: msg.renderedNoticeHtml as string[] | undefined,
           streaming: false,
           createdAt: ts,
         }];

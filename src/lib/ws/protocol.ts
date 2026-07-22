@@ -3,6 +3,8 @@
  * Server forwards pi SDK events as-is, plus custom handshake/control messages.
  */
 
+import type { ParsedComponent } from '$lib/tui-stubs';
+
 // ── Shared data shapes ────────────────────────────────────────────────────────
 
 export interface ModelInfo {
@@ -133,10 +135,10 @@ export type UpdateTarget = 'ui' | 'sdk';
 // ── Extension widget content types ────────────────────────────────────────────
 
 export type WidgetContent =
-  | { type: 'text'; lines: string[] }
+  | { type: 'text'; lines: string[]; htmlLines?: string[] }
   | { type: 'table'; headers: string[]; rows: string[][] }
   | { type: 'badge'; text: string; variant: 'info' | 'warning' | 'error' | 'success' }
-  | { type: 'component'; component: import('$lib/tui-stubs').ParsedComponent };
+  | { type: 'component'; component: ParsedComponent };
 
 /** A node in the session tree for visual display. */
 export interface TreeNode {
@@ -270,7 +272,7 @@ export interface ConnectedMessage {
  *                  is broadcast as custom_render messages.
  *     notify     – toast notification (message, notifyType)
  *     setStatus  – update status text (statusKey, statusText)
- *     setWidget  – register/update widget panel (widgetKey, widgetType?, widgetData?, widgetLines?, widgetPlacement?)
+ *     setWidget  – register/update widget panel (widgetKey, widgetType?, widgetData?, widgetLines?, widgetHtmlLines?, widgetPlacement?). widgetHtmlLines carries ANSI-styled text (theme.fg()/bold()) converted to safe inline-styled HTML — the client prefers it over widgetLines when present.
  *     setTitle   – update document.title (title)
  *     set_editor_text – replace textarea content (text)
  *     paste_to_editor – insert text at cursor (text)

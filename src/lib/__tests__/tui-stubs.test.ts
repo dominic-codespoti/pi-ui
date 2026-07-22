@@ -118,16 +118,35 @@ describe('ansiToHtml', () => {
 });
 
 describe('stubTheme', () => {
-  it('fg returns text unchanged', () => {
-    expect(stubTheme.fg('red', 'hello')).toBe('hello');
+  it('fg wraps text in a real SGR truecolor sequence carrying the semantic color', () => {
+    const styled = stubTheme.fg('success', 'hello');
+    expect(styled).not.toBe('hello');
+    expect(stripAnsi(styled)).toBe('hello');
+    expect(ansiToHtml(styled)).toBe('<span style="color:rgb(79,204,146)">hello</span>');
   });
 
-  it('bg returns text unchanged', () => {
-    expect(stubTheme.bg('blue', 'world')).toBe('world');
+  it('fg falls back to the base text color for an unrecognized name', () => {
+    const styled = stubTheme.fg('not-a-real-theme-color', 'hello');
+    expect(stripAnsi(styled)).toBe('hello');
+    expect(ansiToHtml(styled)).toBe('<span style="color:rgb(215,214,223)">hello</span>');
   });
 
-  it('bold returns text unchanged', () => {
-    expect(stubTheme.bold('bold text')).toBe('bold text');
+  it('bg wraps text in a real SGR truecolor background sequence', () => {
+    const styled = stubTheme.bg('selectedBg', 'world');
+    expect(stripAnsi(styled)).toBe('world');
+    expect(ansiToHtml(styled)).toBe('<span style="background-color:rgb(49,48,57)">world</span>');
+  });
+
+  it('bold wraps text in a real SGR bold sequence', () => {
+    const styled = stubTheme.bold('bold text');
+    expect(stripAnsi(styled)).toBe('bold text');
+    expect(ansiToHtml(styled)).toBe('<span style="font-weight:bold">bold text</span>');
+  });
+
+  it('composes fg + bold on the same text (extension nesting pattern)', () => {
+    const styled = stubTheme.fg('error', stubTheme.bold('failed'));
+    expect(stripAnsi(styled)).toBe('failed');
+    expect(ansiToHtml(styled)).toBe('<span style="color:rgb(246,108,109);font-weight:bold">failed</span>');
   });
 });
 

@@ -211,6 +211,11 @@ class ProjectsState {
     try {
       const url = new URL(window.location.href);
       url.searchParams.set('session', path);
+      // Raw DOM API, deliberately not $app/navigation's replaceState: this
+      // must work with no dependency on SvelteKit's router having started
+      // (replaceState() throws "Cannot call replaceState(...) before router
+      // is initialized" otherwise). This never navigates; it only keeps the
+      // URL bar in sync.
       history.replaceState(null, '', url.pathname + url.search);
     } catch { /* window may not be available during SSR */ }
   }

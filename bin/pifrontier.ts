@@ -243,10 +243,14 @@ if (process.env.PI_DAEMONIZED) {
 
 // ── Start server ──────────────────────────────────────────────────────────────
 
-// Prefer the pre-built bundle (present in npm-installed packages) over the raw
-// TypeScript source (used during development / after `bun run build:server`).
+// Source checkouts have no build step to keep in sync — Bun runs `.ts`
+// directly, so always run the actual source being edited. The pre-built
+// bundle is only relevant for npm-installed packages, where it's produced
+// at publish time and ships already in lockstep with the source (no local
+// edits are possible there, so no staleness is possible either).
+const isSourceCheckout = existsSync(fileURLToPath(new URL('../.git', import.meta.url)));
 const bundlePath = new URL('../server.bundle.js', import.meta.url);
-const serverPath = (await Bun.file(bundlePath).exists())
+const serverPath = !isSourceCheckout && (await Bun.file(bundlePath).exists())
   ? bundlePath
   : new URL('../server.ts', import.meta.url);
 

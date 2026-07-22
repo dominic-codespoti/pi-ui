@@ -190,8 +190,8 @@ export function extensionSetWidgetPayload(
   };
 }
 
-/** Simulate a setWidget message with plain text lines. */
-export function extensionSetWidgetTextPayload(key: string, lines: string[]) {
+/** Simulate a setWidget message with plain text lines, optionally with ANSI-derived HTML lines (mirrors server.ts's widgetHtmlLines field). */
+export function extensionSetWidgetTextPayload(key: string, lines: string[], htmlLines?: string[]) {
   return {
     type: 'extension_ui_request',
     id: crypto.randomUUID(),
@@ -199,6 +199,7 @@ export function extensionSetWidgetTextPayload(key: string, lines: string[]) {
     widgetKey: key,
     widgetType: 'text',
     widgetLines: lines,
+    ...(htmlLines ? { widgetHtmlLines: htmlLines } : {}),
   };
 }
 
@@ -210,6 +211,21 @@ export function extensionCustomPayload(id: string, title: string, parsed: Record
     method: 'custom',
     title,
     parsed,
+  };
+}
+
+/** Simulate an interactive custom overlay (keyboard-driven terminal-emulation
+ *  components like pi-subagents' TranscriptOverlay) — no `parsed` tree, just
+ *  rendered lines and the `interactive: true` flag that drives the de-chromed
+ *  floating-close-button overlay. */
+export function extensionInteractiveCustomPayload(id: string, lines: string[], htmlLines?: string[]) {
+  return {
+    type: 'extension_ui_request',
+    id,
+    method: 'custom',
+    interactive: true,
+    lines,
+    ...(htmlLines ? { htmlLines } : {}),
   };
 }
 

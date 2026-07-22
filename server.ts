@@ -28,7 +28,7 @@ import { log } from './src/lib/server/logger.ts';
 import { trimMessagesForWire } from './src/lib/server/wire-messages.ts';
 import { initSessionScanCache, scanAllSessions, scanSessionsForCwd, type SessionFileInfo } from './src/lib/server/session-scan.ts';
 import type { ClientMessage, ModelInfo, ProjectInfo, ProviderInfo, SessionSummary, SkillSummary, PromptSummary, ExtensionSummary, UpdatePackageStatus, UpdateStatus, UpdateTarget } from './src/lib/ws/protocol.ts';
-import { callFactoryAndParse, parseComponentTree, shouldUseInteractiveCustom, StubTui, stubKeybindings, stubTui, stubTheme, stripAnsi, ansiToHtml, type ParsedComponent } from './src/lib/tui-stubs.ts';
+import { callFactoryAndParse, parseComponentTree, shouldUseInteractiveCustom, StubTui, stubKeybindings, stubTui, stubTheme, stripAnsi, ansiToHtml, renderToolCallHtml, renderToolResultHtml, renderCustomMessage, renderCustomMessagesForWire, type ParsedComponent } from './src/lib/tui-stubs.ts';
 import ownPkgJson from './package.json' with { type: 'json' };
 
 const APP_ROOT = dirname(fileURLToPath(import.meta.url));
@@ -84,16 +84,16 @@ const MAX_INITIAL_MESSAGES = 100;
 
 /** Truncate messages for initial payload — keeps the WS + client render fast.
  *  Oversized text/thinking blocks are additionally size-capped for transfer. */
-function initialMessages(messages: unknown[]): { msgs: unknown[]; total: number; truncated: boolean } {
+function initialMessages(messages: unknown[], sess: AgentSession): { msgs: unknown[]; total: number; truncated: boolean } {
   const total = messages.length;
   const tail = total <= MAX_INITIAL_MESSAGES ? messages : messages.slice(-MAX_INITIAL_MESSAGES);
-  return { msgs: trimMessagesForWire(tail), total, truncated: total > MAX_INITIAL_MESSAGES };
+  return { msgs: trimMessagesForWire(renderCustomMessagesForWire(sess, tail)), total, truncated: total > MAX_INITIAL_MESSAGES };
 }
 
 /** Current in-memory partial response, capped like history before it crosses the wire. */
 function streamingMessageForWire(session: AgentSession): unknown {
   const message = session.agent.state.streamingMessage;
-  return message ? trimMessagesForWire([message])[0] : undefined;
+  return message ? trimMessagesForWire([renderCustomMessage(session, message)])[0] : undefined;
 }
 
 const cwd = Bun.env.PI_CWD ?? process.cwd();
@@ -251,12 +251,14 @@ function piUiUpdateStep(): string[] {
 }
 
 async function getUpdateStatus(): Promise<UpdateStatus> {
-  const [uiLatest, sdkLatest, gitExists, packageJsonExists] = await Promise.all([
+  const [uiLatest, sdkLatest, packageJsonExists] = await Promise.all([
     fetchNpmLatestVersion(UI_PACKAGE_NAME),
     fetchNpmLatestVersion(PI_SDK_PACKAGE_NAME),
-    Bun.file(join(APP_ROOT, '.git')).exists(),
     Bun.file(join(APP_ROOT, 'package.json')).exists(),
   ]);
+  // `.git` is a directory — `Bun.file(...).exists()` always reports false
+  // for directories, so this must use `existsSync`, not `Bun.file`.
+  const gitExists = existsSync(join(APP_ROOT, '.git'));
   const ephemeralHint = gitExists ? null : ephemeralUpdateHint(APP_ROOT);
   const mode: UpdateStatus['mode'] = gitExists ? 'source' : ephemeralHint ? 'ephemeral' : 'package';
 
@@ -341,7 +343,7 @@ async function runUpdate(target: UpdateTarget, ws: { send(data: string): void })
   updateInProgress = true;
   const chunks: string[] = [];
   try {
-    const isSourceCheckout = await Bun.file(join(APP_ROOT, '.git')).exists();
+    const isSourceCheckout = existsSync(join(APP_ROOT, '.git'));
     if (target === 'ui' && !isSourceCheckout) {
       const hint = ephemeralUpdateHint(APP_ROOT);
       if (hint) throw new Error(`This pi-ui run looks ephemeral. Restart with: ${hint}`);
@@ -980,7 +982,8 @@ const uiContext: Omit<ExtensionUIContext, 'getEditorText'> & { getEditorText(): 
         method: 'setWidget',
         widgetKey: key,
         widgetType: 'text',
-        widgetLines: content,
+        widgetLines: content.map((l: string) => stripAnsi(l)),
+        widgetHtmlLines: content.map((l: string) => ansiToHtml(l)),
         widgetPlacement: options?.placement,
       });
     } else if (typeof content === 'function') {
@@ -1001,13 +1004,24 @@ const uiContext: Omit<ExtensionUIContext, 'getEditorText'> & { getEditorText(): 
             if (isRich) {
               payload = { widgetType: 'component', widgetComponent: parsed };
             } else {
-              // Fallback: render as plain text lines
+              // Fallback: render as plain text lines. Preserve theme.fg()/bold()
+              // styling as HTML — widgetLines stays ANSI-stripped for accessibility
+              // and JSON-diffing; widgetHtmlLines carries the styled rendering the
+              // client prefers when present (same convention as custom_render).
               const rawLines = result.render(80) as string[];
               if (!Array.isArray(rawLines)) return;
-              payload = { widgetType: 'text', widgetLines: rawLines.map((l: string) => stripAnsi(l)) };
+              payload = {
+                widgetType: 'text',
+                widgetLines: rawLines.map((l: string) => stripAnsi(l)),
+                widgetHtmlLines: rawLines.map((l: string) => ansiToHtml(l)),
+              };
             }
           } else if (Array.isArray(result)) {
-            payload = { widgetType: 'text', widgetLines: result };
+            payload = {
+              widgetType: 'text',
+              widgetLines: result.map((l: string) => stripAnsi(l)),
+              widgetHtmlLines: result.map((l: string) => ansiToHtml(l)),
+            };
           }
           if (!payload) return;
           // Skip the broadcast entirely when nothing actually changed —
@@ -1156,6 +1170,16 @@ async function getSDK(): Promise<typeof PiSDKNS> {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     _sdk = await import('@earendil-works/pi-coding-agent') as any;
     log.info('[pifrontier] Pi SDK loaded.');
+    // Real pi-coding-agent interactive components (ToolExecutionComponent,
+    // AssistantMessageComponent, …) read a module-level theme singleton
+    // (`@earendil-works/pi-coding-agent`'s theme.ts `get theme()`) that
+    // throws "Theme not initialized" until `initTheme()` has run once —
+    // normally done by the real interactive-mode CLI entry points we never
+    // execute. Extensions that mount those components via `ui.custom()`
+    // (e.g. pi-subagents' `/subagents:sessions` transcript overlay) crash
+    // without this. Safe headless: falls back to the 'dark' theme via env
+    // detection, no TTY required.
+    _sdk!.initTheme();
     // Resolve SDK version from its package.json (best-effort)
     try {
       const piPkgSpecifier = '@earendil-works/pi-coding-agent/package.json';
@@ -1410,6 +1434,7 @@ async function ensureSession(): Promise<AgentSession> {
  * - `message_end`: enriched with live context usage.
  */
 function makeEventForwarder(sid: string, sess: AgentSession): (event: PiSDKNS.AgentSessionEvent) => void {
+  const pendingToolArgs = new Map<string, unknown>();
   return (event) => {
     if (activeSessionId !== sid) return; // not active — skip forwarding
     if (event.type === 'message_update') {
@@ -1417,12 +1442,24 @@ function makeEventForwarder(sid: string, sess: AgentSession): (event: PiSDKNS.Ag
     } else if (event.type === 'message_end') {
       try { broadcast({ ...event, sessionId: sid, contextUsage: sess.getContextUsage() }); }
       catch { broadcast({ ...event, sessionId: sid }); }
+    } else if (event.type === 'tool_execution_start') {
+      pendingToolArgs.set(event.toolCallId, event.args);
+      const renderedCallHtml = renderToolCallHtml(sess, event.toolName, event.args, event.toolCallId);
+      broadcast({ ...event, sessionId: sid, ...(renderedCallHtml ? { renderedCallHtml } : {}) });
+    } else if (event.type === 'tool_execution_update') {
+      const args = pendingToolArgs.get(event.toolCallId);
+      const renderedResultHtml = renderToolResultHtml(sess, event.toolName, event.partialResult, args, event.toolCallId, true);
+      broadcast({ ...event, sessionId: sid, ...(renderedResultHtml ? { renderedResultHtml } : {}) });
+    } else if (event.type === 'tool_execution_end') {
+      const args = pendingToolArgs.get(event.toolCallId);
+      pendingToolArgs.delete(event.toolCallId);
+      const renderedResultHtml = renderToolResultHtml(sess, event.toolName, event.result, args, event.toolCallId, false);
+      broadcast({ ...event, sessionId: sid, ...(renderedResultHtml ? { renderedResultHtml } : {}) });
     } else {
       broadcast({ ...event, sessionId: sid });
     }
   };
 }
-
 /** Register a session in the pool, subscribe runtime tracking, and optionally bind extensions. */
 function registerSession(sid: string, sess: AgentSession, cwdV: string, bindExt: boolean) {
   const path = sess.sessionManager.getSessionFile() ?? null;
@@ -1564,7 +1601,7 @@ async function setActiveSession(newSession: AgentSession, newCwd?: string) {
   entry.unseen = false;
   entry.lastActivity = Date.now();
 
-  const init = initialMessages(newSession.messages);
+  const init = initialMessages(newSession.messages, newSession);
   broadcast({
     type: 'session_loaded',
     sessionId: newSession.sessionId,
@@ -1679,7 +1716,7 @@ try {
       try {
         // Load SDK + session on first connection; subsequent calls return instantly.
         const sess = await ensureSession();
-        const init = initialMessages(sess.messages);
+        const init = initialMessages(sess.messages, sess);
         const availableModels = (await sess.modelRuntime.getAvailable()).map(serializeModel);
 
         // Serialization/send of a pathological history must not kill the
@@ -2325,6 +2362,10 @@ try {
         }
 
         case 'compact': {
+          if (activeSession().isStreaming) {
+            sendSlashResult(ws, 'compact', 'Wait for the agent to finish before compacting.', 'warning');
+            break;
+          }
           activeSession().compact().catch((err) => {
             log.error('[pifrontier] compact error:', err);
           });
@@ -2344,6 +2385,19 @@ try {
         case 'run_builtin': {
           const command = String((msg as { type: 'run_builtin'; command: string; args?: string }).command ?? '').toLowerCase();
           const args = String((msg as { type: 'run_builtin'; command: string; args?: string }).args ?? '').trim();
+          // These mutate live session/agent state (context, tools/prompts,
+          // model auth, branch files) in ways that can race an in-flight
+          // turn — block them while streaming instead of letting them run
+          // concurrently with agent.prompt(). Read-only/independent commands
+          // (session, export, share, changelog, name, tree, shell, extension
+          // commands) are unaffected and stay allowed mid-stream.
+          if (
+            ['reload', 'clone', 'login', 'logout'].includes(command) &&
+            activeSession().isStreaming
+          ) {
+            sendSlashResult(ws, command, 'Wait for the agent to finish before running this command.', 'warning');
+            break;
+          }
           try {
             switch (command) {
               case 'reload': {
@@ -2909,7 +2963,7 @@ try {
             const older = all.slice(start, end);
             ws.send(JSON.stringify({
               type: 'older_messages',
-              messages: trimMessagesForWire(older),
+              messages: trimMessagesForWire(renderCustomMessagesForWire(s, older)),
               totalMessageCount: total,
               messagesTruncated: start > 0,
             }));

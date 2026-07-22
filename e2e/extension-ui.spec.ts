@@ -5,7 +5,9 @@ import {
   extensionSelectPayload,
   extensionNotifyPayload,
   extensionSetWidgetPayload,
+  extensionSetWidgetTextPayload,
   extensionCustomPayload,
+  extensionInteractiveCustomPayload,
   extensionEventPayload,
 } from './mocks/payloads';
 import { CONNECTED_PAYLOAD } from './mocks/payloads';
@@ -216,6 +218,111 @@ test.describe('Extension component widgets', () => {
     const dismissBtn = page.getByRole('button', { name: /dismiss widget/i }).first();
     await dismissBtn.click();
     await expect(page.getByText('Widget to dismiss')).not.toBeVisible({ timeout: 3000 });
+  });
+
+  test('renders ANSI-styled text widget lines as colored HTML, matching the theme.fg() pattern extensions like pi-subagents use', async ({ page }) => {
+    // "\x1b[38;2;79;204;146m...\x1b[0m" is exactly what stubTheme.fg('success', text)
+    // produces server-side (server.ts converts it to widgetHtmlLines via ansiToHtml).
+    const htmlLines = ['<span style="color:rgb(79,204,146)">&#x2713;</span> <span style="font-weight:bold">Fix login bug</span> completed'];
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.onMessage(() => {});
+      ws.send(JSON.stringify(CONNECTED_PAYLOAD));
+      setTimeout(() => {
+        ws.send(JSON.stringify(extensionSetWidgetTextPayload('agents', ['✓ Fix login bug completed'], htmlLines)));
+      }, 500);
+    });
+
+    const widgetText = page.getByText('Fix login bug', { exact: false });
+    await expect(widgetText).toBeVisible({ timeout: 5000 });
+    // The bold span must actually be present in the DOM, not just the plain text —
+    // proves the client rendered widgetHtmlLines via {@html} rather than falling
+    // back to the plain widgetLines join.
+    const boldSpan = page.locator('span[style*="font-weight:bold"]', { hasText: 'Fix login bug' });
+    await expect(boldSpan).toBeVisible();
+  });
+});
+
+test.describe('Interactive custom overlay (de-chromed)', () => {
+  test.beforeEach(async ({ page, login, mockWs }) => {
+    await mockWs(page);
+    await login(page, 'test-password');
+  });
+
+  test('renders the extension\'s own chrome without pi-ui\'s redundant header/footer', async ({ page }) => {
+    const lines = ['╭──────────────────╮', '│ Subagent session │', '╰──────────────────╯'];
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.onMessage(() => {});
+      ws.send(JSON.stringify(CONNECTED_PAYLOAD));
+      setTimeout(() => {
+        ws.send(JSON.stringify(extensionInteractiveCustomPayload('t1', lines)));
+      }, 500);
+    });
+
+    await expect(page.getByText('Subagent session', { exact: false })).toBeVisible({ timeout: 5000 });
+    // No generic "EXTENSION UI" filler header — the extension's own drawn title is the only one shown.
+    await expect(page.getByText('EXTENSION UI')).not.toBeVisible();
+    // No redundant footer hint row duplicating the extension's own hints.
+    await expect(page.getByText('Arrow keys & Enter sent to extension')).not.toBeVisible();
+  });
+
+  test('floating close button cancels the overlay', async ({ page }) => {
+    const wsMessages: string[] = [];
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.onMessage((data) => { wsMessages.push(String(data)); });
+      ws.send(JSON.stringify(CONNECTED_PAYLOAD));
+      setTimeout(() => {
+        ws.send(JSON.stringify(extensionInteractiveCustomPayload('t2', ['some content'])));
+      }, 500);
+    });
+
+    await expect(page.getByText('some content')).toBeVisible({ timeout: 5000 });
+    await page.getByRole('button', { name: /close extension overlay/i }).click();
+
+    const parsed = wsMessages.map((m) => { try { return JSON.parse(m); } catch { return null; } });
+    expect(parsed.some((p) => p?.type === 'extension_ui_response' && p.id === 't2' && p.cancelled === true)).toBe(true);
+  });
+
+  test('Escape key closes the overlay', async ({ page }) => {
+    const wsMessages: string[] = [];
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.onMessage((data) => { wsMessages.push(String(data)); });
+      ws.send(JSON.stringify(CONNECTED_PAYLOAD));
+      setTimeout(() => {
+        ws.send(JSON.stringify(extensionInteractiveCustomPayload('t3', ['some content'])));
+      }, 500);
+    });
+
+    await expect(page.getByText('some content')).toBeVisible({ timeout: 5000 });
+    await page.keyboard.press('Escape');
+
+    await expect.poll(() => {
+      const parsed = wsMessages.map((m) => { try { return JSON.parse(m); } catch { return null; } });
+      return parsed.some((p) => p?.type === 'extension_ui_response' && p.id === 't3' && p.cancelled === true);
+    }).toBe(true);
+  });
+
+  test('arrow key forwards a terminal-encoded keystroke to the extension', async ({ page }) => {
+    const wsMessages: string[] = [];
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.onMessage((data) => {
+        const msg = JSON.parse(String(data));
+        wsMessages.push(String(data));
+        if (msg.type === 'extension_custom_input' && msg.id === 't4') {
+          ws.send(JSON.stringify({ type: 'custom_render', id: 't4', lines: ['scrolled'] }));
+        }
+      });
+      ws.send(JSON.stringify(CONNECTED_PAYLOAD));
+      setTimeout(() => {
+        ws.send(JSON.stringify(extensionInteractiveCustomPayload('t4', ['some content'])));
+      }, 500);
+    });
+
+    await expect(page.getByText('some content')).toBeVisible({ timeout: 5000 });
+    await page.keyboard.press('ArrowDown');
+
+    const parsed = wsMessages.map((m) => { try { return JSON.parse(m); } catch { return null; } });
+    expect(parsed.some((p) => p?.type === 'extension_custom_input' && p.id === 't4')).toBe(true);
+    await expect(page.getByText('scrolled')).toBeVisible({ timeout: 3000 });
   });
 });
 

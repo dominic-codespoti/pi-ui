@@ -7,6 +7,7 @@
  * content — serializable shapes the web client can render natively.
  */
 
+import type { AgentSession } from '@earendil-works/pi-coding-agent';
 // ── Stubs ────────────────────────────────────────────────────────────────────
 
 /** Strips ANSI escape codes from a string. */
@@ -139,9 +140,59 @@ export function ansiToHtml(line: string): string {
 }
 /* eslint-enable no-control-regex */
 
+/**
+ * Semantic color palette matching pi-ui's own "pi" daisyUI theme (see
+ * src/app.css) so extension-authored `theme.fg()`/`theme.bg()` calls render
+ * in colors consistent with the surrounding web UI chrome instead of going
+ * flat/monochrome. Covers the full `ThemeColor` vocabulary from
+ * `@earendil-works/pi-coding-agent`'s theme schema; names outside this list
+ * (typos, extension-invented names) fall back to the base text color rather
+ * than throwing or silently dropping styling.
+ */
+const FG_PALETTE: Record<string, string> = {
+  text: '#d7d6df', userMessageText: '#d7d6df', customMessageText: '#d7d6df', toolOutput: '#d7d6df',
+  syntaxVariable: '#d7d6df', mdCodeBlock: '#d7d6df',
+  dim: '#6d6c75', thinkingText: '#6d6c75', mdLinkUrl: '#6d6c75', mdListBullet: '#6d6c75',
+  toolDiffContext: '#6d6c75', syntaxComment: '#6d6c75', thinkingOff: '#6d6c75', thinkingMinimal: '#6d6c75',
+  muted: '#8e8d96', mdQuote: '#8e8d96', syntaxOperator: '#8e8d96', syntaxPunctuation: '#8e8d96', thinkingLow: '#8e8d96',
+  border: '#313039', borderMuted: '#313039', mdCodeBlockBorder: '#313039', mdQuoteBorder: '#313039', mdHr: '#313039',
+  borderAccent: '#ba93fb',
+  accent: '#ba93fb', mdHeading: '#ba93fb', syntaxKeyword: '#ba93fb',
+  thinkingHigh: '#ba93fb', thinkingXhigh: '#ba93fb', thinkingMax: '#ba93fb',
+  toolTitle: '#4dc3dd', customMessageLabel: '#4dc3dd', mdLink: '#4dc3dd', syntaxFunction: '#4dc3dd', thinkingMedium: '#4dc3dd',
+  mdCode: '#50d5ae', syntaxType: '#50d5ae',
+  success: '#4fcc92', toolDiffAdded: '#4fcc92', syntaxString: '#4fcc92',
+  error: '#f66c6d', toolDiffRemoved: '#f66c6d',
+  warning: '#eec05b', bashMode: '#eec05b', syntaxNumber: '#eec05b',
+};
+
+/** Background counterpart of `FG_PALETTE`, for `theme.bg()`. */
+const BG_PALETTE: Record<string, string> = {
+  selectedBg: '#313039',
+  userMessageBg: '#1f1e28',
+  customMessageBg: '#1f1e28',
+  toolPendingBg: '#1f1e28',
+  toolSuccessBg: '#1f1e28',
+  toolErrorBg: '#1f1e28',
+};
+
+const DEFAULT_FG_HEX = '#d7d6df';
+const DEFAULT_BG_HEX = '#1f1e28';
+
+/** `"#rrggbb"` -> `"r;g;b"` for embedding in an SGR truecolor sequence. */
+function hexToRgbParams(hex: string): string {
+  const n = parseInt(hex.slice(1), 16);
+  return `${(n >> 16) & 255};${(n >> 8) & 255};${n & 255}`;
+}
+
+/** Wrap `text` in an SGR sequence, self-terminated with a full reset so styles compose regardless of call order. */
+function sgrWrap(code: string, text: string): string {
+  return `\x1b[${code}m${text}\x1b[0m`;
+}
+
 interface ThemeFn {
-  fg: (_color: string, text: string) => string;
-  bg: (_color: string, text: string) => string;
+  fg: (color: string, text: string) => string;
+  bg: (color: string, text: string) => string;
   bold: (text: string) => string;
   italic: (text: string) => string;
   underline: (text: string) => string;
@@ -150,15 +201,29 @@ interface ThemeFn {
   [key: string]: unknown;
 }
 
-/** No-op theme — fg/bg/bold all return the text unchanged. */
+/**
+ * Theme stub passed to extension factories in place of the real pi TUI theme.
+ * Emits genuine ANSI truecolor/style SGR codes from `FG_PALETTE`/`BG_PALETTE`
+ * so extension widget/dialog/tool-render text built with `theme.fg()`/
+ * `theme.bold()` etc. keeps its semantic color once run through `ansiToHtml`
+ * downstream, instead of rendering flat and monochrome (the previous no-op
+ * behavior of this stub).
+ */
 export const stubTheme: ThemeFn = new Proxy({} as ThemeFn, {
   get(_target, prop) {
-    if (prop === 'fg' || prop === 'bg') {
-      return (_color: string, text: string) => text;
+    if (prop === 'fg') {
+      return (color: string, text: string) =>
+        sgrWrap(`38;2;${hexToRgbParams(FG_PALETTE[color] ?? DEFAULT_FG_HEX)}`, text);
     }
-    if (prop === 'bold' || prop === 'italic' || prop === 'underline' || prop === 'inverse' || prop === 'strikethrough') {
-      return (text: string) => text;
+    if (prop === 'bg') {
+      return (color: string, text: string) =>
+        sgrWrap(`48;2;${hexToRgbParams(BG_PALETTE[color] ?? DEFAULT_BG_HEX)}`, text);
     }
+    if (prop === 'bold') return (text: string) => sgrWrap('1', text);
+    if (prop === 'italic') return (text: string) => sgrWrap('3', text);
+    if (prop === 'underline') return (text: string) => sgrWrap('4', text);
+    if (prop === 'inverse') return (text: string) => sgrWrap('7', text);
+    if (prop === 'strikethrough') return (text: string) => sgrWrap('9', text);
     return undefined;
   },
 });
@@ -179,6 +244,17 @@ export interface StubComponent {
 /** Minimal TUI stub — satisfies `tui` parameter of extension factories. */
 export class StubTui {
   children: StubComponent[] = [];
+  /**
+   * Fixed fake terminal size — real pi-tui `TUI.terminal` (`columns`/`rows`
+   * getters, see `@earendil-works/pi-tui/dist/tui.d.ts`) is read by some
+   * extension components (e.g. scrollable list/transcript overlays) inside
+   * `render()`/`handleInput()` for viewport math. Without this, those calls
+   * throw on `undefined.rows`, get swallowed by `parseComponentTree`'s
+   * try/catch, and the component silently renders as an empty component.
+   * 80 matches the hardcoded render width used throughout this file/server.ts;
+   * 40 rows gives a reasonable modal-sized viewport.
+   */
+  terminal = { columns: 80, rows: 40 };
   private focused: StubComponent | null = null;
 
   requestRender() {}
@@ -666,6 +742,130 @@ function extractLabel(comp: Record<string, unknown>): string {
   }
 
   return '';
+}
+
+
+// ── Extension render hooks ─────────────────────────────────────────────────────
+
+/**
+ * Build the ToolRenderContext extensions expect for renderCall/renderResult.
+ * pi-ui renders once per event (no live redraw loop), so `invalidate` is a
+ * no-op and `state`/`lastComponent` always start fresh — extensions that rely
+ * on `context.state` persisting across renders will not see that persistence.
+ * `expanded: true` always — pi-ui's own expand/collapse toggle is client-side
+ * only (never re-requests a render), so the extension is asked for its
+ * fullest rendering and the client's existing show/hide toggle wraps it.
+ */
+function buildToolRenderContext(args: unknown, toolCallId: string, isPartial: boolean, isError: boolean) {
+  return {
+    args,
+    toolCallId,
+    invalidate: () => {},
+    lastComponent: undefined,
+    state: {},
+    cwd: process.cwd(),
+    executionStarted: true,
+    argsComplete: true,
+    isPartial,
+    expanded: true,
+    showImages: false,
+    isError,
+  };
+}
+
+/** Run a rendered `Component` through the same ansiToHtml pipeline setWidget uses. Returns undefined on any failure or empty output. */
+function componentToHtmlLines(component: unknown): string[] | undefined {
+  if (!component || typeof (component as { render?: unknown }).render !== 'function') return undefined;
+  const lines = (component as { render: (width: number) => string[] }).render(80);
+  if (!Array.isArray(lines) || lines.length === 0) return undefined;
+  return lines.map((l: string) => ansiToHtml(l));
+}
+
+/**
+ * Invoke the tool's `renderCall` (if registered) and convert its output to
+ * HTML lines. Returns undefined when the tool has no `renderCall`, isn't
+ * found (extensions not yet bound), or the call throws/returns nothing
+ * renderable — callers must fall back to the existing plain rendering.
+ */
+export function renderToolCallHtml(
+  sess: AgentSession,
+  toolName: string,
+  args: unknown,
+  toolCallId: string,
+): string[] | undefined {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- SDK's Theme type isn't exported publicly; renderCall's real signature is unreachable by name.
+    const toolDef = sess.extensionRunner.getToolDefinition(toolName) as any;
+    if (!toolDef?.renderCall) return undefined;
+    const ctx = buildToolRenderContext(args, toolCallId, false, false);
+    return componentToHtmlLines(toolDef.renderCall(args, stubTheme, ctx));
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Invoke the tool's `renderResult` (if registered) and convert its output to
+ * HTML lines. `result` must be the `AgentToolResult<TDetails>` object the
+ * tool's `execute`/`onUpdate` produced (the `result`/`partialResult` field of
+ * `tool_execution_end`/`tool_execution_update` events, which mirror the SDK's
+ * `AgentToolUpdateCallback<T> = (partialResult: AgentToolResult<T>) => void`
+ * contract exactly). Returns undefined on no renderer / not-found / failure.
+ */
+export function renderToolResultHtml(
+  sess: AgentSession,
+  toolName: string,
+  result: unknown,
+  args: unknown,
+  toolCallId: string,
+  isPartial: boolean,
+): string[] | undefined {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- see renderToolCallHtml
+    const toolDef = sess.extensionRunner.getToolDefinition(toolName) as any;
+    if (!toolDef?.renderResult) return undefined;
+    const isError = !!(result as { isError?: boolean } | undefined)?.isError;
+    const ctx = buildToolRenderContext(args, toolCallId, isPartial, isError);
+    return componentToHtmlLines(toolDef.renderResult(result, { expanded: true, isPartial }, stubTheme, ctx));
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Invoke the registered `registerMessageRenderer` for `msg.customType` (if
+ * any) and attach its output as `renderedNoticeHtml` on a COPY of `msg` — the
+ * original object (a live reference into the SDK's in-memory/session message
+ * array) is never mutated. Returns `msg` unchanged when `msg.role !== 'custom'`,
+ * there's no registered renderer, or invocation fails.
+ */
+export function renderCustomMessage(sess: AgentSession, msg: unknown): unknown {
+  if (!msg || typeof msg !== 'object') return msg;
+  const m = msg as { role?: string; customType?: string; display?: boolean };
+  if (m.role !== 'custom' || !m.customType) return msg;
+  // display: false means the message is LLM-context only — never visible in the UI.
+  if (m.display === false) return msg;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- see renderToolCallHtml
+    const renderer = sess.extensionRunner.getMessageRenderer(m.customType) as any;
+    if (!renderer) return msg;
+    const lines = componentToHtmlLines(renderer(msg, { expanded: true }, stubTheme));
+    if (!lines) return msg;
+    return { ...msg, renderedNoticeHtml: lines };
+  } catch {
+    return msg;
+  }
+}
+
+/** Array wrapper for history payloads — copy-on-write, same convention as `trimMessagesForWire`. */
+export function renderCustomMessagesForWire(sess: AgentSession, messages: unknown[]): unknown[] {
+  let changed = false;
+  const out = messages.map((msg) => {
+    const rendered = renderCustomMessage(sess, msg);
+    if (rendered !== msg) changed = true;
+    return rendered;
+  });
+  return changed ? out : messages;
 }
 
 // ── Factory executor ──────────────────────────────────────────────────────────
