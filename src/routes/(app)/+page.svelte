@@ -122,6 +122,8 @@
     insert: string;
     muted?: boolean;
     disabled?: boolean;
+    /** Optional section header for grouping commands. */
+    section?: string;
   };
 
   const SHELL_SHORTCUTS = [
@@ -518,15 +520,23 @@
         description: c.description,
         insert: `/${c.name} `,
       }));
-      const extCmds = extensionCommands
-        .filter((c) => typeof c.name === 'string' && (!q || c.name.startsWith(q)))
-        .slice(0, 8)
-        .map((c) => ({
-          trigger: '/' as const,
-          label: `/${c.name}`,
-          description: c.description || `${c.source} command`,
-          insert: `/${c.name} `,
-        }));
+      // Group extension commands by source (file/package name)
+      const extBySource = Object.groupBy(
+        extensionCommands.filter((c) => typeof c.name === 'string' && (!q || c.name.startsWith(q))),
+        (c) => c.source
+      );
+      const extCmds: ComposerShortcut[] = [];
+      for (const [source, cmds] of Object.entries(extBySource).filter((e): e is [string, typeof extensionCommands] => !!e[1])) {
+        for (const c of cmds.slice(0, 6)) {
+          extCmds.push({
+            trigger: '/' as const,
+            label: `/${c.name}`,
+            description: c.description || `${source} command`,
+            insert: `/${c.name} `,
+            section: source,
+          });
+        }
+      }
       const skills = resourcesSkills
         .filter((s) => !q || match(s.name) || match(s.description))
         .slice(0, 8)
@@ -636,37 +646,24 @@
   let sessionId = $state<string | null>(null);
   let thinkingLevel = $state('off');
   let model = $state<ModelInfo | null>(null);
-  /** All possible thinking levels in canonical order. */
-  const ALL_THINKING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'] as const;
-  type ThinkingLevel = (typeof ALL_THINKING_LEVELS)[number];
+  /** Canonical order for sorting thinking levels — derives from SDK's ModelThinkingLevel. */
+  const THINKING_LEVEL_CANONICAL = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+  type ThinkingLevel = (typeof THINKING_LEVEL_CANONICAL)[number];
   function isThinkingLevel(level: string): level is ThinkingLevel {
-    return (ALL_THINKING_LEVELS as readonly string[]).includes(level);
+    return (THINKING_LEVEL_CANONICAL as readonly string[]).includes(level);
   }
+  /** Derive supported levels from the model's thinkingLevelMap — no hardcoded list. */
   function getSupportedThinkingLevels(m: ModelInfo | null): ThinkingLevel[] {
-    if (!m?.reasoning) return ['off'];
-    return ALL_THINKING_LEVELS.filter((level) => {
-      const mapped = m.thinkingLevelMap?.[level];
-      if (mapped === null) return false;
-      if (level === 'xhigh') return mapped !== undefined;
-      return true;
-    });
+    if (!m?.reasoning || !m.thinkingLevelMap) return ['off'];
+    return THINKING_LEVEL_CANONICAL.filter((level) => level in m.thinkingLevelMap!);
   }
+  /** When the current level is invalid, default to the highest available level. */
   function clampThinkingLevelForModel(m: ModelInfo | null, level: string): ThinkingLevel {
-    const availableLevels = getSupportedThinkingLevels(m);
-    if (isThinkingLevel(level) && availableLevels.includes(level)) return level;
-    const requestedIndex = isThinkingLevel(level) ? ALL_THINKING_LEVELS.indexOf(level) : -1;
-    if (requestedIndex === -1) return availableLevels[0] ?? 'off';
-    for (let i = requestedIndex; i < ALL_THINKING_LEVELS.length; i++) {
-      const candidate = ALL_THINKING_LEVELS[i];
-      if (availableLevels.includes(candidate)) return candidate;
-    }
-    for (let i = requestedIndex - 1; i >= 0; i--) {
-      const candidate = ALL_THINKING_LEVELS[i];
-      if (availableLevels.includes(candidate)) return candidate;
-    }
-    return availableLevels[0] ?? 'off';
+    const available = getSupportedThinkingLevels(m);
+    if (isThinkingLevel(level) && available.includes(level)) return level;
+    return available[available.length - 1] ?? 'off';
   }
-  /** Thinking levels available for the current model using SDK semantics. */
+  /** Thinking levels available for the current model — derived from model.thinkingLevelMap. */
   let availableThinkingLevels = $derived(getSupportedThinkingLevels(model));
   $effect(() => {
     const clamped = clampThinkingLevelForModel(model, thinkingLevel);
@@ -709,9 +706,9 @@
   let queuedFollowUp = $state<string[]>([]);
   /** Whether context compaction is currently running */
   let isCompacting = $state(false);
-  /** Whether auto-compaction is enabled */
+  /** Whether auto-compaction is enabled — persisted in localStorage */
   let autoCompactionEnabled = $state(true);
-  /** Whether auto-retry on transient errors is enabled */
+  /** Whether auto-retry on transient errors is enabled — persisted in localStorage */
   let autoRetryEnabled = $state(true);
   /** STT: true while SpeechRecognition is active. */
   let isRecording = $state(false);
@@ -829,7 +826,7 @@
   ];
 
   /** All tools reported by the server */
-  let toolsList = $state<{ name: string; description: string; isBuiltin: boolean }[]>([]);
+  let toolsList = $state<{ name: string; description: string; isBuiltin: boolean; origin?: string }[]>([]);
   /** Names of currently active/enabled tools */
   let activeToolNames = $state<string[]>([]);
   /** Registered slash commands from extensions */
@@ -1511,9 +1508,14 @@
     if (newWindow != null) contextUsageWindow = newWindow;
     // Session-level settings (optional — present on connected/session_loaded)
     if ('isCompacting' in payload) isCompacting = Boolean(payload.isCompacting);
-    if ('autoCompactionEnabled' in payload)
+    if ('autoCompactionEnabled' in payload) {
       autoCompactionEnabled = Boolean(payload.autoCompactionEnabled ?? true);
-    if ('autoRetryEnabled' in payload) autoRetryEnabled = Boolean(payload.autoRetryEnabled ?? true);
+      try { localStorage.setItem('pifrontier:autoCompactionEnabled', JSON.stringify(autoCompactionEnabled)); } catch { /* noop */ }
+    }
+    if ('autoRetryEnabled' in payload) {
+      autoRetryEnabled = Boolean(payload.autoRetryEnabled ?? true);
+      try { localStorage.setItem('pifrontier:autoRetryEnabled', JSON.stringify(autoRetryEnabled)); } catch { /* noop */ }
+    }
   }
 
   function handleServer(msg: ServerMessage) {
@@ -1595,8 +1597,9 @@
       }
 
       case 'thinking_level_changed': {
+        const incoming = (msg as { type: string; level: string }).level ?? 'off';
         applySessionState({
-          thinkingLevel: (msg as { type: string; level: string }).level ?? 'off',
+          thinkingLevel: clampThinkingLevelForModel(model, incoming),
         });
         break;
       }
@@ -2073,7 +2076,7 @@
 
       case 'tools_list': {
         toolsList =
-          (msg.tools as { name: string; description: string; isBuiltin: boolean }[] | undefined) ??
+          (msg.tools as { name: string; description: string; isBuiltin: boolean; origin?: string }[] | undefined) ??
           [];
         activeToolNames = (msg.activeToolNames as string[] | undefined) ?? [];
         break;
@@ -2505,8 +2508,9 @@
   // ── Model & session actions ──────────────────────────────────────────────────
 
   function pickThinkingLevel(level: string) {
-    thinkingLevel = level; // optimistic
-    send({ type: 'set_thinking_level', level });
+    const clamped = clampThinkingLevelForModel(model, level);
+    thinkingLevel = clamped; // optimistic
+    send({ type: 'set_thinking_level', level: clamped });
   }
 
   function openTab(tab: 'models' | 'tools' | 'skills') {
@@ -3451,6 +3455,15 @@
     } catch {
       /* localStorage unavailable */
     }
+    // Load persisted auto-compact/auto-retry settings
+    try {
+      const ac = localStorage.getItem('pifrontier:autoCompactionEnabled');
+      if (ac !== null) autoCompactionEnabled = JSON.parse(ac);
+      const ar = localStorage.getItem('pifrontier:autoRetryEnabled');
+      if (ar !== null) autoRetryEnabled = JSON.parse(ar);
+    } catch {
+      /* localStorage unavailable */
+    }
   });
 
   onDestroy(() => {
@@ -4255,6 +4268,13 @@
                   </div>
                   <div class="max-h-[min(18rem,45dvh)] overflow-y-auto p-1.5">
                     {#each filteredSlashCommands as cmd, i (cmd.label ?? i)}
+                      {#if cmd.section && (i === 0 || cmd.section !== filteredSlashCommands[i - 1]?.section)}
+                        <div class="px-3 pt-2 pb-1">
+                          <span class="text-[10px] font-semibold text-base-content/35 uppercase tracking-wider">
+                            {cmd.section}
+                          </span>
+                        </div>
+                      {/if}
                       <button
                         onclick={() => selectSlashCommand(cmd)}
                         role="option"
@@ -4933,6 +4953,7 @@
                           checked={autoCompactionEnabled}
                           onCheckedChange={(v) => {
                             autoCompactionEnabled = v;
+                            try { localStorage.setItem('pifrontier:autoCompactionEnabled', JSON.stringify(v)); } catch { /* noop */ }
                             send({ type: 'set_auto_compaction', enabled: v });
                           }}
                           disabled={wsState !== 'open'}
@@ -4950,6 +4971,7 @@
                           checked={autoRetryEnabled}
                           onCheckedChange={(v) => {
                             autoRetryEnabled = v;
+                            try { localStorage.setItem('pifrontier:autoRetryEnabled', JSON.stringify(v)); } catch { /* noop */ }
                             send({ type: 'set_auto_retry', enabled: v });
                           }}
                           disabled={wsState !== 'open'}
@@ -5096,8 +5118,9 @@
                     <p class="text-sm text-base-content/45">No extensions loaded.</p>
                   {:else}
                     {#each ['user', 'project', 'temporary'] as scope (scope)}
-                      {@const grouped = extensionsList.filter((e) => e.scope === scope)}
-                      {#if grouped.length > 0}
+                      {@const scoped = extensionsList.filter((e) => e.scope === scope)}
+                      {#if scoped.length > 0}
+                        {@const bySource = Object.groupBy(scoped, (e) => e.source)}
                         <div class="mb-5">
                           <p
                             class="text-xs font-semibold text-base-content/50 uppercase tracking-wider mb-2"
@@ -5105,7 +5128,10 @@
                             {scope}
                           </p>
                           <div class="space-y-2">
-                            {#each grouped as ext (ext.path)}
+                            {#each Object.entries(bySource).filter((e): e is [string, ExtensionSummary[]] => !!e[1]) as [source, exts] (source)}
+                              {@const allTools = exts.flatMap((e) => e.tools)}
+                              {@const allCommands = exts.flatMap((e) => e.commands)}
+                              {@const allFlags = [...new Set(exts.flatMap((e) => e.flags ?? []))]}
                               <Card.Root
                                 size="sm"
                                 class="py-0 overflow-hidden bg-base-100/60 border-base-content/10"
@@ -5114,8 +5140,14 @@
                                   <div class="px-4 py-3">
                                     <div class="flex items-center gap-2">
                                       <p class="text-sm font-medium text-base-content/80">
-                                        {ext.source}
+                                        {source}
                                       </p>
+                                      {#if exts.length > 1}
+                                        <span
+                                          class="px-1.5 py-0.5 text-[10px] font-mono rounded bg-base-content/10 text-base-content/45"
+                                          >{exts.length} files</span
+                                        >
+                                      {/if}
                                       <span
                                         class="px-1.5 py-0.5 text-[10px] font-mono rounded bg-base-content/10 text-base-content/45"
                                         >{scope === 'user'
@@ -5125,14 +5157,20 @@
                                             : 'Temporary'}</span
                                       >
                                     </div>
-                                    <p
-                                      class="mt-0.5 text-xs text-base-content/35 font-mono truncate"
-                                      title={ext.path}
-                                    >
-                                      {ext.path}
-                                    </p>
+                                    {#if exts.length === 1}
+                                      <p
+                                        class="mt-0.5 text-xs text-base-content/35 font-mono truncate"
+                                        title={exts[0].path}
+                                      >
+                                        {exts[0].path}
+                                      </p>
+                                    {:else}
+                                      <p class="mt-0.5 text-xs text-base-content/35">
+                                        {exts.map((e) => e.path).join(', ')}
+                                      </p>
+                                    {/if}
                                   </div>
-                                  {#if ext.tools.length > 0}
+                                  {#if allTools.length > 0}
                                     <details class="group px-4 py-2">
                                       <summary
                                         class="cursor-pointer text-xs font-medium text-base-content/55 hover:text-base-content/75 transition-colors list-none flex items-center gap-1.5"
@@ -5140,10 +5178,10 @@
                                         <ChevronRight
                                           class="w-3 h-3 transition-transform group-open:rotate-90"
                                         />
-                                        Tools ({ext.tools.length})
+                                        Tools ({allTools.length})
                                       </summary>
                                       <div class="mt-1.5 ml-4 space-y-1">
-                                        {#each ext.tools as tool (tool.name)}
+                                        {#each allTools as tool (tool.name)}
                                           <div>
                                             <p class="text-xs text-base-content/70 font-mono">
                                               {tool.name}
@@ -5160,7 +5198,7 @@
                                       </div>
                                     </details>
                                   {/if}
-                                  {#if ext.commands.length > 0}
+                                  {#if allCommands.length > 0}
                                     <details class="group px-4 py-2">
                                       <summary
                                         class="cursor-pointer text-xs font-medium text-base-content/55 hover:text-base-content/75 transition-colors list-none flex items-center gap-1.5"
@@ -5168,10 +5206,10 @@
                                         <ChevronRight
                                           class="w-3 h-3 transition-transform group-open:rotate-90"
                                         />
-                                        Commands ({ext.commands.length})
+                                        Commands ({allCommands.length})
                                       </summary>
                                       <div class="mt-1.5 ml-4 space-y-1">
-                                        {#each ext.commands as cmd (cmd.name)}
+                                        {#each allCommands as cmd (cmd.name)}
                                           <div>
                                             <p class="text-xs text-base-content/70 font-mono">
                                               /{cmd.name}
@@ -5188,9 +5226,9 @@
                                       </div>
                                     </details>
                                   {/if}
-                                  {#if ext.flags && ext.flags.length > 0}
+                                  {#if allFlags.length > 0}
                                     <div class="px-4 py-2 flex flex-wrap gap-1">
-                                      {#each ext.flags as flag (flag)}
+                                      {#each allFlags as flag (flag)}
                                         <span
                                           class="px-1.5 py-0.5 text-[10px] font-mono rounded-full bg-primary/8 text-primary/60"
                                           >{flag}</span

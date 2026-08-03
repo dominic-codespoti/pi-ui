@@ -4,7 +4,7 @@
   import { renderMarkdown } from '$lib/markdown';
   import LoaderIcon from '@lucide/svelte/icons/loader';
   import Square from '@lucide/svelte/icons/square';
-  import SquareCheck from '@lucide/svelte/icons/square-check';
+
 
   interface Props {
     component: ParsedComponent;
@@ -147,9 +147,9 @@
         aria-pressed={localChecked}
         onclick={() => { checkboxStates[comp.label] = !localChecked; onaction?.(comp.path ?? [], 'toggle', String(!localChecked)); }}
       >
-        <span class="w-4 h-4 rounded border {localChecked ? 'bg-primary/20 border-primary' : 'border-base-content/20'} flex items-center justify-center text-xs">
+        <span class="w-4 h-4 rounded border flex items-center justify-center text-xs transition-colors {localChecked ? 'bg-primary border-primary' : 'border-base-content/20'}">
           {#if localChecked}
-            <SquareCheck class="w-3.5 h-3.5 text-primary/70" />
+            <svg class="w-3 h-3 text-white" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 6l3 3 5-5" /></svg>
           {:else}
             <Square class="w-3.5 h-3.5 text-base-content/35" />
           {/if}
@@ -158,9 +158,9 @@
       </button>
     {:else}
       <div class="flex items-center gap-2 rounded-lg border border-base-content/8 bg-base-content/[0.025] px-3 py-2 text-sm text-base-content/65">
-        <span class="w-4 h-4 rounded border {comp.checked ? 'bg-primary/20 border-primary' : 'border-base-content/20'} flex items-center justify-center text-xs">
+        <span class="w-4 h-4 rounded border flex items-center justify-center text-xs transition-colors {comp.checked ? 'bg-primary border-primary' : 'border-base-content/20'}">
           {#if comp.checked}
-            <SquareCheck class="w-3.5 h-3.5 text-primary/70" />
+            <svg class="w-3 h-3 text-white" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 6l3 3 5-5" /></svg>
           {:else}
             <Square class="w-3.5 h-3.5 text-base-content/35" />
           {/if}

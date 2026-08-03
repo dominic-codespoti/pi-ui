@@ -561,6 +561,16 @@ function currentSessionSummary(): SessionSummary | null {
     firstMessage: firstMsg,
   };
 }
+type WireExtensionCommand = { name: string; description?: string; source: string };
+
+/** Read the already-bound session command catalog without reloading resources. */
+function extensionCommandsFor(sess: AgentSession): WireExtensionCommand[] {
+  return sess.extensionRunner.getRegisteredCommands().map((command) => ({
+    name: command.invocationName || command.name,
+    description: command.description,
+    source: command.sourceInfo.source,
+  }));
+}
 
 // ── 3. Restart nonce ──────────────────────────────────────────────────────────
 // Single-use nonce for restart_server. Prevents replay and ensures the user
@@ -1602,6 +1612,7 @@ async function setActiveSession(newSession: AgentSession, newCwd?: string) {
   entry.lastActivity = Date.now();
 
   const init = initialMessages(newSession.messages, newSession);
+  broadcast({ type: 'commands_list', commands: extensionCommandsFor(newSession) });
   broadcast({
     type: 'session_loaded',
     sessionId: newSession.sessionId,
@@ -1756,24 +1767,11 @@ try {
           sendConnected([], true);
         }
 
-        // Send extension commands immediately after connected
+        // The session has already bound its extensions before connected is sent.
+        // Read the live runner directly instead of reloading all resources here;
+        // reload() was the source of the visible slash-command delay.
         try {
-          const sessionCwd = sess.sessionManager.getCwd() || cwd;
-          const agentDir = _sdk!.getAgentDir();
-          const loader = new _sdk!.DefaultResourceLoader({ cwd: sessionCwd, agentDir });
-          await loader.reload();
-          const { extensions } = loader.getExtensions();
-          const allCommands: { name: string; description?: string; source: string }[] = [];
-          for (const ext of extensions) {
-            for (const [name, cmd] of ext.commands) {
-              allCommands.push({
-                name,
-                description: cmd.description,
-                source: ext.sourceInfo.source,
-              });
-            }
-          }
-          ws.send(JSON.stringify({ type: 'commands_list', commands: allCommands }));
+          ws.send(JSON.stringify({ type: 'commands_list', commands: extensionCommandsFor(sess) }));
         } catch (err) {
           log.error('[pifrontier] Failed to send extension commands:', err);
         }
@@ -2410,12 +2408,17 @@ try {
                 sendSlashResult(ws, command, 'Reloaded extensions, skills, prompts, and tools.');
                 ws.send(JSON.stringify({
                   type: 'tools_list',
-                  tools: activeSession().getAllTools().map((t) => ({
+                tools: activeSession().getAllTools().map((t) => ({
                     name: t.name,
                     description: t.description,
                     isBuiltin: t.sourceInfo.source === 'builtin',
+                    origin: t.sourceInfo.source,
                   })),
                   activeToolNames: activeSession().getActiveToolNames(),
+                }));
+                ws.send(JSON.stringify({
+                  type: 'commands_list',
+                  commands: extensionCommandsFor(activeSession()),
                 }));
                 break;
               }
@@ -2657,11 +2660,11 @@ try {
             const allTools = activeSession().getAllTools();
             const activeNames = activeSession().getActiveToolNames();
             ws.send(JSON.stringify({
-              type: 'tools_list',
               tools: allTools.map((t) => ({
                 name: t.name,
                 description: t.description,
                 isBuiltin: t.sourceInfo.source === 'builtin',
+                origin: t.sourceInfo.source,
               })),
               activeToolNames: activeNames,
             }));
@@ -2767,22 +2770,10 @@ try {
 
         case 'get_commands': {
           try {
-            const sessionCwd = activeSession().sessionManager.getCwd() || cwd;
-            const agentDir = _sdk!.getAgentDir();
-            const loader = new _sdk!.DefaultResourceLoader({ cwd: sessionCwd, agentDir });
-            await loader.reload();
-            const { extensions } = loader.getExtensions();
-            const allCommands: { name: string; description?: string; source: string }[] = [];
-            for (const ext of extensions) {
-              for (const [name, cmd] of ext.commands) {
-                allCommands.push({
-                  name,
-                  description: cmd.description,
-                  source: ext.sourceInfo.source,
-                });
-              }
-            }
-            ws.send(JSON.stringify({ type: 'commands_list', commands: allCommands }));
+            ws.send(JSON.stringify({
+              type: 'commands_list',
+              commands: extensionCommandsFor(activeSession()),
+            }));
           } catch (err) {
             log.error('[pifrontier] get_commands error:', err);
             ws.send(JSON.stringify({ type: 'commands_list', commands: [] }));

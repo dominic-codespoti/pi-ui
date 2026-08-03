@@ -60,7 +60,7 @@
     modelTab: 'models' | 'providers';
     model: ModelInfo | null;
     availableModels: ModelInfo[];
-    toolsList: { name: string; description: string; isBuiltin: boolean }[];
+    toolsList: { name: string; description: string; isBuiltin: boolean; origin?: string }[];
     activeToolNames: string[];
     resourcesLoaded: boolean;
     thinkingLevel: string;
@@ -75,7 +75,7 @@
     filteredProviders: ProviderInfo[];
     configuredProviderCount: number;
     filteredModelsByProvider: [string, ModelInfo[]][];
-    filteredTools: { name: string; description: string; isBuiltin: boolean }[];
+    filteredTools: { name: string; description: string; isBuiltin: boolean; origin?: string }[];
     filteredSkills: { skills: SkillSummary[]; prompts: PromptSummary[] };
     skillInstallUrl: string;
     skillInstallScope: 'project' | 'user';
@@ -339,20 +339,29 @@
               </button>
             {/each}
           {/if}
-          {#if customTools.length > 0}
-            {@render sectionHeader('C', 'bg-primary/70', 'custom')}
-            {#each customTools as tool (tool.name)}
-              {@const isActive = activeToolNames.includes(tool.name)}
-              <button onclick={() => onToggleTool(tool.name)} class="w-full text-left px-5 py-2.5 text-sm transition-all duration-150 flex items-center gap-3 relative {isActive ? 'hover:bg-base-content/5' : 'opacity-50 hover:opacity-75 hover:bg-base-content/3'}" tabindex={open ? 0 : -1} aria-pressed={isActive}>
-                {#if isActive}<span class="absolute left-0 top-1 bottom-1 w-0.5 rounded-r-full bg-primary glow-primary"></span>{/if}
-                <span class="min-w-0 flex-1">
-                  <span class="text-sm font-mono text-base-content/80 block truncate">{tool.name}</span>
-                  {#if tool.description}<span class="text-xs text-base-content/40 leading-relaxed line-clamp-2">{tool.description}</span>{/if}
-                </span>
-                <span class="shrink-0 w-4 h-4 rounded border flex items-center justify-center transition-colors {isActive ? 'border-primary bg-primary' : 'border-base-content/30 bg-transparent'}">{#if isActive}<svg class="w-2.5 h-2.5 text-primary-content" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="m20 6-11 11-5-5"/></svg>{/if}</span>
-              </button>
+          {@const customToolsByOrigin = (() => {
+              const groups = new Map<string, typeof customTools>();
+              for (const t of customTools) {
+                const key = t.origin || 'custom';
+                const g = groups.get(key);
+                if (g) g.push(t); else groups.set(key, [t]);
+              }
+              return [...groups.entries()];
+            })()}
+            {#each customToolsByOrigin as [origin, tools] (origin)}
+              {@render sectionHeader('C', 'bg-primary/70', origin)}
+              {#each tools as tool (tool.name)}
+                {@const isActive = activeToolNames.includes(tool.name)}
+                <button onclick={() => onToggleTool(tool.name)} class="w-full text-left px-5 py-2.5 text-sm transition-all duration-150 flex items-center gap-3 relative {isActive ? 'hover:bg-base-content/5' : 'opacity-50 hover:opacity-75 hover:bg-base-content/3'}" tabindex={open ? 0 : -1} aria-pressed={isActive}>
+                  {#if isActive}<span class="absolute left-0 top-1 bottom-1 w-0.5 rounded-r-full bg-primary glow-primary"></span>{/if}
+                  <span class="min-w-0 flex-1">
+                    <span class="text-sm font-mono text-base-content/80 block truncate">{tool.name}</span>
+                    {#if tool.description}<span class="text-xs text-base-content/40 leading-relaxed line-clamp-2">{tool.description}</span>{/if}
+                  </span>
+                  <span class="shrink-0 w-4 h-4 rounded border flex items-center justify-center transition-colors {isActive ? 'border-primary bg-primary' : 'border-base-content/30 bg-transparent'}">{#if isActive}<svg class="w-2.5 h-2.5 text-primary-content" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="m20 6-11 11-5-5"/></svg>{/if}</span>
+                </button>
+              {/each}
             {/each}
-          {/if}
         {/if}
       </ScrollArea>
     </div>

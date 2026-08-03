@@ -209,7 +209,7 @@ export interface ConnectedMessage {
  *   { type: "available_models_changed", availableModels: ModelInfo[] }
  *   { type: "sessions_error",          message: string }
  *   { type: "fork_points",             entries: Array<{ entryId: string; text: string }> }
- *   { type: "tools_list",              tools: Array<{ name: string; description: string; isBuiltin: boolean }>, activeToolNames: string[] }
+ *   { type: "tools_list",              tools: Array<{ name: string; description: string; isBuiltin: boolean; origin?: string }>, activeToolNames: string[] }
  *   { type: "resources_list",          skills: SkillSummary[], prompts: PromptSummary[] }
  *   { type: "extensions_list",         extensions: ExtensionSummary[], errors: Array<{ path: string; error: string }> }
  *   { type: "commands_list",           commands: Array<{ name: string; description?: string; source: string }> }
