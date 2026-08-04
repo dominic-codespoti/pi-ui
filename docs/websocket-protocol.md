@@ -34,11 +34,15 @@ Sent on WS open. Contains full session state.
   sessionMode: 'persisted' | 'in-memory';
   sessionPath: string | undefined;
   contextUsage: ContextUsage;
+  /** Extension widgets owned by this active session; replayed on reconnect/switch. */
+  widgets?: WidgetPayload[];
 }
 ```
 
 #### `session_loaded`
 Broadcast when session changes (switch, fork, edit rewind).
+
+`session_loaded` includes the same optional `widgets` array for the newly active session.
 
 #### SDK Events (forwarded as-is)
 - `agent_start` — Generation started
@@ -53,6 +57,7 @@ Broadcast when session changes (switch, fork, edit rewind).
 - `update_status` — Update check results
 - `server_restarting` — Server shutdown initiated
 - `agent_error` — Error from SDK or server
+- `extension_ui_request` with `method: 'setWidget'` — session-stamped widget update. The payload includes `widgetKey`, `widgetType`, widget data, and optional `widgetPlacement` (`'aboveEditor'` or `'belowEditor'`).
 
 ### Client → Server
 
@@ -103,6 +108,7 @@ Broadcast when session changes (switch, fork, edit rewind).
 | Type | Payload | Purpose |
 |------|---------|---------|
 | `extension_ui_response` | `{ id, value?, confirmed?, cancelled? }` | Respond to extension dialog |
+| `dismiss_widget` | `{ key }` | Tear down a widget server-side and broadcast its removal |
 | `extension_custom_input` | `{ id, key, alt?, ctrl?, meta?, shift? }` | Send keyboard input to extension |
 | `editor_text_response` | `{ id, text }` | Respond to editor text request |
 
@@ -134,6 +140,8 @@ Broadcast when session changes (switch, fork, edit rewind).
 2. Client renders the dialog (confirm, input, select, or custom)
 3. User interacts → client sends `extension_ui_response`
 4. Server unblocks the session (5 min timeout)
+5. Widgets are replayed from `connected`/`session_loaded` and stamped broadcasts from other sessions are ignored by the client.
+6. User dismissal sends `dismiss_widget`; the server disposes the factory and broadcasts removal to every tab.
 
 ## Error Handling
 

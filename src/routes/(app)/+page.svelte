@@ -12,6 +12,7 @@
     PromptSummary,
     ExtensionSummary,
     WidgetContent,
+    WidgetPayload,
     TreeNode,
     UpdateStatus,
     UpdateTarget,
@@ -21,6 +22,7 @@
   import { renderMarkdown } from '$lib/markdown';
   import type { ParsedComponent } from '$lib/tui-stubs';
   import { projectsState } from '$lib/state/projects-state.svelte';
+  import { extensionUiState } from '$lib/state/extension-ui-state.svelte';
   import {
     rawMessagesToUI,
     uid,
@@ -90,7 +92,6 @@
   function versionText(version?: string): string {
     return version && version !== 'unknown' ? `v${version}` : 'unknown';
   }
-
 
   // ── Builtin slash commands (from pi SDK) ────────────────────────────────────
 
@@ -172,7 +173,6 @@
     return false;
   }
 
-
   function parsedComponentIsDisplayOnly(comp: ParsedComponent | undefined): boolean {
     if (!comp) return false;
     if (comp.kind === 'container') return comp.children.every(parsedComponentIsDisplayOnly);
@@ -197,75 +197,7 @@
     return true;
   }
 
-  type ModalState =
-    | { method: 'confirm'; id: string; title: string; message: string }
-    | { method: 'input'; id: string; title: string; placeholder?: string }
-    | { method: 'select'; id: string; title: string; options: string[] }
-    | { method: 'editor'; id: string; title: string; prefill?: string }
-    | {
-        method: 'custom';
-        id: string;
-        title: string;
-        parsed?: ParsedComponent;
-        lines?: string[];
-        htmlLines?: string[];
-        interactive?: true;
-      };
-
-  function modalFromExtensionRequest(msg: Record<string, unknown>): ModalState | null {
-    const id = msg.id as string;
-    const method = msg.method as string;
-    switch (method) {
-      case 'confirm':
-        return {
-          method: 'confirm',
-          id,
-          title: (msg.title as string | undefined) ?? 'Confirm',
-          message: (msg.message as string | undefined) ?? '',
-        };
-      case 'input':
-        return {
-          method: 'input',
-          id,
-          title: (msg.title as string | undefined) ?? 'Input',
-          placeholder: msg.placeholder as string | undefined,
-        };
-      case 'select':
-        return {
-          method: 'select',
-          id,
-          title: (msg.title as string | undefined) ?? 'Select',
-          options: (msg.options as string[] | undefined) ?? [],
-        };
-      case 'editor':
-        return {
-          method: 'editor',
-          id,
-          title: (msg.title as string | undefined) ?? 'Editor',
-          prefill: msg.prefill as string | undefined,
-        };
-      case 'custom': {
-        const parsed = msg.parsed as ParsedComponent | undefined;
-        const lines = msg.lines as string[] | undefined;
-        const htmlLines = msg.htmlLines as string[] | undefined;
-        const interactive = msg.interactive as boolean | undefined;
-        return {
-          method: 'custom',
-          id,
-          title: (msg.title as string | undefined) ?? 'Extension Request',
-          parsed,
-          ...(lines ? { lines } : {}),
-          ...(htmlLines ? { htmlLines } : {}),
-          ...(interactive ? { interactive: true as const } : {}),
-        };
-      }
-      default:
-        return null;
-    }
-  }
-
-  let modalQueue = $state<ModalState[]>([]);
-  let modal = $derived(modalQueue[0] ?? null);
+  let modal = $derived(extensionUiState.modalQueue[0] ?? null);
   let modalInput = $state('');
   let modalFocusEl = $state<HTMLElement | undefined>(undefined);
   let preparedModalId = $state<string | null>(null);
@@ -420,24 +352,18 @@
 
   // ── Extension UI state ───────────────────────────────────────────────────────
 
-  /** Keyed status texts from extension setStatus() calls. */
-  let extensionStatuses = $state<Record<string, string>>({});
-  /** Keyed widget panels from extension setWidget() calls. */
-  let extensionWidgets = $state<Record<string, WidgetContent>>({});
-  /** Widget placement mapping (aboveEditor / belowEditor). */
-  let extensionWidgetPlacement = $state<Record<string, string>>({});
-  /** Custom working message from extension setWorkingMessage() calls. */
-  let workingMessage = $state<string | undefined>(undefined);
-  /** Whether the streaming working indicator is visible (setWorkingVisible). */
-  let workingVisible = $state(true);
-  /** Frames for the working indicator animation (setWorkingIndicator). */
-  let workingIndicatorFrames = $state<string[]>([]);
-  /** Interval in ms between frame ticks (setWorkingIndicator). */
-  let workingIndicatorMs = $state(80);
+  let aboveEditorWidgets = $derived(
+    Object.entries(extensionUiState.widgets).filter(
+      ([key]) => (extensionUiState.widgetPlacement[key] ?? 'aboveEditor') === 'aboveEditor'
+    )
+  );
+  let belowEditorWidgets = $derived(
+    Object.entries(extensionUiState.widgets).filter(
+      ([key]) => (extensionUiState.widgetPlacement[key] ?? 'aboveEditor') === 'belowEditor'
+    )
+  );
   /** Current frame index for the working indicator animation. */
   let workingFrameIndex = $state(0);
-  /** Label shown for collapsed thinking blocks (setHiddenThinkingLabel). */
-  let hiddenThinkingLabel = $state('thinking');
   /** Global tool output expansion state (setToolsExpanded). */
   let toolsExpandedGlobal = $state(false);
   /** Argument completions for the current extension command (subcommands). */
@@ -453,12 +379,6 @@
     }, 1000);
     return () => clearInterval(id);
   });
-  /** Extension-injected header content (setHeader). */
-  let extensionHeader = $state('');
-  /** Extension-injected footer content (setFooter). */
-  let extensionFooter = $state('');
-  /** Extension-injected editor component panel (setEditorComponent). */
-  let editorComponentPanel = $state<ParsedComponent | null>(null);
   /** Whether the composer shortcut menu is open. */
   let showSlashMenu = $state(false);
   /** Currently highlighted index in the composer shortcut menu (-1 = none). */
@@ -526,7 +446,9 @@
         (c) => c.source
       );
       const extCmds: ComposerShortcut[] = [];
-      for (const [source, cmds] of Object.entries(extBySource).filter((e): e is [string, typeof extensionCommands] => !!e[1])) {
+      for (const [source, cmds] of Object.entries(extBySource).filter(
+        (e): e is [string, typeof extensionCommands] => !!e[1]
+      )) {
         for (const c of cmds.slice(0, 6)) {
           extCmds.push({
             trigger: '/' as const,
@@ -647,7 +569,15 @@
   let thinkingLevel = $state('off');
   let model = $state<ModelInfo | null>(null);
   /** Canonical order for sorting thinking levels — derives from SDK's ModelThinkingLevel. */
-  const THINKING_LEVEL_CANONICAL = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+  const THINKING_LEVEL_CANONICAL = [
+    'off',
+    'minimal',
+    'low',
+    'medium',
+    'high',
+    'xhigh',
+    'max',
+  ] as const;
   type ThinkingLevel = (typeof THINKING_LEVEL_CANONICAL)[number];
   function isThinkingLevel(level: string): level is ThinkingLevel {
     return (THINKING_LEVEL_CANONICAL as readonly string[]).includes(level);
@@ -826,7 +756,9 @@
   ];
 
   /** All tools reported by the server */
-  let toolsList = $state<{ name: string; description: string; isBuiltin: boolean; origin?: string }[]>([]);
+  let toolsList = $state<
+    { name: string; description: string; isBuiltin: boolean; origin?: string }[]
+  >([]);
   /** Names of currently active/enabled tools */
   let activeToolNames = $state<string[]>([]);
   /** Registered slash commands from extensions */
@@ -1140,8 +1072,8 @@
   // ── Working indicator frame animation ──────────────────────────────────────
 
   $effect(() => {
-    const frames = workingIndicatorFrames;
-    const ms = workingIndicatorMs;
+    const frames = extensionUiState.workingIndicatorFrames;
+    const ms = extensionUiState.workingIndicatorMs;
     if (frames.length === 0) return;
     workingFrameIndex = 0;
     const id = setInterval(() => {
@@ -1441,10 +1373,12 @@
 
   // Give the shared projects store access to the live socket.
   projectsState.send = send;
+  // Same for the extension UI store (modal answers need to send responses).
+  extensionUiState.send = send;
 
   // ── Server event handling ────────────────────────────────────────────────────
-
   function applySessionState(payload: Record<string, unknown>) {
+    const prevSessionId = sessionId;
     if ('sessionId' in payload) sessionId = payload.sessionId as string;
     if ('isStreaming' in payload) isStreaming = payload.isStreaming as boolean;
     if ('thinkingLevel' in payload) thinkingLevel = payload.thinkingLevel as string;
@@ -1459,9 +1393,7 @@
     if ('messages' in payload) {
       const raw = (payload.messages as unknown[]) ?? [];
       const streamingMessage = payload.streamingMessage;
-      messages = rawMessagesToUI(
-        streamingMessage === undefined ? raw : [...raw, streamingMessage],
-      );
+      messages = rawMessagesToUI(streamingMessage === undefined ? raw : [...raw, streamingMessage]);
       activeStreamMsg = null;
       if (streamingMessage !== undefined && isStreaming) {
         for (let i = messages.length - 1; i >= 0; i--) {
@@ -1475,6 +1407,16 @@
       totalRawMessagesLoaded = raw.length;
       if ('totalMessageCount' in payload) totalMessageCount = payload.totalMessageCount as number;
       if ('messagesTruncated' in payload) messagesTruncated = Boolean(payload.messagesTruncated);
+    }
+    if ('widgets' in payload) {
+      extensionUiState.clearWidgets();
+      for (const w of (payload.widgets as WidgetPayload[]) ?? []) {
+        extensionUiState.applyWidget(w as unknown as Record<string, unknown>);
+      }
+    } else if ('sessionId' in payload && (payload.sessionId as string) !== prevSessionId) {
+      // Defensive: a session change without a widgets payload must never keep
+      // the previous session's panels (e.g. legacy/partial server payloads).
+      extensionUiState.clearWidgets();
     }
     // Sync the shared projects store with the active session.
     projectsState.cwd = cwd;
@@ -1510,11 +1452,22 @@
     if ('isCompacting' in payload) isCompacting = Boolean(payload.isCompacting);
     if ('autoCompactionEnabled' in payload) {
       autoCompactionEnabled = Boolean(payload.autoCompactionEnabled ?? true);
-      try { localStorage.setItem('pifrontier:autoCompactionEnabled', JSON.stringify(autoCompactionEnabled)); } catch { /* noop */ }
+      try {
+        localStorage.setItem(
+          'pifrontier:autoCompactionEnabled',
+          JSON.stringify(autoCompactionEnabled)
+        );
+      } catch {
+        /* noop */
+      }
     }
     if ('autoRetryEnabled' in payload) {
       autoRetryEnabled = Boolean(payload.autoRetryEnabled ?? true);
-      try { localStorage.setItem('pifrontier:autoRetryEnabled', JSON.stringify(autoRetryEnabled)); } catch { /* noop */ }
+      try {
+        localStorage.setItem('pifrontier:autoRetryEnabled', JSON.stringify(autoRetryEnabled));
+      } catch {
+        /* noop */
+      }
     }
   }
 
@@ -1523,9 +1476,18 @@
     // after a session switch. Only events tagged with sessionId are gated —
     // global events (connected, model_changed, etc.) pass through without it.
     // Events that set the initial sessionId are explicitly exempted.
+    // `session_runtime` is also exempted: it is a global sidebar-state
+    // broadcast (running dots / unseen markers for ANY pooled session, not
+    // just the active one). Gating it would freeze the background-session
+    // dots forever — a finished background session would keep its "running"
+    // dot and the "ready to check" marker could never appear.
     if (msg && typeof msg === 'object' && 'sessionId' in msg) {
       const msgType = (msg as Record<string, unknown>).type;
-      if (msgType !== 'connected' && msgType !== 'session_loaded') {
+      if (
+        msgType !== 'connected' &&
+        msgType !== 'session_loaded' &&
+        msgType !== 'session_runtime'
+      ) {
         const sid = (msg as Record<string, unknown>).sessionId;
         if (typeof sid === 'string' && sid !== sessionId) {
           return;
@@ -1839,10 +1801,7 @@
 
       case 'extension_ui_request': {
         const method = msg.method as string;
-        const newModal = modalFromExtensionRequest(msg);
-        if (newModal) {
-          modalQueue = [...modalQueue, newModal];
-        }
+        extensionUiState.queueModalFromRequest(msg);
 
         // Non-blocking extension methods (fire-and-forget, no modal response needed):
         if (method === 'notify') {
@@ -1851,53 +1810,14 @@
             (msg.notifyType as 'info' | 'warning' | 'error' | undefined) ?? 'info'
           );
         } else if (method === 'setStatus') {
-          const key = msg.statusKey as string | undefined;
-          const text = msg.statusText as string | undefined;
-          if (key) {
-            if (text == null) {
-              delete extensionStatuses[key];
-            } else {
-              extensionStatuses[key] = text;
-            }
-          }
+          extensionUiState.setStatus(
+            msg.statusKey as string | undefined,
+            msg.statusText as string | undefined
+          );
         } else if (method === 'setWidget') {
-          const key = msg.widgetKey as string | undefined;
-          if (key) {
-            const widgetType = (msg.widgetType as string | undefined) ?? 'text';
-            const widgetLines = msg.widgetLines as string[] | undefined;
-            const widgetHtmlLines = msg.widgetHtmlLines as string[] | undefined;
-            const widgetPlacement = msg.widgetPlacement as string | undefined;
-            const widgetData = msg.widgetData as Record<string, unknown> | undefined;
-            const widgetComponent = msg.widgetComponent as ParsedComponent | undefined;
-            if (widgetType === 'text' && (!widgetLines || widgetLines.length === 0)) {
-              delete extensionWidgets[key];
-            } else if (widgetType === 'component' && widgetComponent) {
-              extensionWidgets[key] = { type: 'component', component: widgetComponent };
-            } else if (widgetType === 'table') {
-              const headers = (widgetData?.headers as string[]) ?? [];
-              const rows = (widgetData?.rows as string[][]) ?? [];
-              extensionWidgets[key] = { type: 'table', headers, rows };
-            } else if (widgetType === 'badge') {
-              const text = (widgetData?.text as string) ?? '';
-              const variant =
-                (widgetData?.variant as WidgetContent extends { variant: infer V } ? V : never) ??
-                'info';
-              extensionWidgets[key] = { type: 'badge', text, variant };
-            } else {
-              extensionWidgets[key] = {
-                type: 'text',
-                lines: widgetLines ?? [],
-                ...(widgetHtmlLines?.length ? { htmlLines: widgetHtmlLines } : {}),
-              };
-            }
-            if (widgetPlacement) {
-              extensionWidgetPlacement[key] = widgetPlacement;
-            } else {
-              delete extensionWidgetPlacement[key];
-            }
-          }
+          extensionUiState.applyWidget(msg);
         } else if (method === 'setTitle') {
-          document.title = (msg.title as string | undefined) ?? 'pi UI';
+          extensionUiState.setTitle(msg.title as string | undefined);
         } else if (method === 'set_editor_text') {
           input = (msg.text as string | undefined) ?? '';
           tick().then(() => {
@@ -1926,16 +1846,15 @@
             send({ type: 'editor_text_response', id: requestId, text: input });
           }
         } else if (method === 'setWorkingMessage') {
-          workingMessage = (msg.message as string | undefined) ?? undefined;
+          extensionUiState.setWorkingMessage(msg.message as string | undefined);
         } else if (method === 'setWorkingVisible') {
-          workingVisible = (msg.visible as boolean | undefined) ?? true;
+          extensionUiState.setWorkingVisible((msg.visible as boolean | undefined) ?? true);
         } else if (method === 'setWorkingIndicator') {
           const frames = (msg.frames as string[] | undefined) ?? [];
-          workingIndicatorFrames = frames;
-          workingIndicatorMs = (msg.intervalMs as number | undefined) ?? 80;
+          extensionUiState.setWorkingIndicator(frames, msg.intervalMs as number | undefined);
           workingFrameIndex = 0;
         } else if (method === 'setHiddenThinkingLabel') {
-          hiddenThinkingLabel = (msg.label as string | undefined) ?? 'thinking';
+          extensionUiState.setHiddenThinkingLabel(msg.label as string | undefined);
         } else if (method === 'setToolsExpanded') {
           const exp = (msg.expanded as boolean | undefined) ?? false;
           toolsExpandedGlobal = exp;
@@ -1943,11 +1862,11 @@
             if (m.role === 'tool' && !m.streaming) m.expanded = exp;
           }
         } else if (method === 'set_header') {
-          extensionHeader = (msg.content as string | undefined) ?? '';
+          extensionUiState.setHeader(msg.content as string | undefined);
         } else if (method === 'set_footer') {
-          extensionFooter = (msg.content as string | undefined) ?? '';
+          extensionUiState.setFooter(msg.content as string | undefined);
         } else if (method === 'set_editor_component') {
-          editorComponentPanel = (msg.parsed as ParsedComponent | null) ?? null;
+          extensionUiState.setEditorComponent((msg.parsed as ParsedComponent | null) ?? null);
         } else if (method === 'diagnostic') {
           messages.push({
             id: uid(),
@@ -1965,12 +1884,7 @@
       }
 
       case 'extension_ui_request_replay': {
-        const newModal = modalFromExtensionRequest(msg);
-        if (!newModal) break;
-        const alreadyQueued = modalQueue.some((m) => m.id === newModal.id);
-        if (!alreadyQueued) {
-          modalQueue = [...modalQueue, newModal];
-        }
+        extensionUiState.replayModalFromRequest(msg);
         break;
       }
 
@@ -2019,9 +1933,13 @@
           notice.streaming = false;
           const aborted = (msg.aborted as boolean | undefined) ?? false;
           const errMsg = msg.errorMessage as string | undefined;
+          const result = msg.result as
+            { tokensBefore?: number; estimatedTokensAfter?: number } | undefined;
           notice.content = aborted
             ? `compaction ${errMsg ? `failed: ${errMsg}` : 'aborted'}`
-            : 'context compacted';
+            : result?.tokensBefore != null && result.estimatedTokensAfter != null
+              ? `context compacted · ${result.tokensBefore.toLocaleString()} → ${result.estimatedTokensAfter.toLocaleString()} tokens`
+              : 'context compacted';
         }
         break;
       }
@@ -2076,8 +1994,9 @@
 
       case 'tools_list': {
         toolsList =
-          (msg.tools as { name: string; description: string; isBuiltin: boolean; origin?: string }[] | undefined) ??
-          [];
+          (msg.tools as
+            | { name: string; description: string; isBuiltin: boolean; origin?: string }[]
+            | undefined) ?? [];
         activeToolNames = (msg.activeToolNames as string[] | undefined) ?? [];
         break;
       }
@@ -2208,41 +2127,21 @@
         const renderId = msg.id as string | undefined;
         const renderLines = msg.lines as string[] | undefined;
         const renderHtmlLines = msg.htmlLines as string[] | undefined;
-        if (
-          renderId &&
-          modal?.method === 'custom' &&
-          modal.id === renderId &&
-          modal.interactive &&
-          renderLines &&
-          modalQueue.length > 0
-        ) {
-          const [active, ...queued] = modalQueue;
-          modalQueue = [
-            { ...active, lines: renderLines, ...(renderHtmlLines ? { htmlLines: renderHtmlLines } : {}) } as ModalState,
-            ...queued,
-          ];
-        }
+        extensionUiState.updateCustomRender(renderId, renderLines, renderHtmlLines);
         break;
       }
 
       case 'extension_ui_update': {
         const updateId = msg.id as string | undefined;
         const updatedParsed = msg.parsed as ParsedComponent | undefined;
-        if (updateId && updatedParsed) {
-          modalQueue = modalQueue.map((m) =>
-            m.method === 'custom' && m.id === updateId ? { ...m, parsed: updatedParsed } : m
-          );
-        }
+        extensionUiState.updateCustomParsed(updateId, updatedParsed);
         break;
       }
 
       case 'extension_ui_dismiss': {
         const dismissId = msg.id as string | undefined;
-        if (dismissId) {
-          const wasActive = modal?.id === dismissId;
-          modalQueue = modalQueue.filter((m) => m.id !== dismissId);
-          if (wasActive) modalInput = '';
-        }
+        const wasActive = extensionUiState.dismissModal(dismissId);
+        if (wasActive) modalInput = '';
         break;
       }
 
@@ -2415,38 +2314,20 @@
   function modalComponentAction(
     path: number[],
     event: 'select' | 'click' | 'toggle' | 'submit' | 'setting',
-    value?: string,
+    value?: string
   ) {
     if (!modal || modal.method !== 'custom') return;
     send({ type: 'extension_component_event', id: modal.id, path, event, value });
   }
 
-  function modalConfirm(confirmed: boolean) {
-    if (!modal) return;
-    if (send({ type: 'extension_ui_response', id: modal.id, confirmed })) {
-      modalQueue = modalQueue.slice(1);
-    }
-  }
-
   function modalSubmitValue() {
-    if (!modal) return;
-    if (send({ type: 'extension_ui_response', id: modal.id, value: modalInput })) {
-      modalQueue = modalQueue.slice(1);
+    if (extensionUiState.answerSubmitValue(modalInput)) {
       modalInput = '';
     }
   }
 
-  function modalSelectOption(value: string) {
-    if (!modal) return;
-    if (send({ type: 'extension_ui_response', id: modal.id, value })) {
-      modalQueue = modalQueue.slice(1);
-    }
-  }
-
   function modalCancel() {
-    if (!modal) return;
-    if (send({ type: 'extension_ui_response', id: modal.id, cancelled: true })) {
-      modalQueue = modalQueue.slice(1);
+    if (extensionUiState.answerCancel()) {
       modalInput = '';
     }
   }
@@ -2457,7 +2338,7 @@
   function modalContentKeydown(e: KeyboardEvent) {
     if (e.key === 'Enter' && !e.shiftKey && modal?.method !== 'editor') {
       e.preventDefault();
-      if (modal?.method === 'confirm') modalConfirm(true);
+      if (modal?.method === 'confirm') extensionUiState.answerConfirm(true);
       else if (modal?.method === 'input' || modal?.method === 'custom') modalSubmitValue();
     }
   }
@@ -2941,11 +2822,6 @@
   function dismissChatNotice(id: string) {
     const idx = messages.findIndex((m) => m.id === id);
     if (idx >= 0) messages.splice(idx, 1);
-  }
-
-  function dismissWidget(key: string) {
-    delete extensionWidgets[key];
-    delete extensionWidgetPlacement[key];
   }
 
   function selectSlashCommand(shortcut: ComposerShortcut) {
@@ -3524,7 +3400,6 @@
 
 <svelte:window onkeydown={handleGlobalKeydown} />
 
-
 <!--
   Root: flex-row — three columns:
     [session panel] [main content] [model picker panel]
@@ -3987,16 +3862,16 @@
       {/if}
 
       <!-- Extension header -->
-      {#if extensionHeader}
+      {#if extensionUiState.header}
         <div
           class="shrink-0 px-3 py-1.5 text-xs text-base-content/60 bg-base-200/50 border-b border-base-content/10 font-mono whitespace-pre-wrap flex items-start gap-2"
         >
-          <span class="flex-1">{extensionHeader}</span>
+          <span class="flex-1">{extensionUiState.header}</span>
           <Button
             variant="ghost"
             size="icon-xs"
             onclick={() => {
-              extensionHeader = '';
+              extensionUiState.setHeader(undefined);
             }}
             aria-label="Dismiss header"><X class="w-3 h-3" /></Button
           >
@@ -4028,11 +3903,11 @@
           {isStreaming}
           {expandedUserMsgs}
           {truncatedUserMsgs}
-          {workingVisible}
-          {hiddenThinkingLabel}
-          {workingIndicatorFrames}
+          workingVisible={extensionUiState.workingVisible}
+          hiddenThinkingLabel={extensionUiState.hiddenThinkingLabel}
+          workingIndicatorFrames={extensionUiState.workingIndicatorFrames}
           {workingFrameIndex}
-          {workingMessage}
+          workingMessage={extensionUiState.workingMessage}
           {messagesTruncated}
           {totalRawMessagesLoaded}
           {totalMessageCount}
@@ -4066,16 +3941,16 @@
       </main>
 
       <!-- Extension footer -->
-      {#if extensionFooter}
+      {#if extensionUiState.footer}
         <div
           class="shrink-0 px-3 py-1.5 text-xs text-base-content/60 bg-base-200/50 border-t border-base-content/10 font-mono whitespace-pre-wrap flex items-start gap-2"
         >
-          <span class="flex-1">{extensionFooter}</span>
+          <span class="flex-1">{extensionUiState.footer}</span>
           <Button
             variant="ghost"
             size="icon-xs"
             onclick={() => {
-              extensionFooter = '';
+              extensionUiState.setFooter(undefined);
             }}
             aria-label="Dismiss footer"><X class="w-3 h-3" /></Button
           >
@@ -4155,18 +4030,18 @@
           {/if}
 
           <!-- Extension editor component panel -->
-          {#if editorComponentPanel}
+          {#if extensionUiState.editorComponentPanel}
             <div
               class="mb-2 bg-base-content/5 rounded-xl px-3 py-2 text-xs text-base-content/60 flex items-start gap-2"
             >
               <span class="flex-1">
-                <ExtensionComponent component={editorComponentPanel} />
+                <ExtensionComponent component={extensionUiState.editorComponentPanel} />
               </span>
               <Button
                 variant="ghost"
                 size="icon-xs"
                 onclick={() => {
-                  editorComponentPanel = null;
+                  extensionUiState.setEditorComponent(null);
                 }}
                 aria-label="Dismiss editor panel"><X class="w-3 h-3" /></Button
               >
@@ -4174,67 +4049,75 @@
           {/if}
 
           <!-- Extension widget panels -->
-          {#if Object.keys(extensionWidgets).length > 0}
-            <div class="mb-2 flex flex-col gap-1">
-              {#each Object.entries(extensionWidgets) as [key, widget] (key)}
-                <div class="group relative">
-                  <button
-                    onclick={() => dismissWidget(key)}
-                    class="touch-reveal absolute -top-1 -right-1 w-4 h-4 bg-base-content/20 hover:bg-base-content/40 rounded-full flex items-center justify-center text-[9px] leading-none transition-opacity z-10 {isMobile
-                      ? 'opacity-100'
-                      : 'opacity-0 group-hover:opacity-100'}"
-                    aria-label="Dismiss widget"><X class="w-2.5 h-2.5" /></button
-                  >
-                  {#if widget.type === 'text'}
-                    <div
-                      class="bg-base-content/5 rounded-xl px-3 py-2 text-xs text-base-content/70 font-mono whitespace-pre overflow-x-auto leading-relaxed"
-                    >{#if widget.htmlLines}{#each widget.htmlLines as line, i (i)}<div>{@html line || '&nbsp;'}</div>{/each}{:else}{widget.lines.join('\n')}{/if}</div>
-                  {:else if widget.type === 'table'}
-                    <div
-                      class="bg-base-content/5 rounded-xl px-3 py-2 text-xs text-base-content/70 font-mono overflow-x-auto"
-                    >
-                      <table class="w-full border-collapse">
-                        {#if widget.headers.length > 0}
-                          <thead>
-                            <tr class="border-b border-base-content/10">
-                              {#each widget.headers as header (header)}
-                                <th class="text-left px-2 py-1 text-base-content/60 font-semibold"
-                                  >{header}</th
-                                >
-                              {/each}
-                            </tr>
-                          </thead>
-                        {/if}
-                        <tbody>
-                          {#each widget.rows as row (row)}
-                            <tr class="border-b border-base-content/5 last:border-0">
-                              {#each row as cell (cell)}
-                                <td class="px-2 py-1">{cell}</td>
-                              {/each}
-                            </tr>
-                          {/each}
-                        </tbody>
-                      </table>
-                    </div>
-                  {:else if widget.type === 'badge'}
-                    <div class="flex items-center gap-2 px-2">
-                      <span
-                        class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium
-                    {widget.variant === 'success'
-                          ? 'bg-success/15 text-success'
-                          : widget.variant === 'error'
-                            ? 'bg-error/15 text-error'
-                            : widget.variant === 'warning'
-                              ? 'bg-warning/15 text-warning'
-                              : 'bg-info/15 text-info'}">{widget.text}</span
-                      >
-                    </div>
-                  {:else if widget.type === 'component'}
-                    <div class="bg-base-content/5 rounded-xl px-3 py-2">
-                      <ExtensionComponent component={widget.component} />
-                    </div>
-                  {/if}
+          {#snippet extensionWidgetPanel(key: string, widget: WidgetContent)}
+            <div class="group relative">
+              <button
+                onclick={() => extensionUiState.dismissWidget(key)}
+                class="touch-reveal absolute -top-1 -right-1 w-4 h-4 bg-base-content/20 hover:bg-base-content/40 rounded-full flex items-center justify-center text-[9px] leading-none transition-opacity z-10 {isMobile
+                  ? 'opacity-100'
+                  : 'opacity-0 group-hover:opacity-100'}"
+                aria-label="Dismiss widget"><X class="w-2.5 h-2.5" /></button
+              >
+              {#if widget.type === 'text'}
+                <div
+                  class="bg-base-content/5 rounded-xl px-3 py-2 text-xs text-base-content/70 font-mono whitespace-pre overflow-x-auto leading-relaxed"
+                >
+                  {#if widget.htmlLines}{#each widget.htmlLines as line, i (i)}<div>
+                        {@html line || '&nbsp;'}
+                      </div>{/each}{:else}{widget.lines.join('\n')}{/if}
                 </div>
+              {:else if widget.type === 'table'}
+                <div
+                  class="bg-base-content/5 rounded-xl px-3 py-2 text-xs text-base-content/70 font-mono overflow-x-auto"
+                >
+                  <table class="w-full border-collapse">
+                    {#if widget.headers.length > 0}
+                      <thead>
+                        <tr class="border-b border-base-content/10">
+                          {#each widget.headers as header (header)}
+                            <th class="text-left px-2 py-1 text-base-content/60 font-semibold"
+                              >{header}</th
+                            >
+                          {/each}
+                        </tr>
+                      </thead>
+                    {/if}
+                    <tbody>
+                      {#each widget.rows as row (row)}
+                        <tr class="border-b border-base-content/5 last:border-0">
+                          {#each row as cell (cell)}
+                            <td class="px-2 py-1">{cell}</td>
+                          {/each}
+                        </tr>
+                      {/each}
+                    </tbody>
+                  </table>
+                </div>
+              {:else if widget.type === 'badge'}
+                <div class="flex items-center gap-2 px-2">
+                  <span
+                    class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium
+                {widget.variant === 'success'
+                      ? 'bg-success/15 text-success'
+                      : widget.variant === 'error'
+                        ? 'bg-error/15 text-error'
+                        : widget.variant === 'warning'
+                          ? 'bg-warning/15 text-warning'
+                          : 'bg-info/15 text-info'}">{widget.text}</span
+                  >
+                </div>
+              {:else if widget.type === 'component'}
+                <div class="bg-base-content/5 rounded-xl px-3 py-2">
+                  <ExtensionComponent component={widget.component} />
+                </div>
+              {/if}
+            </div>
+          {/snippet}
+
+          {#if aboveEditorWidgets.length > 0}
+            <div class="mb-2 flex flex-col gap-1">
+              {#each aboveEditorWidgets as [key, widget] (key)}
+                {@render extensionWidgetPanel(key, widget)}
               {/each}
             </div>
           {/if}
@@ -4270,7 +4153,9 @@
                     {#each filteredSlashCommands as cmd, i (cmd.label ?? i)}
                       {#if cmd.section && (i === 0 || cmd.section !== filteredSlashCommands[i - 1]?.section)}
                         <div class="px-3 pt-2 pb-1">
-                          <span class="text-[10px] font-semibold text-base-content/35 uppercase tracking-wider">
+                          <span
+                            class="text-[10px] font-semibold text-base-content/35 uppercase tracking-wider"
+                          >
                             {cmd.section}
                           </span>
                         </div>
@@ -4667,11 +4552,19 @@
           </div>
           <!-- end .relative slash/input wrapper -->
 
-          {#if Object.keys(extensionStatuses).length > 0 || effectiveContextTokens > 0 || sessionCostTotal > 0}
+          {#if belowEditorWidgets.length > 0}
+            <div class="mt-2 flex flex-col gap-1">
+              {#each belowEditorWidgets as [key, widget] (key)}
+                {@render extensionWidgetPanel(key, widget)}
+              {/each}
+            </div>
+          {/if}
+
+          {#if Object.keys(extensionUiState.statuses).length > 0 || effectiveContextTokens > 0 || sessionCostTotal > 0}
             <div class="flex mt-1.5 px-1 items-center gap-2 text-xs select-none min-w-0">
-              {#if Object.keys(extensionStatuses).length > 0}
+              {#if Object.keys(extensionUiState.statuses).length > 0}
                 <span class="text-base-content/50 truncate min-w-0">
-                  {Object.values(extensionStatuses).filter(Boolean).join(' · ')}
+                  {Object.values(extensionUiState.statuses).filter(Boolean).join(' · ')}
                 </span>
               {/if}
 
@@ -4953,7 +4846,14 @@
                           checked={autoCompactionEnabled}
                           onCheckedChange={(v) => {
                             autoCompactionEnabled = v;
-                            try { localStorage.setItem('pifrontier:autoCompactionEnabled', JSON.stringify(v)); } catch { /* noop */ }
+                            try {
+                              localStorage.setItem(
+                                'pifrontier:autoCompactionEnabled',
+                                JSON.stringify(v)
+                              );
+                            } catch {
+                              /* noop */
+                            }
                             send({ type: 'set_auto_compaction', enabled: v });
                           }}
                           disabled={wsState !== 'open'}
@@ -4971,7 +4871,14 @@
                           checked={autoRetryEnabled}
                           onCheckedChange={(v) => {
                             autoRetryEnabled = v;
-                            try { localStorage.setItem('pifrontier:autoRetryEnabled', JSON.stringify(v)); } catch { /* noop */ }
+                            try {
+                              localStorage.setItem(
+                                'pifrontier:autoRetryEnabled',
+                                JSON.stringify(v)
+                              );
+                            } catch {
+                              /* noop */
+                            }
                             send({ type: 'set_auto_retry', enabled: v });
                           }}
                           disabled={wsState !== 'open'}
@@ -5547,10 +5454,12 @@
           </button>
           <!-- Content: a soft legibility scrim only — no border, no shadow, no title bar.
                The extension's own rendered box border is the only hard-edged frame. -->
-          <div class="max-h-[min(30rem,calc(100dvh-4rem))] overflow-y-auto rounded-lg bg-base-100/40">
+          <div
+            class="max-h-[min(30rem,calc(100dvh-4rem))] overflow-y-auto rounded-lg bg-base-100/40"
+          >
             <pre
-              class="text-xs text-base-content/80 whitespace-pre-wrap leading-relaxed font-mono select-text p-2"
-            >{#if modal.htmlLines}{#each modal.htmlLines as line, i (i)}<div>{@html line || '&nbsp;'}</div>{/each}{:else}{(modal.lines ?? []).join('\n')}{/if}</pre>
+              class="text-xs text-base-content/80 whitespace-pre-wrap leading-relaxed font-mono select-text p-2">{#if modal.htmlLines}{#each modal.htmlLines as line, i (i)}<div>{@html line ||
+                      '&nbsp;'}</div>{/each}{:else}{(modal.lines ?? []).join('\n')}{/if}</pre>
           </div>
           <!-- Hidden input to capture keystrokes, paste, and IME composition. -->
           <input
@@ -5626,7 +5535,7 @@
           {#each modal.options as opt (opt)}
             <button
               class="w-full text-left px-3.5 py-2.5 rounded-xl border border-transparent text-sm text-base-content/75 transition-all duration-150 hover:border-primary/25 hover:bg-primary/8 hover:text-base-content focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
-              onclick={() => modalSelectOption(opt)}>{opt}</button
+              onclick={() => extensionUiState.answerSelect(opt)}>{opt}</button
             >
           {/each}
         </div>
@@ -5670,13 +5579,20 @@
     {/if}
 
     <Dialog.Footer class="mt-0">
-      <Button variant="ghost" size="sm" class="text-muted-foreground/80 hover:text-base-content" onclick={modalCancel}>Cancel</Button>
+      <Button
+        variant="ghost"
+        size="sm"
+        class="text-muted-foreground/80 hover:text-base-content"
+        onclick={modalCancel}>Cancel</Button
+      >
       {#if modal?.method === 'confirm'}
-        <Button size="sm" onclick={() => modalConfirm(true)}>Confirm</Button>
+        <Button size="sm" onclick={() => extensionUiState.answerConfirm(true)}>Confirm</Button>
       {:else if modal?.method === 'input' || modal?.method === 'editor'}
         <Button size="sm" onclick={modalSubmitValue}>Submit</Button>
       {:else if modal?.method === 'custom' && !modal.interactive && (customModalNeedsTextInput(modal.parsed) || parsedComponentHasInput(modal.parsed) || parsedComponentHasCheckbox(modal.parsed) || parsedComponentIsDisplayOnly(modal.parsed))}
-        <Button size="sm" onclick={modalSubmitValue}>{parsedComponentIsDisplayOnly(modal.parsed) ? 'OK' : 'Submit'}</Button>
+        <Button size="sm" onclick={modalSubmitValue}
+          >{parsedComponentIsDisplayOnly(modal.parsed) ? 'OK' : 'Submit'}</Button
+        >
       {/if}
     </Dialog.Footer>
   </Dialog.Content>

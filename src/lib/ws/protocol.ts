@@ -139,6 +139,41 @@ export type WidgetContent =
   | { type: 'table'; headers: string[]; rows: string[][] }
   | { type: 'badge'; text: string; variant: 'info' | 'warning' | 'error' | 'success' }
   | { type: 'component'; component: ParsedComponent };
+export type WidgetPlacement = 'aboveEditor' | 'belowEditor';
+
+/** Wire payload for one extension widget — the setWidget broadcast body (sans type/id/sessionId/method), replayed in connected/session_loaded. */
+export interface WidgetPayload {
+  widgetKey: string;
+  widgetType: 'text' | 'table' | 'badge' | 'component';
+  widgetLines?: string[];
+  widgetHtmlLines?: string[];
+  widgetData?: Record<string, unknown>;
+  widgetComponent?: ParsedComponent;
+  widgetPlacement?: WidgetPlacement;
+}
+
+/**
+ * Full snapshot of one session's extension UI state — the serializable
+ * projection of the server's per-session bucket. Sent as
+ * `{ type: 'extension_ui_state', sessionId, ui }` right after
+ * `connected`/`session_loaded` so the client renders exactly the active
+ * session's extension UI; live updates arrive as stamped
+ * `extension_ui_request` deltas on top of it.
+ */
+export interface ExtensionUiStatePayload {
+  statuses: Record<string, string>;
+  workingMessage?: string;
+  workingVisible: boolean;
+  workingIndicator?: { frames: string[]; intervalMs: number };
+  hiddenThinkingLabel: string;
+  header?: string;
+  footer?: string;
+  editorComponent?: ParsedComponent;
+  title?: string;
+  widgets: WidgetPayload[];
+  /** Open dialog/editor-text extension_ui_request payloads (id + method included). */
+  pendingDialogs: Array<Record<string, unknown>>;
+}
 
 /** A node in the session tree for visual display. */
 export interface TreeNode {
@@ -190,6 +225,8 @@ export interface ConnectedMessage {
   contextUsage?: ContextUsage;
   /** Current notification webhook URL (empty/null = disabled). */
   webhookUrl?: string;
+  /** Extension widgets owned by the active session; replayed on connect/session switch. */
+  widgets?: WidgetPayload[];
 }
 
 /**
@@ -329,9 +366,23 @@ export type ClientMessage =
   /** Interaction with a parsed component inside an open custom() dialog — the
    * server invokes the corresponding LIVE callback (onSelect/onClick/onToggle/
    * onSubmit/updateValue) on the component at `path` and re-parses the tree. */
-  | { type: 'extension_component_event'; id: string; path: number[]; event: 'select' | 'click' | 'toggle' | 'submit' | 'setting'; value?: string }
+  | {
+      type: 'extension_component_event';
+      id: string;
+      path: number[];
+      event: 'select' | 'click' | 'toggle' | 'submit' | 'setting';
+      value?: string;
+    }
   /** Response to a blocking extension_ui_request (select / confirm / input / editor / custom). */
-  | { type: 'extension_ui_response'; id: string; value?: string; confirmed?: boolean; cancelled?: true }
+  | {
+      type: 'extension_ui_response';
+      id: string;
+      value?: string;
+      confirmed?: boolean;
+      cancelled?: true;
+    }
+  /** Dismiss an extension widget — server tears down its factory and broadcasts removal to all tabs. */
+  | { type: 'dismiss_widget'; key: string }
   /** Editor text content response to a request_editor_text extension_ui_request. */
   | { type: 'editor_text_response'; id: string; text: string }
   /** Request list of all providers with auth status. */

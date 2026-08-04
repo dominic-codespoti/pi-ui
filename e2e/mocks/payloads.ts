@@ -8,7 +8,13 @@ export const CONNECTED_PAYLOAD = {
   sessionId: 'mock-session-001',
   isStreaming: false,
   thinkingLevel: 'medium',
-  model: { provider: 'openai', id: 'gpt-4o', name: 'GPT-4o', reasoning: false, contextWindow: 128_000 },
+  model: {
+    provider: 'openai',
+    id: 'gpt-4o',
+    name: 'GPT-4o',
+    reasoning: false,
+    contextWindow: 128_000,
+  },
   availableModels: [
     { provider: 'openai', id: 'gpt-4o', name: 'GPT-4o', reasoning: false, contextWindow: 128_000 },
   ],
@@ -29,7 +35,13 @@ export const SESSION_LOADED_PAYLOAD = {
   sessionId: 'mock-session-002',
   isStreaming: false,
   thinkingLevel: 'medium',
-  model: { provider: 'openai', id: 'gpt-4o', name: 'GPT-4o', reasoning: false, contextWindow: 128_000 },
+  model: {
+    provider: 'openai',
+    id: 'gpt-4o',
+    name: 'GPT-4o',
+    reasoning: false,
+    contextWindow: 128_000,
+  },
   availableModels: [
     { provider: 'openai', id: 'gpt-4o', name: 'GPT-4o', reasoning: false, contextWindow: 128_000 },
   ],
@@ -60,22 +72,80 @@ export const SESSION_LOADED_PAYLOAD = {
 export const PROJECTS_LIST_PAYLOAD = {
   type: 'projects_list',
   projects: [
-    { cwd: '/home/user/project-a', name: 'project-a', pinned: true, exists: true, registered: true, sessionCount: 2, lastActivity: Date.now() },
-    { cwd: '/home/user/project-b', name: 'project-b', pinned: false, exists: true, registered: true, sessionCount: 1, lastActivity: Date.now() - 3600000 },
+    {
+      cwd: '/home/user/project-a',
+      name: 'project-a',
+      pinned: true,
+      exists: true,
+      registered: true,
+      sessionCount: 2,
+      lastActivity: Date.now(),
+    },
+    {
+      cwd: '/home/user/project-b',
+      name: 'project-b',
+      pinned: false,
+      exists: true,
+      registered: true,
+      sessionCount: 1,
+      lastActivity: Date.now() - 3600000,
+    },
   ],
 };
 
 export const ALL_SESSIONS_LIST_PAYLOAD = {
   type: 'all_sessions_list',
   sessions: [
-    { id: 's1', path: '/home/user/project-a/s1.jsonl', cwd: '/home/user/project-a', name: 'Bug fix', created: Date.now() - 86400000, modified: Date.now() - 3600000, messageCount: 12, firstMessage: 'Fix the login bug' },
-    { id: 's2', path: '/home/user/project-a/s2.jsonl', cwd: '/home/user/project-a', name: '', created: Date.now() - 43200000, modified: Date.now() - 7200000, messageCount: 5, firstMessage: 'Add tests' },
-    { id: 's3', path: '/home/user/project-b/s1.jsonl', cwd: '/home/user/project-b', name: '', created: Date.now() - 7200000, modified: Date.now() - 1800000, messageCount: 3, firstMessage: 'hello world' },
+    {
+      id: 's1',
+      path: '/home/user/project-a/s1.jsonl',
+      cwd: '/home/user/project-a',
+      name: 'Bug fix',
+      created: Date.now() - 86400000,
+      modified: Date.now() - 3600000,
+      messageCount: 12,
+      firstMessage: 'Fix the login bug',
+    },
+    {
+      id: 's2',
+      path: '/home/user/project-a/s2.jsonl',
+      cwd: '/home/user/project-a',
+      name: '',
+      created: Date.now() - 43200000,
+      modified: Date.now() - 7200000,
+      messageCount: 5,
+      firstMessage: 'Add tests',
+    },
+    {
+      id: 's3',
+      path: '/home/user/project-b/s1.jsonl',
+      cwd: '/home/user/project-b',
+      name: '',
+      created: Date.now() - 7200000,
+      modified: Date.now() - 1800000,
+      messageCount: 3,
+      firstMessage: 'hello world',
+    },
   ],
 };
 
 export function agentStartPayload() {
   return { type: 'agent_start' };
+}
+
+/**
+ * Runtime-status broadcast for any pooled session (active or background).
+ * Drives the sidebar orbs: green pulse while running, violet when done with
+ * unseen results, grey once checked.
+ */
+export function sessionRuntimePayload(sessionId: string, isRunning: boolean, unseen: boolean) {
+  return {
+    type: 'session_runtime',
+    sessionId,
+    isRunning,
+    unseen,
+    lastActivity: Date.now(),
+  };
 }
 
 export function assistantMessageStartPayload() {
@@ -90,7 +160,12 @@ export function thinkingDeltaPayload(text: string) {
   return { type: 'message_update', assistantMessageEvent: { type: 'thinking_delta', delta: text } };
 }
 
-export function assistantMessageEndPayload(usage?: { input: number; output: number; totalTokens: number; cost: { total: number } }) {
+export function assistantMessageEndPayload(usage?: {
+  input: number;
+  output: number;
+  totalTokens: number;
+  cost: { total: number };
+}) {
   return {
     type: 'message_end',
     message: {
@@ -106,7 +181,11 @@ export function agentEndPayload(willRetry = false) {
   return { type: 'agent_end', willRetry };
 }
 
-export function toolExecutionStartPayload(toolName: string, toolCallId: string, args?: Record<string, unknown>) {
+export function toolExecutionStartPayload(
+  toolName: string,
+  toolCallId: string,
+  args?: Record<string, unknown>
+) {
   return { type: 'tool_execution_start', toolName, toolCallId, args: args ?? {} };
 }
 
@@ -164,10 +243,22 @@ export const TOOLS_LIST_PAYLOAD = {
 export const RESOURCES_LIST_PAYLOAD = {
   type: 'resources_list',
   skills: [
-    { name: 'debug', description: 'Debugging assistant', scope: 'user', isBuiltin: false, source: 'skills/debug.md' },
+    {
+      name: 'debug',
+      description: 'Debugging assistant',
+      scope: 'user',
+      isBuiltin: false,
+      source: 'skills/debug.md',
+    },
   ],
   prompts: [
-    { name: 'review', description: 'Code review prompt', scope: 'project', isBuiltin: false, source: '.pi/prompts/review.md' },
+    {
+      name: 'review',
+      description: 'Code review prompt',
+      scope: 'project',
+      isBuiltin: false,
+      source: '.pi/prompts/review.md',
+    },
   ],
 };
 
@@ -178,6 +269,7 @@ export function extensionSetWidgetPayload(
   key: string,
   component: Record<string, unknown>,
   placement?: string,
+  sessionId: string = CONNECTED_PAYLOAD.sessionId
 ) {
   return {
     type: 'extension_ui_request',
@@ -186,12 +278,18 @@ export function extensionSetWidgetPayload(
     widgetKey: key,
     widgetType: 'component',
     widgetComponent: component,
+    sessionId,
     ...(placement ? { widgetPlacement: placement } : {}),
   };
 }
 
 /** Simulate a setWidget message with plain text lines, optionally with ANSI-derived HTML lines (mirrors server.ts's widgetHtmlLines field). */
-export function extensionSetWidgetTextPayload(key: string, lines: string[], htmlLines?: string[]) {
+export function extensionSetWidgetTextPayload(
+  key: string,
+  lines: string[],
+  htmlLines?: string[],
+  sessionId: string = CONNECTED_PAYLOAD.sessionId
+) {
   return {
     type: 'extension_ui_request',
     id: crypto.randomUUID(),
@@ -199,6 +297,7 @@ export function extensionSetWidgetTextPayload(key: string, lines: string[], html
     widgetKey: key,
     widgetType: 'text',
     widgetLines: lines,
+    sessionId,
     ...(htmlLines ? { widgetHtmlLines: htmlLines } : {}),
   };
 }
@@ -218,7 +317,11 @@ export function extensionCustomPayload(id: string, title: string, parsed: Record
  *  components like pi-subagents' TranscriptOverlay) — no `parsed` tree, just
  *  rendered lines and the `interactive: true` flag that drives the de-chromed
  *  floating-close-button overlay. */
-export function extensionInteractiveCustomPayload(id: string, lines: string[], htmlLines?: string[]) {
+export function extensionInteractiveCustomPayload(
+  id: string,
+  lines: string[],
+  htmlLines?: string[]
+) {
   return {
     type: 'extension_ui_request',
     id,
@@ -230,7 +333,12 @@ export function extensionInteractiveCustomPayload(id: string, lines: string[], h
 }
 
 /** Simulate an extension_event with a level. */
-export function extensionEventPayload(source: string, event: string, level: string, message?: string) {
+export function extensionEventPayload(
+  source: string,
+  event: string,
+  level: string,
+  message?: string
+) {
   return {
     type: 'extension_event',
     source,

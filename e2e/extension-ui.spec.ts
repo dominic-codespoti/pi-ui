@@ -1,4 +1,5 @@
 import { test, expect, submitPrompt } from './fixtures';
+import type { Page } from '@playwright/test';
 import {
   extensionConfirmPayload,
   extensionInputPayload,
@@ -9,6 +10,8 @@ import {
   extensionCustomPayload,
   extensionInteractiveCustomPayload,
   extensionEventPayload,
+  ALL_SESSIONS_LIST_PAYLOAD,
+  PROJECTS_LIST_PAYLOAD,
 } from './mocks/payloads';
 import { CONNECTED_PAYLOAD } from './mocks/payloads';
 
@@ -142,6 +145,53 @@ function wsInit(ws: { send: (msg: string) => void }) {
   for (const msg of BASE_WS_INIT) ws.send(JSON.stringify(msg));
 }
 
+async function openProjectsSidebar(page: Page) {
+  const search = page.locator('input[aria-label="Filter projects and sessions"]');
+  const isOpen = async () => {
+    const box = await search.boundingBox();
+    return !!box && box.width > 0 && box.x >= -1;
+  };
+  if (await isOpen()) return;
+  const toggle = page.locator('[aria-label="Toggle session panel"]');
+  for (let i = 0; i < 5; i++) {
+    if (await isOpen()) break;
+    await toggle.click();
+    await page.waitForTimeout(250);
+  }
+  await expect(search).toBeVisible({ timeout: 3000 });
+}
+
+const CONNECTED_S1 = {
+  type: 'connected',
+  sessionId: 's1',
+  isStreaming: false,
+  thinkingLevel: 'medium',
+  model: null,
+  availableModels: [],
+  messages: [],
+  cwd: '/home/user/project-a',
+  sessionMode: 'persisted',
+};
+
+function sessionLoadedFor(path: string, widgets: unknown[] = []) {
+  const isProjectB = path.includes('project-b');
+  return {
+    type: 'session_loaded',
+    sessionId: isProjectB ? 's3' : 's1',
+    isStreaming: false,
+    thinkingLevel: 'medium',
+    model: null,
+    availableModels: [],
+    messages: [],
+    cwd: isProjectB ? '/home/user/project-b' : '/home/user/project-a',
+    sessionName: isProjectB ? undefined : 'Bug fix',
+    sessionPath: path,
+    sessionMode: 'persisted',
+    contextUsage: null,
+    widgets,
+  };
+}
+
 test.describe('Extension component widgets', () => {
   test.beforeEach(async ({ page, login, mockWs }) => {
     await mockWs(page);
@@ -239,6 +289,122 @@ test.describe('Extension component widgets', () => {
     // back to the plain widgetLines join.
     const boldSpan = page.locator('span[style*="font-weight:bold"]', { hasText: 'Fix login bug' });
     await expect(boldSpan).toBeVisible();
+  });
+
+  test('scopes widgets to the active session when switching', async ({ page }) => {
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.onMessage((data) => {
+        const msg = JSON.parse(String(data));
+        if (msg.type === 'get_projects') ws.send(JSON.stringify(PROJECTS_LIST_PAYLOAD));
+        if (msg.type === 'get_all_sessions') ws.send(JSON.stringify(ALL_SESSIONS_LIST_PAYLOAD));
+        if (msg.type === 'switch_session') {
+          ws.send(JSON.stringify(sessionLoadedFor(msg.path)));
+        }
+      });
+      ws.send(JSON.stringify(CONNECTED_S1));
+      setTimeout(() => {
+        ws.send(
+          JSON.stringify(
+            extensionSetWidgetPayload(
+              'subagents',
+              { kind: 'text', label: '', content: 'Active subagents: 2' },
+              undefined,
+              's1'
+            )
+          )
+        );
+      }, 500);
+    });
+
+    await openProjectsSidebar(page);
+    await expect(page.getByText('Active subagents: 2')).toBeVisible({ timeout: 5000 });
+    await page.getByRole('button', { name: /hello world/ }).click();
+    await expect(page.getByText('Active subagents: 2')).toHaveCount(0, { timeout: 3000 });
+  });
+
+  test('replays widgets from session state after loading a session', async ({ page }) => {
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.onMessage(() => {});
+      ws.send(JSON.stringify(CONNECTED_S1));
+      setTimeout(() => {
+        ws.send(
+          JSON.stringify({
+            ...sessionLoadedFor('/home/user/project-a/mock-session-002.jsonl'),
+            sessionId: 'mock-session-002',
+            widgets: [
+              {
+                widgetKey: 'subagents',
+                widgetType: 'component',
+                widgetComponent: {
+                  kind: 'text',
+                  label: '',
+                  content: 'Active subagents: 1',
+                },
+                widgetPlacement: 'belowEditor',
+              },
+            ],
+          })
+        );
+      }, 500);
+    });
+
+    await expect(page.getByText('Active subagents: 1')).toBeVisible({ timeout: 5000 });
+  });
+
+  test('drops widget broadcasts stamped for another session', async ({ page }) => {
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.onMessage(() => {});
+      ws.send(JSON.stringify(CONNECTED_S1));
+      setTimeout(() => {
+        ws.send(
+          JSON.stringify(
+            extensionSetWidgetPayload(
+              'stale',
+              { kind: 'text', label: '', content: 'Stale widget' },
+              undefined,
+              'other-session'
+            )
+          )
+        );
+      }, 500);
+    });
+
+    await page.waitForTimeout(1000);
+    await expect(page.getByText('Stale widget')).toHaveCount(0);
+  });
+
+  test('dismisses a widget durably through the server', async ({ page }) => {
+    const wsMessages: string[] = [];
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.onMessage((data) => wsMessages.push(String(data)));
+      ws.send(JSON.stringify(CONNECTED_S1));
+      setTimeout(() => {
+        ws.send(
+          JSON.stringify(
+            extensionSetWidgetPayload(
+              'dismiss-durable',
+              { kind: 'text', label: '', content: 'Dismiss durably' },
+              undefined,
+              's1'
+            )
+          )
+        );
+      }, 500);
+    });
+
+    await expect(page.getByText('Dismiss durably')).toBeVisible({ timeout: 5000 });
+    await page.getByRole('button', { name: /dismiss widget/i }).first().click();
+    await expect(page.getByText('Dismiss durably')).toHaveCount(0, { timeout: 3000 });
+    await expect.poll(() => {
+      return wsMessages.some((raw) => {
+        try {
+          const msg = JSON.parse(raw);
+          return msg.type === 'dismiss_widget' && msg.key === 'dismiss-durable';
+        } catch {
+          return false;
+        }
+      });
+    }).toBe(true);
   });
 });
 
