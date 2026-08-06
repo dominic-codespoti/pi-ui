@@ -3,16 +3,24 @@ import { PROJECTS_LIST_PAYLOAD, ALL_SESSIONS_LIST_PAYLOAD, SESSION_LOADED_PAYLOA
 import type { Page } from '@playwright/test';
 
 async function openProjectsSidebar(page: Page) {
-  const search = page.locator('input[aria-label="Filter projects and sessions"]:visible');
-  if (await search.count()) return;
-  const sidebarButton = page.locator('[aria-label="Sessions"]').first();
-  if (await sidebarButton.isVisible()) {
-    await sidebarButton.click();
-  }
-  if (!(await search.count())) {
-    await page.evaluate(() => {
-      document.dispatchEvent(new KeyboardEvent('keydown', { key: '/', ctrlKey: true, bubbles: true }));
-    });
+  const search = page.locator('input[aria-label="Filter projects and sessions"]');
+  // The panel is a fixed off-canvas drawer on mobile: it keeps a non-empty
+  // bounding box (translateX(-100%)) even when closed, so `:visible` cannot
+  // detect openness. Judge by actual position/size instead, then toggle via
+  // the real header button (opens the drawer on mobile, the inline sidebar on
+  // desktop).
+  const isOpen = async () => {
+    const box = await search.boundingBox();
+    return !!box && box.width > 0 && box.x >= -1;
+  };
+  if (await isOpen()) return;
+  const toggle = page.locator('[aria-label="Toggle session panel"]');
+  // The toggle's listener may not be attached yet during initial hydration —
+  // verify the drawer actually opened and retry if the click no-opped.
+  for (let i = 0; i < 5; i++) {
+    if (await isOpen()) break;
+    await toggle.click();
+    await page.waitForTimeout(250); // drawer slide-in transition (220ms)
   }
   await expect(search).toBeVisible({ timeout: 3000 });
 }
