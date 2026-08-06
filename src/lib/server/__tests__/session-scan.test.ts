@@ -1,11 +1,19 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdirSync, rmSync, writeFileSync, appendFileSync, utimesSync, existsSync, readFileSync } from 'node:fs';
+import {
+  mkdirSync,
+  rmSync,
+  writeFileSync,
+  appendFileSync,
+  utimesSync,
+  existsSync,
+  readFileSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import {
   scanAllSessions,
-  scanSessionsForCwd,
   encodeSessionDirName,
   clearSessionScanCache,
+  flushSessionScanCache,
   initSessionScanCache,
 } from '../session-scan';
 
@@ -15,7 +23,12 @@ const DIR = join(ROOT, encodeSessionDirName(CWD));
 
 function writeSession(
   file: string,
-  opts: { id: string; ts: string; name?: string; messages?: { role: string; text: string; ts?: number }[] }
+  opts: {
+    id: string;
+    ts: string;
+    name?: string;
+    messages?: { role: string; text: string; ts?: number }[];
+  }
 ): string {
   const lines = [
     JSON.stringify({ type: 'session', version: 3, id: opts.id, timestamp: opts.ts, cwd: CWD }),
@@ -82,16 +95,14 @@ describe('session-scan', () => {
     expect(infos.map((i) => i.id)).toEqual(['new', 'old']);
   });
 
-  it('scanSessionsForCwd only sees the encoded project directory', async () => {
-    writeSession('a.jsonl', { id: 's1', ts: '2026-01-01T00:00:00.000Z' });
-    const otherDir = join(ROOT, encodeSessionDirName('/other/proj'));
-    mkdirSync(otherDir, { recursive: true });
-    writeFileSync(
-      join(otherDir, 'b.jsonl'),
-      JSON.stringify({ type: 'session', id: 's2', timestamp: '2026-01-01T00:00:00.000Z', cwd: '/other/proj' }) + '\n'
-    );
-    const infos = await scanSessionsForCwd(ROOT, CWD);
-    expect(infos.map((i) => i.id)).toEqual(['s1']);
+  it('excludes skipPaths files without touching them', async () => {
+    const path = writeSession('a.jsonl', { id: 's1', ts: '2026-01-01T00:00:00.000Z' });
+    writeSession('b.jsonl', { id: 's2', ts: '2026-01-01T00:00:00.000Z' });
+    // Skipped files are neither statted nor parsed — they simply don't appear.
+    const infos = await scanAllSessions(ROOT, { skipPaths: new Set([path]) });
+    expect(infos.map((i) => i.id)).toEqual(['s2']);
+    // A scan without the skip set still sees them.
+    expect((await scanAllSessions(ROOT)).map((i) => i.id).sort()).toEqual(['s1', 's2']);
   });
 
   it('re-parses when a file changes and serves cache when it does not', async () => {
@@ -146,6 +157,8 @@ describe('session-scan', () => {
     utimesSync(path, pinned, pinned);
     const first = await scanAllSessions(ROOT);
     expect(first[0].name).toBe('Original name');
+    // The persist is debounced — flush it before asserting the file exists.
+    await flushSessionScanCache();
     expect(existsSync(cacheFile)).toBe(true);
 
     // Simulate a restart: wipe in-memory state, rewrite the session file with

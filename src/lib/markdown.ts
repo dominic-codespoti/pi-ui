@@ -37,6 +37,22 @@ const _lazyLangs: Record<string, () => Promise<{ default: unknown }>> = {
 
 const _lazyLoaders = new Map<string, Promise<void>>();
 
+/** Notified with the raw fence-language token whenever a lazy hljs language
+ *  finishes loading — lets callers that memoized pre-registration HTML
+ *  re-render once real highlighting becomes available. */
+const _langReadyListeners = new Set<(lang: string) => void>();
+
+/** Subscribe to lazy-language-ready notifications. Returns an unsubscribe fn. */
+export function onLangRegistered(listener: (lang: string) => void): () => void {
+  _langReadyListeners.add(listener);
+  return () => _langReadyListeners.delete(listener);
+}
+
+/** Resolves once `lang` finishes loading (immediately if already loaded, eager, or unknown). */
+export function whenLangReady(lang: string): Promise<void> {
+  return _lazyLoaders.get(lang) ?? Promise.resolve();
+}
+
 /** Ensure a lazy hljs language is loaded — fire-and-forget dynamic import. */
 function ensureLang(lang: string): void {
   if (_lazyLoaders.has(lang) || hljs.getLanguage(lang)) return;
@@ -65,6 +81,7 @@ function ensureLang(lang: string): void {
       };
       const canonical = aliases[lang] ?? lang;
       hljs.registerLanguage(canonical, mod.default as LanguageFn);
+      for (const listener of _langReadyListeners) listener(lang);
     })
     .catch(() => {
       _lazyLoaders.delete(lang);
@@ -81,6 +98,9 @@ function escAttr(s: string) {
 function escHtml(s: string) {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
+
+/** When true, code blocks are escaped without hljs — used while a message is streaming. */
+let _skipHighlight = false;
 
 /** Highlight code or fall back to plain-escaped text if language unknown. */
 function highlight(code: string, lang: string): string {
@@ -131,7 +151,7 @@ const renderer: RendererObject = {
     const showLabel =
       safeLang && safeLang !== 'text' && safeLang !== 'plaintext' && safeLang !== 'plain';
     const langLabel = showLabel ? escAttr(safeLang) : '';
-    const highlighted = highlight(text, safeLang);
+    const highlighted = _skipHighlight ? escHtml(text) : highlight(text, safeLang);
     const langSpan = langLabel ? `<span class="code-block-lang">${langLabel}</span>` : '';
     return (
       `<div class="code-block">` +
@@ -310,11 +330,17 @@ const MAX_MARKDOWN_CHARS = 150_000;
  * Synchronous (no async extension loaded). Oversized inputs are rendered as
  * escaped plain text instead of parsed markdown.
  */
-export function renderMarkdown(src: string): string {
+export function renderMarkdown(src: string, opts?: { skipHighlight?: boolean }): string {
   if (src.length > MAX_MARKDOWN_CHARS) {
     return `<pre class="whitespace-pre-wrap break-words">${escHtml(src)}</pre>`;
   }
-  return marked.parse(src) as string;
+  const prev = _skipHighlight;
+  _skipHighlight = opts?.skipHighlight ?? false;
+  try {
+    return marked.parse(src) as string;
+  } finally {
+    _skipHighlight = prev;
+  }
 }
 
 /**

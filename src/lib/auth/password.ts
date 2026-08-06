@@ -20,14 +20,15 @@ async function deriveSecret(): Promise<Uint8Array> {
 // ── Token revocation ──────────────────────────────────────────────────────────
 // Lightweight in-memory token ID blacklist. Cleared on restart.
 
-function revokedSet(): Set<string> {
-  if (!g.__piRevokedJtis) g.__piRevokedJtis = new Set<string>();
-  return g.__piRevokedJtis as Set<string>;
+function revokedMap(): Map<string, number> {
+  if (!(g.__piRevokedJtis instanceof Map)) g.__piRevokedJtis = new Map<string, number>();
+  return g.__piRevokedJtis as Map<string, number>;
 }
 
-/** Revoke a specific token by its JTI claim (called on logout). */
-export function revokeToken(jti: string): void {
-  revokedSet().add(jti);
+/** Revoke a specific token by its JTI claim (called on logout). Entries are
+ *  pruned once their expiry passes, so logout churn cannot grow unbounded. */
+export function revokeToken(jti: string, exp?: number): void {
+  revokedMap().set(jti, exp ?? Math.floor(Date.now() / 1000) + TOKEN_EXPIRY_S);
 }
 
 // ── Password hashing ────────────────────────────────────────────────────────
@@ -147,8 +148,15 @@ export async function verifySessionToken(token: string): Promise<boolean> {
     // Check expiration
     if (payload.exp && Date.now() / 1000 > payload.exp) return false;
 
-    // Check revocation
-    if (payload.jti && revokedSet().has(payload.jti)) return false;
+    // Check revocation — prune expired entries while we're here.
+    if (payload.jti) {
+      const revoked = revokedMap();
+      const revokeExp = revoked.get(payload.jti);
+      if (revokeExp !== undefined) {
+        if (Date.now() / 1000 > revokeExp) revoked.delete(payload.jti);
+        else return false;
+      }
+    }
 
     return true;
   } catch {

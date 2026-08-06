@@ -129,4 +129,10 @@ describe('parseDiff', () => {
     expect(files[0].hunks[0].oldLineCount).toBe(1);
     expect(files[0].hunks[0].newLineCount).toBe(1);
   });
+
+  it('does not throw when a hunk appears without a preceding file header', () => {
+    const malformed = ['@@ -1,2 +1,2 @@', '-old', '+new'].join('\n');
+    expect(() => parseDiff(malformed)).not.toThrow();
+    expect(parseDiff(malformed)).toEqual([]);
+  });
 });

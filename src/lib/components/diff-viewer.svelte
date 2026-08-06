@@ -46,16 +46,23 @@
     return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 
-  /** Track total highlighted lines per-file to cap highlighting cost. */
-  let highlightCounters = $state<Record<string, number>>({});
+  /** Cache of highlighted lines — hljs is expensive and re-renders re-run highlightLine.
+   *  Plain (non-reactive) maps: the previous $state counter was mutated during
+   *  render, which Svelte forbids. */
+  const _highlightCache = new Map<string, string>();
+  const _highlightCounts = new Map<string, number>();
 
   function highlightLine(content: string, lang: string, filePath: string): string {
     if (!lang) return escapeHtml(content);
-    const count = highlightCounters[filePath] ?? 0;
+    const key = `${filePath}\u0000${lang}\u0000${content}`;
+    const cached = _highlightCache.get(key);
+    if (cached !== undefined) return cached;
+    const count = _highlightCounts.get(filePath) ?? 0;
     if (count > HIGHLIGHT_LINE_LIMIT) return escapeHtml(content);
     try {
       const result = highlightCode(content, lang);
-      highlightCounters[filePath] = count + 1;
+      _highlightCache.set(key, result);
+      _highlightCounts.set(filePath, count + 1);
       return result;
     } catch {
       return escapeHtml(content);
@@ -63,7 +70,8 @@
   }
 
   function resetHighlightCounters() {
-    highlightCounters = {};
+    _highlightCache.clear();
+    _highlightCounts.clear();
   }
 
   function copyDiff() {

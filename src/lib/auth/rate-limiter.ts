@@ -32,6 +32,20 @@ function store(): Map<string, AttemptRecord> {
   return g.__piRateLimit as Map<string, AttemptRecord>;
 }
 
+/** Prune expired records once the map grows past a bound — prevents a
+ *  distributed-IP attack from accumulating entries forever. */
+const MAX_RECORDS = 1000;
+function sweepExpired(now: number): void {
+  const map = store();
+  if (map.size < MAX_RECORDS) return;
+  for (const [ip, rec] of map) {
+    const expired =
+      (rec.blockedUntil !== null && now >= rec.blockedUntil) ||
+      (rec.blockedUntil === null && now - rec.firstAttempt >= WINDOW_MS);
+    if (expired) map.delete(ip);
+  }
+}
+
 /** Normalize IPv6-mapped IPv4 addresses to bare IPv4, e.g. ::ffff:127.0.0.1 → 127.0.0.1 */
 function normalizeIp(ip: string): string {
   return ip.replace(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/, '$1');
@@ -94,6 +108,7 @@ export function recordFailure(rawIp: string): RateLimitResult {
   const ip = normalizeIp(rawIp);
   const map = store();
   const now = Date.now();
+  sweepExpired(now);
   const rec = map.get(ip);
 
   if (!rec || now - rec.firstAttempt >= WINDOW_MS) {

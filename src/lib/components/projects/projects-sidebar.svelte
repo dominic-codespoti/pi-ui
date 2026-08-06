@@ -182,7 +182,7 @@
           {/if}
           <button
             onclick={() => { if (ps.collapsed.has(g.cwd)) ps.toggleCollapsed(g.cwd); ps.newSession(g.cwd); }}
-            disabled={!g.exists}
+            disabled={!g.exists || ps.pendingNewSession || ps.sessionLoading}
             class="w-7 h-7 flex items-center justify-center text-base-content/30 hover:text-primary hover:bg-primary/10 rounded-xl transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
             title="New session in {g.name}" aria-label="New session in {g.name}" tabindex={open ? 0 : -1}
           ><Plus class="w-3.5 h-3.5" /></button>
@@ -358,11 +358,11 @@
   <button
     onclick={() => (newProjectMode = !newProjectMode)}
     class="w-full flex items-center justify-center gap-2 text-sm text-base-content/50 hover:text-base-content/80 transition-colors py-3 bg-base-content/[0.045] hover:bg-base-content/[0.075] border border-base-content/[0.035] rounded-2xl disabled:opacity-50"
-    disabled={ps.pendingNewSession}
+    disabled={ps.pendingNewSession || ps.sessionLoading}
     tabindex={open ? 0 : -1}
   >
     <FolderPlus class="w-4 h-4" />
-    <span>{newProjectMode ? 'cancel' : ps.pendingNewSession ? 'opening…' : 'open project…'}</span>
+    <span>{newProjectMode ? 'cancel' : ps.pendingNewSession || ps.sessionLoading ? 'opening…' : 'open project…'}</span>
   </button>
   {#if newProjectMode}
     <DirectoryPicker

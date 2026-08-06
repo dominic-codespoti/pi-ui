@@ -324,9 +324,56 @@ export interface ConnectedMessage {
  *     set_editor_component – parsed component panel above composer (parsed), or null to clear
  *     extension_completions – response to get_extension_autocomplete (trigger, query, items[])
  */
+/** Loose SDK-forwarded event (pi SDK passthrough, tagged with sessionId). */
 export type PiEvent = { type: string } & Record<string, unknown>;
 
-export type ServerMessage = ConnectedMessage | PiEvent;
+/** Custom server-authored events (not from the SDK). Typed so payload drift —
+ *  a missing or renamed field — fails at compile time on the broadcast site. */
+export type ServerCustomEvent =
+  | { type: 'model_changed'; model: ModelInfo | null }
+  | { type: 'session_loaded'; sessionId: string; isStreaming: boolean; thinkingLevel: string; model: ModelInfo | null; availableModels: ModelInfo[]; messages: unknown[]; streamingMessage?: unknown; totalMessageCount?: number; messagesTruncated?: boolean; cwd?: string; sessionName?: string; isCompacting?: boolean; autoCompactionEnabled?: boolean; autoRetryEnabled?: boolean; queuedSteering?: string[]; queuedFollowUp?: string[]; piVersion?: string; uiVersion?: string; sessionMode?: 'in-memory' | 'persisted'; sessionPath?: string; contextUsage?: ContextUsage; widgets?: WidgetPayload[] }
+  | { type: 'sessions_list'; sessions: SessionSummary[] }
+  | { type: 'all_sessions_list'; sessions: SessionSummary[] }
+  | { type: 'projects_list'; projects: ProjectInfo[] }
+  | { type: 'dir_completions'; prefix: string; entries: string[] }
+  | { type: 'file_completions'; query: string; entries: string[] }
+  | { type: 'providers_list'; providers: ProviderInfo[] }
+  | { type: 'providers_error'; message: string }
+  | { type: 'available_models_changed'; availableModels: ModelInfo[] }
+  | { type: 'sessions_error'; message: string }
+  | { type: 'fork_points'; entries: Array<{ entryId: string; text: string }> }
+  | { type: 'tools_list'; tools: Array<{ name: string; description: string; isBuiltin: boolean; origin?: string }>; activeToolNames: string[] }
+  | { type: 'resources_list'; skills: SkillSummary[]; prompts: PromptSummary[] }
+  | { type: 'extensions_list'; extensions: ExtensionSummary[]; errors: Array<{ path: string; error: string }> }
+  | { type: 'commands_list'; commands: Array<{ name: string; description?: string; source: string }> }
+  | { type: 'skill_install_result'; success: boolean; name?: string; error?: string }
+  | ({ type: 'update_status' } & UpdateStatus)
+  | { type: 'update_progress'; target: UpdateTarget; command?: string; message: string }
+  | { type: 'update_result'; target: UpdateTarget; success: boolean; message: string }
+  | { type: 'restart_nonce'; nonce: string }
+  | { type: 'server_restarting' }
+  | { type: 'notification_webhook_url'; url: string | null }
+  | { type: 'slash_result'; command: string; message: string; level?: 'info' | 'warning' | 'error' }
+  | { type: 'file_content'; path: string; content: string; error?: string }
+  | { type: 'file_saved'; path: string; error?: string }
+  | { type: 'older_messages'; messages: unknown[]; totalMessageCount: number; messagesTruncated: boolean }
+  | { type: 'session_tree'; tree: TreeNode[] }
+  | { type: 'command_completions'; command: string; prefix: string; items: Array<{ value: string; label: string; description?: string }> }
+  | { type: 'extension_completions'; trigger: string; query: string; items: unknown[] }
+  | { type: 'settings'; settings: Record<string, unknown> }
+  | { type: 'pong' }
+  | { type: 'agent_error'; error: string }
+  | { type: 'queue_restored'; text: string }
+  | { type: 'session_runtime'; sessionId: string; isRunning: boolean; unseen: boolean; lastActivity: number }
+  | { type: 'extension_ui_state'; sessionId: string; ui: ExtensionUiStatePayload }
+  | ({ type: 'extension_ui_request'; id: string; method?: string } & Record<string, unknown>)
+  | ({ type: 'extension_ui_request_replay'; id: string; method?: string } & Record<string, unknown>)
+  | { type: 'extension_ui_dismiss'; id: string }
+  | { type: 'extension_ui_update'; id: string; parsed: ParsedComponent }
+  | { type: 'custom_render'; id: string; lines: string[]; htmlLines?: string[] }
+  | { type: 'compaction_end'; sessionId: string; reason: string; result?: unknown; aborted?: boolean; willRetry?: boolean; errorMessage?: string };
+
+export type ServerMessage = ConnectedMessage | ServerCustomEvent | PiEvent;
 
 // ── Browser → Server ─────────────────────────────────────────────────────────
 
@@ -337,7 +384,6 @@ export type ClientMessage =
   | { type: 'abort' }
   | { type: 'set_thinking_level'; level: string }
   | { type: 'set_model'; provider: string; modelId: string }
-  | { type: 'list_sessions' }
   | { type: 'new_session'; targetCwd?: string }
   | { type: 'switch_session'; path: string }
   /** Request all sessions across all project directories. Server replies with all_sessions_list. */

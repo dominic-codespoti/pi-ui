@@ -1,19 +1,20 @@
 /**
- * Persisted project registry — makes projects first-class on the server
- * instead of an emergent client-side grouping of session cwds.
+ * Persisted project registry — low-level persistence for the project catalog.
  *
- * SERVER-ONLY: imported by server.ts. Never import from browser code.
+ * SERVER-ONLY: imported by project-catalog.ts (never directly by server.ts,
+ * and never from browser code).
  *
  * Stored as a small JSON file at ~/.pi/agent/pi-ui-projects.json:
  *   { "projects": [{ "path", "name"?, "pinned", "lastOpened" }] }
  *
- * Writes are synchronous + atomic (tmp file + rename) — the file is tiny and
- * mutations are rare (open/pin/rename/forget), so this is cheap even on a Pi.
+ * Load is cached in memory; saves are synchronous + atomic (tmp file +
+ * rename) and small. Callers own debouncing — the catalog coalesces the
+ * sync write so session switches never block the critical path.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { log } from './logger';
 
 export interface ProjectRecord {
@@ -31,7 +32,8 @@ const REGISTRY_FILE = join(REGISTRY_DIR, 'pi-ui-projects.json');
 
 let records: ProjectRecord[] | null = null;
 
-function load(): ProjectRecord[] {
+/** Load the registry (cached in memory). Corrupt/missing files start empty. */
+export function loadProjectRecords(): ProjectRecord[] {
   if (records) return records;
   try {
     if (existsSync(REGISTRY_FILE)) {
@@ -55,71 +57,14 @@ function load(): ProjectRecord[] {
   return records;
 }
 
-function save(): void {
-  if (!records) return;
+/** Atomically persist the given records. */
+export function saveProjectRecords(projectRecords: ProjectRecord[]): void {
   try {
     mkdirSync(REGISTRY_DIR, { recursive: true });
     const tmp = `${REGISTRY_FILE}.tmp`;
-    writeFileSync(tmp, JSON.stringify({ projects: records }, null, 2));
+    writeFileSync(tmp, JSON.stringify({ projects: projectRecords }, null, 2));
     renameSync(tmp, REGISTRY_FILE);
   } catch (err) {
     log.error('[pifrontier] project registry: failed to save:', err);
   }
-}
-
-/** All registered projects (no particular order — callers sort). */
-export function listProjects(): readonly ProjectRecord[] {
-  return load();
-}
-
-/**
- * Upsert a project and stamp lastOpened. Called whenever a session is
- * created or switched into a directory, so opening a folder registers it.
- */
-export function touchProject(path: string): ProjectRecord {
-  const all = load();
-  let rec = all.find((r) => r.path === path);
-  if (rec) {
-    rec.lastOpened = Date.now();
-  } else {
-    rec = { path, pinned: false, lastOpened: Date.now() };
-    all.push(rec);
-  }
-  save();
-  return rec;
-}
-
-/** Remove a project from the registry. Returns false when it wasn't registered. */
-export function removeProject(path: string): boolean {
-  const all = load();
-  const idx = all.findIndex((r) => r.path === path);
-  if (idx === -1) return false;
-  all.splice(idx, 1);
-  save();
-  return true;
-}
-
-/** Pin/unpin a project — upserts so pinning an unregistered project registers it. */
-export function setProjectPinned(path: string, pinned: boolean): void {
-  const all = load();
-  const rec = all.find((r) => r.path === path);
-  if (rec) {
-    rec.pinned = pinned;
-  } else {
-    all.push({ path, pinned, lastOpened: Date.now() });
-  }
-  save();
-}
-
-/** Set a custom display name — upserts. An empty name clears the override. */
-export function renameProject(path: string, name: string): void {
-  const all = load();
-  const trimmed = name.trim();
-  const rec = all.find((r) => r.path === path);
-  if (rec) {
-    rec.name = trimmed || undefined;
-  } else {
-    all.push({ path, name: trimmed || undefined, pinned: false, lastOpened: Date.now() });
-  }
-  save();
 }

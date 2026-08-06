@@ -19,6 +19,7 @@ import { parseArgs } from 'util';
 import { dirname, resolve } from 'node:path';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { formatCommand, ephemeralUpdateHint } from '../src/lib/server/ws-helpers.ts';
 
 // ── Version ───────────────────────────────────────────────────────────────────
 
@@ -28,10 +29,6 @@ const pkg = JSON.parse(readFileSync(fileURLToPath(pkgPath), 'utf8')) as { name: 
 
 type PackageManager = 'npm' | 'bun' | 'pnpm' | 'yarn';
 
-function quoteCommand(args: string[]): string {
-  return args.map((arg) => (/\s/.test(arg) ? JSON.stringify(arg) : arg)).join(' ');
-}
-
 function shellCommand(command: string): string[] {
   return process.platform === 'win32'
     ? ['cmd', '/d', '/s', '/c', command]
@@ -39,7 +36,7 @@ function shellCommand(command: string): string[] {
 }
 
 async function runUpdateStep(args: string[], cwd = packageRoot): Promise<void> {
-  console.log(`$ ${quoteCommand(args)}`);
+  console.log(`$ ${formatCommand(args)}`);
   const proc = Bun.spawn(args, {
     cwd,
     env: process.env as Record<string, string>,
@@ -47,16 +44,7 @@ async function runUpdateStep(args: string[], cwd = packageRoot): Promise<void> {
     stderr: 'inherit',
   });
   const exitCode = await proc.exited;
-  if (exitCode !== 0) throw new Error(`${quoteCommand(args)} failed with exit code ${exitCode}`);
-}
-
-function ephemeralUpdateHint(root: string): string | null {
-  const normalized = root.replaceAll('\\', '/');
-  if (normalized.includes('/.bun/install/cache/')) return `bunx ${pkg.name}@latest --password ...`;
-  if (normalized.includes('/.npm/_npx/') || normalized.includes('/_npx/')) return `npx -y ${pkg.name}@latest --password ...`;
-  if (normalized.includes('/pnpm/dlx/') || normalized.includes('/.pnpm/dlx/')) return `pnpm dlx ${pkg.name}@latest --password ...`;
-  if (normalized.includes('/yarn/dlx/')) return `yarn dlx ${pkg.name}@latest --password ...`;
-  return null;
+  if (exitCode !== 0) throw new Error(`${formatCommand(args)} failed with exit code ${exitCode}`);
 }
 
 function detectPackageManager(root: string): PackageManager {
@@ -101,7 +89,7 @@ async function updatePiUi(): Promise<void> {
     return;
   }
 
-  const hint = ephemeralUpdateHint(packageRoot);
+  const hint = ephemeralUpdateHint(packageRoot, pkg.name);
   if (hint) {
     throw new Error(`This pi-ui run looks ephemeral, so there is no durable install to update. Restart with: ${hint}`);
   }

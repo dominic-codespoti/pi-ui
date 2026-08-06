@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { renderMarkdown, highlightCode } from '../markdown';
+import { renderMarkdown, highlightCode, onLangRegistered, whenLangReady } from '../markdown';
 
 describe('renderMarkdown', () => {
   it('renders plain text', () => {
@@ -84,5 +84,28 @@ describe('highlightCode', () => {
     // Short snippets (< 40 chars) skip auto-detect and return escaped text
     expect(result).not.toContain('hljs');
     expect(result).toContain('const x = 1;');
+  });
+});
+
+describe('lazy language race (onLangRegistered / whenLangReady)', () => {
+  it('falls back to escaped text on first use, then highlights once the language loads', async () => {
+    // 'yaml' is lazy-loaded and untouched by any earlier test in this file — the
+    // first call must hit the real fire-and-forget import path in ensureLang().
+    const before = highlightCode('key: value', 'yaml');
+    expect(before).toBe('key: value');
+
+    await whenLangReady('yaml');
+
+    const after = highlightCode('key: value', 'yaml');
+    expect(after).toContain('hljs-attr');
+  });
+
+  it('notifies subscribers with the requested language token once it registers', async () => {
+    const seen: string[] = [];
+    const unsubscribe = onLangRegistered((lang) => seen.push(lang));
+    highlightCode('fn main() {}', 'rust');
+    await whenLangReady('rust');
+    unsubscribe();
+    expect(seen).toContain('rust');
   });
 });

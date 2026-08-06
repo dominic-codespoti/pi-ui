@@ -199,7 +199,7 @@
     </div>
   {:else if comp.kind === 'container'}
     <div class="flex {comp.direction === 'horizontal' ? 'flex-row flex-wrap gap-3' : 'flex-col gap-2'}">
-      {#each comp.children as child (child.kind + (JSON.stringify(child).slice(0, 32)))}
+      {#each comp.children as child, i (i)}
         {@render renderParsed(child)}
       {/each}
     </div>

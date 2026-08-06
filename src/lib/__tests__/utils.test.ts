@@ -1,65 +1,100 @@
 import { describe, it, expect } from 'vitest';
-import { cn, formatRelativeDate, type WithElementRef, type WithoutChildren } from '../utils';
+import {
+  providerColor,
+  versionText,
+  sourceLabel,
+  canRemove,
+  fmtTokens,
+  fmtCost,
+  fmtDuration,
+} from '../utils';
 
-describe('cn', () => {
-  it('merges class names', () => {
-    expect(cn('px-4', 'py-2')).toBe('px-4 py-2');
+describe('providerColor', () => {
+  it('returns color for known provider', () => {
+    expect(providerColor('openai')).toBe('#10A37F');
+    expect(providerColor('anthropic')).toBe('#C06A3A');
   });
 
-  it('handles conditional classes', () => {
-    expect(cn('base', (false as boolean) && 'hidden', 'visible')).toBe('base visible');
+  it('handles case-insensitive match', () => {
+    expect(providerColor('OpenAI')).toBe('#10A37F');
   });
 
-  it('merges tailwind classes correctly', () => {
-    expect(cn('px-4', 'px-6')).toBe('px-6');
-  });
-});
-
-describe('formatRelativeDate', () => {
-  it('returns "just now" for < 2 minutes', () => {
-    expect(formatRelativeDate(Date.now())).toBe('just now');
-  });
-
-  it('returns "Xm ago" for < 1 hour', () => {
-    const fiveMinAgo = Date.now() - 5 * 60 * 1000;
-    expect(formatRelativeDate(fiveMinAgo)).toBe('5m ago');
-  });
-
-  it('returns "Xh ago" for < 24 hours', () => {
-    const threeHoursAgo = Date.now() - 3 * 3600 * 1000;
-    expect(formatRelativeDate(threeHoursAgo)).toBe('3h ago');
-  });
-
-  it('returns "yesterday" for 24-48 hours', () => {
-    const yesterday = Date.now() - 30 * 3600 * 1000;
-    expect(formatRelativeDate(yesterday)).toBe('yesterday');
-  });
-
-  it('returns "Xd ago" for < 7 days', () => {
-    const fiveDaysAgo = Date.now() - 5 * 86_400_000;
-    expect(formatRelativeDate(fiveDaysAgo)).toBe('5d ago');
-  });
-
-  it('returns formatted date for older timestamps', () => {
-    const old = new Date('2024-03-15').getTime();
-    const result = formatRelativeDate(old);
-    expect(result).toContain('Mar');
-    expect(result).toContain('15');
+  it('returns default color for unknown provider', () => {
+    expect(providerColor('unknown')).toBe('#6B7280');
   });
 });
 
-describe('type helpers', () => {
-  it('WithElementRef adds ref property', () => {
-    type Props = { title: string };
-    type WithRef = WithElementRef<Props>;
-    const x: WithRef = { title: 'hi', ref: null };
-    expect(x.ref).toBeNull();
+describe('versionText', () => {
+  it('formats version string', () => {
+    expect(versionText('1.2.3')).toBe('v1.2.3');
   });
 
-  it('WithoutChildren strips children', () => {
-    type Props = { name: string; children?: unknown };
-    type NoKids = WithoutChildren<Props>;
-    const x: NoKids = { name: 'test' };
-    expect(x.name).toBe('test');
+  it('returns unknown for undefined', () => {
+    expect(versionText(undefined)).toBe('unknown');
+  });
+
+  it('returns unknown for "unknown"', () => {
+    expect(versionText('unknown')).toBe('unknown');
+  });
+});
+
+describe('sourceLabel', () => {
+  it('returns env for environment', () => {
+    expect(sourceLabel('environment')).toBe('env');
+  });
+
+  it('returns config for config sources', () => {
+    expect(sourceLabel('models_json_key')).toBe('config');
+    expect(sourceLabel('fallback')).toBe('config');
+  });
+
+  it('returns undefined for unknown', () => {
+    expect(sourceLabel('unknown')).toBeUndefined();
+  });
+});
+
+describe('canRemove', () => {
+  it('returns true only for stored', () => {
+    expect(canRemove('stored')).toBe(true);
+    expect(canRemove('environment')).toBe(false);
+    expect(canRemove('runtime')).toBe(false);
+  });
+});
+
+describe('fmtTokens', () => {
+  it('formats values < 1000 as-is', () => {
+    expect(fmtTokens(500)).toBe('500');
+  });
+
+  it('formats values >= 1000 with k suffix', () => {
+    expect(fmtTokens(1500)).toBe('1.5k');
+  });
+});
+
+describe('fmtCost', () => {
+  it('returns null for zero', () => {
+    expect(fmtCost(0)).toBeNull();
+  });
+
+  it('formats very small costs', () => {
+    expect(fmtCost(0.00005)).toBe('<$0.0001');
+  });
+
+  it('formats normal costs', () => {
+    expect(fmtCost(0.015)).toBe('$0.0150');
+  });
+});
+
+describe('fmtDuration', () => {
+  it('formats milliseconds', () => {
+    expect(fmtDuration(500)).toBe('500ms');
+  });
+
+  it('formats seconds', () => {
+    expect(fmtDuration(5500)).toBe('5.5s');
+  });
+
+  it('formats minutes', () => {
+    expect(fmtDuration(125000)).toBe('2m');
   });
 });

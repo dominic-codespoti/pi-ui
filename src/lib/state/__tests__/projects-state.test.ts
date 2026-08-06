@@ -30,6 +30,7 @@ describe('ProjectsState', () => {
     projectsState.filter = '';
     projectsState.error = null;
     projectsState.pendingNewSession = false;
+    projectsState.sessionLoading = false;
     projectsState.dirCompletions = [];
     projectsState.collapsed.clear();
     projectsState.expandedGroups.clear();
@@ -140,8 +141,12 @@ describe('ProjectsState', () => {
     });
 
     it('handles sessions_error', () => {
+      projectsState.sessionLoading = true;
+      projectsState.pendingNewSession = true;
       projectsState.handleMessage({ type: 'sessions_error', message: 'oops' } as { type: string } & Record<string, unknown>);
       expect(projectsState.error).toBe('oops');
+      expect(projectsState.pendingNewSession).toBe(false);
+      expect(projectsState.sessionLoading).toBe(false);
     });
 
     it('handles dir_completions', () => {
@@ -163,19 +168,29 @@ describe('ProjectsState', () => {
       expect(projectsState.uncheckedSessions.has('s1')).toBe(false);
     });
 
-    it('newSession sets pending flag when send succeeds', () => {
+    it('newSession sets pending and loading flags when send succeeds', () => {
       const send = vi.fn().mockReturnValue(true);
       projectsState.send = send;
       projectsState.newSession();
       expect(send).toHaveBeenCalledWith({ type: 'new_session' });
       expect(projectsState.pendingNewSession).toBe(true);
+      expect(projectsState.sessionLoading).toBe(true);
     });
 
-    it('newSession does not set pending when send fails', () => {
+    it('newSession ignores duplicate requests while one is pending', () => {
+      const send = vi.fn().mockReturnValue(true);
+      projectsState.send = send;
+      projectsState.newSession();
+      projectsState.newSession('/another/project');
+      expect(send).toHaveBeenCalledTimes(1);
+    });
+
+    it('newSession does not set pending or loading when send fails', () => {
       const send = vi.fn().mockReturnValue(false);
       projectsState.send = send;
       projectsState.newSession();
       expect(projectsState.pendingNewSession).toBe(false);
+      expect(projectsState.sessionLoading).toBe(false);
     });
 
     it('addProject sends message and clears completions', () => {
@@ -219,10 +234,12 @@ describe('ProjectsState', () => {
       expect(send).toHaveBeenCalledWith({ type: 'dir_complete', prefix: '~/projects/' });
     });
 
-    it('onSessionLoaded clears pending and returns true', () => {
+    it('onSessionLoaded clears pending and loading flags', () => {
       projectsState.pendingNewSession = true;
+      projectsState.sessionLoading = true;
       expect(projectsState.onSessionLoaded()).toBe(true);
       expect(projectsState.pendingNewSession).toBe(false);
+      expect(projectsState.sessionLoading).toBe(false);
     });
 
     it('markUnchecked adds to unchecked set', () => {

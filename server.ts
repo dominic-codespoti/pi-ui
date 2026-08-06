@@ -19,7 +19,6 @@ import type {
   ExtensionUIContext,
   ExtensionUIDialogOptions,
 } from '@earendil-works/pi-coding-agent';
-import type { Model } from '@earendil-works/pi-ai';
 import { rm, mkdir, writeFile } from 'node:fs/promises';
 import { join, resolve, basename, sep, dirname } from 'node:path';
 import { homedir } from 'node:os';
@@ -36,26 +35,29 @@ import {
   sendWebhookNotification,
 } from './src/lib/server/notification-webhook.ts';
 import {
-  listProjects,
-  touchProject,
-  removeProject,
-  setProjectPinned,
-  renameProject,
-} from './src/lib/server/project-registry.ts';
+  serializeModel,
+  serializeSession,
+  resolveGitHubRawUrl,
+  formatCommand,
+  ephemeralUpdateHint,
+  ALLOWED_SKILL_HOSTS,
+  SKIP_DIRS,
+} from './src/lib/server/ws-helpers.ts';
+import { ProjectCatalog } from './src/lib/server/project-catalog.ts';
 import { readSettings, updateSettings } from './src/lib/server/ui-settings.ts';
 import { log } from './src/lib/server/logger.ts';
 import { trimMessagesForWire } from './src/lib/server/wire-messages.ts';
 import { createCompactionWatchdog } from './src/lib/server/compaction-watchdog.ts';
 import {
+  flushSessionScanCache,
   initSessionScanCache,
-  scanAllSessions,
-  scanSessionsForCwd,
   type SessionFileInfo,
 } from './src/lib/server/session-scan.ts';
+import { SessionCatalog } from './src/lib/server/session-catalog.ts';
 import type {
   ClientMessage,
+  ServerMessage,
   ModelInfo,
-  ProjectInfo,
   ProviderInfo,
   SessionSummary,
   SkillSummary,
@@ -202,18 +204,6 @@ function expandTilde(p: string): string {
   return p;
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function serializeModel(model: Model<any> | undefined | null): ModelInfo | null {
-  if (!model) return null;
-  return {
-    provider: model.provider,
-    id: model.id,
-    name: model.name,
-    reasoning: model.reasoning,
-    contextWindow: model.contextWindow,
-  };
-}
-
 function getProviders(): ProviderInfo[] {
   const runtime = activeSession().modelRuntime;
   const modelCounts = new Map<string, number>();
@@ -305,18 +295,6 @@ function packageStatus(
   };
 }
 
-function ephemeralUpdateHint(root: string): string | null {
-  const normalized = root.replaceAll('\\', '/');
-  if (normalized.includes('/.bun/install/cache/'))
-    return `bunx ${UI_PACKAGE_NAME}@latest --password ...`;
-  if (normalized.includes('/.npm/_npx/') || normalized.includes('/_npx/'))
-    return `npx -y ${UI_PACKAGE_NAME}@latest --password ...`;
-  if (normalized.includes('/pnpm/dlx/') || normalized.includes('/.pnpm/dlx/'))
-    return `pnpm dlx ${UI_PACKAGE_NAME}@latest --password ...`;
-  if (normalized.includes('/yarn/dlx/')) return `yarn dlx ${UI_PACKAGE_NAME}@latest --password ...`;
-  return null;
-}
-
 function piUiUpdateStep(): string[] {
   const cliTs = join(APP_ROOT, 'bin', 'pifrontier.ts');
   if (existsSync(cliTs)) return [process.execPath, cliTs, 'update'];
@@ -336,7 +314,7 @@ async function getUpdateStatus(): Promise<UpdateStatus> {
   // `.git` is a directory — `Bun.file(...).exists()` always reports false
   // for directories, so this must use `existsSync`, not `Bun.file`.
   const gitExists = existsSync(join(APP_ROOT, '.git'));
-  const ephemeralHint = gitExists ? null : ephemeralUpdateHint(APP_ROOT);
+  const ephemeralHint = gitExists ? null : ephemeralUpdateHint(APP_ROOT, UI_PACKAGE_NAME);
   const mode: UpdateStatus['mode'] = gitExists ? 'source' : ephemeralHint ? 'ephemeral' : 'package';
 
   const notes: string[] = [];
@@ -365,10 +343,6 @@ async function getUpdateStatus(): Promise<UpdateStatus> {
     sdk: packageStatus(PI_SDK_PACKAGE_NAME, PI_SDK_VERSION, sdkLatest),
     notes,
   };
-}
-
-function formatCommand(args: string[]): string {
-  return args.map((arg) => (/\s/.test(arg) ? JSON.stringify(arg) : arg)).join(' ');
 }
 
 function sanitizeEnv(): Record<string, string> {
@@ -450,7 +424,7 @@ async function runUpdate(target: UpdateTarget, ws: { send(data: string): void })
   try {
     const isSourceCheckout = existsSync(join(APP_ROOT, '.git'));
     if (target === 'ui' && !isSourceCheckout) {
-      const hint = ephemeralUpdateHint(APP_ROOT);
+      const hint = ephemeralUpdateHint(APP_ROOT, UI_PACKAGE_NAME);
       if (hint) throw new Error(`This pi-ui run looks ephemeral. Restart with: ${hint}`);
     }
     if (target === 'sdk' && !isSourceCheckout) {
@@ -562,133 +536,25 @@ function serializeTreeNode(node: {
 const PI_CONFIG_DIR = '.pi';
 
 /**
- * Resolve a GitHub URL (blob/tree UI or raw) to a raw.githubusercontent.com URL.
- * Passes non-GitHub URLs through unchanged.
- *
- * Supported patterns:
- *   https://github.com/owner/repo/blob/branch/path/file.md
- *   https://raw.githubusercontent.com/...  (pass-through)
- *   Any other URL (pass-through — may be a direct .md link)
+ * Build a session summary from a pooled session's live memory state — the
+ * catalog's overlay authority for everything the server currently holds.
+ * Mirrors the scanner's SessionFileInfo shape so the merge is seamless.
  */
-function resolveGitHubRawUrl(url: string): string {
-  try {
-    const u = new URL(url);
-    if (u.hostname === 'github.com') {
-      // /owner/repo/blob/branch/...path → raw
-      const parts = u.pathname.replace(/^\//, '').split('/');
-      if (parts[2] === 'blob' && parts.length >= 5) {
-        const [owner, repo, , branch, ...rest] = parts;
-        return `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${rest.join('/')}`;
-      }
-    }
-  } catch {
-    // invalid URL — will fail at fetch time with a useful error
-  }
-  return url;
-}
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function serializeSession(s: Record<string, any>): SessionSummary {
-  return {
-    id: s.id,
-    path: s.path,
-    cwd: s.cwd,
-    name: s.name,
-    created: s.created instanceof Date ? s.created.getTime() : s.created,
-    modified: s.modified instanceof Date ? s.modified.getTime() : s.modified,
-    messageCount: s.messageCount,
-    turns: s.turns,
-    firstMessage: s.firstMessage,
-  };
-}
-
-/**
- * Merge the persisted project registry with directories discovered from
- * session files into the wire-format project list.
- * Sort: pinned first, then most recent activity.
- */
-async function buildProjectsList(): Promise<ProjectInfo[]> {
-  const byCwd = new Map<string, { count: number; lastModified: number }>();
-  try {
-    const sessions = await listAllSessions();
-    for (const s of sessions) {
-      const key = (s as { cwd?: string }).cwd ?? '';
-      if (!key) continue;
-      const modified = s.modified instanceof Date ? s.modified.getTime() : Number(s.modified) || 0;
-      const agg = byCwd.get(key);
-      if (agg) {
-        agg.count += 1;
-        agg.lastModified = Math.max(agg.lastModified, modified);
-      } else {
-        byCwd.set(key, { count: 1, lastModified: modified });
-      }
-    }
-  } catch (err) {
-    log.error('[pifrontier] buildProjectsList: listAll failed:', err);
-  }
-
-  const map = new Map<string, ProjectInfo>();
-  for (const rec of listProjects()) {
-    map.set(rec.path, {
-      cwd: rec.path,
-      name: rec.name ?? basename(rec.path),
-      pinned: rec.pinned,
-      exists: existsSync(rec.path),
-      registered: true,
-      sessionCount: 0,
-      lastActivity: rec.lastOpened,
-    });
-  }
-  for (const [dir, agg] of byCwd) {
-    const entry = map.get(dir);
-    if (entry) {
-      entry.sessionCount = agg.count;
-      entry.lastActivity = Math.max(entry.lastActivity, agg.lastModified);
-    } else {
-      map.set(dir, {
-        cwd: dir,
-        name: basename(dir) || dir,
-        pinned: false,
-        exists: existsSync(dir),
-        registered: false,
-        sessionCount: agg.count,
-        lastActivity: agg.lastModified,
-      });
-    }
-  }
-
-  return [...map.values()].sort((a, b) =>
-    a.pinned !== b.pinned ? (a.pinned ? -1 : 1) : b.lastActivity - a.lastActivity
-  );
-}
-
-/** Broadcast the merged project list to all connected tabs. */
-async function broadcastProjects(): Promise<void> {
-  try {
-    broadcast({ type: 'projects_list', projects: await buildProjectsList() });
-  } catch (err) {
-    log.error('[pifrontier] broadcastProjects failed:', err);
-  }
-}
-
-/** Build a SessionSummary for the active session. */
-function currentSessionSummary(): SessionSummary | null {
-  const s = activeSessionOrNull();
-  if (!s) return null;
-  const msg = s.messages[0] as { content?: string | Array<unknown> } | undefined;
+function poolSummary(sess: AgentSession, entry: ManagedSession): SessionFileInfo {
+  const msg = sess.messages[0] as { content?: string | Array<unknown> } | undefined;
   const firstMsg = msg?.content
     ? typeof msg.content === 'string'
       ? msg.content.slice(0, 120)
       : '(complex)'
     : '';
   return {
-    id: s.sessionId,
-    path: s.sessionManager.getSessionFile() ?? '(in-memory)',
-    cwd: s.sessionManager.getCwd() || cwd,
-    name: s.sessionManager.getSessionName() || undefined,
-    created: Date.now(),
-    modified: Date.now(),
-    messageCount: s.messages.length,
+    id: sess.sessionId,
+    path: entry.path ?? '(in-memory)',
+    cwd: entry.cwd,
+    name: sess.sessionManager.getSessionName() || undefined,
+    created: new Date(entry.createdAt),
+    modified: new Date(entry.lastActivity),
+    messageCount: sess.messages.length,
     firstMessage: firstMsg,
   };
 }
@@ -732,6 +598,8 @@ const _promptsInFlight = new Set<string>();
 type PendingRequest = {
   requestPayload: Record<string, unknown>;
   resolve: (response: Record<string, unknown>) => void;
+  /** Dialog timeout handle — cleared when the request resolves early. */
+  timeoutId?: Timer;
 };
 
 /**
@@ -844,7 +712,7 @@ function finalizeExtensionResponse(id: string): void {
 }
 
 // broadcast is a thin wrapper; reassigned once the Bun server is live.
-let broadcast: (payload: unknown) => void = () => {};
+let broadcast: (payload: ServerMessage) => void = () => {};
 
 function createDialogPromise<T>(
   id: string,
@@ -854,25 +722,25 @@ function createDialogPromise<T>(
 ): Promise<T> {
   return new Promise<T>((resolve) => {
     const ui = uiStateFor(ownerSessionId);
-    ui.pendingDialogs.set(id, {
+    const entry: PendingRequest = {
       requestPayload,
       resolve: (response) => {
+        if (entry.timeoutId) clearTimeout(entry.timeoutId);
         ui.pendingDialogs.delete(id);
         finalizeExtensionResponse(id);
         pendingRequestOwners.delete(id);
         resolve(parseResponse(response));
       },
-    });
+    };
+    ui.pendingDialogs.set(id, entry);
     pendingRequestOwners.set(id, ownerSessionId);
     broadcast({ type: 'extension_ui_request', id, ...requestPayload });
     // Timeout — prevents the agent from hanging forever if the browser
     // never responds (e.g. tab was closed without notifying the server).
     // The 15s grace timer (close handler) may cancel it earlier.
-    setTimeout(() => {
+    entry.timeoutId = setTimeout(() => {
       const pending = ui.pendingDialogs.get(id);
-      if (pending) {
-        pending.resolve({ cancelled: true });
-      }
+      if (pending) pending.resolve({ cancelled: true });
     }, EXTENSION_DIALOG_TIMEOUT_MS);
   });
 }
@@ -1490,16 +1358,20 @@ const uiContext: ServerExtensionUIContext = {
     const owner = ownerSessionId ?? null;
     const ui = uiStateFor(owner);
     return new Promise<string>((resolve) => {
-      ui.pendingEditorText.set(id, { resolve });
+      const entry: { resolve: (text: string) => void; timeoutId?: Timer } = {
+        resolve: (text) => {
+          if (entry.timeoutId) clearTimeout(entry.timeoutId);
+          ui.pendingEditorText.delete(id);
+          pendingRequestOwners.delete(id);
+          resolve(text);
+        },
+      };
+      ui.pendingEditorText.set(id, entry);
       pendingRequestOwners.set(id, owner);
       broadcast({ type: 'extension_ui_request', id, method: 'request_editor_text' });
       // Timeout after 5 seconds to avoid hanging forever
-      setTimeout(() => {
-        if (ui.pendingEditorText.has(id)) {
-          ui.pendingEditorText.delete(id);
-          pendingRequestOwners.delete(id);
-          resolve('');
-        }
+      entry.timeoutId = setTimeout(() => {
+        if (ui.pendingEditorText.has(id)) entry.resolve('');
       }, 5000);
     });
   },
@@ -1885,6 +1757,7 @@ function scheduleNavOutDisposal(sid: string): void {
     }
     disposeUi(sid);
     sessionPool.delete(sid);
+    sessionCatalog.apply({ kind: 'release', id: sid });
     log.info(`[pifrontier] Released navigated-away session ${sid} from memory.`);
   }, NAV_OUT_DISPOSE_GRACE_MS);
 }
@@ -1902,56 +1775,35 @@ let activeSessionId: string | null = null;
 // Promise lock — prevents concurrent first-connection races from creating duplicate sessions.
 let _sessionInitPromise: Promise<string> | null = null;
 
-// ── Session-list cache ────────────────────────────────────────────────────────
-// The SDK's SessionManager.list()/listAll() load every session .jsonl fully
-// AND build a concatenated allMessagesText per file — with hundreds of MB of
-// sessions a scan both takes seconds and can OOM the process. Sidebar/project
-// listings use the streaming, per-file-mtime-cached scanner instead
-// (src/lib/server/session-scan.ts). The cache is kept until explicitly
-// invalidated — invalidateSessionLists() is called on every session mutation
-// (new/fork/rename/delete, message_end). No time-based expiry; the stat-based
-// per-file cache inside the scanner handles detecting changed files cheaply.
-
-interface SessionListCacheEntry {
-  promise: Promise<SessionFileInfo[]>;
-}
-
-let _listAllCache: SessionListCacheEntry | null = null;
-const _listByCwdCache = new Map<string, SessionListCacheEntry>();
-
-function invalidateSessionLists(): void {
-  _listAllCache = null;
-  _listByCwdCache.clear();
-}
+// ── Session catalog ───────────────────────────────────────────────────────────
+// Single source of truth for the merged session list (sidebar, project
+// picker, resume dialog). The SDK's SessionManager.list()/listAll() load
+// every session .jsonl fully AND build a concatenated allMessagesText per
+// file — with hundreds of MB of sessions a scan both takes seconds and can
+// OOM the process, so listing goes through the streaming per-file-mtime-
+// cached scanner (src/lib/server/session-scan.ts) composed with a live
+// overlay for pooled sessions (src/lib/server/session-catalog.ts). Pooled
+// summaries win over disk while resident, so the active session's file is
+// never re-read after every message. All mutations go through
+// sessionCatalog.apply() (single write chokepoint); the onChange
+// subscription below turns them into coalesced sidebar refreshes.
 
 /** Root directory holding per-project session dirs (~/.pi/agent/sessions). */
 function sessionsRoot(): string {
   return join(_sdk!.getAgentDir(), 'sessions');
 }
 
-/** Cached all-projects session listing. `fresh` bypasses (and refills) the cache. */
-function listAllSessions(fresh = false): Promise<SessionFileInfo[]> {
-  if (!fresh && _listAllCache) return _listAllCache.promise;
-  const entry: SessionListCacheEntry = { promise: scanAllSessions(sessionsRoot()) };
-  _listAllCache = entry;
-  // Never cache a failed scan.
-  entry.promise.catch(() => {
-    if (_listAllCache === entry) _listAllCache = null;
-  });
-  return entry.promise;
-}
+const sessionCatalog = new SessionCatalog(sessionsRoot);
 
-/** Cached per-project session listing. */
-function listSessionsFor(cwdKey: string): Promise<SessionFileInfo[]> {
-  const cached = _listByCwdCache.get(cwdKey);
-  if (cached) return cached.promise;
-  const entry: SessionListCacheEntry = { promise: scanSessionsForCwd(sessionsRoot(), cwdKey) };
-  _listByCwdCache.set(cwdKey, entry);
-  entry.promise.catch(() => {
-    if (_listByCwdCache.get(cwdKey) === entry) _listByCwdCache.delete(cwdKey);
-  });
-  return entry.promise;
-}
+sessionCatalog.onChange(() => scheduleSessionListRefresh());
+
+// Merged project list: persisted registry + live session counts (see
+// project-catalog.ts). Mutations flow through projectCatalog.apply(); the
+// onChange subscription below turns them (and session-catalog changes it
+// observes internally) into coalesced projects_list broadcasts.
+const projectCatalog = new ProjectCatalog(sessionCatalog);
+
+projectCatalog.onChange(() => scheduleProjectsRefresh());
 
 // ── LRU idle session cleanup ──────────────────────────────────────────────────
 // Dispose inactive pooled sessions after 30 min of inactivity so the Pi doesn't
@@ -1980,6 +1832,7 @@ function startIdleCleanup(): void {
       }
       disposeUi(sid);
       sessionPool.delete(sid);
+      sessionCatalog.apply({ kind: 'release', id: sid });
     }
   }, 60_000); // check every 60s
 }
@@ -2034,7 +1887,7 @@ async function ensureSession(): Promise<AgentSession> {
         sessionManager: sm,
       });
       const sess = result.session;
-      touchProject(sess.sessionManager.getCwd() || cwd);
+      projectCatalog.apply({ kind: 'touch', path: sess.sessionManager.getCwd() || cwd });
       log.info(
         `[pifrontier] Pi session ready: ${sess.sessionId} (${sm.isPersisted() ? 'persisted' : 'in-memory'})`
       );
@@ -2144,9 +1997,10 @@ function registerSession(sid: string, sess: AgentSession, cwdV: string, bindExt:
     disposeTimer: null,
   };
   sessionPool.set(sid, entry);
-  // A registered session means a session file exists (or will imminently) that
-  // cached list scans haven't seen.
-  invalidateSessionLists();
+  // Pooled sessions are overlay-authoritative while resident — register the
+  // live summary immediately so the sidebar sees the session without any
+  // file scan (and without waiting for the first message_end).
+  sessionCatalog.apply({ kind: 'upsert', session: poolSummary(sess, entry) });
 
   // Subscribe runtime-status tracking for ALL pooled sessions (always on)
   entry.runtimeUnsub = sess.subscribe((event) => {
@@ -2165,8 +2019,15 @@ function registerSession(sid: string, sess: AgentSession, cwdV: string, bindExt:
       case 'message_end':
         entry.lastActivity = Date.now();
         if (activeSessionId !== sid) entry.unseen = true;
-        // The session file gained content — cached lists are stale.
-        invalidateSessionLists();
+        // Live summary replaces the disk parse — the file is not re-read.
+        sessionCatalog.apply({ kind: 'upsert', session: poolSummary(sess, entry) });
+        break;
+      case 'session_info_changed':
+        // Rename via any path (slash command, WS handler, SDK) — refresh the
+        // live summary so the sidebar name is never stale. The WS rename
+        // handler's explicit apply stays for non-pooled targets (no
+        // AgentSession → no event); for pooled ones this is the chokepoint.
+        sessionCatalog.apply({ kind: 'upsert', session: poolSummary(sess, entry) });
         break;
       case 'compaction_start': {
         compactionWatchdog.start(sid);
@@ -2200,6 +2061,12 @@ function registerSession(sid: string, sess: AgentSession, cwdV: string, bindExt:
             broadcastSessionLoaded(sess);
           }, 0);
         }
+        // Compaction rewrote the session — memory is already the compacted
+        // truth (the SDK reassigns agent.state.messages before emitting
+        // compaction_end), so refresh the live summary. The old code left
+        // the sidebar on pre-compaction counts until the next message.
+        entry.lastActivity = Date.now();
+        sessionCatalog.apply({ kind: 'upsert', session: poolSummary(sess, entry) });
         break;
       }
     }
@@ -2350,6 +2217,52 @@ function broadcastSessionLoaded(sess: AgentSession): void {
     widgets: widgetsForSession(sess.sessionId),
   });
 }
+let _sessionListRefreshTimer: Timer | null = null;
+
+/**
+ * Refresh sidebar data after the active session is visible.
+ *
+ * The merged list is cheap now (catalog overlay + stat-only scan), but the
+ * broadcast itself scales with session count, so bursts of mutations
+ * (message_end per message in a turn) coalesce into one refresh. It must
+ * also never sit on the new-session/session-switch response path: the
+ * browser can render the session immediately, while the sidebar catches up
+ * on a later tick.
+ */
+async function refreshSessionLists(): Promise<void> {
+  try {
+    const all = await sessionCatalog.list();
+    broadcast({ type: 'all_sessions_list', sessions: all.map(serializeSession) });
+  } catch (err) {
+    log.error('[pifrontier] refreshSessionLists: failed to broadcast session list:', err);
+  }
+}
+
+let _projectsRefreshTimer: Timer | null = null;
+
+/** Coalesced projects_list broadcast — the project catalog emits on registry
+ *  patches and on session-catalog changes (counts/recency it observes). */
+function scheduleProjectsRefresh(): void {
+  if (_projectsRefreshTimer) return;
+  _projectsRefreshTimer = setTimeout(() => {
+    _projectsRefreshTimer = null;
+    void (async () => {
+      try {
+        broadcast({ type: 'projects_list', projects: await projectCatalog.list() });
+      } catch (err) {
+        log.error('[pifrontier] failed to broadcast project list:', err);
+      }
+    })();
+  }, 300);
+}
+
+function scheduleSessionListRefresh(): void {
+  if (_sessionListRefreshTimer) return;
+  _sessionListRefreshTimer = setTimeout(() => {
+    _sessionListRefreshTimer = null;
+    void refreshSessionLists();
+  }, 300);
+}
 
 async function setActiveSession(newSession: AgentSession, newCwd?: string) {
   const newId = newSession.sessionId;
@@ -2425,21 +2338,11 @@ async function setActiveSession(newSession: AgentSession, newCwd?: string) {
   }
 
   // Register/touch the project for the session's directory.
-  touchProject(newSession.sessionManager.getCwd() || cwd);
+  projectCatalog.apply({ kind: 'touch', path: newSession.sessionManager.getCwd() || cwd });
 
-  // Refresh sidebar session + project lists so all connected tabs see the change
-  try {
-    const all = await listAllSessions();
-    const sessions = all.map(serializeSession);
-    const current = currentSessionSummary();
-    if (current && !sessions.some((s) => s.id === current.id)) {
-      sessions.unshift(current);
-    }
-    broadcast({ type: 'all_sessions_list', sessions });
-  } catch (err) {
-    log.error('[pifrontier] setActiveSession: failed to broadcast session list:', err);
-  }
-  await broadcastProjects();
+  // Refresh sidebar session + project lists after the switch response. The
+  // session_loaded broadcast above is the latency-critical acknowledgement.
+  scheduleSessionListRefresh();
 }
 
 // ── 5. Start server ───────────────────────────────────────────────────────────
@@ -2456,6 +2359,8 @@ interface WSData {
   tokenExp: number;
   /** Periodic expiry-check interval (60s), cleared on close. */
   _expTimer?: Timer;
+  /** True once the close handler ran — guards the async open() against installing timers on a dead socket. */
+  closed?: boolean;
 }
 
 let server: ReturnType<typeof Bun.serve>;
@@ -2515,6 +2420,10 @@ try {
           const sess = await ensureSession();
           const init = initialMessages(sess.messages, sess);
           const availableModels = (await sess.modelRuntime.getAvailable()).map(serializeModel);
+
+          // The client may have disconnected while the SDK/model snapshot loaded —
+          // don't send to (or install a timer on) a dead socket.
+          if (ws.data.closed) return;
 
           // Serialization/send of a pathological history must not kill the
           // connection — closing here would loop the client through reconnects.
@@ -2742,24 +2651,6 @@ try {
               break;
             }
 
-            case 'list_sessions': {
-              try {
-                const list = await listSessionsFor(activeCwd());
-                const sessions = list.slice(0, 30).map(serializeSession);
-                // Prepend the current session — deduplicate if it already appears in the list
-                const current = currentSessionSummary();
-                if (current) {
-                  const alreadyListed = sessions.some((s) => s.id === current.id);
-                  if (!alreadyListed) sessions.unshift(current);
-                }
-                ws.send(JSON.stringify({ type: 'sessions_list', sessions }));
-              } catch (err) {
-                log.error('[pifrontier] list_sessions error:', err);
-                ws.send(JSON.stringify({ type: 'sessions_list', sessions: [] }));
-              }
-              break;
-            }
-
             case 'new_session': {
               try {
                 const rawTargetCwd =
@@ -2800,9 +2691,9 @@ try {
                 // Security: only open known session files — never raw client paths.
                 // Cache-miss falls back to a fresh scan — a session created moments
                 // ago (e.g. by the pi TUI) must not be rejected on a stale cache.
-                let knownSessions = await listAllSessions();
+                let knownSessions = await sessionCatalog.list();
                 if (!knownSessions.some((s) => s.path === resolvedPath)) {
-                  knownSessions = await listAllSessions(true);
+                  knownSessions = await sessionCatalog.list({ fresh: true });
                 }
                 if (!knownSessions.some((s) => s.path === resolvedPath)) {
                   ws.send(
@@ -3011,7 +2902,7 @@ try {
               try {
                 // Security: only accept paths of known sessions — never trust raw user paths.
                 // (Session files live under ~/.pi, outside cwd, so containment checks don't apply.)
-                const known = await listAllSessions();
+                const known = await sessionCatalog.list();
                 const target = known.find((s) => s.path === msg.path);
                 if (!target) {
                   ws.send(
@@ -3021,14 +2912,14 @@ try {
                 }
                 const sm = _sdk!.SessionManager.open(target.path);
                 sm.appendSessionInfo(msg.name);
-                invalidateSessionLists();
+                // Patch the overlay (if pooled) and force the next scan to
+                // re-parse that one file; onChange broadcasts the new list.
+                sessionCatalog.apply({ kind: 'rename', path: msg.path, name: msg.name });
                 // If renaming the active session, also fire the SDK event so all
                 // connected browsers see the name change via session_info_changed.
                 if (msg.path === activeSession().sessionFile) {
                   activeSession().setSessionName(msg.name);
                 }
-                const all = await listAllSessions();
-                broadcast({ type: 'all_sessions_list', sessions: all.map(serializeSession) });
                 ws.send(JSON.stringify({ type: 'sessions_list', sessions: [] }));
               } catch (err) {
                 log.error('[pifrontier] rename_session error:', err);
@@ -3040,8 +2931,8 @@ try {
             case 'delete_session': {
               try {
                 // Validate the path is a known session file — never trust raw user paths.
-                // listAll() because the sidebar offers deletion across all projects.
-                const list = await listAllSessions();
+                // list() because the sidebar offers deletion across all projects.
+                const list = await sessionCatalog.list();
                 const target = list.find((s) => s.path === msg.path);
                 if (!target) {
                   ws.send(
@@ -3058,9 +2949,8 @@ try {
                   );
                   break;
                 }
-                // Path came from SessionManager.listAll() — already validated by SDK.
+                // Path came from the scan/catalog — already validated.
                 await rm(target.path);
-                invalidateSessionLists();
 
                 // Clean up pooled session (if still in memory) to prevent leaks
                 const pooled = sessionPool.get(target.id);
@@ -3075,10 +2965,9 @@ try {
                   }
                   sessionPool.delete(target.id);
                 }
-
-                const all = await listAllSessions();
-                broadcast({ type: 'all_sessions_list', sessions: all.map(serializeSession) });
-                await broadcastProjects();
+                // Drop the overlay entry and force the next scan; onChange
+                // broadcasts the new list (sidebar + projects).
+                sessionCatalog.apply({ kind: 'remove', path: target.path });
                 ws.send(JSON.stringify({ type: 'sessions_list', sessions: [] }));
               } catch (err) {
                 log.error('[pifrontier] delete_session error:', err);
@@ -3089,12 +2978,10 @@ try {
 
             case 'get_all_sessions': {
               try {
-                const all = await listAllSessions();
+                // The active session is pooled, so the overlay guarantees it
+                // is in the merged list — no manual prepend needed.
+                const all = await sessionCatalog.list();
                 const sessions = all.map(serializeSession);
-                const current = currentSessionSummary();
-                if (current && !sessions.some((s) => s.id === current.id)) {
-                  sessions.unshift(current);
-                }
                 ws.send(JSON.stringify({ type: 'all_sessions_list', sessions }));
               } catch (err) {
                 log.error('[pifrontier] get_all_sessions error:', err);
@@ -3105,7 +2992,7 @@ try {
 
             case 'get_projects': {
               ws.send(
-                JSON.stringify({ type: 'projects_list', projects: await buildProjectsList() })
+                JSON.stringify({ type: 'projects_list', projects: await projectCatalog.list() })
               );
               break;
             }
@@ -3122,8 +3009,7 @@ try {
                 const target = resolve(expandTilde(raw.trim()));
                 // Same trust level as new_session: create the folder if it's brand new.
                 await mkdir(target, { recursive: true });
-                touchProject(target);
-                await broadcastProjects();
+                projectCatalog.apply({ kind: 'touch', path: target });
               } catch (err) {
                 log.error('[pifrontier] add_project error:', err);
                 ws.send(JSON.stringify({ type: 'sessions_error', message: String(err) }));
@@ -3142,8 +3028,7 @@ try {
                 );
                 break;
               }
-              removeProject(target);
-              await broadcastProjects();
+              projectCatalog.apply({ kind: 'remove', path: target });
               break;
             }
 
@@ -3154,8 +3039,7 @@ try {
                 pinned: boolean;
               };
               if (typeof target === 'string' && target.trim()) {
-                setProjectPinned(target, Boolean(pinned));
-                await broadcastProjects();
+                projectCatalog.apply({ kind: 'setPinned', path: target, pinned: Boolean(pinned) });
               }
               break;
             }
@@ -3167,8 +3051,11 @@ try {
                 name: string;
               };
               if (typeof target === 'string' && target.trim()) {
-                renameProject(target, typeof name === 'string' ? name : '');
-                await broadcastProjects();
+                projectCatalog.apply({
+                  kind: 'rename',
+                  path: target,
+                  name: typeof name === 'string' ? name : '',
+                });
               }
               break;
             }
@@ -3217,14 +3104,6 @@ try {
                 const { readdir } = await import('node:fs/promises');
                 const { join, relative } = await import('node:path');
                 const root = activeSession().sessionManager.getCwd() || cwd;
-                const skip = new Set([
-                  '.git',
-                  'node_modules',
-                  '.svelte-kit',
-                  'build',
-                  'dist',
-                  '.cache',
-                ]);
                 const entries: string[] = [];
                 const queue: Array<{ dir: string; depth: number }> = [{ dir: root, depth: 0 }];
 
@@ -3239,7 +3118,7 @@ try {
 
                   for (const dirent of dirents) {
                     if (dirent.name.startsWith('.') && dirent.name !== '.env') continue;
-                    if (skip.has(dirent.name)) continue;
+                    if (SKIP_DIRS.has(dirent.name)) continue;
                     const abs = join(item.dir, dirent.name);
                     const rel = relative(root, abs);
                     if (dirent.isFile() && (!query || rel.toLowerCase().includes(query))) {
@@ -3260,6 +3139,8 @@ try {
             }
 
             case 'get_extension_autocomplete': {
+              // Declared outside the try so the finally below can always clear it.
+              let timeoutId: Timer | undefined;
               try {
                 const { trigger, query } = msg as {
                   type: 'get_extension_autocomplete';
@@ -3278,7 +3159,7 @@ try {
                 const cursorLine = 0;
                 const cursorCol = inputText.length;
                 const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), 2000);
+                timeoutId = setTimeout(() => controller.abort(), 2000);
                 const result = await chainedAutocompleteProvider.getSuggestions(
                   lines,
                   cursorLine,
@@ -3287,7 +3168,6 @@ try {
                     signal: controller.signal,
                   }
                 );
-                clearTimeout(timeoutId);
                 const items = result?.items ?? [];
                 ws.send(JSON.stringify({ type: 'extension_completions', trigger, query, items }));
               } catch (err) {
@@ -3304,6 +3184,8 @@ try {
                     items: [],
                   })
                 );
+              } finally {
+                if (timeoutId) clearTimeout(timeoutId);
               }
               break;
             }
@@ -3721,6 +3603,7 @@ try {
                 const activeNames = activeSession().getActiveToolNames();
                 ws.send(
                   JSON.stringify({
+                    type: 'tools_list',
                     tools: allTools.map((t) => ({
                       name: t.name,
                       description: t.description,
@@ -3875,14 +3758,9 @@ try {
               try {
                 const rawUrl = resolveGitHubRawUrl(msg.url as string);
                 // Security: only allow fetching from trusted hosts to prevent SSRF.
-                const ALLOWED_HOSTS = [
-                  'github.com',
-                  'raw.githubusercontent.com',
-                  'gist.githubusercontent.com',
-                ];
                 try {
                   const parsedUrl = new URL(rawUrl);
-                  if (!ALLOWED_HOSTS.includes(parsedUrl.hostname)) {
+                  if (!ALLOWED_SKILL_HOSTS.includes(parsedUrl.hostname)) {
                     ws.send(
                       JSON.stringify({
                         type: 'skill_install_result',
@@ -4241,6 +4119,7 @@ try {
       },
 
       close(ws) {
+        ws.data.closed = true;
         ws.unsubscribe(WS_TOPIC);
         // Clear the periodic token expiry check
         if (ws.data._expTimer) {
@@ -4281,7 +4160,12 @@ try {
 // ── 6. Wire up broadcast ──────────────────────────────────────────────────────
 // Session subscription is set up inside ensureSession() on first WS connection.
 
-broadcast = (payload) => server.publish(WS_TOPIC, JSON.stringify(payload));
+broadcast = (payload) => {
+  // No subscribers — skip stringify/publish entirely. The open handler replays
+  // full state snapshots to the next client that connects.
+  if (connectedClients === 0) return;
+  server.publish(WS_TOPIC, JSON.stringify(payload));
+};
 startIdleCleanup();
 // Hydrate session summaries from the previous run — sidebar loads become
 // stat-calls-only; files are fully read at most once per change.
@@ -4314,6 +4198,19 @@ const _shutdown = async () => {
     }
   }
   sessionPool.clear();
+  // Flush any debounced session-scan cache write so the next start is
+  // stat-only for unchanged files.
+  try {
+    await flushSessionScanCache();
+  } catch {
+    /* best effort — worst case is one re-scan */
+  }
+  // Flush any debounced project-registry write.
+  try {
+    await projectCatalog.flush();
+  } catch {
+    /* best effort — worst case is one re-registration */
+  }
   process.exit(0);
 };
 

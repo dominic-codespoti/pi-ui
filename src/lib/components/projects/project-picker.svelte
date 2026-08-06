@@ -31,12 +31,13 @@
   });
 
   function pick(g: ProjectGroup) {
-    if (!g.exists) return;
+    if (!g.exists || ps.pendingNewSession || ps.sessionLoading) return;
     ps.newSession(g.cwd);
     onClose();
   }
 
   function openPath(path: string) {
+    if (ps.pendingNewSession || ps.sessionLoading) return;
     ps.newSession(path);
     onClose();
   }
@@ -77,7 +78,7 @@
           {@const isActive = g.cwd === ps.cwd}
           <button
             onclick={() => pick(g)}
-            disabled={!g.exists}
+            disabled={!g.exists || ps.pendingNewSession || ps.sessionLoading}
             class="group w-full rounded-xl px-3 py-2.5 sm:py-2.5 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-45 {isActive ? 'bg-primary/[0.09] text-primary' : 'text-base-content/70 hover:bg-base-content/[0.075] hover:text-base-content'}"
             role="option"
             aria-selected={isActive}

@@ -1,5 +1,5 @@
 import { test, expect } from './fixtures';
-import { PROJECTS_LIST_PAYLOAD, ALL_SESSIONS_LIST_PAYLOAD } from './mocks/payloads';
+import { PROJECTS_LIST_PAYLOAD, ALL_SESSIONS_LIST_PAYLOAD, SESSION_LOADED_PAYLOAD } from './mocks/payloads';
 import type { Page } from '@playwright/test';
 
 async function openProjectsSidebar(page: Page) {
@@ -88,5 +88,39 @@ test.describe('Projects sidebar', () => {
 
     // Wait for session to appear
     await expect(page.getByText('hello world')).toBeVisible({ timeout: 3000 });
+  });
+
+  test('shows loading state and blocks duplicate new sessions', async ({ page }) => {
+    let newSessionCount = 0;
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.onMessage((data) => {
+        const msg = JSON.parse(String(data));
+        if (msg.type === 'get_projects') ws.send(JSON.stringify(PROJECTS_LIST_PAYLOAD));
+        if (msg.type === 'get_all_sessions') ws.send(JSON.stringify(ALL_SESSIONS_LIST_PAYLOAD));
+        if (msg.type === 'new_session') {
+          newSessionCount += 1;
+          setTimeout(() => {
+            ws.send(
+              JSON.stringify({
+                ...SESSION_LOADED_PAYLOAD,
+                sessionId: 'new-session',
+                messages: [],
+                sessionName: undefined,
+              })
+            );
+          }, 250);
+        }
+      });
+      ws.send(JSON.stringify({ type: 'connected', sessionId: 's1', isStreaming: false, thinkingLevel: 'medium', model: null, availableModels: [], messages: [] }));
+    });
+
+    await openProjectsSidebar(page);
+    await page.getByRole('button', { name: 'project-a 2' }).hover();
+    const newSessionButton = page.getByRole('button', { name: 'New session in project-a' });
+    await newSessionButton.click();
+
+    await expect(newSessionButton).toBeDisabled();
+    await expect(page.getByPlaceholder('Opening session…')).toBeVisible();
+    expect(newSessionCount).toBe(1);
   });
 });

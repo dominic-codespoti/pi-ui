@@ -180,6 +180,7 @@ class ProjectsState {
       case 'sessions_error':
         this.error = (msg.message as string) ?? 'Unknown error';
         this.pendingNewSession = false;
+        this.sessionLoading = false;
         return true;
       case 'dir_completions':
         this.dirCompletions = (msg.entries as string[]) ?? [];
@@ -196,12 +197,14 @@ class ProjectsState {
   onSessionLoaded(): boolean {
     const wasPending = this.pendingNewSession;
     this.pendingNewSession = false;
+    this.sessionLoading = false;
     return wasPending;
   }
 
   // ── Actions ──────────────────────────────────────────────────────────────
 
   switchSession(path: string): void {
+    if (this.pendingNewSession || this.sessionLoading) return;
     const sent = this.send({ type: 'switch_session', path });
     if (!sent) return;
     this.pendingSwitchPath = path;
@@ -221,8 +224,12 @@ class ProjectsState {
   }
 
   newSession(targetCwd?: string): void {
+    if (this.pendingNewSession || this.sessionLoading) return;
     const sent = this.send(targetCwd ? { type: 'new_session', targetCwd } : { type: 'new_session' });
-    if (sent) this.pendingNewSession = true;
+    if (sent) {
+      this.pendingNewSession = true;
+      this.sessionLoading = true;
+    }
     this.dirCompletions = [];
   }
 

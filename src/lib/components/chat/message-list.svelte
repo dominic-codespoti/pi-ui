@@ -22,25 +22,36 @@
   import DiffViewer from '$lib/components/diff-viewer.svelte';
   import ProjectPicker from '$lib/components/projects/project-picker.svelte';
 
-  /** Precomputed turn-boundary map. For each assistant message, true = last assistant in its turn. */
-  const isLastInTurnMap = $derived.by(() => {
-    const map: Record<string, boolean> = {};
-    let i = 0;
-    while (i < messages.length) {
-      if (messages[i].role === 'user') { i++; continue; }
-      // Find end of this turn (next user message or end of array)
-      const turnStart = i;
-      while (i < messages.length && messages[i].role !== 'user') i++;
-      const turnEnd = i;
-      // Walk backward from turn end to find the last assistant message
-      for (let j = turnEnd - 1; j >= turnStart; j--) {
-        if (messages[j].role === 'assistant') {
-          map[messages[j].id] = true;
+  /** Precomputed turn-boundary map. For each assistant message, true = last assistant in its turn.
+   *  Maintained incrementally on tail changes (append/truncate) — recomputing the
+   *  whole map per append was O(N²) over a session. */
+  const isLastInTurnMap = $state<Record<string, boolean>>({});
+  let _prevTailKey = '';
+  let _prevMarkedId: string | undefined;
+  $effect(() => {
+    const n = messages.length;
+    const lastMsg = n > 0 ? messages[n - 1] : undefined;
+    const tailKey = lastMsg ? `${n}:${lastMsg.id}:${lastMsg.role}` : '';
+    if (tailKey === _prevTailKey) return;
+    _prevTailKey = tailKey;
+    // Only the final turn's marker can change with the tail: appending a user
+    // message opens a new empty turn and leaves the previous marker intact.
+    if (lastMsg && lastMsg.role !== 'user' && _prevMarkedId !== undefined) {
+      isLastInTurnMap[_prevMarkedId] = false;
+    }
+    let newMarked: string | undefined;
+    if (lastMsg && lastMsg.role !== 'user') {
+      for (let i = n - 1; i >= 0; i--) {
+        const m = messages[i];
+        if (m.role === 'user') break;
+        if (m.role === 'assistant') {
+          newMarked = m.id;
           break;
         }
       }
     }
-    return map;
+    if (newMarked !== undefined) isLastInTurnMap[newMarked] = true;
+    _prevMarkedId = newMarked;
   });
 
   let {
@@ -198,6 +209,17 @@
     toolCopiedId = id;
     setTimeout(() => { if (toolCopiedId === id) toolCopiedId = null; }, 1500);
   }
+
+  /**
+   * Client-side DOM cap — the full array stays in state (pagination, edits),
+   * but only the tail is mounted. Prevents unbounded DOM growth in very long
+   * sessions; older messages re-mount via the button rendered at the top.
+   */
+  const MAX_MOUNTED_MESSAGES = 400;
+  let mountedLimit = $state(MAX_MOUNTED_MESSAGES);
+  const visibleMessages = $derived(
+    messages.length > mountedLimit ? messages.slice(-mountedLimit) : messages
+  );
 </script>
 
 {#if sessionLoading}
@@ -274,7 +296,20 @@
       </div>
     {/if}
 
-    {#each messages as msg (msg.id)}
+    {#if messages.length > mountedLimit}
+      <div class="flex items-center gap-3 py-2 select-none">
+        <span class="flex-1 h-px bg-gradient-to-r from-transparent via-base-content/12 to-transparent"></span>
+        <button
+          onclick={() => (mountedLimit += MAX_MOUNTED_MESSAGES)}
+          class="shrink-0 text-[11px] transition-colors px-3 py-1 rounded-full border bg-base-content/[0.02] text-base-content/35 hover:text-primary border-base-content/8 hover:border-primary/25 hover:bg-primary/[0.04]"
+        >
+          Show {messages.length - mountedLimit} older messages
+        </button>
+        <span class="flex-1 h-px bg-gradient-to-r from-base-content/12 to-transparent"></span>
+      </div>
+    {/if}
+
+    {#each visibleMessages as msg (msg.id)}
 
       <!-- ── User message ───────────────────────────────────────────────── -->
       {#if msg.role === 'user'}

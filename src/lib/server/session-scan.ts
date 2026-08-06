@@ -16,8 +16,8 @@
  * ever — not once per process.
  */
 
-import { createReadStream, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { readdir, stat } from 'node:fs/promises';
+import { createReadStream, existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { readdir, rename, stat, writeFile } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
 import { dirname, join, resolve } from 'node:path';
 import { log } from './logger';
@@ -66,11 +66,18 @@ export function initSessionScanCache(filePath: string): void {
   try {
     if (!existsSync(filePath)) return;
     const parsed: unknown = JSON.parse(readFileSync(filePath, 'utf8'));
-    if (!parsed || typeof parsed !== 'object' || !('entries' in parsed) || !Array.isArray(parsed.entries)) return;
+    if (
+      !parsed ||
+      typeof parsed !== 'object' ||
+      !('entries' in parsed) ||
+      !Array.isArray(parsed.entries)
+    )
+      return;
     for (const raw of parsed.entries) {
       if (!Array.isArray(raw) || raw.length !== 4) continue;
       const [path, mtimeMs, size, info] = raw as [unknown, unknown, unknown, unknown];
-      if (typeof path !== 'string' || typeof mtimeMs !== 'number' || typeof size !== 'number') continue;
+      if (typeof path !== 'string' || typeof mtimeMs !== 'number' || typeof size !== 'number')
+        continue;
       fileInfoCache.set(path, { mtimeMs, size, info: reviveInfo(info) });
     }
   } catch (err) {
@@ -90,7 +97,8 @@ function reviveInfo(raw: unknown): SessionFileInfo | null {
     id: record.id,
     cwd: typeof record.cwd === 'string' ? record.cwd : '',
     name: typeof record.name === 'string' ? record.name : undefined,
-    parentSessionPath: typeof record.parentSessionPath === 'string' ? record.parentSessionPath : undefined,
+    parentSessionPath:
+      typeof record.parentSessionPath === 'string' ? record.parentSessionPath : undefined,
     created: new Date(typeof record.created === 'number' ? record.created : 0),
     modified: new Date(typeof record.modified === 'number' ? record.modified : 0),
     messageCount: typeof record.messageCount === 'number' ? record.messageCount : 0,
@@ -98,9 +106,25 @@ function reviveInfo(raw: unknown): SessionFileInfo | null {
   };
 }
 
-/** Write the cache to disk when enabled and dirty. Sync + atomic; the file is
- *  small (~1 KB per session) and scans are already async. */
-function persistCache(): void {
+let persistTimer: Timer | null = null;
+
+/**
+ * Mark the cache dirty and schedule an atomic write. Debounced so a burst of
+ * scans (e.g. one per message_end) coalesces into a single disk write, and
+ * async so the write never blocks the scan path (the old sync write could
+ * serialize a multi-MB cache file on the refresh path).
+ */
+function schedulePersist(): void {
+  cacheDirty = true;
+  if (persistTimer) return;
+  persistTimer = setTimeout(() => {
+    persistTimer = null;
+    void persistCache();
+  }, 500);
+}
+
+/** Atomic tmp+rename write. The file is small (~1 KB per session). */
+async function persistCache(): Promise<void> {
   if (!cacheFilePath || !cacheDirty) return;
   try {
     mkdirSync(dirname(cacheFilePath), { recursive: true });
@@ -113,12 +137,21 @@ function persistCache(): void {
         : null,
     ]);
     const tmp = `${cacheFilePath}.tmp`;
-    writeFileSync(tmp, JSON.stringify({ version: 1, entries }));
-    renameSync(tmp, cacheFilePath);
+    await writeFile(tmp, JSON.stringify({ version: 1, entries }));
+    await rename(tmp, cacheFilePath);
     cacheDirty = false;
   } catch (err) {
     log.error('[pifrontier] session-scan cache: failed to save:', err);
   }
+}
+
+/** Flush any pending cache write — call on shutdown and in tests. */
+export async function flushSessionScanCache(): Promise<void> {
+  if (persistTimer) {
+    clearTimeout(persistTimer);
+    persistTimer = null;
+  }
+  await persistCache();
 }
 
 /**
@@ -243,7 +276,7 @@ async function fileInfo(filePath: string): Promise<SessionFileInfo | null> {
     mtimeMs = stats.mtimeMs;
     size = stats.size;
   } catch {
-    if (fileInfoCache.delete(filePath)) cacheDirty = true;
+    if (fileInfoCache.delete(filePath)) schedulePersist();
     return null;
   }
   const cached = fileInfoCache.get(filePath);
@@ -255,19 +288,22 @@ async function fileInfo(filePath: string): Promise<SessionFileInfo | null> {
     info = null;
   }
   fileInfoCache.set(filePath, { mtimeMs, size, info });
-  cacheDirty = true;
+  schedulePersist();
   return info;
 }
 
 async function collectInfos(files: string[]): Promise<SessionFileInfo[]> {
   const results: (SessionFileInfo | null)[] = new Array(files.length).fill(null);
   let next = 0;
-  const workers = Array.from({ length: Math.min(MAX_CONCURRENT_PARSES, files.length) }, async () => {
-    while (next < files.length) {
-      const idx = next++;
-      results[idx] = await fileInfo(files[idx]);
+  const workers = Array.from(
+    { length: Math.min(MAX_CONCURRENT_PARSES, files.length) },
+    async () => {
+      while (next < files.length) {
+        const idx = next++;
+        results[idx] = await fileInfo(files[idx]);
+      }
     }
-  });
+  );
   await Promise.all(workers);
   const infos = results.filter((info): info is SessionFileInfo => info !== null);
   infos.sort((a, b) => b.modified.getTime() - a.modified.getTime());
@@ -278,45 +314,57 @@ async function jsonlFilesIn(dir: string): Promise<string[]> {
   try {
     const entries = await readdir(dir);
     return entries.filter((f) => f.endsWith('.jsonl')).map((f) => join(dir, f));
-  } catch {
+  } catch (err) {
+    // Deleted-between-scans is a normal race; anything else is an operator
+    // error (permissions) — log it instead of silently dropping the project.
+    if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return [];
+    log.error(`[pifrontier] cannot scan sessions in ${dir}:`, err);
     return [];
   }
 }
 
-/** List sessions for one project cwd (default SDK session-dir layout). */
-export async function scanSessionsForCwd(
+/**
+ * List sessions across every project directory under the sessions root.
+ * `skipPaths` excludes files from the scan entirely (no stat, no parse) —
+ * the session catalog uses it for pooled sessions whose live summaries are
+ * authoritative; their per-file cache entries are kept so a later release
+ * falls back to a cheap stat-only re-check.
+ */
+export async function scanAllSessions(
   sessionsRoot: string,
-  cwd: string
+  opts?: { skipPaths?: Set<string> }
 ): Promise<SessionFileInfo[]> {
-  const infos = await collectInfos(await jsonlFilesIn(join(sessionsRoot, encodeSessionDirName(cwd))));
-  persistCache();
-  return infos;
-}
-
-/** List sessions across every project directory under the sessions root. */
-export async function scanAllSessions(sessionsRoot: string): Promise<SessionFileInfo[]> {
   let dirs: string[];
   try {
     const entries = await readdir(sessionsRoot, { withFileTypes: true });
     dirs = entries.filter((e) => e.isDirectory()).map((e) => join(sessionsRoot, e.name));
-  } catch {
-    return [];
+  } catch (err) {
+    // A missing root is a fresh install (legitimately no sessions); anything
+    // else (permissions, corrupt mount) must surface instead of silently
+    // masquerading as an empty sidebar.
+    if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return [];
+    throw err;
   }
-  const files: string[] = [];
+  let files: string[] = [];
   for (const dir of dirs) {
     files.push(...(await jsonlFilesIn(dir)));
   }
-  // Drop cache entries for files that vanished so the cache can't grow unbounded.
+  const skipPaths = opts?.skipPaths;
+  if (skipPaths?.size) files = files.filter((f) => !skipPaths.has(f));
+  // Drop cache entries for files that vanished so the cache can't grow
+  // unbounded. Skipped (pooled) files still exist on disk — keep their
+  // entries so a release falls back to a stat-only check.
   const live = new Set(files);
+  if (skipPaths) {
+    for (const p of skipPaths) live.add(p);
+  }
   for (const cachedPath of fileInfoCache.keys()) {
     if (!live.has(cachedPath)) {
       fileInfoCache.delete(cachedPath);
-      cacheDirty = true;
+      schedulePersist();
     }
   }
-  const infos = await collectInfos(files);
-  persistCache();
-  return infos;
+  return collectInfos(files);
 }
 
 /** Test hook — clears the per-file stat cache and disables persistence. */

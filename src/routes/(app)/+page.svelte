@@ -19,7 +19,8 @@
     ConnectedMessage,
   } from '$lib/ws/protocol';
   import type { PiEvent } from '$lib/ws/protocol';
-  import { renderMarkdown } from '$lib/markdown';
+  import { renderMarkdown, onLangRegistered } from '$lib/markdown';
+  import { providerColor, versionText, fmtTokens, fmtCost, fmtDuration } from '$lib/utils';
   import type { ParsedComponent } from '$lib/tui-stubs';
   import { projectsState } from '$lib/state/projects-state.svelte';
   import { extensionUiState } from '$lib/state/extension-ui-state.svelte';
@@ -58,42 +59,10 @@
   import PiIcon from '@lucide/svelte/icons/pi';
   import RefreshCw from '@lucide/svelte/icons/refresh-cw';
   import Bell from '@lucide/svelte/icons/bell';
-  import Cpu from '@lucide/svelte/icons/cpu';
   import Wrench from '@lucide/svelte/icons/wrench';
   import BookOpen from '@lucide/svelte/icons/book-open';
 
-  // ── Provider colour chips ────────────────────────────────────────────────────
-
-  function providerColor(id: string): string {
-    const map: Record<string, string> = {
-      anthropic: '#C06A3A',
-      openai: '#10A37F',
-      google: '#4285F4',
-      gemini: '#4285F4',
-      mistral: '#FF7000',
-      groq: '#F55036',
-      cohere: '#39D3C3',
-      deepseek: '#4D90FE',
-      xai: '#888888',
-      grok: '#888888',
-      openrouter: '#6E56CF',
-      meta: '#0668E1',
-      llama: '#0668E1',
-      bedrock: '#FF9900',
-      aws: '#FF9900',
-    };
-    const lower = id.toLowerCase();
-    for (const [key, color] of Object.entries(map)) {
-      if (lower.includes(key)) return color;
-    }
-    return '#6B7280';
-  }
-
-  function versionText(version?: string): string {
-    return version && version !== 'unknown' ? `v${version}` : 'unknown';
-  }
-
-  // ── Builtin slash commands (from pi SDK) ────────────────────────────────────
+  // ── Builtin slash commands ───────────────────────────────────────────────────
 
   const SLASH_COMMANDS = [
     { name: 'reload', description: 'Reload extensions, skills, prompts, and themes' },
@@ -374,6 +343,10 @@
   /** Live elapsed-seconds tick for streaming tool timers. */
   let now = $state(Date.now());
   $effect(() => {
+    // Only tick while something is streaming — the 1s `now` prop feeds tool
+    // timers; ticking forever re-renders the whole message list every second.
+    const anyStreaming = isStreaming || messages.some((m) => m.streaming);
+    if (!anyStreaming) return;
     const id = setInterval(() => {
       now = Date.now();
     }, 1000);
@@ -1055,7 +1028,7 @@
   // ── Load tools when tools tab is active ─────────────────────────────────────
 
   $effect(() => {
-    if (showRightPanel && rightPanelTab === 'tools') {
+    if (showRightPanel && rightPanelTab === 'tools' && wsState === 'open') {
       send({ type: 'get_tools' });
     }
   });
@@ -1074,7 +1047,7 @@
   $effect(() => {
     const frames = extensionUiState.workingIndicatorFrames;
     const ms = extensionUiState.workingIndicatorMs;
-    if (frames.length === 0) return;
+    if (frames.length === 0 || !extensionUiState.workingVisible) return;
     workingFrameIndex = 0;
     const id = setInterval(() => {
       workingFrameIndex = (workingFrameIndex + 1) % frames.length;
@@ -2429,24 +2402,6 @@
     scrollBottom();
   }
 
-  function fmtTokens(n: number): string {
-    if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
-    return `${n}`;
-  }
-
-  function fmtCost(c: number): string | null {
-    if (!c) return null;
-    if (c < 0.0001) return '<$0.0001';
-    return `$${c.toFixed(4)}`;
-  }
-
-  function fmtDuration(ms: number): string {
-    if (ms < 1000) return `${ms}ms`;
-    const s = ms / 1000;
-    if (s < 60) return `${s.toFixed(1)}s`;
-    return `${Math.round(s / 60)}m`;
-  }
-
   // ── Message helpers ──────────────────────────────────────────────────────────
 
   function freshAssistant(): UIMessage {
@@ -2480,8 +2435,11 @@
     requestAnimationFrame(() => {
       for (const m of _pendingRenderSet) {
         if (!messages.includes(m)) continue; // stale — evicted or replaced
-        if (m.content) m.renderedContent = renderMarkdown(m.content);
-        if (m.thinking) m.renderedThinking = renderMarkdown(m.thinking);
+        // Skip hljs while the message is still streaming (per-frame re-highlight
+        // of the full accumulated text is the streaming hot spot); the finalize
+        // paths (message_end / sealStreaming) re-render with highlighting.
+        if (m.content) m.renderedContent = renderMarkdown(m.content, { skipHighlight: m.streaming });
+        if (m.thinking) m.renderedThinking = renderMarkdown(m.thinking, { skipHighlight: m.streaming });
       }
       _pendingRenderSet.clear();
       _renderScheduled = false;
@@ -2507,17 +2465,21 @@
     return undefined;
   }
 
+  /** One pending scroll per frame — token deltas and WS frames call this often. */
+  let _scrollRaf: number | null = null;
+  /** Lazy-cached media query — allocating a MediaQueryList per call is wasteful. */
+  let _reducedMotion: MediaQueryList | null = null;
+
   async function scrollBottom() {
-    await tick();
-    if (!isAtBottom || !scrollEl) return;
-    if (
-      typeof window !== 'undefined' &&
-      window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
-    ) {
+    if (_scrollRaf !== null || !isAtBottom || !scrollEl) return;
+    _scrollRaf = requestAnimationFrame(async () => {
+      _scrollRaf = null;
+      await tick();
+      if (!isAtBottom || !scrollEl) return;
+      // Instant (not smooth) — a smooth animation restarts every frame while
+      // streaming and never settles; the bottom button stays smooth below.
       scrollEl.scrollTop = scrollEl.scrollHeight;
-    } else {
-      scrollEl.scrollTo({ top: scrollEl.scrollHeight, behavior: 'smooth' });
-    }
+    });
   }
 
   function handleScroll() {
@@ -2528,10 +2490,8 @@
 
   function scrollToBottom() {
     isAtBottom = true;
-    if (
-      typeof window !== 'undefined' &&
-      window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
-    ) {
+    if (!_reducedMotion) _reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
+    if (_reducedMotion.matches) {
       if (scrollEl) scrollEl.scrollTop = scrollEl.scrollHeight;
     } else {
       scrollEl?.scrollTo({ top: scrollEl.scrollHeight, behavior: 'smooth' });
@@ -2650,7 +2610,7 @@
     }
 
     // Ctrl+/ — toggle sessions panel
-    if ((e.ctrlKey || e.metaKey) && e.key === '/') {
+    if (!inEditable() && (e.ctrlKey || e.metaKey) && e.key === '/') {
       e.preventDefault();
       showSessionPanel = !showSessionPanel;
       if (showSessionPanel && showRightPanel) showRightPanel = false;
@@ -2659,21 +2619,21 @@
     }
 
     // Ctrl+K — toggle model picker
-    if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
+    if (!inEditable() && (e.ctrlKey || e.metaKey) && e.key === 'k') {
       e.preventDefault();
       openTab('models');
       return;
     }
 
     // Ctrl+T — open thinking level selector
-    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key === 't') {
+    if (!inEditable() && (e.ctrlKey || e.metaKey) && !e.shiftKey && e.key === 't') {
       e.preventDefault();
       openTab('models');
       return;
     }
 
     // Ctrl+Shift+T — cycle thinking level
-    if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 't' || e.key === 'T')) {
+    if (!inEditable() && (e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 't' || e.key === 'T')) {
       e.preventDefault();
       const current = thinkingLevel;
       const idx = (availableThinkingLevels as readonly string[]).indexOf(current);
@@ -2916,6 +2876,7 @@
   function canSubmitFollowUp() {
     return (
       wsState === 'open' &&
+      !sessionLoading &&
       !isStreaming &&
       input.trim().length > 0 &&
       attachedImages.length === 0 &&
@@ -3009,7 +2970,7 @@
   }
 
   function submitMessage(asFollowUp = false) {
-    if (wsState !== 'open') return;
+    if (wsState !== 'open' || sessionLoading) return;
     const text = input.trim();
 
     // Slash/bang commands are commands, not conversation text — dispatch
@@ -3254,6 +3215,7 @@
   let _appInstalledHandler: (() => void) | null = null;
   let _onlineHandler: (() => void) | null = null;
   let _offlineHandler: (() => void) | null = null;
+  let _unsubLangReady: (() => void) | null = null;
 
   onMount(() => {
     // Paint the last conversation immediately on cold start (mobile OSes
@@ -3340,6 +3302,12 @@
     } catch {
       /* localStorage unavailable */
     }
+    // Re-render memoized markdown once a lazily-loaded hljs language
+    // registers — first-render code blocks in that language fall back to
+    // escaped plain text until this fires.
+    _unsubLangReady = onLangRegistered(() => {
+      for (const m of messages) scheduleContentRender(m);
+    });
   });
 
   onDestroy(() => {
@@ -3354,6 +3322,7 @@
     if (_onlineHandler) window.removeEventListener('online', _onlineHandler);
     if (_offlineHandler) window.removeEventListener('offline', _offlineHandler);
     if (_mq && _mqHandler) _mq.removeEventListener('change', _mqHandler);
+    if (_unsubLangReady) _unsubLangReady();
   });
 
   /** Single visibility-change handler: pause reconnection + manage wake lock. */
@@ -3507,28 +3476,6 @@
             </Tooltip.Trigger>
             <Tooltip.Content side="bottom">Sessions</Tooltip.Content>
           </Tooltip.Root>
-          <button
-            onclick={() => openTab('models')}
-            class="h-9 hidden sm:flex items-center overflow-hidden rounded-xl border border-base-content/8 bg-base-content/[0.045] text-base-content/65 hover:text-base-content/90 hover:bg-base-content/[0.07] transition-colors"
-            aria-label="Open model picker"
-            aria-expanded={showRightPanel && rightPanelTab === 'models'}
-          >
-            <span
-              class="w-10 h-full flex items-center justify-center border-r border-base-content/8"
-              ><Cpu class="w-4 h-4" /></span
-            >
-            <span class="w-8 h-full flex items-center justify-center"
-              ><svg
-                class="w-3.5 h-3.5"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="2.5"
-                stroke-linecap="round"
-                stroke-linejoin="round"><path d="m6 9 6 6 6-6" /></svg
-              ></span
-            >
-          </button>
         </div>
 
         <button
@@ -4259,17 +4206,19 @@
                 onkeydown={handleKeydown}
                 oninput={autoResizeTextarea}
                 rows={1}
-                placeholder={wsState === 'closed'
-                  ? 'Disconnected'
-                  : wsState === 'connecting'
-                    ? 'Reconnecting…'
-                    : isStreaming
-                      ? 'Steer pi…'
-                      : isMobile
-                        ? 'Message pi…'
-                        : 'Message pi — @ files · / commands · ! shell'}
+                placeholder={sessionLoading
+                  ? 'Opening session…'
+                  : wsState === 'closed'
+                    ? 'Disconnected'
+                    : wsState === 'connecting'
+                      ? 'Reconnecting…'
+                      : isStreaming
+                        ? 'Steer pi…'
+                        : isMobile
+                          ? 'Message pi…'
+                          : 'Message pi — @ files · / commands · ! shell'}
                 aria-label="Message to pi"
-                disabled={wsState !== 'open'}
+                disabled={wsState !== 'open' || sessionLoading}
                 class="w-full min-h-10 sm:min-h-12 mt-0 sm:mt-1 bg-transparent resize-none outline-none placeholder-base-content/45 disabled:opacity-40 leading-relaxed max-h-40 sm:max-h-48 overflow-y-auto transition-opacity text-base"
                 style="field-sizing: content"></textarea>
 
@@ -4324,7 +4273,7 @@
                         <button
                           {...props}
                           onclick={() => fileInputEl?.click()}
-                          disabled={wsState !== 'open'}
+                          disabled={wsState !== 'open' || sessionLoading}
                           class="w-10 h-10 sm:w-8 sm:h-8 flex items-center justify-center text-base-content/45 hover:text-base-content/70 hover:bg-base-content/8 rounded-full transition-colors shrink-0 disabled:opacity-30 disabled:cursor-default"
                           aria-label="Attach file"
                           ><svg
@@ -4364,7 +4313,7 @@
                           <button
                             {...props}
                             onclick={compactSession}
-                            disabled={wsState !== 'open'}
+                            disabled={wsState !== 'open' || sessionLoading}
                             class="hidden md:flex w-8 h-8 items-center justify-center text-base-content/35 hover:text-base-content/60 hover:bg-base-content/8 rounded-full transition-colors shrink-0 disabled:opacity-30 disabled:cursor-default"
                             aria-label="Compact context"
                             ><svg
@@ -4394,7 +4343,7 @@
                         <button
                           {...props}
                           onclick={toggleConversationMode}
-                          disabled={wsState !== 'open'}
+                          disabled={wsState !== 'open' || sessionLoading}
                           class="{conversationMode
                             ? 'flex'
                             : 'hidden md:flex'} w-10 h-10 sm:w-8 sm:h-8 items-center justify-center rounded-full transition-colors shrink-0 disabled:opacity-30 disabled:cursor-default {conversationMode
@@ -4434,7 +4383,7 @@
                         <button
                           {...props}
                           onclick={toggleSTT}
-                          disabled={wsState !== 'open'}
+                          disabled={wsState !== 'open' || sessionLoading}
                           class="w-10 h-10 sm:w-8 sm:h-8 flex items-center justify-center rounded-full transition-colors shrink-0 disabled:opacity-30 disabled:cursor-default {isRecording
                             ? 'text-error bg-error/10 animate-pulse'
                             : 'text-base-content/35 hover:text-base-content/60 hover:bg-base-content/8'}"
@@ -4487,11 +4436,13 @@
                           disabled={(!input.trim() &&
                             attachedImages.length === 0 &&
                             attachedFiles.length === 0) ||
-                            wsState !== 'open'}
+                            wsState !== 'open' ||
+                            sessionLoading}
                           class="relative w-10 h-10 sm:w-8 sm:h-8 flex items-center justify-center rounded-full transition-all duration-200 shrink-0 {(input.trim() ||
                             attachedImages.length > 0 ||
                             attachedFiles.length > 0) &&
-                          wsState === 'open'
+                          wsState === 'open' &&
+                          !sessionLoading
                             ? 'bg-primary text-primary-content hover:brightness-110 shadow-[0_0_16px_-4px_color-mix(in_oklch,var(--color-primary)_60%,transparent)]'
                             : 'text-base-content/25'} disabled:cursor-default"
                           aria-label="Send message"
@@ -4765,10 +4716,16 @@
                 </button>
               {/each}
             </nav>
-            <div
-              class="px-5 py-3 border-t border-base-content/8 text-[10px] text-base-content/32 font-mono"
-            >
-              {uiVersion ? `pi-ui v${uiVersion}` : 'pi-ui'}
+            <div class="px-5 py-3 border-t border-base-content/8 space-y-1.5">
+              <a
+                href="/logout"
+                class="w-full flex items-center gap-2 rounded-lg px-2 py-1.5 text-xs text-base-content/45 hover:text-base-content/85 hover:bg-base-content/[0.055] transition-colors"
+              >
+                Sign out
+              </a>
+              <div class="text-[10px] text-base-content/32 font-mono">
+                {uiVersion ? `pi-ui v${uiVersion}` : 'pi-ui'}
+              </div>
             </div>
           </aside>
 

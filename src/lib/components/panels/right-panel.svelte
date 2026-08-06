@@ -6,6 +6,7 @@
   import CornerDownLeft from '@lucide/svelte/icons/corner-down-left';
   import Sparkles from '@lucide/svelte/icons/sparkles';
   import type { ModelInfo, ProviderInfo, SkillSummary, PromptSummary } from '$lib/ws/protocol';
+  import { providerColor, sourceLabel, canRemove } from '$lib/utils';
 
   let {
     open,
@@ -97,28 +98,6 @@
     onDismissProviderError: () => void;
   } = $props();
 
-  function providerColor(id: string): string {
-    const map: Record<string, string> = {
-      anthropic: '#C06A3A', openai: '#10A37F', google: '#4285F4', gemini: '#4285F4',
-      mistral: '#FF7000', groq: '#F55036', cohere: '#39D3C3', deepseek: '#4D90FE',
-      xai: '#888888', grok: '#888888', openrouter: '#6E56CF', meta: '#0668E1',
-      llama: '#0668E1', bedrock: '#FF9900', aws: '#FF9900',
-    };
-    const lower = id.toLowerCase();
-    for (const [key, color] of Object.entries(map)) { if (lower.includes(key)) return color; }
-    return '#6B7280';
-  }
-
-  function sourceLabel(source?: string): string | undefined {
-    switch (source) {
-      case 'environment': return 'env';
-      case 'models_json_key': case 'models_json_command': return 'config';
-      case 'fallback': return 'config';
-      case 'runtime': return 'runtime';
-      default: return undefined;
-    }
-  }
-  function canRemove(source?: string): boolean { return source === 'stored'; }
 </script>
 
 {#snippet sectionHeader(letter: string, bg: string, label: string, color?: string)}
