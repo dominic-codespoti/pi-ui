@@ -18,7 +18,9 @@ import type {
   AgentSession,
   ExtensionUIContext,
   ExtensionUIDialogOptions,
+  TerminalInputHandler,
 } from '@earendil-works/pi-coding-agent';
+import type { AuthEvent, AuthInteraction, AuthPrompt } from '@earendil-works/pi-ai';
 import { rm, mkdir, writeFile } from 'node:fs/promises';
 import { join, resolve, basename, sep, dirname } from 'node:path';
 import { homedir } from 'node:os';
@@ -34,6 +36,7 @@ import {
   setWebhookUrl,
   sendWebhookNotification,
 } from './src/lib/server/notification-webhook.ts';
+import { persistProviderApiKey } from './src/lib/server/provider-auth.ts';
 import {
   serializeModel,
   serializeSession,
@@ -46,28 +49,31 @@ import {
 import { ProjectCatalog } from './src/lib/server/project-catalog.ts';
 import { readSettings, updateSettings } from './src/lib/server/ui-settings.ts';
 import { log } from './src/lib/server/logger.ts';
+import { terminalInputRegistry } from './src/lib/server/terminal-input.ts';
 import { trimMessagesForWire } from './src/lib/server/wire-messages.ts';
 import { createCompactionWatchdog } from './src/lib/server/compaction-watchdog.ts';
 import {
   flushSessionScanCache,
   initSessionScanCache,
+  firstTextContent,
   type SessionFileInfo,
 } from './src/lib/server/session-scan.ts';
 import { SessionCatalog } from './src/lib/server/session-catalog.ts';
-import type {
-  ClientMessage,
-  ServerMessage,
-  ModelInfo,
-  ProviderInfo,
-  SessionSummary,
-  SkillSummary,
-  PromptSummary,
-  ExtensionSummary,
-  UpdatePackageStatus,
-  UpdateStatus,
-  UpdateTarget,
-  WidgetPayload,
-  WidgetPlacement,
+import {
+  EXTENSION_UI_SCHEMA_VERSION,
+  type ClientMessage,
+  type ServerMessage,
+  type ModelInfo,
+  type ProviderInfo,
+  type SkillSummary,
+  type PromptSummary,
+  type ExtensionSummary,
+  type UpdatePackageStatus,
+  type UpdateStatus,
+  type UpdateTarget,
+  type WidgetPayload,
+  type WidgetPlacement,
+  type ExtensionUiStatePayload,
 } from './src/lib/ws/protocol.ts';
 import {
   callFactoryAndParse,
@@ -79,6 +85,7 @@ import {
   stubTheme,
   stripAnsi,
   ansiToHtml,
+  renderTerminalLines,
   renderToolCallHtml,
   renderToolResultHtml,
   renderCustomMessage,
@@ -204,8 +211,17 @@ function expandTilde(p: string): string {
   return p;
 }
 
-function getProviders(): ProviderInfo[] {
-  const runtime = activeSession().modelRuntime;
+async function getProviders(runtime = activeSession().modelRuntime): Promise<ProviderInfo[]> {
+  let storedProviderIds: Set<string> | undefined;
+  try {
+    storedProviderIds = new Set(
+      (await runtime.listCredentials()).map((credential) => credential.providerId)
+    );
+  } catch (err) {
+    // Status snapshots are still useful when the credential store cannot be read.
+    log.warn('[pifrontier] Failed to read stored provider credentials:', err);
+  }
+
   const modelCounts = new Map<string, number>();
   for (const model of runtime.getModels()) {
     modelCounts.set(model.provider, (modelCounts.get(model.provider) ?? 0) + 1);
@@ -216,11 +232,18 @@ function getProviders(): ProviderInfo[] {
     const modelCount = modelCounts.get(provider.id);
     if (!modelCount) continue;
     const status = runtime.getProviderAuthStatus(provider.id);
+    // ModelRuntime's async availability snapshot can be stale when an
+    // unrelated provider auth check fails. Credential metadata is authoritative
+    // for a just-completed login/logout, so use it as a narrow fallback.
+    const effectiveStatus =
+      !status.configured && storedProviderIds?.has(provider.id)
+        ? { configured: true, source: 'stored' }
+        : status;
     providers.push({
       id: provider.id,
       name: provider.name,
-      configured: status.configured,
-      source: status.source,
+      configured: effectiveStatus.configured,
+      source: effectiveStatus.source,
       modelCount,
     });
   }
@@ -230,6 +253,141 @@ function getProviders(): ProviderInfo[] {
     if (a.configured !== b.configured) return a.configured ? -1 : 1;
     return a.name.localeCompare(b.name);
   });
+}
+
+async function availableModelsForBroadcast(
+  runtime: AgentSession['modelRuntime'],
+  changedProviderId?: string
+): Promise<ModelInfo[]> {
+  const serializeAvailable = (models: readonly Parameters<typeof serializeModel>[0][]) =>
+    models.map(serializeModel).filter((model): model is ModelInfo => model !== null);
+
+  try {
+    return serializeAvailable(await runtime.getAvailable());
+  } catch (err) {
+    log.warn('[pifrontier] Provider availability refresh failed:', err);
+    if (changedProviderId) {
+      try {
+        // A single broken provider must not hide a successful login for another
+        // provider. Re-check the changed provider and merge it into the last
+        // good snapshot.
+        return serializeAvailable([
+          ...runtime.getAvailableSnapshot().filter((model) => model.provider !== changedProviderId),
+          ...(await runtime.getAvailable(changedProviderId)),
+        ]);
+      } catch (changedErr) {
+        log.warn(
+          `[pifrontier] Failed to refresh changed provider ${changedProviderId}:`,
+          changedErr
+        );
+      }
+    }
+    return serializeAvailable(runtime.getAvailableSnapshot());
+  }
+}
+
+/** Broadcast the authoritative provider/auth and available-model snapshots. */
+async function broadcastProviderState(
+  runtime: AgentSession['modelRuntime'],
+  changedProviderId?: string
+): Promise<void> {
+  const availableModels = await availableModelsForBroadcast(runtime, changedProviderId);
+  broadcast({ type: 'providers_list', providers: await getProviders(runtime) });
+  broadcast({ type: 'available_models_changed', availableModels });
+}
+
+let providerAuthMutationQueue: Promise<void> = Promise.resolve();
+
+/** Serialize credential mutations so refresh snapshots cannot complete out of order. */
+function enqueueProviderAuthMutation<T>(operation: () => Promise<T>): Promise<T> {
+  const result = providerAuthMutationQueue.then(operation);
+  providerAuthMutationQueue = result.then(
+    () => undefined,
+    () => undefined
+  );
+  return result;
+}
+
+async function mutateProviderAuth(
+  providerId: string,
+  mutation: (runtime: AgentSession['modelRuntime']) => Promise<void>
+): Promise<void> {
+  return enqueueProviderAuthMutation(async () => {
+    const runtime = activeSession().modelRuntime;
+    try {
+      await mutation(runtime);
+    } finally {
+      // A persisted credential is useful even when a model catalog or an
+      // unrelated provider's availability check fails during SDK refresh.
+      try {
+        await broadcastProviderState(runtime, providerId);
+      } catch (err) {
+        log.error('[pifrontier] Failed to broadcast provider state:', err);
+      }
+    }
+  });
+}
+
+function browserAuthInteraction(ownerSessionId: string | null): AuthInteraction {
+  return {
+    prompt: async (prompt: AuthPrompt) => {
+      if (prompt.type === 'select') {
+        const selected = await uiContext.select(
+          prompt.message,
+          prompt.options.map((option) => option.label),
+          undefined,
+          ownerSessionId
+        );
+        if (!selected) throw new Error('Login cancelled');
+        const option = prompt.options.find((candidate) => candidate.label === selected);
+        if (!option) throw new Error('Login cancelled');
+        return option.id;
+      }
+
+      const value = await createDialogPromise<string | undefined>(
+        crypto.randomUUID(),
+        {
+          method: 'input',
+          title: prompt.message,
+          placeholder: prompt.placeholder,
+          ...(prompt.type === 'secret' ? { secret: true } : {}),
+        },
+        (response) =>
+          'cancelled' in response && response.cancelled
+            ? undefined
+            : 'value' in response && typeof response.value === 'string'
+              ? response.value
+              : undefined,
+        ownerSessionId
+      );
+      if (value === undefined) throw new Error('Login cancelled');
+      return value;
+    },
+    notify: (event: AuthEvent) => {
+      switch (event.type) {
+        case 'info':
+          uiContext.notify(event.message, 'info', ownerSessionId);
+          break;
+        case 'progress':
+          uiContext.notify(event.message, 'info', ownerSessionId);
+          break;
+        case 'auth_url':
+          uiContext.notify(
+            `${event.instructions ? `${event.instructions}\n` : ''}${event.url}`,
+            'info',
+            ownerSessionId
+          );
+          break;
+        case 'device_code':
+          uiContext.notify(
+            `Enter ${event.userCode} at ${event.verificationUri}`,
+            'info',
+            ownerSessionId
+          );
+          break;
+      }
+    },
+  };
 }
 
 function sendSlashResult(
@@ -541,12 +699,16 @@ const PI_CONFIG_DIR = '.pi';
  * Mirrors the scanner's SessionFileInfo shape so the merge is seamless.
  */
 function poolSummary(sess: AgentSession, entry: ManagedSession): SessionFileInfo {
-  const msg = sess.messages[0] as { content?: string | Array<unknown> } | undefined;
-  const firstMsg = msg?.content
-    ? typeof msg.content === 'string'
-      ? msg.content.slice(0, 120)
-      : '(complex)'
-    : '';
+  let firstMsg = '';
+  for (const message of sess.messages) {
+    if (!message || typeof message !== 'object' || !('role' in message)) continue;
+    if (message.role !== 'user' && message.role !== 'assistant') continue;
+    const text = firstTextContent(message);
+    if (text) {
+      firstMsg = text.slice(0, 120);
+      break;
+    }
+  }
   return {
     id: sess.sessionId,
     path: entry.path ?? '(in-memory)',
@@ -619,24 +781,45 @@ interface ActiveCustomDialog {
 
 /** All extension UI state + live resources owned by one session. */
 interface SessionUiState {
+  statuses: Map<string, string>;
+  workingMessage?: string;
+  workingVisible: boolean;
+  workingIndicatorFrames: string[];
+  workingIndicatorMs: number;
+  hiddenThinkingLabel: string;
+  header: string;
+  footer: string;
+  editorComponent?: ParsedComponent;
+  title: string;
+  editorText: string;
   widgets: Map<string, WidgetStoreEntry>;
   pendingDialogs: Map<string, PendingRequest>;
-  pendingEditorText: Map<string, { resolve: (text: string) => void }>;
   /** Live pi-tui instance for an interactive custom() dialog, keyed by dialog id. */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   interactiveCustomComponents: Map<string, any>;
   /** Render-polling intervals for interactive custom() dialogs (keyed by dialog id). */
   interactiveRenderIntervals: Map<string, Timer>;
+  /** Last broadcast clean-line snapshot for interactive custom() dialogs. */
+  interactiveLastRender: Map<string, string>;
   activeCustomDialogs: Map<string, ActiveCustomDialog>;
 }
 
 function createSessionUiState(): SessionUiState {
   return {
+    statuses: new Map(),
+    workingVisible: true,
+    workingIndicatorFrames: [],
+    workingIndicatorMs: 80,
+    hiddenThinkingLabel: 'thinking',
+    header: '',
+    footer: '',
+    title: 'pi UI',
+    editorText: '',
     widgets: new Map(),
     pendingDialogs: new Map(),
-    pendingEditorText: new Map(),
     interactiveCustomComponents: new Map(),
     interactiveRenderIntervals: new Map(),
+    interactiveLastRender: new Map(),
     activeCustomDialogs: new Map(),
   };
 }
@@ -698,6 +881,32 @@ function cleanupCustomDialog(id: string): void {
     clearInterval(pollId);
     ui.interactiveRenderIntervals.delete(id);
   }
+  ui.interactiveLastRender.delete(id);
+}
+/** Render, deduplicate, and broadcast an interactive custom() snapshot. */
+function flushInteractiveRender(id: string): void {
+  const owner = pendingRequestOwners.get(id) ?? null;
+  const ui = existingUiStateFor(owner);
+  if (!ui) return;
+  const tui = ui.interactiveCustomComponents.get(id);
+  if (!tui) return;
+  const rendered = renderTerminalLines(tui);
+  if (!rendered) return;
+  const json = JSON.stringify(rendered.cleanLines);
+  if (json === ui.interactiveLastRender.get(id)) return;
+  ui.interactiveLastRender.set(id, json);
+  broadcast({
+    type: 'custom_render',
+    id,
+    lines: rendered.cleanLines,
+    htmlLines: rendered.htmlLines,
+    ...stampOwner(owner),
+  });
+  const pending = ui.pendingDialogs.get(id);
+  if (pending) {
+    pending.requestPayload.lines = rendered.cleanLines;
+    pending.requestPayload.htmlLines = rendered.htmlLines;
+  }
 }
 
 /**
@@ -707,8 +916,9 @@ function cleanupCustomDialog(id: string): void {
  * connected tab, not just the one that answered.
  */
 function finalizeExtensionResponse(id: string): void {
+  const owner = pendingRequestOwners.get(id) ?? null;
   cleanupCustomDialog(id);
-  broadcast({ type: 'extension_ui_dismiss', id });
+  broadcast({ type: 'extension_ui_dismiss', id, ...stampOwner(owner) });
 }
 
 // broadcast is a thin wrapper; reassigned once the Bun server is live.
@@ -734,7 +944,12 @@ function createDialogPromise<T>(
     };
     ui.pendingDialogs.set(id, entry);
     pendingRequestOwners.set(id, ownerSessionId);
-    broadcast({ type: 'extension_ui_request', id, ...requestPayload });
+    broadcast({
+      type: 'extension_ui_request',
+      id,
+      ...requestPayload,
+      ...stampOwner(ownerSessionId),
+    });
     // Timeout — prevents the agent from hanging forever if the browser
     // never responds (e.g. tab was closed without notifying the server).
     // The 15s grace timer (close handler) may cancel it earlier.
@@ -772,12 +987,6 @@ const COMPACTION_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 function disposeUiState(ui: SessionUiState): void {
   for (const entry of ui.pendingDialogs.values()) {
     entry.resolve({ cancelled: true });
-  }
-  for (const id of ui.pendingEditorText.keys()) {
-    pendingRequestOwners.delete(id);
-  }
-  for (const entry of ui.pendingEditorText.values()) {
-    entry.resolve('');
   }
   // Clean up interactive custom components
   for (const component of ui.interactiveCustomComponents.values()) {
@@ -846,9 +1055,33 @@ function flattenParsedText(parsed: ParsedComponent | null): string {
 
 type ServerExtensionUIContext = Omit<
   ExtensionUIContext,
-  'getEditorText' | 'setWidget' | 'select' | 'confirm' | 'input' | 'editor' | 'custom'
+  | 'getEditorText'
+  | 'onTerminalInput'
+  | 'setWidget'
+  | 'select'
+  | 'confirm'
+  | 'input'
+  | 'editor'
+  | 'custom'
+  | 'setStatus'
+  | 'setWorkingMessage'
+  | 'setWorkingVisible'
+  | 'setWorkingIndicator'
+  | 'setHiddenThinkingLabel'
+  | 'setFooter'
+  | 'setHeader'
+  | 'setTitle'
+  | 'setEditorComponent'
+  | 'notify'
+  | 'pasteToEditor'
+  | 'setEditorText'
+  | 'diagnostic'
+  | 'getEditorComponent'
+  | 'setToolsExpanded'
+  | 'getToolsExpanded'
 > & {
-  getEditorText(ownerSessionId?: string | null): Promise<string>;
+  getEditorText(ownerSessionId?: string | null): string;
+  onTerminalInput(handler: TerminalInputHandler, ownerSessionId?: string | null): () => void;
   setWidget(
     key: string,
     content: unknown,
@@ -884,7 +1117,44 @@ type ServerExtensionUIContext = Omit<
     arg3?: unknown,
     ownerSessionId?: string | null
   ): Promise<unknown>;
-  diagnostic(message: string, level?: string, details?: string, source?: string): void;
+  setStatus(key: string, text: string | undefined, ownerSessionId?: string | null): void;
+  setWorkingMessage(message?: string, ownerSessionId?: string | null): void;
+  setWorkingVisible(visible: boolean, ownerSessionId?: string | null): void;
+  setWorkingIndicator(
+    options?: Parameters<ExtensionUIContext['setWorkingIndicator']>[0],
+    ownerSessionId?: string | null
+  ): void;
+  setHiddenThinkingLabel(label?: string, ownerSessionId?: string | null): void;
+  setFooter(
+    factory: Parameters<ExtensionUIContext['setFooter']>[0],
+    ownerSessionId?: string | null
+  ): void;
+  setHeader(
+    factory: Parameters<ExtensionUIContext['setHeader']>[0],
+    ownerSessionId?: string | null
+  ): void;
+  setTitle(title: string, ownerSessionId?: string | null): void;
+  setEditorComponent(
+    factory: Parameters<ExtensionUIContext['setEditorComponent']>[0],
+    ownerSessionId?: string | null
+  ): void;
+  notify(
+    message: string,
+    type?: Parameters<ExtensionUIContext['notify']>[1],
+    ownerSessionId?: string | null
+  ): void;
+  pasteToEditor(text: string, ownerSessionId?: string | null): void;
+  setEditorText(text: string, ownerSessionId?: string | null): void;
+  diagnostic(
+    message: string,
+    level?: string,
+    details?: string,
+    source?: string,
+    ownerSessionId?: string | null
+  ): void;
+  getEditorComponent(): undefined;
+  getToolsExpanded(): boolean;
+  setToolsExpanded(expanded: boolean, ownerSessionId?: string | null): void;
 };
 
 const uiContext: ServerExtensionUIContext = {
@@ -1006,27 +1276,15 @@ const uiContext: ServerExtensionUIContext = {
           // input control in a closure, so structured parsing cannot drive them.
           if (shouldUseInteractiveCustom(component, parsed)) {
             ui.interactiveCustomComponents.set(id, tui); // Store the TUI wrapper so we can route keys
+            tui.onRequestRender = () => flushInteractiveRender(id);
+            tui.terminal.start(
+              () => {},
+              () => flushInteractiveRender(id)
+            );
 
-            // Poll render every 200ms so sub-session events update the display
-            const pollId = setInterval(() => {
-              try {
-                const rawLines = tui.render();
-                const cleanLines = Array.isArray(rawLines)
-                  ? rawLines.map((l: string) => stripAnsi(l))
-                  : [];
-                const htmlLines = Array.isArray(rawLines)
-                  ? rawLines.map((l: string) => ansiToHtml(l))
-                  : [];
-                broadcast({ type: 'custom_render', id, lines: cleanLines, htmlLines });
-                const pending = ui.pendingDialogs.get(id);
-                if (pending) {
-                  pending.requestPayload.lines = cleanLines;
-                  pending.requestPayload.htmlLines = htmlLines;
-                }
-              } catch {
-                /* disposed */
-              }
-            }, 200);
+            // Poll render every 200ms as a safety net for updates that do not
+            // trigger requestRender() or a terminal resize.
+            const pollId = setInterval(() => flushInteractiveRender(id), 200);
             ui.interactiveRenderIntervals.set(id, pollId);
 
             const rawLines = tui.render();
@@ -1067,7 +1325,13 @@ const uiContext: ServerExtensionUIContext = {
                 },
               });
               pendingRequestOwners.set(id, owner);
-              broadcast({ type: 'extension_ui_request', id, ...requestPayload });
+              broadcast({
+                type: 'extension_ui_request',
+                id,
+                ...requestPayload,
+                ...stampOwner(owner),
+              });
+              ui.interactiveLastRender.set(id, JSON.stringify(cleanLines));
               // Timeout parity with createDialogPromise — prevents the agent
               // hanging forever if no browser ever responds (e.g. dialog was
               // created while no client was connected and none reconnects).
@@ -1092,7 +1356,12 @@ const uiContext: ServerExtensionUIContext = {
                 const json = JSON.stringify(reparsed);
                 if (json !== dlg.lastParsedJson) {
                   dlg.lastParsedJson = json;
-                  broadcast({ type: 'extension_ui_update', id, parsed: reparsed });
+                  broadcast({
+                    type: 'extension_ui_update',
+                    id,
+                    parsed: reparsed,
+                    ...stampOwner(owner),
+                  });
                   const pending = ui.pendingDialogs.get(id);
                   if (pending) pending.requestPayload.parsed = reparsed;
                 }
@@ -1132,13 +1401,15 @@ const uiContext: ServerExtensionUIContext = {
     );
   },
 
-  notify(message, type) {
+  notify(message, type, ownerSessionId) {
+    const owner = ownerSessionId ?? activeSessionId ?? null;
     broadcast({
       type: 'extension_ui_request',
       id: crypto.randomUUID(),
       method: 'notify',
       message,
       notifyType: type,
+      ...stampOwner(owner),
     });
     // When no browser tab is connected, fire the webhook instead of the
     // in-app notification (which would go nowhere). This avoids double
@@ -1148,65 +1419,109 @@ const uiContext: ServerExtensionUIContext = {
     }
   },
 
-  onTerminalInput() {
-    return () => {};
+  onTerminalInput(handler, ownerSessionId) {
+    const owner = ownerSessionId ?? activeSessionId ?? null;
+    const wasActive = terminalInputRegistry.has(owner);
+    terminalInputRegistry.register(owner, handler);
+    if (!wasActive) {
+      broadcast({
+        type: 'extension_terminal_input_active',
+        active: true,
+        ...stampOwner(owner),
+      });
+    }
+    return () => {
+      const had = terminalInputRegistry.has(owner);
+      terminalInputRegistry.unregister(owner, handler);
+      if (had && !terminalInputRegistry.has(owner)) {
+        broadcast({
+          type: 'extension_terminal_input_active',
+          active: false,
+          ...stampOwner(owner),
+        });
+      }
+    };
   },
 
-  setStatus(key, text) {
+  setStatus(key, text, ownerSessionId) {
+    const owner = ownerSessionId ?? activeSessionId ?? null;
+    const ui = uiStateFor(owner);
+    if (text === undefined) ui.statuses.delete(key);
+    else ui.statuses.set(key, text);
     broadcast({
       type: 'extension_ui_request',
       id: crypto.randomUUID(),
       method: 'setStatus',
       statusKey: key,
       statusText: text,
+      ...stampOwner(owner),
     });
   },
 
-  setWorkingMessage(message) {
+  setWorkingMessage(message, ownerSessionId) {
+    const owner = ownerSessionId ?? activeSessionId ?? null;
+    uiStateFor(owner).workingMessage = message;
     broadcast({
       type: 'extension_ui_request',
       id: crypto.randomUUID(),
       method: 'setWorkingMessage',
       message,
+      ...stampOwner(owner),
     });
   },
-  setWorkingVisible(visible) {
+  setWorkingVisible(visible, ownerSessionId) {
+    const owner = ownerSessionId ?? activeSessionId ?? null;
+    uiStateFor(owner).workingVisible = visible;
     broadcast({
       type: 'extension_ui_request',
       id: crypto.randomUUID(),
       method: 'setWorkingVisible',
       visible,
+      ...stampOwner(owner),
     });
   },
-  setWorkingIndicator(options) {
+  setWorkingIndicator(options, ownerSessionId) {
+    const owner = ownerSessionId ?? activeSessionId ?? null;
+    const ui = uiStateFor(owner);
+    ui.workingIndicatorFrames = options?.frames ?? [];
+    ui.workingIndicatorMs = options?.intervalMs ?? 80;
     broadcast({
       type: 'extension_ui_request',
       id: crypto.randomUUID(),
       method: 'setWorkingIndicator',
       frames: options?.frames,
       intervalMs: options?.intervalMs,
+      ...stampOwner(owner),
     });
   },
-  setHiddenThinkingLabel(label) {
+  setHiddenThinkingLabel(label, ownerSessionId) {
+    const owner = ownerSessionId ?? activeSessionId ?? null;
+    uiStateFor(owner).hiddenThinkingLabel = label ?? 'thinking';
     broadcast({
       type: 'extension_ui_request',
       id: crypto.randomUUID(),
       method: 'setHiddenThinkingLabel',
       label,
+      ...stampOwner(owner),
     });
   },
-
-  diagnostic(message: string, level?: string, details?: string, source?: string) {
-    // Persist to session so the message survives reconnects
+  diagnostic(
+    message: string,
+    level?: string,
+    details?: string,
+    source?: string,
+    ownerSessionId?: string | null
+  ) {
+    const owner = ownerSessionId ?? activeSessionId ?? null;
+    // Persist to the owning session so diagnostics do not cross-contaminate
+    // pooled sessions.
     try {
-      const sess = activeSession();
-      if (sess) {
-        sess.sessionManager.appendCustomMessageEntry('pi-ui:diagnostic', message, true, {
-          level,
-          details,
-          source,
-        });
-      }
+      const sess = owner ? sessionPool.get(owner)?.session : activeSessionOrNull();
+      sess?.sessionManager.appendCustomMessageEntry('pi-ui:diagnostic', message, true, {
+        level,
+        details,
+        source,
+      });
     } catch {
       /* session may not be ready — still broadcast to live clients */
     }
@@ -1219,6 +1534,7 @@ const uiContext: ServerExtensionUIContext = {
       details,
       source,
       timestamp: Date.now(),
+      ...stampOwner(owner),
     });
   },
 
@@ -1284,96 +1600,88 @@ const uiContext: ServerExtensionUIContext = {
     }
   },
 
-  setFooter(factory) {
-    if (!factory) {
+  setFooter(factory, ownerSessionId) {
+    const owner = ownerSessionId ?? activeSessionId ?? null;
+    const apply = (content: string) => {
+      uiStateFor(owner).footer = content;
       broadcast({
         type: 'extension_ui_request',
         id: crypto.randomUUID(),
         method: 'set_footer',
-        content: '',
+        content,
+        ...stampOwner(owner),
       });
+    };
+    if (!factory) {
+      apply('');
       return;
     }
     void callFactoryAndParse(factory, '', undefined)
-      .then((parsed) => {
-        broadcast({
-          type: 'extension_ui_request',
-          id: crypto.randomUUID(),
-          method: 'set_footer',
-          content: flattenParsedText(parsed),
-        });
-      })
+      .then((parsed) => apply(flattenParsedText(parsed)))
       .catch(() => {
         /* factory may fail without real TUI */
       });
   },
-  setHeader(factory) {
-    if (!factory) {
+  setHeader(factory, ownerSessionId) {
+    const owner = ownerSessionId ?? activeSessionId ?? null;
+    const apply = (content: string) => {
+      uiStateFor(owner).header = content;
       broadcast({
         type: 'extension_ui_request',
         id: crypto.randomUUID(),
         method: 'set_header',
-        content: '',
+        content,
+        ...stampOwner(owner),
       });
+    };
+    if (!factory) {
+      apply('');
       return;
     }
     void callFactoryAndParse(factory, '', undefined)
-      .then((parsed) => {
-        broadcast({
-          type: 'extension_ui_request',
-          id: crypto.randomUUID(),
-          method: 'set_header',
-          content: flattenParsedText(parsed),
-        });
-      })
+      .then((parsed) => apply(flattenParsedText(parsed)))
       .catch(() => {
         /* factory may fail without real TUI */
       });
   },
 
-  setTitle(title) {
-    broadcast({ type: 'extension_ui_request', id: crypto.randomUUID(), method: 'setTitle', title });
+  setTitle(title, ownerSessionId) {
+    const owner = ownerSessionId ?? activeSessionId ?? null;
+    uiStateFor(owner).title = title;
+    broadcast({
+      type: 'extension_ui_request',
+      id: crypto.randomUUID(),
+      method: 'setTitle',
+      title,
+      ...stampOwner(owner),
+    });
   },
 
-  pasteToEditor(text) {
+  pasteToEditor(text, ownerSessionId) {
+    const owner = ownerSessionId ?? activeSessionId ?? null;
     broadcast({
       type: 'extension_ui_request',
       id: crypto.randomUUID(),
       method: 'paste_to_editor',
       text,
+      ...stampOwner(owner),
     });
   },
 
-  setEditorText(text) {
+  setEditorText(text, ownerSessionId) {
+    const owner = ownerSessionId ?? activeSessionId ?? null;
     broadcast({
       type: 'extension_ui_request',
       id: crypto.randomUUID(),
       method: 'set_editor_text',
       text,
+      ...stampOwner(owner),
     });
   },
 
   getEditorText(ownerSessionId?: string | null) {
-    const id = crypto.randomUUID();
-    const owner = ownerSessionId ?? null;
-    const ui = uiStateFor(owner);
-    return new Promise<string>((resolve) => {
-      const entry: { resolve: (text: string) => void; timeoutId?: Timer } = {
-        resolve: (text) => {
-          if (entry.timeoutId) clearTimeout(entry.timeoutId);
-          ui.pendingEditorText.delete(id);
-          pendingRequestOwners.delete(id);
-          resolve(text);
-        },
-      };
-      ui.pendingEditorText.set(id, entry);
-      pendingRequestOwners.set(id, owner);
-      broadcast({ type: 'extension_ui_request', id, method: 'request_editor_text' });
-      // Timeout after 5 seconds to avoid hanging forever
-      entry.timeoutId = setTimeout(() => {
-        if (ui.pendingEditorText.has(id)) entry.resolve('');
-      }, 5000);
-    });
+    const owner = ownerSessionId ?? activeSessionId ?? null;
+    return uiStateFor(owner).editorText;
   },
 
   addAutocompleteProvider(factory) {
@@ -1382,25 +1690,24 @@ const uiContext: ServerExtensionUIContext = {
       chainAutocompleteProviders();
     }
   },
-  setEditorComponent(factory) {
-    if (!factory) {
+  setEditorComponent(factory, ownerSessionId) {
+    const owner = ownerSessionId ?? activeSessionId ?? null;
+    const apply = (parsed: ParsedComponent | null) => {
+      uiStateFor(owner).editorComponent = parsed ?? undefined;
       broadcast({
         type: 'extension_ui_request',
         id: crypto.randomUUID(),
         method: 'set_editor_component',
-        parsed: null,
+        parsed,
+        ...stampOwner(owner),
       });
+    };
+    if (!factory) {
+      apply(null);
       return;
     }
     void callFactoryAndParse(factory, '', undefined)
-      .then((parsed) => {
-        broadcast({
-          type: 'extension_ui_request',
-          id: crypto.randomUUID(),
-          method: 'set_editor_component',
-          parsed,
-        });
-      })
+      .then((parsed) => apply(parsed))
       .catch(() => {
         /* factory may fail without real TUI */
       });
@@ -1445,8 +1752,27 @@ const uiContext: ServerExtensionUIContext = {
 function uiContextForSession(sid: string): ExtensionUIContext {
   return {
     ...uiContext,
+    notify: (message: string, type?: Parameters<ExtensionUIContext['notify']>[1]) =>
+      uiContext.notify(message, type, sid),
+    pasteToEditor: (text: string) => uiContext.pasteToEditor(text, sid),
+    setEditorText: (text: string) => uiContext.setEditorText(text, sid),
+    diagnostic: (message: string, level?: string, details?: string, source?: string) =>
+      uiContext.diagnostic(message, level, details, source, sid),
+    setStatus: (key: string, text: string | undefined) => uiContext.setStatus(key, text, sid),
+    setWorkingMessage: (message?: string) => uiContext.setWorkingMessage(message, sid),
+    setWorkingVisible: (visible: boolean) => uiContext.setWorkingVisible(visible, sid),
+    setWorkingIndicator: (options?: Parameters<ExtensionUIContext['setWorkingIndicator']>[0]) =>
+      uiContext.setWorkingIndicator(options, sid),
+    setHiddenThinkingLabel: (label?: string) => uiContext.setHiddenThinkingLabel(label, sid),
     setWidget: (key: string, content: unknown, options?: { placement?: WidgetPlacement }) =>
       uiContext.setWidget(key, content, options, sid),
+    setFooter: (factory: Parameters<ExtensionUIContext['setFooter']>[0]) =>
+      uiContext.setFooter(factory, sid),
+    setHeader: (factory: Parameters<ExtensionUIContext['setHeader']>[0]) =>
+      uiContext.setHeader(factory, sid),
+    setTitle: (title: string) => uiContext.setTitle(title, sid),
+    setEditorComponent: (factory: Parameters<ExtensionUIContext['setEditorComponent']>[0]) =>
+      uiContext.setEditorComponent(factory, sid),
     select: (title: string, options: string[], opts?: ExtensionUIDialogOptions) =>
       uiContext.select(title, options, opts, sid),
     confirm: (title: string, message: string, opts?: ExtensionUIDialogOptions) =>
@@ -1457,6 +1783,7 @@ function uiContextForSession(sid: string): ExtensionUIContext {
     custom: (arg1?: unknown, arg2?: unknown, arg3?: unknown) =>
       uiContext.custom(arg1, arg2, arg3, sid),
     getEditorText: () => uiContext.getEditorText(sid),
+    onTerminalInput: (handler: TerminalInputHandler) => uiContext.onTerminalInput(handler, sid),
   } as unknown as ExtensionUIContext;
 }
 
@@ -1501,6 +1828,10 @@ function teardownWidget(key: string, owner: string | null): void {
  * because the server's active session gates disposal).
  */
 function disposeUi(sid: string): void {
+  // Clear the terminal-input registry FIRST — a session whose extension only
+  // registered an onTerminalInput handler may never have created a UI bucket,
+  // and the early return below would otherwise leak its handlers.
+  terminalInputRegistry.clear(sid);
   const ui = uiStateBuckets.get(sid);
   if (!ui) return;
   disposeUiState(ui);
@@ -1513,6 +1844,35 @@ function widgetsForSession(sid: string): WidgetPayload[] {
   const out: WidgetPayload[] = [];
   for (const entry of ui.widgets.values()) out.push(entry.payload);
   return out;
+}
+
+function extensionUiStateForSession(sid: string): ExtensionUiStatePayload {
+  const ui = uiStateBuckets.get(sid) ?? createSessionUiState();
+  return {
+    schemaVersion: EXTENSION_UI_SCHEMA_VERSION,
+    statuses: Object.fromEntries(ui.statuses),
+    terminalInputActive: terminalInputRegistry.has(sid),
+    ...(ui.workingMessage !== undefined ? { workingMessage: ui.workingMessage } : {}),
+    workingVisible: ui.workingVisible,
+    ...(ui.workingIndicatorFrames.length > 0 || ui.workingIndicatorMs !== 80
+      ? {
+          workingIndicator: {
+            frames: ui.workingIndicatorFrames,
+            intervalMs: ui.workingIndicatorMs,
+          },
+        }
+      : {}),
+    hiddenThinkingLabel: ui.hiddenThinkingLabel,
+    ...(ui.header ? { header: ui.header } : {}),
+    ...(ui.footer ? { footer: ui.footer } : {}),
+    ...(ui.editorComponent ? { editorComponent: ui.editorComponent } : {}),
+    ...(ui.title !== 'pi UI' ? { title: ui.title } : {}),
+    widgets: widgetsForSession(sid),
+    pendingDialogs: Array.from(ui.pendingDialogs, ([id, pending]) => ({
+      id,
+      ...pending.requestPayload,
+    })),
+  };
 }
 
 function syncWidgetFactories(activeSid: string | null): void {
@@ -2214,6 +2574,7 @@ function broadcastSessionLoaded(sess: AgentSession): void {
     sessionMode: sess.sessionManager.isPersisted() ? 'persisted' : 'in-memory',
     sessionPath: sess.sessionManager.getSessionFile() ?? undefined,
     contextUsage: sess.getContextUsage(),
+    extensionUiState: extensionUiStateForSession(sess.sessionId),
     widgets: widgetsForSession(sess.sessionId),
   });
 }
@@ -2454,6 +2815,7 @@ try {
                 sessionPath: sess.sessionManager.getSessionFile() ?? undefined,
                 contextUsage: sess.getContextUsage(),
                 webhookUrl: getWebhookUrl() || undefined,
+                extensionUiState: extensionUiStateForSession(sess.sessionId),
                 widgets: widgetsForSession(sess.sessionId),
               })
             );
@@ -2478,15 +2840,22 @@ try {
             log.error('[pifrontier] Failed to send extension commands:', err);
           }
 
-          // Replay any pending extension UI requests so the reconnecting client
-          // can respond to modals that were open before the disconnect.
-          for (const ui of [ownerlessUiState, ...uiStateBuckets.values()]) {
+          // Replay only ownerless requests and requests for the active
+          // session. Replaying every pooled session's dialogs leaks stale UI
+          // into the newly connected tab and duplicates modal queues.
+          const replayBuckets: Array<[string | null, SessionUiState]> = [[null, ownerlessUiState]];
+          const activeUi = uiStateBuckets.get(sess.sessionId);
+          if (activeUi) replayBuckets.push([sess.sessionId, activeUi]);
+          for (const [owner, ui] of replayBuckets) {
             for (const [id, pending] of ui.pendingDialogs) {
-              broadcast({ type: 'extension_ui_request_replay', id, ...pending.requestPayload });
-            }
-            // Same for editor text requests.
-            for (const [id] of ui.pendingEditorText) {
-              broadcast({ type: 'extension_ui_request_replay', id, method: 'request_editor_text' });
+              ws.send(
+                JSON.stringify({
+                  type: 'extension_ui_request_replay',
+                  id,
+                  ...pending.requestPayload,
+                  ...stampOwner(owner),
+                })
+              );
             }
           }
 
@@ -2591,14 +2960,28 @@ try {
               break;
             }
 
-            case 'steer':
+            case 'steer': {
               try {
-                await activeSession().steer(msg.message);
+                const s = activeSession();
+                // `steer()` always queues in the SDK. If the browser's
+                // streaming state was stale and the turn already ended, start
+                // a normal prompt instead of leaving text stranded in a queue.
+                if (s.isStreaming || _promptsInFlight.has(s.sessionId)) {
+                  await s.steer(msg.message);
+                } else {
+                  _promptsInFlight.add(s.sessionId);
+                  try {
+                    await s.prompt(msg.message);
+                  } finally {
+                    _promptsInFlight.delete(s.sessionId);
+                  }
+                }
               } catch (err) {
                 log.error('[pifrontier] steer error:', err);
                 ws.send(JSON.stringify({ type: 'agent_error', error: String(err) }));
               }
               break;
+            }
 
             case 'follow_up':
               try {
@@ -2751,23 +3134,44 @@ try {
                 if (typeof component.handleInput === 'function') {
                   component.handleInput(data);
                 }
-                // Re-render and broadcast updated lines
-                const rawLines = typeof component.render === 'function' ? component.render(80) : [];
-                const cleanLines = Array.isArray(rawLines)
-                  ? rawLines.map((l: string) => stripAnsi(l))
-                  : [];
-                const htmlLines = Array.isArray(rawLines)
-                  ? rawLines.map((l: string) => ansiToHtml(l))
-                  : [];
-                broadcast({ type: 'custom_render', id: customId, lines: cleanLines, htmlLines });
-                const pending = ui?.pendingDialogs.get(customId);
-                if (pending) {
-                  pending.requestPayload.lines = cleanLines;
-                  pending.requestPayload.htmlLines = htmlLines;
-                }
+                flushInteractiveRender(customId);
               } catch (err) {
                 log.error('[pifrontier] extension_custom_input error:', err);
               }
+              break;
+            }
+            case 'extension_custom_resize': {
+              const resizeId = msg.id as string | undefined;
+              if (!resizeId) break;
+              const owner = pendingRequestOwners.get(resizeId) ?? null;
+              const tui = existingUiStateFor(owner)?.interactiveCustomComponents.get(resizeId);
+              if (!tui?.terminal?.setSize) break;
+              const columns = typeof msg.columns === 'number' ? msg.columns : 80;
+              const rows = typeof msg.rows === 'number' ? msg.rows : 24;
+              tui.terminal.setSize(columns, rows);
+              break;
+            }
+            case 'extension_terminal_input': {
+              const inputId = msg.id as string | undefined;
+              const data = msg.data as string | undefined;
+              if (!inputId || typeof data !== 'string') break;
+              const owner = (msg.sessionId as string | undefined) || activeSessionId || null;
+              const verdict = terminalInputRegistry.dispatch(owner, data);
+              broadcast({
+                type: 'extension_terminal_input_result',
+                id: inputId,
+                consumed: verdict.consumed,
+                ...(verdict.data !== undefined ? { data: verdict.data } : {}),
+                ...stampOwner(owner),
+              });
+              break;
+            }
+
+            case 'extension_editor_text_change': {
+              const text = msg.text as string | undefined;
+              if (typeof text !== 'string') break;
+              const owner = (msg.sessionId as string | undefined) || activeSessionId || null;
+              uiStateFor(owner).editorText = text;
               break;
             }
 
@@ -2777,9 +3181,8 @@ try {
               const path = (msg.path as number[] | undefined) ?? [];
               const event = msg.event as string;
               const value = msg.value as string | undefined;
-              const dlg = existingUiStateFor(
-                pendingRequestOwners.get(dialogId) ?? null
-              )?.activeCustomDialogs.get(dialogId);
+              const owner = pendingRequestOwners.get(dialogId) ?? null;
+              const dlg = existingUiStateFor(owner)?.activeCustomDialogs.get(dialogId);
               const node = dlg?.nodeMap.get(path.join('.'));
               let handled = false;
               try {
@@ -2827,7 +3230,12 @@ try {
                   const json = JSON.stringify(reparsed);
                   if (json !== dlg.lastParsedJson) {
                     dlg.lastParsedJson = json;
-                    broadcast({ type: 'extension_ui_update', id: dialogId, parsed: reparsed });
+                    broadcast({
+                      type: 'extension_ui_update',
+                      id: dialogId,
+                      parsed: reparsed,
+                      ...stampOwner(owner),
+                    });
                     const ui = existingUiStateFor(pendingRequestOwners.get(dialogId) ?? null);
                     const pending = ui?.pendingDialogs.get(dialogId);
                     if (pending) pending.requestPayload.parsed = reparsed;
@@ -2847,50 +3255,25 @@ try {
               break;
             }
 
-            case 'editor_text_response': {
-              const owner = pendingRequestOwners.get(msg.id) ?? null;
-              const ui = existingUiStateFor(owner);
-              const pendingEditor = ui?.pendingEditorText.get(msg.id);
-              if (pendingEditor) {
-                ui?.pendingEditorText.delete(msg.id);
-                pendingRequestOwners.delete(msg.id);
-                pendingEditor.resolve(msg.text ?? '');
-              }
-              break;
-            }
-
             case 'get_providers': {
-              ws.send(JSON.stringify({ type: 'providers_list', providers: getProviders() }));
+              ws.send(JSON.stringify({ type: 'providers_list', providers: await getProviders() }));
               break;
             }
 
             case 'set_provider_key': {
               try {
-                await activeSession().modelRuntime.setRuntimeApiKey(msg.provider, msg.key);
-                ws.send(JSON.stringify({ type: 'providers_list', providers: getProviders() }));
-                broadcast({
-                  type: 'available_models_changed',
-                  availableModels: (await activeSession().modelRuntime.getAvailable()).map(
-                    serializeModel
-                  ),
-                });
+                await mutateProviderAuth(msg.provider, (runtime) =>
+                  persistProviderApiKey(runtime, msg.provider, msg.key)
+                );
               } catch (err) {
                 log.error('[pifrontier] set_provider_key error:', err);
                 ws.send(JSON.stringify({ type: 'providers_error', message: String(err) }));
               }
               break;
             }
-
             case 'remove_provider_key': {
               try {
-                await activeSession().modelRuntime.removeRuntimeApiKey(msg.provider);
-                ws.send(JSON.stringify({ type: 'providers_list', providers: getProviders() }));
-                broadcast({
-                  type: 'available_models_changed',
-                  availableModels: (await activeSession().modelRuntime.getAvailable()).map(
-                    serializeModel
-                  ),
-                });
+                await mutateProviderAuth(msg.provider, (runtime) => runtime.logout(msg.provider));
               } catch (err) {
                 log.error('[pifrontier] remove_provider_key error:', err);
                 ws.send(JSON.stringify({ type: 'providers_error', message: String(err) }));
@@ -3261,6 +3644,24 @@ try {
               try {
                 switch (command) {
                   case 'reload': {
+                    // Extensions re-run their factories inside reload() and
+                    // register fresh onTerminalInput handlers. The old
+                    // factories' handlers are never unsubscribed (the SDK
+                    // provides no reload hook to us), so drop them now —
+                    // mirroring pi-tui, which clears its terminal listeners on
+                    // session shutdown before re-registering on session_start.
+                    // Keystrokes during the reload window fall back to native
+                    // composer behavior, and the re-registration broadcasts
+                    // active:true again.
+                    const reloadSid = activeSessionId ?? null;
+                    if (reloadSid && terminalInputRegistry.has(reloadSid)) {
+                      terminalInputRegistry.clear(reloadSid);
+                      broadcast({
+                        type: 'extension_terminal_input_active',
+                        active: false,
+                        ...stampOwner(reloadSid),
+                      });
+                    }
                     await activeSession().reload();
                     sendSlashResult(
                       ws,
@@ -3290,67 +3691,106 @@ try {
                     break;
                   }
                   case 'login': {
-                    if (args) {
-                      // If a specific provider was passed, try prompt so extensions can handle it
-                      try {
-                        await activeSession().prompt(`/login ${args}`);
-                      } catch (e) {
-                        // If prompt fails (e.g. no extension handles it), fall through to built-in flow
-                        log.error('[pifrontier] login prompt error:', e);
-                      }
-                      break;
-                    }
-                    // Built-in login flow: show provider selector
-                    const loginProviders = getProviders().filter((p) => !p.configured);
-                    if (loginProviders.length === 0) {
-                      sendSlashResult(ws, command, 'All providers are already configured.', 'info');
-                      break;
-                    }
-                    const loginLabels = loginProviders.map((p) => `${p.name} (${p.id})`);
-                    const selectedLogin = await uiContext.select(
-                      'Select a provider to log in',
-                      loginLabels
-                    );
-                    if (!selectedLogin) break;
-                    const loginIdx = loginLabels.indexOf(selectedLogin);
-                    if (loginIdx === -1) break;
-                    const loginProvider = loginProviders[loginIdx];
-
-                    // Check if provider uses OAuth
                     const runtime = activeSession().modelRuntime;
-                    const oauthProvider = runtime
-                      .getProviders()
-                      .find((p) => p.id === loginProvider.id);
-                    if (oauthProvider && runtime.isUsingOAuth(loginProvider.id)) {
-                      // OAuth flow — trigger via prompt() which routes through the extension UI
-                      try {
-                        await activeSession().prompt(`/login ${loginProvider.id}`);
-                      } catch (e) {
-                        sendSlashResult(ws, command, String(e), 'error');
+                    const providerInfos = await getProviders(runtime);
+                    const providerRef = args?.trim().toLowerCase();
+                    const loginCandidates = runtime.getProviders().filter((provider) => {
+                      if (!provider.auth.oauth && !provider.auth.apiKey) return false;
+                      if (providerRef) {
+                        return (
+                          provider.id.toLowerCase() === providerRef ||
+                          provider.name.toLowerCase() === providerRef
+                        );
                       }
-                    } else {
-                      // API key — prompt for key
-                      const key = await uiContext.input(
-                        `API key for ${loginProvider.name}`,
-                        'Paste your API key…'
+                      const info = providerInfos.find((candidate) => candidate.id === provider.id);
+                      return !info?.configured;
+                    });
+
+                    if (loginCandidates.length === 0) {
+                      sendSlashResult(
+                        ws,
+                        command,
+                        providerRef
+                          ? `Unknown provider or no login method: ${args}`
+                          : 'All providers are already configured.',
+                        providerRef ? 'error' : 'info'
                       );
-                      if (!key) break;
-                      await activeSession().modelRuntime.setRuntimeApiKey(loginProvider.id, key);
-                      ws.send(
-                        JSON.stringify({ type: 'providers_list', providers: getProviders() })
+                      break;
+                    }
+
+                    let loginProvider = loginCandidates[0];
+                    if (!providerRef) {
+                      const labels = loginCandidates.map(
+                        (provider) => `${provider.name} (${provider.id})`
                       );
-                      broadcast({
-                        type: 'available_models_changed',
-                        availableModels: (await activeSession().modelRuntime.getAvailable()).map(
-                          serializeModel
-                        ),
+                      const selected = await uiContext.select(
+                        'Select a provider to log in',
+                        labels,
+                        undefined,
+                        activeSessionId
+                      );
+                      if (!selected) break;
+                      const index = labels.indexOf(selected);
+                      if (index === -1) break;
+                      loginProvider = loginCandidates[index];
+                    }
+
+                    const authChoices: Array<{ type: 'oauth' | 'api_key'; label: string }> = [];
+                    if (loginProvider.auth.oauth) {
+                      authChoices.push({
+                        type: 'oauth',
+                        label: loginProvider.auth.oauth.loginLabel ?? 'Sign in with account',
                       });
+                    }
+                    if (loginProvider.auth.apiKey) {
+                      authChoices.push({ type: 'api_key', label: 'Sign in with API key' });
+                    }
+                    if (authChoices.length === 0) break;
+
+                    let authType = authChoices[0].type;
+                    if (authChoices.length > 1) {
+                      const selected = await uiContext.select(
+                        `Select authentication method for ${loginProvider.name}`,
+                        authChoices.map((choice) => choice.label),
+                        undefined,
+                        activeSessionId
+                      );
+                      if (!selected) break;
+                      const choice = authChoices.find((candidate) => candidate.label === selected);
+                      if (!choice) break;
+                      authType = choice.type;
+                    }
+
+                    if (authType === 'api_key' && !loginProvider.auth.apiKey?.login) {
+                      sendSlashResult(
+                        ws,
+                        command,
+                        `${loginProvider.name} is configured outside pi.`,
+                        'warning'
+                      );
+                      break;
+                    }
+
+                    try {
+                      await mutateProviderAuth(loginProvider.id, (providerRuntime) =>
+                        providerRuntime
+                          .login(
+                            loginProvider.id,
+                            authType,
+                            browserAuthInteraction(activeSessionId)
+                          )
+                          .then(() => undefined)
+                      );
                       sendSlashResult(ws, command, `Logged in to ${loginProvider.name}.`);
+                    } catch (err) {
+                      sendSlashResult(ws, command, String(err), 'error');
                     }
                     break;
                   }
                   case 'logout': {
-                    const provider = args || activeSession().model?.provider;
+                    const providerRef = args?.trim();
+                    const runtime = activeSession().modelRuntime;
+                    const provider = providerRef || activeSession().model?.provider;
                     if (!provider) {
                       sendSlashResult(
                         ws,
@@ -3360,15 +3800,22 @@ try {
                       );
                       break;
                     }
-                    await activeSession().modelRuntime.removeRuntimeApiKey(provider);
-                    ws.send(JSON.stringify({ type: 'providers_list', providers: getProviders() }));
-                    broadcast({
-                      type: 'available_models_changed',
-                      availableModels: (await activeSession().modelRuntime.getAvailable()).map(
-                        serializeModel
-                      ),
-                    });
-                    sendSlashResult(ws, command, `Removed stored credentials for ${provider}.`);
+                    const providerDefinition = runtime
+                      .getProviders()
+                      .find(
+                        (candidate) =>
+                          candidate.id.toLowerCase() === provider.toLowerCase() ||
+                          candidate.name.toLowerCase() === provider.toLowerCase()
+                      );
+                    const providerId = providerDefinition?.id ?? provider;
+                    try {
+                      await mutateProviderAuth(providerId, (providerRuntime) =>
+                        providerRuntime.logout(providerId)
+                      );
+                      sendSlashResult(ws, command, `Removed stored credentials for ${providerId}.`);
+                    } catch (err) {
+                      sendSlashResult(ws, command, String(err), 'error');
+                    }
                     break;
                   }
                   case 'clone': {

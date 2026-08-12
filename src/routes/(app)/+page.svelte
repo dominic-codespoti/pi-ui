@@ -13,6 +13,7 @@
     ExtensionSummary,
     WidgetContent,
     WidgetPayload,
+    ExtensionUiStatePayload,
     TreeNode,
     UpdateStatus,
     UpdateTarget,
@@ -169,6 +170,11 @@
   let modal = $derived(extensionUiState.modalQueue[0] ?? null);
   let modalInput = $state('');
   let modalFocusEl = $state<HTMLElement | undefined>(undefined);
+  let overlayPreEl = $state<HTMLElement | undefined>(undefined);
+  let overlayViewportEl = $state<HTMLElement | undefined>(undefined);
+  let overlayResizeConnection = $state(0);
+  let lastOverlayResize:
+    { id: string; connection: number; columns: number; rows: number } | undefined;
   let preparedModalId = $state<string | null>(null);
   let focusedModalId = $state<string | null>(null);
 
@@ -205,6 +211,74 @@
       modalFocusEl.focus({ preventScroll: true });
       focusedModalId = m.id;
     });
+  });
+  $effect(() => {
+    const m = modal;
+    const pre = overlayPreEl;
+    const viewport = overlayViewportEl;
+    const connection = overlayResizeConnection;
+    if (!m) {
+      lastOverlayResize = undefined;
+      return;
+    }
+    if (m.method !== 'custom' || !m.interactive || !pre || !viewport) return;
+
+    const probe = document.createElement('span');
+    probe.textContent = 'M';
+    probe.style.position = 'absolute';
+    probe.style.visibility = 'hidden';
+    probe.style.font = 'inherit';
+    pre.appendChild(probe);
+
+    let charAdvance = probe.getBoundingClientRect().width;
+    let resizeTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const measureAndSend = () => {
+      if (modal?.id !== m.id) return;
+      if (!(charAdvance > 0)) {
+        charAdvance = probe.getBoundingClientRect().width;
+      }
+      const style = getComputedStyle(pre);
+      const lineHeight = Number.parseFloat(style.lineHeight);
+      if (!(charAdvance > 0) || !(lineHeight > 0)) return;
+
+      const paddingX = Number.parseFloat(style.paddingLeft) + Number.parseFloat(style.paddingRight);
+      const paddingY = Number.parseFloat(style.paddingTop) + Number.parseFloat(style.paddingBottom);
+      const contentWidth = viewport.clientWidth - paddingX;
+      const contentHeight = viewport.clientHeight - paddingY;
+      const columns = Math.min(200, Math.max(20, Math.floor(contentWidth / charAdvance)));
+      const rows = Math.min(80, Math.max(5, Math.floor(contentHeight / lineHeight)));
+      if (
+        lastOverlayResize?.id === m.id &&
+        lastOverlayResize.connection === connection &&
+        columns === lastOverlayResize.columns &&
+        rows === lastOverlayResize.rows
+      )
+        return;
+
+      if (send({ type: 'extension_custom_resize', id: m.id, columns, rows })) {
+        lastOverlayResize = { id: m.id, connection, columns, rows };
+      }
+    };
+
+    const scheduleMeasure = () => {
+      if (resizeTimer !== undefined) clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        resizeTimer = undefined;
+        measureAndSend();
+      }, 150);
+    };
+
+    const observer = new ResizeObserver(scheduleMeasure);
+    observer.observe(viewport);
+    const frame = requestAnimationFrame(measureAndSend);
+
+    return () => {
+      observer.disconnect();
+      cancelAnimationFrame(frame);
+      if (resizeTimer !== undefined) clearTimeout(resizeTimer);
+      probe.remove();
+    };
   });
 
   // ── File viewer modal state ──────────────────────────────────────────────
@@ -321,9 +395,25 @@
 
   // ── Extension UI state ───────────────────────────────────────────────────────
 
+  const AGENT_SUMMARY_WIDGET_KEYS = new Set(['agents', 'subagents']);
+  const FLEET_WIDGET_KEY = 'fleet';
+
+  let visibleExtensionStatuses = $derived(
+    Object.entries(extensionUiState.statuses).filter(([, value]) => Boolean(value))
+  );
+  let visibleExtensionFooter = $derived(extensionUiState.footer || undefined);
+  let hasFleetWidget = $derived(
+    Object.entries(extensionUiState.widgets).some(
+      ([key]) =>
+        key === FLEET_WIDGET_KEY &&
+        (extensionUiState.widgetPlacement[key] ?? 'aboveEditor') === 'belowEditor'
+    )
+  );
   let aboveEditorWidgets = $derived(
     Object.entries(extensionUiState.widgets).filter(
-      ([key]) => (extensionUiState.widgetPlacement[key] ?? 'aboveEditor') === 'aboveEditor'
+      ([key]) =>
+        (extensionUiState.widgetPlacement[key] ?? 'aboveEditor') === 'aboveEditor' &&
+        !(AGENT_SUMMARY_WIDGET_KEYS.has(key) && hasFleetWidget)
     )
   );
   let belowEditorWidgets = $derived(
@@ -1019,7 +1109,7 @@
   // ── Load providers when models tab is active ──────────────────────────────────
 
   $effect(() => {
-    if (showRightPanel && rightPanelTab === 'models') {
+    if (showRightPanel && rightPanelTab === 'models' && wsState === 'open') {
       send({ type: 'get_providers' });
       modelFilter = '';
     }
@@ -1162,8 +1252,46 @@
     }, delay);
   }
 
+  /** Navigate to /login, preserving the current URL so login can return here. */
+  function redirectToLogin() {
+    _intentionalClose = true;
+    cancelReconnect();
+    stopHeartbeat();
+    wsState = 'closed';
+    const current = location.pathname + location.search;
+    location.assign(`/login?redirect=${encodeURIComponent(current)}`);
+  }
+
+  let _authProbeInFlight = false;
+
+  /**
+   * Detect an expired/revoked session after a socket failure. A rejected WS
+   * upgrade (401) surfaces to the client as a generic abnormal close, so the
+   * only way to tell "server down" from "session expired" is an HTTP probe:
+   * hooks.server redirects every path but /login with a 302 when the JWT is
+   * missing or invalid. Network failures mean the server is unreachable and
+   * the normal reconnect loop applies.
+   */
+  async function probeSessionExpired(): Promise<void> {
+    if (_authProbeInFlight || document.hidden || !navigator.onLine) return;
+    _authProbeInFlight = true;
+    try {
+      const res = await fetch('/', { method: 'HEAD', redirect: 'manual', cache: 'no-store' });
+      if (res.type === 'opaqueredirect' || (res.status >= 300 && res.status < 400)) {
+        redirectToLogin();
+      }
+    } catch {
+      // Server unreachable — keep the reconnect loop.
+    } finally {
+      _authProbeInFlight = false;
+    }
+  }
+
   function connect() {
     if (document.hidden) return;
+    // Belt-and-braces: connect() nulls the old socket's onclose before
+    // closing it, so its close event may never reach flushPendingTerminalInputs.
+    flushPendingTerminalInputs();
     if (ws) {
       try {
         ws.onclose = null;
@@ -1196,6 +1324,7 @@
         const parsed = JSON.parse(data) as ServerMessage & Record<string, unknown>;
         if (parsed.type === 'connected') {
           _wsHandshakeComplete = true;
+          overlayResizeConnection++;
           _reconnectAttempt = 0;
           if (reloadAfterRestart) {
             reloadAfterRestart = false;
@@ -1212,8 +1341,15 @@
     };
 
     socket.onclose = (event) => {
+      flushPendingTerminalInputs();
       stopHeartbeat();
       if (_intentionalClose) return;
+      // 4001 = the server closed the socket because the session token expired
+      // (or was revoked). Reconnecting can never succeed — go to /login.
+      if (event.code === 4001) {
+        redirectToLogin();
+        return;
+      }
       if (!_wsHandshakeComplete && event.code === 1011) {
         showChatNotice(`Server initialization failed: ${event.reason || 'unknown error'}`, 'error');
       }
@@ -1225,6 +1361,9 @@
       }
       activeStreamMsg = null;
       scheduleReconnect();
+      // A rejected upgrade (expired cookie) looks like a dead server to the
+      // WS API — probe HTTP to distinguish the two.
+      probeSessionExpired();
     };
 
     socket.onerror = () => {
@@ -1349,10 +1488,40 @@
   // Same for the extension UI store (modal answers need to send responses).
   extensionUiState.send = send;
 
+  $effect(() => {
+    const text = input;
+    // Same handshake gate as the bridge: before `connected` the stale
+    // sessionId would write the previous session's editor mirror.
+    if (wsState === 'open' && _wsHandshakeComplete && sessionId) {
+      send({ type: 'extension_editor_text_change', text, sessionId });
+    }
+  });
+
+  /**
+   * Explicit resync — the mirror $effect above only refires when `input` or
+   * `sessionId` change as SVELTE STATE. A same-session reconnect changes
+   * neither (sessionId is reassigned to the identical value, a no-op for
+   * $state equality), so the effect would never resend and the server's
+   * synchronous getEditorText() mirror could stay stale/empty after the
+   * server recreates the session's UI bucket. Call after every
+   * connected/session_loaded once sessionId is current.
+   */
+  function resyncEditorMirror() {
+    if (sessionId) send({ type: 'extension_editor_text_change', text: input, sessionId });
+  }
+
   // ── Server event handling ────────────────────────────────────────────────────
   function applySessionState(payload: Record<string, unknown>) {
     const prevSessionId = sessionId;
-    if ('sessionId' in payload) sessionId = payload.sessionId as string;
+    if ('sessionId' in payload) {
+      sessionId = payload.sessionId as string;
+      if (payload.sessionId !== prevSessionId) {
+        // A key round-trip for the previous session must never be applied to
+        // or routed toward the new one (its late verdict would insert text or
+        // even submit into the wrong composer).
+        discardPendingTerminalInputs();
+      }
+    }
     if ('isStreaming' in payload) isStreaming = payload.isStreaming as boolean;
     if ('thinkingLevel' in payload) thinkingLevel = payload.thinkingLevel as string;
     const newModel = payload.model as ModelInfo | null | undefined;
@@ -1381,15 +1550,18 @@
       if ('totalMessageCount' in payload) totalMessageCount = payload.totalMessageCount as number;
       if ('messagesTruncated' in payload) messagesTruncated = Boolean(payload.messagesTruncated);
     }
-    if ('widgets' in payload) {
+    if (payload.extensionUiState && typeof payload.extensionUiState === 'object') {
+      extensionUiState.applySnapshot(payload.extensionUiState as ExtensionUiStatePayload);
+    } else if ('widgets' in payload) {
       extensionUiState.clearWidgets();
+      extensionUiState.setTerminalInputActive(false);
       for (const w of (payload.widgets as WidgetPayload[]) ?? []) {
         extensionUiState.applyWidget(w as unknown as Record<string, unknown>);
       }
     } else if ('sessionId' in payload && (payload.sessionId as string) !== prevSessionId) {
-      // Defensive: a session change without a widgets payload must never keep
-      // the previous session's panels (e.g. legacy/partial server payloads).
-      extensionUiState.clearWidgets();
+      // Defensive: a session change without a snapshot must never keep the
+      // previous session's extension UI behind (legacy/partial payloads).
+      extensionUiState.reset();
     }
     // Sync the shared projects store with the active session.
     projectsState.cwd = cwd;
@@ -1471,6 +1643,7 @@
       case 'connected': {
         const c = msg as ConnectedMessage;
         applySessionState(c as unknown as Record<string, unknown>);
+        resyncEditorMirror();
         sessionStartTime = Date.now();
         if (c.piVersion) piVersion = c.piVersion;
         if (c.sessionMode) sessionMode = c.sessionMode;
@@ -1502,6 +1675,7 @@
       case 'session_loaded': {
         const sl = msg as Record<string, unknown>;
         applySessionState(sl);
+        resyncEditorMirror();
         sessionStartTime = Date.now();
         if (sl.piVersion) piVersion = sl.piVersion as string;
         if (sl.uiVersion) uiVersion = sl.uiVersion as string;
@@ -1813,11 +1987,6 @@
           } else {
             input += textToInsert;
           }
-        } else if (method === 'request_editor_text') {
-          const requestId = msg.id as string | undefined;
-          if (requestId) {
-            send({ type: 'editor_text_response', id: requestId, text: input });
-          }
         } else if (method === 'setWorkingMessage') {
           extensionUiState.setWorkingMessage(msg.message as string | undefined);
         } else if (method === 'setWorkingVisible') {
@@ -1858,6 +2027,41 @@
 
       case 'extension_ui_request_replay': {
         extensionUiState.replayModalFromRequest(msg);
+        break;
+      }
+      case 'extension_ui_state': {
+        const uiMsg = msg as {
+          type: 'extension_ui_state';
+          sessionId: string;
+          ui: ExtensionUiStatePayload;
+        };
+        if (uiMsg.sessionId === sessionId) extensionUiState.applySnapshot(uiMsg.ui);
+        break;
+      }
+
+      case 'extension_terminal_input_active': {
+        const act = msg as { type: string; active: boolean; sessionId?: string };
+        if (act.sessionId === undefined || act.sessionId === sessionId) {
+          extensionUiState.setTerminalInputActive(Boolean(act.active));
+        }
+        break;
+      }
+
+      case 'extension_terminal_input_result': {
+        const res = msg as {
+          type: string;
+          id: string;
+          consumed: boolean;
+          data?: string;
+          sessionId?: string;
+        };
+        if (res.sessionId !== undefined && res.sessionId !== sessionId) break;
+        const settle = pendingTerminalInputs.get(res.id);
+        if (settle)
+          settle({
+            consumed: Boolean(res.consumed),
+            ...(res.data !== undefined ? { data: res.data } : {}),
+          });
         break;
       }
 
@@ -2438,8 +2642,10 @@
         // Skip hljs while the message is still streaming (per-frame re-highlight
         // of the full accumulated text is the streaming hot spot); the finalize
         // paths (message_end / sealStreaming) re-render with highlighting.
-        if (m.content) m.renderedContent = renderMarkdown(m.content, { skipHighlight: m.streaming });
-        if (m.thinking) m.renderedThinking = renderMarkdown(m.thinking, { skipHighlight: m.streaming });
+        if (m.content)
+          m.renderedContent = renderMarkdown(m.content, { skipHighlight: m.streaming });
+        if (m.thinking)
+          m.renderedThinking = renderMarkdown(m.thinking, { skipHighlight: m.streaming });
       }
       _pendingRenderSet.clear();
       _renderScheduled = false;
@@ -2633,7 +2839,12 @@
     }
 
     // Ctrl+Shift+T — cycle thinking level
-    if (!inEditable() && (e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 't' || e.key === 'T')) {
+    if (
+      !inEditable() &&
+      (e.ctrlKey || e.metaKey) &&
+      e.shiftKey &&
+      (e.key === 't' || e.key === 'T')
+    ) {
       e.preventDefault();
       const current = thinkingLevel;
       const idx = (availableThinkingLevels as readonly string[]).indexOf(current);
@@ -2797,7 +3008,15 @@
   function steerAgent() {
     const text = input.trim();
     if (!text || wsState !== 'open') return;
-    send({ type: 'steer', message: text });
+    // Commands entered while the agent is running must retain command
+    // semantics; only ordinary text belongs in the steering queue.
+    if (runSlashCommand(text, true)) {
+      input = '';
+      resetTextareaHeight();
+      return;
+    }
+    // Keep the draft when the socket closes between the guard and send().
+    if (!send({ type: 'steer', message: text })) return;
     input = '';
     resetTextareaHeight();
   }
@@ -3057,32 +3276,366 @@
     submitMessage();
   }
 
-  function handleKeydown(e: KeyboardEvent) {
+  function handleComposerKey(e: KeyboardEvent): boolean {
     if (showSlashMenu) {
       if (e.key === 'ArrowDown') {
         e.preventDefault();
-        if (filteredSlashCommands.length === 0) return;
+        if (filteredSlashCommands.length === 0) return true;
         slashMenuIndex = (slashMenuIndex + 1) % filteredSlashCommands.length;
-        return;
+        return true;
       }
       if (e.key === 'ArrowUp') {
         e.preventDefault();
-        if (filteredSlashCommands.length === 0) return;
+        if (filteredSlashCommands.length === 0) return true;
         slashMenuIndex =
           (slashMenuIndex - 1 + filteredSlashCommands.length) % filteredSlashCommands.length;
-        return;
+        return true;
       }
       if (e.key === 'Enter' && slashMenuIndex >= 0) {
         e.preventDefault();
         const selected = filteredSlashCommands[slashMenuIndex];
         if (!selected?.disabled) selectSlashCommand(selected);
-        return;
+        return true;
       }
     }
     if (e.key === 'Enter' && (isMobile ? e.shiftKey : !e.shiftKey)) {
       e.preventDefault();
       submitMessage();
+      return true;
     }
+    return false;
+  }
+
+  type ComposerSnapshot = {
+    value: string;
+    start: number;
+    end: number;
+    seq: number;
+    /** composerForeignEditSeq at snapshot time — any bump before the verdict
+     *  arrives means something OTHER than this key's own expected native
+     *  action changed the text (paste, IME, programmatic, another verdict). */
+    foreignSeq: number;
+    menuOpen: boolean;
+    /** Native delete was prevented (keys were pending) — replayed at verdict time. */
+    deferredDelete?: 'backward' | 'forward';
+  };
+
+  let terminalInputChain: Promise<void> = Promise.resolve();
+  /** Bumped when pending inputs are flushed/discarded — stale queued executors
+   *  and late verdicts check it before sending/applying anything. */
+  let terminalInputGeneration = 0;
+  /** Bumped ONLY by a session-switch discard (never by a flush). A queued
+   *  entry captured before a discard epoch bump must always be dropped even
+   *  if a LATER, unrelated flush also invalidates its generation — otherwise
+   *  a stale entry from session A could resurrect and apply after session
+   *  B's socket closes. Comparing epochs (not a single mutable "discarding"
+   *  flag) makes each entry's own capture point authoritative. */
+  let terminalInputDiscardEpoch = 0;
+  const pendingTerminalInputs = new Map<
+    string,
+    (verdict: { consumed: boolean; data?: string }, discard?: boolean) => void
+  >();
+  let composerEditSeq = 0;
+  /** Bumped by any composer input event NOT attributable to the immediately
+   *  preceding optimistic keydown's own native action (see expectingNativeEdit
+   *  below) — paste, IME commit, programmatic replace, or a verdict's own
+   *  insert/delete/restore. Lets a pending verdict tell "my key's expected
+   *  native change" apart from "something else changed the text". */
+  let composerForeignEditSeq = 0;
+  /** True for the one input event expected to follow an optimistic keydown's
+   *  own native default action (if it produces one at all — arrows/Home/End
+   *  don't). Consumed by that event without bumping composerForeignEditSeq;
+   *  cleared on a microtask so a key with NO native input event (e.g. a bare
+   *  arrow) never misattributes a LATER, unrelated edit to itself. */
+  let expectingNativeEdit = false;
+
+  function handleComposerInput() {
+    if (expectingNativeEdit) {
+      expectingNativeEdit = false;
+    } else {
+      composerForeignEditSeq++;
+    }
+    autoResizeTextarea();
+  }
+
+  function handleComposerKeydown(e: KeyboardEvent) {
+    // During the reconnect handshake (socket open, connected not yet arrived)
+    // sessionId/terminalInputActive still describe the previous session —
+    // routing a key now would dispatch it to the wrong session's handlers.
+    if (!_wsHandshakeComplete || !extensionUiState.terminalInputActive || e.isComposing) {
+      handleComposerKey(e);
+      return;
+    }
+    const data = encodeTerminalKey(e);
+    if (!data) {
+      handleComposerKey(e);
+      return;
+    }
+    const optimistic = isOptimisticTerminalKey(e);
+    const snapshot: ComposerSnapshot = {
+      value: inputEl?.value ?? input,
+      start: inputEl?.selectionStart ?? input.length,
+      end: inputEl?.selectionEnd ?? input.length,
+      seq: ++composerEditSeq,
+      foreignSeq: composerForeignEditSeq,
+      menuOpen: showSlashMenu,
+    };
+    if (optimistic) {
+      // Native default action applies the key; app-level handling runs now.
+      // Backspace/Delete with earlier keys still in flight would delete
+      // against pre-verdict text (terminal order breaks: "a" then ⌫ must
+      // delete the "a"). Defer those until the pending verdicts land.
+      if ((e.key === 'Backspace' || e.key === 'Delete') && pendingTerminalInputs.size > 0) {
+        e.preventDefault();
+        e.stopPropagation();
+        snapshot.deferredDelete = e.key === 'Backspace' ? 'backward' : 'forward';
+      } else {
+        expectingNativeEdit = true;
+        handleComposerKey(e);
+        queueMicrotask(() => {
+          expectingNativeEdit = false;
+        });
+      }
+    } else {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+    enqueueTerminalInput(e, data, optimistic, snapshot);
+  }
+
+  /**
+   * Keys whose native textarea behavior is complex (caret/selection/line
+   * movement, clipboard, focus) are applied natively and the verdict arrives
+   * in the background; consumed keys are reverted best-effort. All other keys
+   * (printable chars, Enter, Escape) await the verdict before applying.
+   */
+  function isOptimisticTerminalKey(e: KeyboardEvent): boolean {
+    // Ctrl/Alt-modified keys are optimistic EXCEPT Enter — a consumed
+    // Ctrl+Enter/Alt+Enter verdict must be able to veto the submit.
+    if (e.ctrlKey || e.altKey) return e.key !== 'Enter';
+    switch (e.key) {
+      case 'ArrowUp':
+      case 'ArrowDown':
+      case 'ArrowLeft':
+      case 'ArrowRight':
+      case 'Home':
+      case 'End':
+      case 'PageUp':
+      case 'PageDown':
+      case 'Backspace':
+      case 'Delete':
+      case 'Tab':
+      case 'Insert':
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  function enqueueTerminalInput(
+    e: KeyboardEvent,
+    data: string,
+    optimistic: boolean,
+    snapshot: ComposerSnapshot
+  ) {
+    const id = crypto.randomUUID();
+    const gen = terminalInputGeneration;
+    const discardEpoch = terminalInputDiscardEpoch;
+    terminalInputChain = terminalInputChain
+      .then(
+        () =>
+          new Promise<void>((resolve) => {
+            // Flushed/discarded (socket close, session switch) while queued —
+            // this key must neither be sent nor applied.
+            if (gen !== terminalInputGeneration) {
+              if (discardEpoch === terminalInputDiscardEpoch) {
+                // Only flush(es) — never a discard — happened since capture,
+                // so this key still belongs to the current session and must
+                // not vanish.
+                applyTerminalInputResult(e, { consumed: false }, snapshot, optimistic);
+              }
+              resolve();
+              return;
+            }
+            const entry = {
+              applied: false,
+              timeout: setTimeout(() => settle({ consumed: false }), 2000),
+            };
+            function settle(verdict: { consumed: boolean; data?: string }, discard = false) {
+              if (entry.applied) return;
+              entry.applied = true;
+              clearTimeout(entry.timeout);
+              pendingTerminalInputs.delete(id);
+              resolve();
+              if (!discard) applyTerminalInputResult(e, verdict, snapshot, optimistic);
+            }
+            pendingTerminalInputs.set(id, settle);
+            send({ type: 'extension_terminal_input', id, data, sessionId: sessionId ?? '' });
+          })
+      )
+      .catch(() => {
+        pendingTerminalInputs.delete(id);
+        if (gen === terminalInputGeneration || discardEpoch === terminalInputDiscardEpoch) {
+          applyTerminalInputResult(e, { consumed: false }, snapshot, optimistic);
+        }
+      });
+  }
+
+  function applyTerminalInputResult(
+    e: KeyboardEvent,
+    verdict: { consumed: boolean; data?: string },
+    snapshot: ComposerSnapshot,
+    optimistic: boolean
+  ) {
+    if (verdict.consumed) {
+      // Best-effort revert: only when no later keydown intervened AND the
+      // text wasn't changed by a non-keydown edit (paste/IME/programmatic)
+      // while the verdict was in flight.
+      if (snapshot.seq === composerEditSeq && snapshot.foreignSeq === composerForeignEditSeq) {
+        restoreComposer(snapshot);
+      }
+      return;
+    }
+    if (verdict.data !== undefined) {
+      // pi-tui replaces the key with the rewritten data. For optimistic keys
+      // the native default action already ran, so undo it first (guarded).
+      if (
+        optimistic &&
+        snapshot.seq === composerEditSeq &&
+        snapshot.foreignSeq === composerForeignEditSeq
+      )
+        restoreComposer(snapshot);
+      applyRewrittenData(verdict.data, e);
+      return;
+    }
+    if (optimistic) {
+      if (snapshot.deferredDelete) {
+        // Earlier verdicts have landed by now (chain order) — delete against
+        // the live text so terminal order is preserved.
+        deleteComposerText(snapshot.deferredDelete === 'backward');
+      } else if (!snapshot.menuOpen && showSlashMenu) {
+        // The key's app-level handling may have run before an earlier awaited
+        // key's verdict opened the slash menu (fast typing: "/" then ArrowDown).
+        // Replay the menu interaction now that the menu exists.
+        handleComposerKey(e);
+      }
+      return;
+    }
+    if (handleComposerKey(e)) return;
+    if (e.key === 'Enter')
+      insertComposerText('\n'); // Shift+Enter newline
+    else if (e.key.length === 1) insertComposerText(e.key);
+    else if (e.key === 'Escape') {
+      // The awaited tier preventDefault+stopPropagation'd this key, so the
+      // window handler (close panels, dismiss modal) never saw it — replay it.
+      handleGlobalKeydown(e);
+    }
+    // Other unmapped keys: nothing to apply.
+  }
+
+  /**
+   * Applies handler-rewritten data. In pi-tui the rewritten bytes are
+   * processed as a key, not inserted literally — map the single-byte
+   * sequences with real composer actions; anything else is inserted as text
+   * (the only current consumer never rewrites).
+   */
+  function applyRewrittenData(data: string, sourceEvent: KeyboardEvent) {
+    if (data === '\r') {
+      // Rewritten to Enter — replay the composer's Enter handling with the
+      // original event's modifiers (shift state decides submit vs newline).
+      // A real KeyboardEvent is required: handleComposerKey calls
+      // preventDefault(), which throws Illegal invocation on event fakes.
+      handleComposerKey(
+        new KeyboardEvent('keydown', {
+          key: 'Enter',
+          bubbles: true,
+          cancelable: true,
+          shiftKey: sourceEvent.shiftKey,
+        })
+      );
+      return;
+    }
+    if (data === '\x1b') {
+      // Rewritten to Escape — replay global Escape handling (close panels)
+      // with the key transformed, since handleGlobalKeydown reads e.key.
+      handleGlobalKeydown(
+        new KeyboardEvent('keydown', {
+          key: 'Escape',
+          bubbles: true,
+          cancelable: true,
+          ctrlKey: sourceEvent.ctrlKey,
+          metaKey: sourceEvent.metaKey,
+          shiftKey: sourceEvent.shiftKey,
+          altKey: sourceEvent.altKey,
+        })
+      );
+      return;
+    }
+    insertComposerText(data);
+  }
+
+  function insertComposerText(text: string) {
+    if (!inputEl) {
+      input += text;
+      return;
+    }
+    const start = inputEl.selectionStart ?? input.length;
+    const end = inputEl.selectionEnd ?? input.length;
+    inputEl.setRangeText(text, start, end, 'end');
+    inputEl.dispatchEvent(
+      new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text })
+    );
+    autoResizeTextarea();
+  }
+
+  /** Native-equivalent Backspace/Delete against the live composer text. */
+  function deleteComposerText(backward: boolean) {
+    if (!inputEl) {
+      input = backward ? input.slice(0, Math.max(0, input.length - 1)) : input.slice(1);
+      return;
+    }
+    const start = inputEl.selectionStart ?? input.length;
+    const end = inputEl.selectionEnd ?? input.length;
+    const delStart = backward ? Math.max(0, start - (start === end ? 1 : 0)) : start;
+    const delEnd = backward ? end : Math.min(inputEl.value.length, end + (start === end ? 1 : 0));
+    inputEl.setRangeText('', delStart, delEnd, 'end');
+    inputEl.dispatchEvent(
+      new InputEvent('input', {
+        bubbles: true,
+        inputType: backward ? 'deleteContentBackward' : 'deleteContentForward',
+      })
+    );
+    autoResizeTextarea();
+  }
+
+  function restoreComposer(s: ComposerSnapshot) {
+    if (!inputEl) {
+      input = s.value;
+      return;
+    }
+    inputEl.value = s.value;
+    inputEl.setSelectionRange(s.start, s.end);
+    inputEl.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertFromDrop' }));
+    autoResizeTextarea();
+  }
+
+  function flushPendingTerminalInputs() {
+    // No discardEpoch bump — queued entries invalidated by this flush alone
+    // still apply as unconsumed (see enqueueTerminalInput).
+    terminalInputGeneration++;
+    for (const settle of [...pendingTerminalInputs.values()]) settle({ consumed: false });
+    pendingTerminalInputs.clear();
+    terminalInputChain = Promise.resolve();
+  }
+
+  /** Session switch — keys sent for the previous session must neither be
+   *  applied to the new session's composer nor routed to it. */
+  function discardPendingTerminalInputs() {
+    terminalInputDiscardEpoch++;
+    terminalInputGeneration++;
+    for (const settle of [...pendingTerminalInputs.values()]) settle({ consumed: false }, true);
+    pendingTerminalInputs.clear();
+    terminalInputChain = Promise.resolve();
   }
 
   function autoResizeTextarea() {
@@ -3888,11 +4441,11 @@
       </main>
 
       <!-- Extension footer -->
-      {#if extensionUiState.footer}
+      {#if visibleExtensionFooter}
         <div
           class="shrink-0 px-3 py-1.5 text-xs text-base-content/60 bg-base-200/50 border-t border-base-content/10 font-mono whitespace-pre-wrap flex items-start gap-2"
         >
-          <span class="flex-1">{extensionUiState.footer}</span>
+          <span class="flex-1">{visibleExtensionFooter}</span>
           <Button
             variant="ghost"
             size="icon-xs"
@@ -4203,8 +4756,8 @@
               <textarea
                 bind:this={inputEl}
                 bind:value={input}
-                onkeydown={handleKeydown}
-                oninput={autoResizeTextarea}
+                onkeydown={handleComposerKeydown}
+                oninput={handleComposerInput}
                 rows={1}
                 placeholder={sessionLoading
                   ? 'Opening session…'
@@ -4245,7 +4798,7 @@
                           >
                         {/snippet}
                       </Tooltip.Trigger>
-                      <Tooltip.Content>Queue steer (Enter)</Tooltip.Content>
+                      <Tooltip.Content>Steer after the current turn (Enter)</Tooltip.Content>
                     </Tooltip.Root>
                   {/if}
                   <Tooltip.Root>
@@ -4511,12 +5064,32 @@
             </div>
           {/if}
 
-          {#if Object.keys(extensionUiState.statuses).length > 0 || effectiveContextTokens > 0 || sessionCostTotal > 0}
+          {#if visibleExtensionStatuses.length > 0 || effectiveContextTokens > 0 || sessionCostTotal > 0}
             <div class="flex mt-1.5 px-1 items-center gap-2 text-xs select-none min-w-0">
-              {#if Object.keys(extensionUiState.statuses).length > 0}
-                <span class="text-base-content/50 truncate min-w-0">
-                  {Object.values(extensionUiState.statuses).filter(Boolean).join(' · ')}
-                </span>
+              {#if visibleExtensionStatuses.length > 0}
+                <Tooltip.Root>
+                  <Tooltip.Trigger
+                    class="min-w-0 truncate cursor-help text-left text-base-content/50 transition-colors hover:text-base-content/75"
+                    aria-label="Extension statuses"
+                  >
+                    {visibleExtensionStatuses.map((entry) => entry[1]).join(' · ')}
+                  </Tooltip.Trigger>
+                  <Tooltip.Content sideOffset={6} class="max-w-[min(22rem,calc(100vw-2rem))]">
+                    <div class="flex min-w-[12rem] flex-col gap-1.5">
+                      <p class="text-[10px] uppercase tracking-[0.16em] text-background/50">
+                        Extension status
+                      </p>
+                      {#each visibleExtensionStatuses as [key, value] (key)}
+                        <div class="flex items-start justify-between gap-4 text-xs">
+                          <span class="shrink-0 text-background/55">{key}</span>
+                          <span class="min-w-0 text-right font-mono text-background/90"
+                            >{value}</span
+                          >
+                        </div>
+                      {/each}
+                    </div>
+                  </Tooltip.Content>
+                </Tooltip.Root>
               {/if}
 
               <span class="flex-1"></span>
@@ -4659,8 +5232,9 @@
       onSetProviderKey={(id) => {
         const key = (providerKeyInputs[id] ?? '').trim();
         if (!key) return;
-        send({ type: 'set_provider_key', provider: id, key });
-        providerKeyInputs[id] = '';
+        if (send({ type: 'set_provider_key', provider: id, key })) {
+          providerKeyInputs[id] = '';
+        }
       }}
       onRemoveProviderKey={(id) =>
         requestConfirm(
@@ -5387,42 +5961,70 @@
     <!-- ── Interactive custom component full overlay (ConversationViewer etc.) ── -->
     {#if modal?.method === 'custom' && modal.interactive}
       <div
-        class="fixed inset-0 z-[60] flex items-center justify-center bg-base-100/70 px-3 py-6 backdrop-blur-sm"
+        class="fixed inset-0 z-[60] flex items-center justify-center bg-base-100/76 px-3 py-6 backdrop-blur-md sm:px-6"
       >
         <div
           class="relative w-full max-w-3xl"
           role="dialog"
           aria-label="Extension terminal"
+          aria-modal="true"
           tabindex="-1"
         >
-          <span class="sr-only">
+          <span id="extension-terminal-instructions" class="sr-only">
             Arrow keys, Page Up/Down, Home, End, and Enter are forwarded to the extension. Press
             Escape to close.
           </span>
-          <!-- Floating close — kept outside the extension's own drawn border so it never
-               overlaps its corner glyphs. Matches the floating-dismiss pattern used for
-               widget panels and file attachments elsewhere in this file. -->
+          <!-- Keep dismissal outside the extension's own drawn border so it never
+               overlaps its corner glyphs. -->
           <button
             onclick={modalCancel}
-            class="absolute -top-3 -right-3 z-10 w-7 h-7 rounded-full bg-base-content/15 hover:bg-base-content/25 backdrop-blur-sm flex items-center justify-center text-base-content/70 hover:text-base-content transition-colors shadow-md"
+            class="absolute top-3 right-3 z-20 flex h-11 w-11 items-center justify-center rounded-full border border-base-content/10 bg-base-200/95 text-base-content/65 shadow-lg shadow-black/30 backdrop-blur-md transition-all hover:scale-105 hover:border-primary/30 hover:bg-primary/15 hover:text-base-content focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50 sm:-top-3 sm:-right-3"
             aria-label="Close extension overlay"
           >
             <X class="w-3.5 h-3.5" />
           </button>
-          <!-- Content: a soft legibility scrim only — no border, no shadow, no title bar.
-               The extension's own rendered box border is the only hard-edged frame. -->
           <div
-            class="max-h-[min(30rem,calc(100dvh-4rem))] overflow-y-auto rounded-lg bg-base-100/40"
+            class="flex h-[min(30rem,calc(100dvh-4rem))] flex-col overflow-hidden rounded-2xl border border-base-content/10 bg-base-200/95 shadow-2xl shadow-black/40 ring-1 ring-primary/[0.06] backdrop-blur-xl"
           >
-            <pre
-              class="text-xs text-base-content/80 whitespace-pre-wrap leading-relaxed font-mono select-text p-2">{#if modal.htmlLines}{#each modal.htmlLines as line, i (i)}<div>{@html line ||
-                      '&nbsp;'}</div>{/each}{:else}{(modal.lines ?? []).join('\n')}{/if}</pre>
+            <div
+              aria-hidden="true"
+              class="flex h-10 shrink-0 items-center border-b border-base-content/8 bg-gradient-to-r from-primary/[0.08] via-base-content/[0.025] to-transparent px-4"
+            >
+              <div class="flex items-center gap-1.5">
+                <span class="h-2 w-2 rounded-full bg-error/70"></span>
+                <span class="h-2 w-2 rounded-full bg-warning/70"></span>
+                <span class="h-2 w-2 rounded-full bg-success/70"></span>
+              </div>
+              <div class="ml-3 flex min-w-0 items-center gap-2 font-mono">
+                <span
+                  class="truncate text-[10px] font-medium uppercase tracking-[0.16em] text-base-content/55"
+                  >extension terminal</span
+                >
+                <span class="h-1 w-1 shrink-0 rounded-full bg-success/80"></span>
+                <span class="text-[9px] uppercase tracking-[0.14em] text-base-content/40">live</span
+                >
+              </div>
+              <span
+                class="ml-auto hidden rounded-md border border-base-content/10 bg-base-content/[0.035] px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-[0.14em] text-base-content/35 sm:inline"
+                >esc</span
+              >
+            </div>
+            <div
+              bind:this={overlayViewportEl}
+              class="min-h-0 flex-1 overflow-y-auto bg-base-100/35"
+            >
+              <pre
+                bind:this={overlayPreEl}
+                class="min-h-full select-text whitespace-pre-wrap px-4 py-2 font-mono text-[13px] leading-[1.55] text-base-content/85">{#if modal.htmlLines}{#each modal.htmlLines as line, i (i)}<div>{@html line ||
+                        '&nbsp;'}</div>{/each}{:else}{(modal.lines ?? []).join('\n')}{/if}</pre>
+            </div>
           </div>
           <!-- Hidden input to capture keystrokes, paste, and IME composition. -->
           <input
             type="text"
             class="sr-only"
-            aria-hidden="true"
+            aria-label="Extension terminal input"
+            aria-describedby="extension-terminal-instructions"
             tabindex="-1"
             onkeydown={overlayKeydown}
             onpaste={overlayPaste}
@@ -5481,7 +6083,7 @@
     {#if modal?.method === 'input'}
       <input
         bind:this={modalFocusEl}
-        type="text"
+        type={modal.secret ? 'password' : 'text'}
         bind:value={modalInput}
         placeholder={modal.placeholder ?? ''}
         class="dialog-input mx-5 mb-5 w-[calc(100%-2.5rem)] rounded-xl px-3.5 py-2.5 text-sm outline-none placeholder-muted-foreground transition-colors"

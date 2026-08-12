@@ -4,7 +4,9 @@ import {
   ansiToHtml,
   stubTheme,
   StubTui,
+  HeadlessTerminal,
   parseComponentTree,
+  renderTerminalLines,
   callFactoryAndParse,
   shouldUseInteractiveCustom,
 } from '../tui-stubs';
@@ -146,14 +148,89 @@ describe('stubTheme', () => {
   it('composes fg + bold on the same text (extension nesting pattern)', () => {
     const styled = stubTheme.fg('error', stubTheme.bold('failed'));
     expect(stripAnsi(styled)).toBe('failed');
-    expect(ansiToHtml(styled)).toBe('<span style="color:rgb(246,108,109);font-weight:bold">failed</span>');
+    expect(ansiToHtml(styled)).toBe(
+      '<span style="color:rgb(246,108,109);font-weight:bold">failed</span>'
+    );
+  });
+});
+describe('HeadlessTerminal', () => {
+  it('updates size and clamps the virtual viewport', () => {
+    const terminal = new HeadlessTerminal();
+    const resized: number[] = [];
+    terminal.start(
+      () => {},
+      () => resized.push(terminal.columns, terminal.rows)
+    );
+
+    terminal.setSize(90, 30);
+    expect(terminal.columns).toBe(90);
+    expect(terminal.rows).toBe(30);
+
+    terminal.setSize(10, 500);
+    expect(terminal.columns).toBe(20);
+    expect(terminal.rows).toBe(80);
+    expect(resized).toEqual([90, 30, 20, 80]);
+  });
+
+  it('does not fire resize for unchanged values and never enables kitty protocol', () => {
+    const terminal = new HeadlessTerminal(90, 30);
+    let resizeCount = 0;
+    terminal.start(
+      () => {},
+      () => resizeCount++
+    );
+
+    terminal.setSize(90, 30);
+    expect(resizeCount).toBe(0);
+    expect(terminal.kittyProtocolActive).toBe(false);
+  });
+});
+
+describe('renderTerminalLines', () => {
+  it('strips ANSI for clean lines and preserves styled HTML', () => {
+    const tui = new StubTui();
+    tui.addChild({
+      render() {
+        return ['\x1b[31mred\x1b[0m', 'plain'];
+      },
+    });
+
+    expect(renderTerminalLines(tui)).toEqual({
+      cleanLines: ['red', 'plain'],
+      htmlLines: ['<span style="color:#cc0000">red</span>', 'plain'],
+    });
+  });
+
+  it('drops non-string lines and returns null when rendering throws', () => {
+    const mixed = new StubTui();
+    mixed.addChild({
+      render() {
+        return ['kept', 42, null] as unknown as string[];
+      },
+    });
+    expect(renderTerminalLines(mixed)).toEqual({
+      cleanLines: ['kept'],
+      htmlLines: ['kept'],
+    });
+
+    const broken = new StubTui();
+    broken.addChild({
+      render() {
+        throw new Error('render failed');
+      },
+    });
+    expect(renderTerminalLines(broken)).toBeNull();
   });
 });
 
 describe('StubTui', () => {
   it('addChild registers children', () => {
     const tui = new StubTui();
-    const child = { render() { return ['line']; } };
+    const child = {
+      render() {
+        return ['line'];
+      },
+    };
     tui.addChild(child);
     expect(tui.children).toHaveLength(1);
     expect(tui.children[0]).toBe(child);
@@ -161,16 +238,52 @@ describe('StubTui', () => {
 
   it('render() calls render on children', () => {
     const tui = new StubTui();
-    const child1 = { render() { return ['a']; } };
-    const child2 = { render() { return ['b']; } };
+    const child1 = {
+      render() {
+        return ['a'];
+      },
+    };
+    const child2 = {
+      render() {
+        return ['b'];
+      },
+    };
     tui.addChild(child1);
     tui.addChild(child2);
     expect(tui.render()).toEqual(['a', 'b']);
   });
+  it('renders children at the terminal column width', () => {
+    const tui = new StubTui();
+    let renderedWidth = 0;
+    tui.addChild({
+      render(width: number) {
+        renderedWidth = width;
+        return ['line'];
+      },
+    });
+    tui.terminal.setSize(40, 24);
+
+    expect(tui.render()).toEqual(['line']);
+    expect(renderedWidth).toBe(40);
+  });
+
+  it('requestRender invokes the host callback', () => {
+    const tui = new StubTui();
+    let called = 0;
+    tui.onRequestRender = () => called++;
+
+    tui.requestRender();
+
+    expect(called).toBe(1);
+  });
 
   it('removeChild removes from children', () => {
     const tui = new StubTui();
-    const child = { render() { return []; } };
+    const child = {
+      render() {
+        return [];
+      },
+    };
     tui.addChild(child);
     tui.removeChild(child);
     expect(tui.children).toHaveLength(0);
@@ -178,8 +291,16 @@ describe('StubTui', () => {
 
   it('clear() empties children', () => {
     const tui = new StubTui();
-    tui.addChild({ render() { return []; } });
-    tui.addChild({ render() { return []; } });
+    tui.addChild({
+      render() {
+        return [];
+      },
+    });
+    tui.addChild({
+      render() {
+        return [];
+      },
+    });
     tui.clear();
     expect(tui.children).toHaveLength(0);
   });
@@ -187,7 +308,14 @@ describe('StubTui', () => {
   it('handleInput forwards to focused child', () => {
     const tui = new StubTui();
     const handled: unknown[] = [];
-    const child = { render() { return []; }, handleInput(k: unknown) { handled.push(k); } };
+    const child = {
+      render() {
+        return [];
+      },
+      handleInput(k: unknown) {
+        handled.push(k);
+      },
+    };
     tui.addChild(child);
     tui.handleInput({ key: 'enter' });
     expect(handled).toEqual([{ key: 'enter' }]);
@@ -197,7 +325,10 @@ describe('StubTui', () => {
 describe('parseComponentTree — hand-rolled shapes', () => {
   it('parses a SelectList-shaped component', () => {
     const comp = {
-      items: [{ value: 'a', label: 'A' }, { value: 'b', label: 'B' }],
+      items: [
+        { value: 'a', label: 'A' },
+        { value: 'b', label: 'B' },
+      ],
       setFilter: () => {},
     };
     const result = parseComponentTree(comp as unknown as Record<string, unknown>);
@@ -280,7 +411,10 @@ describe('parseComponentTree — hand-rolled shapes', () => {
 
   it('does NOT infer horizontal direction from an `align` field', () => {
     const comp = {
-      children: [{ label: 'A', onClick: () => {} }, { label: 'B', onClick: () => {} }],
+      children: [
+        { label: 'A', onClick: () => {} },
+        { label: 'B', onClick: () => {} },
+      ],
       addChild: () => {},
       align: 'center',
     };
@@ -366,9 +500,12 @@ describe('parseComponentTree — real pi-tui component instances', () => {
 
   it('detects a real SelectList even before onSelect is assigned', () => {
     const list = new SelectList(
-      [{ value: 'a', label: 'Option A' }, { value: 'b', label: 'Option B' }],
+      [
+        { value: 'a', label: 'Option A' },
+        { value: 'b', label: 'Option B' },
+      ],
       10,
-      selectTheme,
+      selectTheme
     );
     const result = parseComponentTree(list as unknown as Record<string, unknown>);
     expect(result.kind).toBe('select');
@@ -384,7 +521,7 @@ describe('parseComponentTree — real pi-tui component instances', () => {
       10,
       settingsTheme,
       () => {},
-      () => {},
+      () => {}
     );
     const result = parseComponentTree(settings as unknown as Record<string, unknown>);
     expect(result.kind).toBe('settings');
@@ -442,7 +579,10 @@ describe('parseComponentTree — real pi-tui component instances', () => {
     expect(result.kind).toBe('container');
     if (result.kind === 'container') {
       expect(result.children).toHaveLength(2);
-      expect(result.children.map((c) => c.kind === 'text' && c.content)).toEqual(['before', 'after']);
+      expect(result.children.map((c) => c.kind === 'text' && c.content)).toEqual([
+        'before',
+        'after',
+      ]);
     }
   });
 });
@@ -460,7 +600,9 @@ describe('callFactoryAndParse', () => {
   });
 
   it('returns null on factory failure', async () => {
-    const factory = () => { throw new Error('fail'); };
+    const factory = () => {
+      throw new Error('fail');
+    };
     const result = await callFactoryAndParse(factory, 'Fail');
     expect(result).toBeNull();
   });

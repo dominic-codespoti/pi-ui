@@ -163,21 +163,39 @@ export function encodeSessionDirName(cwd: string): string {
   return `--${resolved.replace(/^[/\\]/, '').replace(/[/\\:]/g, '-')}--`;
 }
 
-function firstTextContent(message: object): string {
-  const content = 'content' in message ? message.content : undefined;
-  if (typeof content === 'string') return content.slice(0, FIRST_MESSAGE_MAX_CHARS);
-  if (!Array.isArray(content)) return '';
-  const parts: string[] = [];
-  let length = 0;
-  for (const block of content) {
-    if (!block || typeof block !== 'object') continue;
-    if (!('text' in block) || typeof block.text !== 'string') continue;
-    if (!('type' in block) || block.type !== 'text') continue;
-    parts.push(block.text);
-    length += block.text.length;
-    if (length >= FIRST_MESSAGE_MAX_CHARS) break;
+export function firstTextContent(message: object): string {
+  const record = message as Record<string, unknown>;
+  const content = record.content;
+  if (typeof content === 'string') {
+    const text = content.replace(/\s+/g, ' ').trim();
+    if (text) return text.slice(0, FIRST_MESSAGE_MAX_CHARS);
   }
-  return parts.join(' ').slice(0, FIRST_MESSAGE_MAX_CHARS);
+
+  const candidates: string[] = [];
+  const addCandidate = (value: unknown) => {
+    if (typeof value !== 'string') return;
+    const text = value.replace(/\s+/g, ' ').trim();
+    if (text) candidates.push(text);
+  };
+
+  addCandidate(record.text);
+  addCandidate(record.thinking);
+  addCandidate(record.reasoning);
+  addCandidate(record.summary);
+
+  if (Array.isArray(content)) {
+    for (const block of content) {
+      if (!block || typeof block !== 'object') continue;
+      const blockRecord = block as Record<string, unknown>;
+      addCandidate(blockRecord.text);
+      addCandidate(blockRecord.thinking);
+      addCandidate(blockRecord.reasoning);
+      addCandidate(blockRecord.summary);
+      if (candidates.length > 0) break;
+    }
+  }
+
+  return candidates[0]?.slice(0, FIRST_MESSAGE_MAX_CHARS) ?? '';
 }
 
 function strField(obj: object, key: string): string | undefined {

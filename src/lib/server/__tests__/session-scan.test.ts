@@ -12,6 +12,7 @@ import { join } from 'node:path';
 import {
   scanAllSessions,
   encodeSessionDirName,
+  firstTextContent,
   clearSessionScanCache,
   flushSessionScanCache,
   initSessionScanCache,
@@ -76,6 +77,21 @@ describe('session-scan', () => {
     expect(infos[0].name).toBe('My session');
     expect(infos[0].messageCount).toBe(2);
     expect(infos[0].firstMessage).toBe('hello world');
+  });
+  it('uses the first available text or thinking content for complex messages', () => {
+    expect(
+      firstTextContent({
+        content: [
+          { type: 'toolCall', name: 'search' },
+          { type: 'thinking', thinking: 'Plan the next step' },
+          { type: 'text', text: 'Visible request' },
+        ],
+      })
+    ).toBe('Plan the next step');
+  });
+
+  it('skips empty string content when another text field is available', () => {
+    expect(firstTextContent({ content: '   ', thinking: 'Useful context' })).toBe('Useful context');
   });
 
   it('sorts by last activity descending and skips invalid files', async () => {

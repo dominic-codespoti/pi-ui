@@ -27,6 +27,27 @@ test.describe('Tool rendering', () => {
     await expect(page.getByText('built-in', { exact: true })).toBeVisible();
   });
 
+  test('shows checked tool state and pointer affordance', async ({ page }) => {
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.onMessage((data) => {
+        const msg = JSON.parse(String(data));
+        if (msg.type === 'get_tools') ws.send(JSON.stringify(TOOLS_LIST_PAYLOAD));
+      });
+      ws.send(JSON.stringify(CONNECTED_PAYLOAD));
+    });
+    await page.reload();
+
+    await page.getByRole('button', { name: 'Toggle tools panel' }).click();
+    const readTool = page.getByRole('checkbox', { name: /read/ });
+    await expect(readTool).toHaveAttribute('aria-checked', 'true');
+    await expect(readTool.locator('[data-state="checked"]')).toBeVisible();
+    await expect(readTool).toHaveCSS('cursor', 'pointer');
+
+    await readTool.click();
+    await expect(readTool).toHaveAttribute('aria-checked', 'false');
+    await expect(readTool.locator('[data-state="unchecked"]')).toBeVisible();
+  });
+
   test('does not render the duplicate CPU model opener', async ({ page }) => {
     await expect(page.getByRole('button', { name: 'Open model picker' })).toHaveCount(0);
     await expect(page.getByRole('button', { name: 'Open model and provider panel' })).toHaveCount(

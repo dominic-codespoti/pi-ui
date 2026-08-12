@@ -9,6 +9,7 @@ All communication between client and server happens over a single WebSocket at `
 ### Server → Client
 
 #### `connected`
+
 Sent on WS open. Contains full session state.
 
 ```ts
@@ -36,15 +37,19 @@ Sent on WS open. Contains full session state.
   contextUsage: ContextUsage;
   /** Extension widgets owned by this active session; replayed on reconnect/switch. */
   widgets?: WidgetPayload[];
+  /** Full extension UI snapshot (statuses, widgets, dialogs, terminalInputActive). */
+  extensionUiState?: ExtensionUiStatePayload;
 }
 ```
 
 #### `session_loaded`
+
 Broadcast when session changes (switch, fork, edit rewind).
 
 `session_loaded` includes the same optional `widgets` array for the newly active session.
 
 #### SDK Events (forwarded as-is)
+
 - `agent_start` — Generation started
 - `message_start` — Turn started
 - `message_update` — Text/thinking delta during streaming
@@ -53,78 +58,88 @@ Broadcast when session changes (switch, fork, edit rewind).
 - `agent_end` — Generation completed
 
 #### Custom Server Events
+
 - `model_changed` — Model selection updated
 - `update_status` — Update check results
 - `server_restarting` — Server shutdown initiated
 - `agent_error` — Error from SDK or server
 - `extension_ui_request` with `method: 'setWidget'` — session-stamped widget update. The payload includes `widgetKey`, `widgetType`, widget data, and optional `widgetPlacement` (`'aboveEditor'` or `'belowEditor'`).
+- `extension_terminal_input_active` — `{ active, sessionId? }`; emitted when a session's `onTerminalInput` handler set appears/disappears (register, unregister, extension reload, session dispose).
+- `extension_terminal_input_result` — `{ id, consumed, data?, sessionId? }`; verdict for a client's `extension_terminal_input` round trip. `consumed: true` swallows the key; `data` replaces it.
 
 ### Client → Server
 
 #### Messaging
-| Type | Payload | Purpose |
-|------|---------|---------|
-| `prompt` | `{ message, images? }` | Send a user turn |
+
+| Type           | Payload                           | Purpose                                 |
+| -------------- | --------------------------------- | --------------------------------------- |
+| `prompt`       | `{ message, images? }`            | Send a user turn                        |
 | `edit_message` | `{ originalMessage, newMessage }` | Edit a user message (rewinds + resends) |
-| `steer` | `{ message }` | Send steering during streaming |
-| `follow_up` | `{ message }` | Queue a follow-up message |
-| `abort` | — | Cancel current generation |
+| `steer`        | `{ message }`                     | Send steering during streaming          |
+| `follow_up`    | `{ message }`                     | Queue a follow-up message               |
+| `abort`        | —                                 | Cancel current generation               |
 
 #### Session Management
-| Type | Payload | Purpose |
-|------|---------|---------|
-| `new_session` | `{ targetCwd? }` | Start a new session |
-| `switch_session` | `{ path }` | Switch to an existing session |
-| `fork_session` | `{ entryId }` | Fork session at a specific entry |
-| `get_session_tree` | — | Request session branch tree |
-| `get_fork_points` | — | Request user messages for forking |
-| `compact` | — | Manually compact session context |
-| `rename_session` / `rename_current_session` | `{ path, name }` / `{ name }` | Set session display name |
-| `delete_session` | `{ path }` | Delete a session file |
+
+| Type                                        | Payload                       | Purpose                           |
+| ------------------------------------------- | ----------------------------- | --------------------------------- |
+| `new_session`                               | `{ targetCwd? }`              | Start a new session               |
+| `switch_session`                            | `{ path }`                    | Switch to an existing session     |
+| `fork_session`                              | `{ entryId }`                 | Fork session at a specific entry  |
+| `get_session_tree`                          | —                             | Request session branch tree       |
+| `get_fork_points`                           | —                             | Request user messages for forking |
+| `compact`                                   | —                             | Manually compact session context  |
+| `rename_session` / `rename_current_session` | `{ path, name }` / `{ name }` | Set session display name          |
+| `delete_session`                            | `{ path }`                    | Delete a session file             |
 
 #### Model & Provider
-| Type | Payload | Purpose |
-|------|---------|---------|
-| `set_model` | `{ provider, modelId }` | Switch active model |
-| `set_thinking_level` | `{ level }` | Set reasoning depth |
-| `get_providers` | — | Request provider list |
-| `set_provider_key` | `{ provider, key }` | Set API key for provider |
-| `remove_provider_key` | `{ provider }` | Remove API key |
+
+| Type                  | Payload                 | Purpose                  |
+| --------------------- | ----------------------- | ------------------------ |
+| `set_model`           | `{ provider, modelId }` | Switch active model      |
+| `set_thinking_level`  | `{ level }`             | Set reasoning depth      |
+| `get_providers`       | —                       | Request provider list    |
+| `set_provider_key`    | `{ provider, key }`     | Persist API key for provider |
+| `remove_provider_key` | `{ provider }`          | Remove stored API key    |
 
 #### Project & Filesystem
-| Type | Payload | Purpose |
-|------|---------|---------|
-| `get_projects` | — | Request project list |
-| `add_project` | `{ path }` | Register a project directory |
-| `remove_project` | `{ cwd }` | Unregister a project |
-| `pin_project` | `{ cwd, pinned }` | Pin/unpin a project |
-| `rename_project` | `{ cwd, name }` | Set project display name |
-| `dir_complete` | `{ prefix }` | Directory path autocomplete |
-| `file_complete` | `{ query }` | File path autocomplete |
-| `read_file` | `{ path }` | Read file contents |
-| `write_file` | `{ path, content }` | Write file contents |
+
+| Type             | Payload             | Purpose                      |
+| ---------------- | ------------------- | ---------------------------- |
+| `get_projects`   | —                   | Request project list         |
+| `add_project`    | `{ path }`          | Register a project directory |
+| `remove_project` | `{ cwd }`           | Unregister a project         |
+| `pin_project`    | `{ cwd, pinned }`   | Pin/unpin a project          |
+| `rename_project` | `{ cwd, name }`     | Set project display name     |
+| `dir_complete`   | `{ prefix }`        | Directory path autocomplete  |
+| `file_complete`  | `{ query }`         | File path autocomplete       |
+| `read_file`      | `{ path }`          | Read file contents           |
+| `write_file`     | `{ path, content }` | Write file contents          |
 
 #### Extension UI
-| Type | Payload | Purpose |
-|------|---------|---------|
-| `extension_ui_response` | `{ id, value?, confirmed?, cancelled? }` | Respond to extension dialog |
-| `dismiss_widget` | `{ key }` | Tear down a widget server-side and broadcast its removal |
-| `extension_custom_input` | `{ id, key, alt?, ctrl?, meta?, shift? }` | Send keyboard input to extension |
-| `editor_text_response` | `{ id, text }` | Respond to editor text request |
+
+| Type                           | Payload                                  | Purpose                                                                                                                                                           |
+| ------------------------------ | ---------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `extension_ui_response`        | `{ id, value?, confirmed?, cancelled? }` | Respond to extension dialog                                                                                                                                       |
+| `dismiss_widget`               | `{ key }`                                | Tear down a widget server-side and broadcast its removal                                                                                                          |
+| `extension_custom_input`       | `{ id, data }`                           | Forward raw terminal bytes to an interactive custom() overlay component (`data` is the pi-tui key sequence)                                                       |
+| `extension_terminal_input`     | `{ id, data, sessionId }`                | Forward a composer keystroke (encoded as pi-tui key bytes) to the session's `onTerminalInput` handlers; the server replies with `extension_terminal_input_result` |
+| `extension_editor_text_change` | `{ text, sessionId }`                    | Sync the composer content to the server's per-session editor mirror (feeds synchronous `ctx.ui.getEditorText()`)                                                  |
 
 #### Admin
-| Type | Payload | Purpose |
-|------|---------|---------|
-| `get_tools` | — | Request tool list |
-| `set_active_tools` | `{ toolNames }` | Set active tool subset |
-| `get_resources` | — | Request skills/prompts |
-| `get_extensions` | — | Request extension list |
-| `get_commands` | — | Request slash commands |
-| `install_skill` | `{ url, scope }` | Install a skill from URL |
-| `get_update_status` | — | Check for updates |
-| `run_update` | `{ target }` | Execute update |
-| `request_restart` | — | Request server restart |
-| `restart_server` | `{ nonce? }` | Restart server process |
+
+| Type                | Payload          | Purpose                  |
+| ------------------- | ---------------- | ------------------------ |
+| `get_tools`         | —                | Request tool list        |
+| `set_active_tools`  | `{ toolNames }`  | Set active tool subset   |
+| `get_resources`     | —                | Request skills/prompts   |
+| `get_extensions`    | —                | Request extension list   |
+| `get_commands`      | —                | Request slash commands   |
+| `install_skill`     | `{ url, scope }` | Install a skill from URL |
+| `get_update_status` | —                | Check for updates        |
+| `run_update`        | `{ target }`     | Execute update           |
+| `request_restart`   | —                | Request server restart   |
+| `restart_server`    | `{ nonce? }`     | Restart server process   |
 
 ## Edit Message Flow
 
@@ -148,3 +163,10 @@ Broadcast when session changes (switch, fork, edit rewind).
 - `agent_error` events contain a human-readable error string
 - Server logs errors to console with `[pifrontier]` prefix
 - Client should display errors in the UI and allow retry
+
+## Session Expiry
+
+- The server closes an established socket with close code **4001** (`Session expired`) when the JWT expires or is revoked (checked on message and on a 60s timer)
+- On **4001** the client redirects to `/login?redirect=<current-url>` instead of reconnecting
+- A rejected upgrade (401) is indistinguishable from a dead server to the WS API, so after any other abnormal close the client probes `HEAD /`; `hooks.server` answers with a 302 to `/login` when the JWT is invalid, and the client redirects there
+- `/login` honors `?redirect=` and only follows it when the token verifies, so stale cookies cannot loop redirects

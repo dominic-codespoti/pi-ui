@@ -1,10 +1,15 @@
 import type { ParsedComponent } from '$lib/tui-stubs';
-import type { ClientMessage, ExtensionUiStatePayload, WidgetContent } from '$lib/ws/protocol';
+import {
+  EXTENSION_UI_SCHEMA_VERSION,
+  type ClientMessage,
+  type ExtensionUiStatePayload,
+  type WidgetContent,
+} from '$lib/ws/protocol';
 
 /** A modal dialog queued for the active session (queue head renders). */
 export type ModalState =
   | { method: 'confirm'; id: string; title: string; message: string }
-  | { method: 'input'; id: string; title: string; placeholder?: string }
+  | { method: 'input'; id: string; title: string; placeholder?: string; secret?: boolean }
   | { method: 'select'; id: string; title: string; options: string[] }
   | { method: 'editor'; id: string; title: string; prefill?: string }
   | {
@@ -51,6 +56,8 @@ export class ExtensionUiState {
   editorComponentPanel = $state<ParsedComponent | null>(null);
   /** Document title set by the active session's extension (setTitle). */
   title = $state('pi UI');
+  /** Whether the active session has onTerminalInput handlers. */
+  terminalInputActive = $state(false);
   /** Queued modal dialogs for the active session (queue head renders). */
   modalQueue = $state<ModalState[]>([]);
 
@@ -138,6 +145,9 @@ export class ExtensionUiState {
     this.title = title ?? 'pi UI';
     document.title = this.title;
   }
+  setTerminalInputActive(active: boolean): void {
+    this.terminalInputActive = active;
+  }
 
   /** Build a ModalState from an extension_ui_request payload (null for non-modal methods). */
   modalFromRequest(msg: Record<string, unknown>): ModalState | null {
@@ -157,6 +167,7 @@ export class ExtensionUiState {
           id,
           title: (msg.title as string | undefined) ?? 'Input',
           placeholder: msg.placeholder as string | undefined,
+          ...(msg.secret === true ? { secret: true } : {}),
         };
       case 'select':
         return {
@@ -315,6 +326,12 @@ export class ExtensionUiState {
    * channel first so nothing from the previous session survives.
    */
   applySnapshot(ui: ExtensionUiStatePayload): void {
+    if (ui.schemaVersion !== undefined && ui.schemaVersion !== EXTENSION_UI_SCHEMA_VERSION) {
+      console.warn(
+        `[pi-ui] Dropping extension UI snapshot: schema v${ui.schemaVersion} != v${EXTENSION_UI_SCHEMA_VERSION}`
+      );
+      return;
+    }
     this.statuses = ui.statuses ?? {};
     this.clearWidgets();
     for (const w of ui.widgets ?? []) {
@@ -328,7 +345,8 @@ export class ExtensionUiState {
     this.header = ui.header ?? '';
     this.footer = ui.footer ?? '';
     this.editorComponentPanel = ui.editorComponent ?? null;
-    if (ui.title) this.setTitle(ui.title);
+    this.setTitle(ui.title ?? 'pi UI');
+    this.terminalInputActive = ui.terminalInputActive ?? false;
     this.modalQueue = [];
     for (const dlg of ui.pendingDialogs ?? []) {
       this.replayModalFromRequest(dlg);
@@ -347,6 +365,8 @@ export class ExtensionUiState {
     this.header = '';
     this.footer = '';
     this.editorComponentPanel = null;
+    this.setTitle('pi UI');
+    this.terminalInputActive = false;
     this.modalQueue = [];
   }
 }

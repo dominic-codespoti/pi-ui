@@ -4,6 +4,8 @@
  */
 
 import type { ParsedComponent } from '$lib/tui-stubs';
+/** Version of the extension-UI wire payloads (ExtensionUiStatePayload et al). Bump on breaking shape changes. */
+export const EXTENSION_UI_SCHEMA_VERSION = 1 as const;
 
 // ── Shared data shapes ────────────────────────────────────────────────────────
 
@@ -173,6 +175,8 @@ export interface ExtensionUiStatePayload {
   widgets: WidgetPayload[];
   /** Open dialog/editor-text extension_ui_request payloads (id + method included). */
   pendingDialogs: Array<Record<string, unknown>>;
+  terminalInputActive?: boolean;
+  schemaVersion?: number;
 }
 
 /** A node in the session tree for visual display. */
@@ -225,7 +229,9 @@ export interface ConnectedMessage {
   contextUsage?: ContextUsage;
   /** Current notification webhook URL (empty/null = disabled). */
   webhookUrl?: string;
-  /** Extension widgets owned by the active session; replayed on connect/session switch. */
+  /** Full session-owned extension UI snapshot; replaces stale panels on connect/switch. */
+  extensionUiState?: ExtensionUiStatePayload;
+  /** Legacy widget-only snapshot accepted from older servers. */
   widgets?: WidgetPayload[];
 }
 
@@ -285,6 +291,9 @@ export interface ConnectedMessage {
  *   Custom component update (re-rendered lines for interactive custom() components):
  *   { type: "custom_render",           id: string, lines: string[] }
  *
+ *   Client → Server interactive custom messages:
+ *   { type: "extension_custom_input",  id: string, data: string }
+ *   { type: "extension_custom_resize", id: string, columns: number, rows: number }
  *   Live update to an open custom() dialog's parsed component tree (after a
  *   real extension callback ran, or on animation tick for loaders/progress):
  *   { type: "extension_ui_update",     id: string, parsed: ParsedComponent }
@@ -313,7 +322,6 @@ export interface ConnectedMessage {
  *     setTitle   – update document.title (title)
  *     set_editor_text – replace textarea content (text)
  *     paste_to_editor – insert text at cursor (text)
- *     request_editor_text – request current textarea content (id)
  *     setWorkingMessage – streaming indicator text (message)
  *     setWorkingVisible – streaming indicator visibility (visible)
  *     setWorkingIndicator – animated frame indicator (frames/intervalMs)
@@ -331,7 +339,32 @@ export type PiEvent = { type: string } & Record<string, unknown>;
  *  a missing or renamed field — fails at compile time on the broadcast site. */
 export type ServerCustomEvent =
   | { type: 'model_changed'; model: ModelInfo | null }
-  | { type: 'session_loaded'; sessionId: string; isStreaming: boolean; thinkingLevel: string; model: ModelInfo | null; availableModels: ModelInfo[]; messages: unknown[]; streamingMessage?: unknown; totalMessageCount?: number; messagesTruncated?: boolean; cwd?: string; sessionName?: string; isCompacting?: boolean; autoCompactionEnabled?: boolean; autoRetryEnabled?: boolean; queuedSteering?: string[]; queuedFollowUp?: string[]; piVersion?: string; uiVersion?: string; sessionMode?: 'in-memory' | 'persisted'; sessionPath?: string; contextUsage?: ContextUsage; widgets?: WidgetPayload[] }
+  | {
+      type: 'session_loaded';
+      sessionId: string;
+      isStreaming: boolean;
+      thinkingLevel: string;
+      model: ModelInfo | null;
+      availableModels: ModelInfo[];
+      messages: unknown[];
+      streamingMessage?: unknown;
+      totalMessageCount?: number;
+      messagesTruncated?: boolean;
+      cwd?: string;
+      sessionName?: string;
+      isCompacting?: boolean;
+      autoCompactionEnabled?: boolean;
+      autoRetryEnabled?: boolean;
+      queuedSteering?: string[];
+      queuedFollowUp?: string[];
+      piVersion?: string;
+      uiVersion?: string;
+      sessionMode?: 'in-memory' | 'persisted';
+      sessionPath?: string;
+      contextUsage?: ContextUsage;
+      extensionUiState?: ExtensionUiStatePayload;
+      widgets?: WidgetPayload[];
+    }
   | { type: 'sessions_list'; sessions: SessionSummary[] }
   | { type: 'all_sessions_list'; sessions: SessionSummary[] }
   | { type: 'projects_list'; projects: ProjectInfo[] }
@@ -342,10 +375,21 @@ export type ServerCustomEvent =
   | { type: 'available_models_changed'; availableModels: ModelInfo[] }
   | { type: 'sessions_error'; message: string }
   | { type: 'fork_points'; entries: Array<{ entryId: string; text: string }> }
-  | { type: 'tools_list'; tools: Array<{ name: string; description: string; isBuiltin: boolean; origin?: string }>; activeToolNames: string[] }
+  | {
+      type: 'tools_list';
+      tools: Array<{ name: string; description: string; isBuiltin: boolean; origin?: string }>;
+      activeToolNames: string[];
+    }
   | { type: 'resources_list'; skills: SkillSummary[]; prompts: PromptSummary[] }
-  | { type: 'extensions_list'; extensions: ExtensionSummary[]; errors: Array<{ path: string; error: string }> }
-  | { type: 'commands_list'; commands: Array<{ name: string; description?: string; source: string }> }
+  | {
+      type: 'extensions_list';
+      extensions: ExtensionSummary[];
+      errors: Array<{ path: string; error: string }>;
+    }
+  | {
+      type: 'commands_list';
+      commands: Array<{ name: string; description?: string; source: string }>;
+    }
   | { type: 'skill_install_result'; success: boolean; name?: string; error?: string }
   | ({ type: 'update_status' } & UpdateStatus)
   | { type: 'update_progress'; target: UpdateTarget; command?: string; message: string }
@@ -356,22 +400,54 @@ export type ServerCustomEvent =
   | { type: 'slash_result'; command: string; message: string; level?: 'info' | 'warning' | 'error' }
   | { type: 'file_content'; path: string; content: string; error?: string }
   | { type: 'file_saved'; path: string; error?: string }
-  | { type: 'older_messages'; messages: unknown[]; totalMessageCount: number; messagesTruncated: boolean }
+  | {
+      type: 'older_messages';
+      messages: unknown[];
+      totalMessageCount: number;
+      messagesTruncated: boolean;
+    }
   | { type: 'session_tree'; tree: TreeNode[] }
-  | { type: 'command_completions'; command: string; prefix: string; items: Array<{ value: string; label: string; description?: string }> }
+  | {
+      type: 'command_completions';
+      command: string;
+      prefix: string;
+      items: Array<{ value: string; label: string; description?: string }>;
+    }
   | { type: 'extension_completions'; trigger: string; query: string; items: unknown[] }
   | { type: 'settings'; settings: Record<string, unknown> }
   | { type: 'pong' }
   | { type: 'agent_error'; error: string }
   | { type: 'queue_restored'; text: string }
-  | { type: 'session_runtime'; sessionId: string; isRunning: boolean; unseen: boolean; lastActivity: number }
+  | {
+      type: 'session_runtime';
+      sessionId: string;
+      isRunning: boolean;
+      unseen: boolean;
+      lastActivity: number;
+    }
   | { type: 'extension_ui_state'; sessionId: string; ui: ExtensionUiStatePayload }
+  | { type: 'extension_terminal_input_active'; active: boolean; sessionId?: string }
+  | {
+      type: 'extension_terminal_input_result';
+      id: string;
+      consumed: boolean;
+      data?: string;
+      sessionId?: string;
+    }
   | ({ type: 'extension_ui_request'; id: string; method?: string } & Record<string, unknown>)
   | ({ type: 'extension_ui_request_replay'; id: string; method?: string } & Record<string, unknown>)
-  | { type: 'extension_ui_dismiss'; id: string }
-  | { type: 'extension_ui_update'; id: string; parsed: ParsedComponent }
-  | { type: 'custom_render'; id: string; lines: string[]; htmlLines?: string[] }
-  | { type: 'compaction_end'; sessionId: string; reason: string; result?: unknown; aborted?: boolean; willRetry?: boolean; errorMessage?: string };
+  | { type: 'extension_ui_dismiss'; id: string; sessionId?: string }
+  | { type: 'extension_ui_update'; id: string; parsed: ParsedComponent; sessionId?: string }
+  | { type: 'custom_render'; id: string; lines: string[]; htmlLines?: string[]; sessionId?: string }
+  | {
+      type: 'compaction_end';
+      sessionId: string;
+      reason: string;
+      result?: unknown;
+      aborted?: boolean;
+      willRetry?: boolean;
+      errorMessage?: string;
+    };
 
 export type ServerMessage = ConnectedMessage | ServerCustomEvent | PiEvent;
 
@@ -409,6 +485,10 @@ export type ClientMessage =
    * keystroke/paste — see `$lib/terminal-key-encoder` — and is passed straight to
    * the component's `handleInput()`. */
   | { type: 'extension_custom_input'; id: string; data: string }
+  /** Report the interactive custom overlay's live viewport so the server's headless terminal renders at the real size. */
+  | { type: 'extension_custom_resize'; id: string; columns: number; rows: number }
+  | { type: 'extension_terminal_input'; id: string; data: string; sessionId: string }
+  | { type: 'extension_editor_text_change'; text: string; sessionId: string }
   /** Interaction with a parsed component inside an open custom() dialog — the
    * server invokes the corresponding LIVE callback (onSelect/onClick/onToggle/
    * onSubmit/updateValue) on the component at `path` and re-parses the tree. */
@@ -429,8 +509,6 @@ export type ClientMessage =
     }
   /** Dismiss an extension widget — server tears down its factory and broadcasts removal to all tabs. */
   | { type: 'dismiss_widget'; key: string }
-  /** Editor text content response to a request_editor_text extension_ui_request. */
-  | { type: 'editor_text_response'; id: string; text: string }
   /** Request list of all providers with auth status. */
   | { type: 'get_providers' }
   /** Persist an API key for a provider. */

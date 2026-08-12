@@ -8,20 +8,23 @@
  */
 
 import type { AgentSession } from '@earendil-works/pi-coding-agent';
+import type { Terminal } from '@earendil-works/pi-tui';
 // ── Stubs ────────────────────────────────────────────────────────────────────
 
 /** Strips ANSI escape codes from a string. */
 /* eslint-disable no-control-regex -- matching literal ESC/BEL control bytes is the point */
 export function stripAnsi(s: string): string {
-  return s
-    // OSC sequences (hyperlinks, titles): ESC ] ... (BEL | ESC \)
-    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
-    // DCS/APC/PM/SOS sequences (kitty graphics, etc.): ESC [P_^X] ... ESC \
-    .replace(/\x1b[PX^_].*?\x1b\\/g, '')
-    // CSI sequences (cursor moves, erase, SGR colors, etc.)
-    .replace(/\x1b\[[0-9;:?]*[ -/]*[@-~]/g, '')
-    // Remaining 2-byte escapes
-    .replace(/\x1b[@-Z\\-_]/g, '');
+  return (
+    s
+      // OSC sequences (hyperlinks, titles): ESC ] ... (BEL | ESC \)
+      .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
+      // DCS/APC/PM/SOS sequences (kitty graphics, etc.): ESC [P_^X] ... ESC \
+      .replace(/\x1b[PX^_].*?\x1b\\/g, '')
+      // CSI sequences (cursor moves, erase, SGR colors, etc.)
+      .replace(/\x1b\[[0-9;:?]*[ -/]*[@-~]/g, '')
+      // Remaining 2-byte escapes
+      .replace(/\x1b[@-Z\\-_]/g, '')
+  );
 }
 /* eslint-enable no-control-regex */
 
@@ -35,8 +38,22 @@ export function stripAnsi(s: string): string {
  */
 /* eslint-disable no-control-regex -- matching literal ESC control bytes is the point */
 const ANSI_BASIC_COLORS: Record<number, string> = {
-  0: '#000000', 1: '#cc0000', 2: '#4e9a06', 3: '#c4a000', 4: '#3465a4', 5: '#75507b', 6: '#06989a', 7: '#d3d7cf',
-  8: '#555753', 9: '#ef2929', 10: '#8ae234', 11: '#fce94f', 12: '#729fcf', 13: '#ad7fa8', 14: '#34e2e2', 15: '#eeeeec',
+  0: '#000000',
+  1: '#cc0000',
+  2: '#4e9a06',
+  3: '#c4a000',
+  4: '#3465a4',
+  5: '#75507b',
+  6: '#06989a',
+  7: '#d3d7cf',
+  8: '#555753',
+  9: '#ef2929',
+  10: '#8ae234',
+  11: '#fce94f',
+  12: '#729fcf',
+  13: '#ad7fa8',
+  14: '#34e2e2',
+  15: '#eeeeec',
 };
 
 function ansi256ToHex(n: number): string {
@@ -123,13 +140,21 @@ export function ansiToHtml(line: string): string {
       else if (p === 27) style.inverse = false;
       else if (p === 29) style.strikethrough = false;
       else if (p >= 30 && p <= 37) style.fg = ANSI_BASIC_COLORS[p - 30];
-      else if (p === 38 && params[i + 1] === 5) { style.fg = ansi256ToHex(params[i + 2]); i += 2; }
-      else if (p === 38 && params[i + 1] === 2) { style.fg = `rgb(${params[i + 2]},${params[i + 3]},${params[i + 4]})`; i += 4; }
-      else if (p === 39) style.fg = undefined;
+      else if (p === 38 && params[i + 1] === 5) {
+        style.fg = ansi256ToHex(params[i + 2]);
+        i += 2;
+      } else if (p === 38 && params[i + 1] === 2) {
+        style.fg = `rgb(${params[i + 2]},${params[i + 3]},${params[i + 4]})`;
+        i += 4;
+      } else if (p === 39) style.fg = undefined;
       else if (p >= 40 && p <= 47) style.bg = ANSI_BASIC_COLORS[p - 40];
-      else if (p === 48 && params[i + 1] === 5) { style.bg = ansi256ToHex(params[i + 2]); i += 2; }
-      else if (p === 48 && params[i + 1] === 2) { style.bg = `rgb(${params[i + 2]},${params[i + 3]},${params[i + 4]})`; i += 4; }
-      else if (p === 49) style.bg = undefined;
+      else if (p === 48 && params[i + 1] === 5) {
+        style.bg = ansi256ToHex(params[i + 2]);
+        i += 2;
+      } else if (p === 48 && params[i + 1] === 2) {
+        style.bg = `rgb(${params[i + 2]},${params[i + 3]},${params[i + 4]})`;
+        i += 4;
+      } else if (p === 49) style.bg = undefined;
       else if (p >= 90 && p <= 97) style.fg = ANSI_BASIC_COLORS[p - 90 + 8];
       else if (p >= 100 && p <= 107) style.bg = ANSI_BASIC_COLORS[p - 100 + 8];
     }
@@ -150,20 +175,52 @@ export function ansiToHtml(line: string): string {
  * than throwing or silently dropping styling.
  */
 const FG_PALETTE: Record<string, string> = {
-  text: '#d7d6df', userMessageText: '#d7d6df', customMessageText: '#d7d6df', toolOutput: '#d7d6df',
-  syntaxVariable: '#d7d6df', mdCodeBlock: '#d7d6df',
-  dim: '#6d6c75', thinkingText: '#6d6c75', mdLinkUrl: '#6d6c75', mdListBullet: '#6d6c75',
-  toolDiffContext: '#6d6c75', syntaxComment: '#6d6c75', thinkingOff: '#6d6c75', thinkingMinimal: '#6d6c75',
-  muted: '#8e8d96', mdQuote: '#8e8d96', syntaxOperator: '#8e8d96', syntaxPunctuation: '#8e8d96', thinkingLow: '#8e8d96',
-  border: '#313039', borderMuted: '#313039', mdCodeBlockBorder: '#313039', mdQuoteBorder: '#313039', mdHr: '#313039',
+  text: '#d7d6df',
+  userMessageText: '#d7d6df',
+  customMessageText: '#d7d6df',
+  toolOutput: '#d7d6df',
+  syntaxVariable: '#d7d6df',
+  mdCodeBlock: '#d7d6df',
+  dim: '#6d6c75',
+  thinkingText: '#6d6c75',
+  mdLinkUrl: '#6d6c75',
+  mdListBullet: '#6d6c75',
+  toolDiffContext: '#6d6c75',
+  syntaxComment: '#6d6c75',
+  thinkingOff: '#6d6c75',
+  thinkingMinimal: '#6d6c75',
+  muted: '#8e8d96',
+  mdQuote: '#8e8d96',
+  syntaxOperator: '#8e8d96',
+  syntaxPunctuation: '#8e8d96',
+  thinkingLow: '#8e8d96',
+  border: '#313039',
+  borderMuted: '#313039',
+  mdCodeBlockBorder: '#313039',
+  mdQuoteBorder: '#313039',
+  mdHr: '#313039',
   borderAccent: '#ba93fb',
-  accent: '#ba93fb', mdHeading: '#ba93fb', syntaxKeyword: '#ba93fb',
-  thinkingHigh: '#ba93fb', thinkingXhigh: '#ba93fb', thinkingMax: '#ba93fb',
-  toolTitle: '#4dc3dd', customMessageLabel: '#4dc3dd', mdLink: '#4dc3dd', syntaxFunction: '#4dc3dd', thinkingMedium: '#4dc3dd',
-  mdCode: '#50d5ae', syntaxType: '#50d5ae',
-  success: '#4fcc92', toolDiffAdded: '#4fcc92', syntaxString: '#4fcc92',
-  error: '#f66c6d', toolDiffRemoved: '#f66c6d',
-  warning: '#eec05b', bashMode: '#eec05b', syntaxNumber: '#eec05b',
+  accent: '#ba93fb',
+  mdHeading: '#ba93fb',
+  syntaxKeyword: '#ba93fb',
+  thinkingHigh: '#ba93fb',
+  thinkingXhigh: '#ba93fb',
+  thinkingMax: '#ba93fb',
+  toolTitle: '#4dc3dd',
+  customMessageLabel: '#4dc3dd',
+  mdLink: '#4dc3dd',
+  syntaxFunction: '#4dc3dd',
+  thinkingMedium: '#4dc3dd',
+  mdCode: '#50d5ae',
+  syntaxType: '#50d5ae',
+  success: '#4fcc92',
+  toolDiffAdded: '#4fcc92',
+  syntaxString: '#4fcc92',
+  error: '#f66c6d',
+  toolDiffRemoved: '#f66c6d',
+  warning: '#eec05b',
+  bashMode: '#eec05b',
+  syntaxNumber: '#eec05b',
 };
 
 /** Background counterpart of `FG_PALETTE`, for `theme.bg()`. */
@@ -240,27 +297,103 @@ export interface StubComponent {
   children?: StubComponent[];
   [key: string]: unknown;
 }
+/** Headless implementation of pi-tui's Terminal interface for the web host. */
+export class HeadlessTerminal implements Terminal {
+  private _columns: number;
+  private _rows: number;
+  private inputHandler?: (data: string) => void;
+  private resizeHandler?: () => void;
+
+  constructor(columns = 80, rows = 24) {
+    this._columns = columns;
+    this._rows = rows;
+  }
+
+  start(onInput: (data: string) => void, onResize: () => void): void {
+    this.inputHandler = onInput;
+    this.resizeHandler = onResize;
+  }
+
+  stop(): void {
+    this.inputHandler = undefined;
+    this.resizeHandler = undefined;
+  }
+
+  async drainInput(): Promise<void> {
+    // Headless terminal: there is no stdin to drain.
+  }
+
+  write(data: string): void {
+    // Captured here for a future stream mode; nothing calls it while StubTui hosts.
+    void data;
+  }
+
+  get columns(): number {
+    return this._columns;
+  }
+
+  get rows(): number {
+    return this._rows;
+  }
+
+  get kittyProtocolActive(): boolean {
+    return false;
+  }
+
+  /** Resize the virtual viewport; clamps and fires the start()-registered resize handler on change. */
+  setSize(columns: number, rows: number): void {
+    const c = Math.min(200, Math.max(20, Math.round(columns)));
+    const r = Math.min(80, Math.max(5, Math.round(rows)));
+    if (c === this._columns && r === this._rows) return;
+    this._columns = c;
+    this._rows = r;
+    this.resizeHandler?.();
+  }
+
+  moveBy(lines: number): void {
+    void lines;
+  }
+  hideCursor(): void {}
+  showCursor(): void {}
+  clearLine(): void {}
+  clearFromCursor(): void {}
+  clearScreen(): void {}
+  setTitle(title: string): void {
+    void title;
+  }
+  setProgress(active: boolean): void {
+    void active;
+  }
+}
 
 /** Minimal TUI stub — satisfies `tui` parameter of extension factories. */
 export class StubTui {
   children: StubComponent[] = [];
-  /**
-   * Fixed fake terminal size — real pi-tui `TUI.terminal` (`columns`/`rows`
-   * getters, see `@earendil-works/pi-tui/dist/tui.d.ts`) is read by some
-   * extension components (e.g. scrollable list/transcript overlays) inside
-   * `render()`/`handleInput()` for viewport math. Without this, those calls
-   * throw on `undefined.rows`, get swallowed by `parseComponentTree`'s
-   * try/catch, and the component silently renders as an empty component.
-   * 80 matches the hardcoded render width used throughout this file/server.ts;
-   * 40 rows gives a reasonable modal-sized viewport.
-   */
-  terminal = { columns: 80, rows: 40 };
+  terminal = new HeadlessTerminal(80, 24);
+  onRequestRender?: () => void;
   private focused: StubComponent | null = null;
 
-  requestRender() {}
-  showOverlay() { return { hide() {}, setHidden() {}, isHidden() { return false; }, focus() {}, unfocus() {}, isFocused() { return false; } }; }
+  requestRender() {
+    this.onRequestRender?.();
+  }
+  showOverlay() {
+    return {
+      hide() {},
+      setHidden() {},
+      isHidden() {
+        return false;
+      },
+      focus() {},
+      unfocus() {},
+      isFocused() {
+        return false;
+      },
+    };
+  }
   hideOverlay() {}
-  hasOverlay() { return false; }
+  hasOverlay() {
+    return false;
+  }
   addChild(child: StubComponent) {
     if (child && !this.children.includes(child)) {
       this.children.push(child);
@@ -280,7 +413,7 @@ export class StubTui {
     this.focused = null;
   }
   render() {
-    return this.children.flatMap(c => c.render?.(80) || []);
+    return this.children.flatMap((c) => c.render?.(this.terminal.columns) || []);
   }
   invalidate() {}
   focus(child: StubComponent) {
@@ -315,6 +448,19 @@ export class StubTui {
         if (f) return f;
       }
     }
+    return null;
+  }
+}
+/** Render an interactive custom() TUI at its live column width; null on failure. Non-string lines are dropped. */
+export function renderTerminalLines(
+  tui: StubTui
+): { cleanLines: string[]; htmlLines: string[] } | null {
+  try {
+    const rawLines = tui.render();
+    if (!Array.isArray(rawLines)) return null;
+    const lines = rawLines.filter((line): line is string => typeof line === 'string');
+    return { cleanLines: lines.map(stripAnsi), htmlLines: lines.map(ansiToHtml) };
+  } catch {
     return null;
   }
 }
@@ -432,7 +578,6 @@ export type ParsedComponent =
   | ParsedMarkdown
   | ParsedSettings;
 
-
 // ── Component tree walker ─────────────────────────────────────────────────────
 
 /**
@@ -528,10 +673,7 @@ function isText(comp: Record<string, unknown>): boolean {
  * Button has: label (string), onClick (function), optionally variant (string)
  */
 function isButton(comp: Record<string, unknown>): boolean {
-  return (
-    typeof comp.label === 'string' &&
-    typeof comp.onClick === 'function'
-  );
+  return typeof comp.label === 'string' && typeof comp.onClick === 'function';
 }
 
 /**
@@ -539,10 +681,7 @@ function isButton(comp: Record<string, unknown>): boolean {
  * Checkbox has: checked (boolean), onToggle (function), optionally label (string)
  */
 function isCheckbox(comp: Record<string, unknown>): boolean {
-  return (
-    typeof comp.checked === 'boolean' &&
-    typeof comp.onToggle === 'function'
-  );
+  return typeof comp.checked === 'boolean' && typeof comp.onToggle === 'function';
 }
 
 /**
@@ -571,11 +710,7 @@ function isLoader(comp: Record<string, unknown>): boolean {
  * Spacer has: lines (number), setLines (function), no text field.
  */
 function isSpacer(comp: Record<string, unknown>): boolean {
-  return (
-    typeof comp.lines === 'number' &&
-    typeof comp.setLines === 'function' &&
-    !isText(comp)
-  );
+  return typeof comp.lines === 'number' && typeof comp.setLines === 'function' && !isText(comp);
 }
 
 /**
@@ -583,7 +718,7 @@ function isSpacer(comp: Record<string, unknown>): boolean {
  *
  * Unlike the previous version which returned only the first interactive element,
  * this version returns a recursive container tree that preserves the full layout:
- * - Containers with children are returned as ParsedContainer 
+ * - Containers with children are returned as ParsedContainer
  * - Leaf components are returned as their respective types
  * - Direction (vertical/horizontal) is inferred from container properties
  */
@@ -591,7 +726,7 @@ export function parseComponentTree(
   comp: Record<string, unknown>,
   width: number = 80,
   path: number[] = [],
-  nodeMap?: Map<string, Record<string, unknown>>,
+  nodeMap?: Map<string, Record<string, unknown>>
 ): ParsedComponent {
   const register = (node: ParsedComponent): ParsedComponent => {
     if (nodeMap) nodeMap.set(path.join('.'), comp);
@@ -602,7 +737,13 @@ export function parseComponentTree(
   // ── Leaf: SettingsList — checked before SelectList (items shape differs
   // by field names, but check order still matters for clarity) ──────────
   if (isSettingsList(comp)) {
-    const items = comp.items as { id: string; label: string; description?: string; currentValue: string; values?: string[] }[];
+    const items = comp.items as {
+      id: string;
+      label: string;
+      description?: string;
+      currentValue: string;
+      values?: string[];
+    }[];
     return register({ kind: 'settings', items });
   }
 
@@ -615,7 +756,7 @@ export function parseComponentTree(
 
   // ── Leaf: Input ───────────────────────────────────────────────────────
   if (isInput(comp)) {
-    const value = typeof comp.getValue === 'function' ? comp.getValue() as string : '';
+    const value = typeof comp.getValue === 'function' ? (comp.getValue() as string) : '';
     const label = extractLabel(comp);
     return register({ kind: 'input', label, placeholder: 'Type your response…', value });
   }
@@ -642,7 +783,10 @@ export function parseComponentTree(
   // ── Leaf: Button ──────────────────────────────────────────────────────
   if (isButton(comp)) {
     const label = typeof comp.label === 'string' ? comp.label : '';
-    const variant = typeof comp.variant === 'string' ? comp.variant as 'default' | 'primary' | 'danger' : undefined;
+    const variant =
+      typeof comp.variant === 'string'
+        ? (comp.variant as 'default' | 'primary' | 'danger')
+        : undefined;
     return register({ kind: 'button', label, variant });
   }
 
@@ -691,7 +835,12 @@ export function parseComponentTree(
   {
     const imgData = (comp.base64Data ?? comp.data) as unknown;
     if (typeof imgData === 'string' && typeof comp.mimeType === 'string') {
-      return register({ kind: 'image', label: extractLabel(comp), data: imgData, mimeType: comp.mimeType });
+      return register({
+        kind: 'image',
+        label: extractLabel(comp),
+        data: imgData,
+        mimeType: comp.mimeType,
+      });
     }
   }
   // ── Fallback: try render() for unknown components ─────────────────────
@@ -699,10 +848,15 @@ export function parseComponentTree(
     try {
       const lines = comp.render(width) as string[];
       if (Array.isArray(lines) && lines.length > 0) {
-        const content = lines.map((l) => stripAnsi(l)).join('\n').trim();
+        const content = lines
+          .map((l) => stripAnsi(l))
+          .join('\n')
+          .trim();
         if (content) return register({ kind: 'text', label: '', content, monoPreserve: true });
       }
-    } catch { /* render may fail without real TUI */ }
+    } catch {
+      /* render may fail without real TUI */
+    }
   }
   return { kind: 'text', label: '', content: '' };
 }
@@ -714,7 +868,7 @@ export function parseComponentTree(
  */
 export function shouldUseInteractiveCustom(
   component: Record<string, unknown>,
-  parsed: ParsedComponent | null,
+  parsed: ParsedComponent | null
 ): boolean {
   if (typeof component.handleInput !== 'function') return false;
   if (!parsed) return true;
@@ -744,7 +898,6 @@ function extractLabel(comp: Record<string, unknown>): string {
   return '';
 }
 
-
 // ── Extension render hooks ─────────────────────────────────────────────────────
 
 /**
@@ -756,7 +909,12 @@ function extractLabel(comp: Record<string, unknown>): string {
  * only (never re-requests a render), so the extension is asked for its
  * fullest rendering and the client's existing show/hide toggle wraps it.
  */
-function buildToolRenderContext(args: unknown, toolCallId: string, isPartial: boolean, isError: boolean) {
+function buildToolRenderContext(
+  args: unknown,
+  toolCallId: string,
+  isPartial: boolean,
+  isError: boolean
+) {
   return {
     args,
     toolCallId,
@@ -775,7 +933,8 @@ function buildToolRenderContext(args: unknown, toolCallId: string, isPartial: bo
 
 /** Run a rendered `Component` through the same ansiToHtml pipeline setWidget uses. Returns undefined on any failure or empty output. */
 function componentToHtmlLines(component: unknown): string[] | undefined {
-  if (!component || typeof (component as { render?: unknown }).render !== 'function') return undefined;
+  if (!component || typeof (component as { render?: unknown }).render !== 'function')
+    return undefined;
   const lines = (component as { render: (width: number) => string[] }).render(80);
   if (!Array.isArray(lines) || lines.length === 0) return undefined;
   return lines.map((l: string) => ansiToHtml(l));
@@ -791,7 +950,7 @@ export function renderToolCallHtml(
   sess: AgentSession,
   toolName: string,
   args: unknown,
-  toolCallId: string,
+  toolCallId: string
 ): string[] | undefined {
   try {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- SDK's Theme type isn't exported publicly; renderCall's real signature is unreachable by name.
@@ -818,7 +977,7 @@ export function renderToolResultHtml(
   result: unknown,
   args: unknown,
   toolCallId: string,
-  isPartial: boolean,
+  isPartial: boolean
 ): string[] | undefined {
   try {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- see renderToolCallHtml
@@ -826,7 +985,9 @@ export function renderToolResultHtml(
     if (!toolDef?.renderResult) return undefined;
     const isError = !!(result as { isError?: boolean } | undefined)?.isError;
     const ctx = buildToolRenderContext(args, toolCallId, isPartial, isError);
-    return componentToHtmlLines(toolDef.renderResult(result, { expanded: true, isPartial }, stubTheme, ctx));
+    return componentToHtmlLines(
+      toolDef.renderResult(result, { expanded: true, isPartial }, stubTheme, ctx)
+    );
   } catch {
     return undefined;
   }
@@ -883,7 +1044,7 @@ export async function callFactoryAndParse(
   factory: (...args: any[]) => any | Promise<any>,
   title: string,
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  options?: Record<string, any>,
+  options?: Record<string, any>
 ): Promise<ParsedComponent | null> {
   try {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
