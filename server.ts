@@ -21,8 +21,8 @@ import type {
   TerminalInputHandler,
 } from '@earendil-works/pi-coding-agent';
 import type { AuthEvent, AuthInteraction, AuthPrompt } from '@earendil-works/pi-ai';
-import { rm, mkdir, writeFile } from 'node:fs/promises';
-import { join, resolve, basename, sep, dirname } from 'node:path';
+import { rm, mkdir, writeFile, readdir } from 'node:fs/promises';
+import { join, resolve, basename, sep, dirname, relative } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import {
@@ -2079,6 +2079,8 @@ interface ManagedSession {
   lastActivity: number;
   /** Pending navigated-away disposal timer (null when none scheduled). */
   disposeTimer: Timer | null;
+  /** Pending coalesced session_runtime broadcast timer (null when none scheduled). */
+  runtimeBroadcastTimer: Timer | null;
 }
 
 /** Grace before a navigated-away idle session is dropped from memory. Long
@@ -2355,6 +2357,7 @@ function registerSession(sid: string, sess: AgentSession, cwdV: string, bindExt:
     unseen: false,
     lastActivity: Date.now(),
     disposeTimer: null,
+    runtimeBroadcastTimer: null,
   };
   sessionPool.set(sid, entry);
   // Pooled sessions are overlay-authoritative while resident — register the
@@ -2430,8 +2433,18 @@ function registerSession(sid: string, sess: AgentSession, cwdV: string, bindExt:
         break;
       }
     }
-    // Broadcast runtime-status snapshot so sidebar can show live dots
-    broadcastSessionRuntime(sid, entry);
+    // Broadcast runtime-status snapshot so sidebar can show live dots. A turn
+    // emits message_end per message, so coalesce trailing — the client only
+    // needs the settled state, and the frame storm on long turns is pure
+    // overhead (mirrors the 300ms session/project list coalescers).
+    if (entry.runtimeBroadcastTimer) return;
+    entry.runtimeBroadcastTimer = setTimeout(() => {
+      entry.runtimeBroadcastTimer = null;
+      // Session disposed/re-registered under the timer — never broadcast a
+      // stale entry's state for a live session (or a removed one).
+      if (sessionPool.get(sid) !== entry) return;
+      broadcastSessionRuntime(sid, entry);
+    }, 300);
   });
 
   // Subscribe event-forwarding (only active session gets this)
@@ -2591,6 +2604,10 @@ let _sessionListRefreshTimer: Timer | null = null;
  * on a later tick.
  */
 async function refreshSessionLists(): Promise<void> {
+  // No browser attached — the scan + serialize + broadcast would be pure churn
+  // (background sessions keep mutating the catalogs). The next connect replays
+  // runtime snapshots and the client re-requests the lists itself.
+  if (connectedClients === 0) return;
   try {
     const all = await sessionCatalog.list();
     broadcast({ type: 'all_sessions_list', sessions: all.map(serializeSession) });
@@ -2608,6 +2625,8 @@ function scheduleProjectsRefresh(): void {
   _projectsRefreshTimer = setTimeout(() => {
     _projectsRefreshTimer = null;
     void (async () => {
+      // Same idle guard as refreshSessionLists — no clients, no work.
+      if (connectedClients === 0) return;
       try {
         broadcast({ type: 'projects_list', projects: await projectCatalog.list() });
       } catch (err) {
@@ -3448,16 +3467,10 @@ try {
                 const prefix = expandTilde(
                   (msg as { type: 'dir_complete'; prefix: string }).prefix
                 );
-                const { readdir } = await import('node:fs/promises');
-                const {
-                  dirname,
-                  basename: pathBasename,
-                  join: pathJoin,
-                } = await import('node:path');
                 const isDir = prefix.endsWith('/');
                 const dir = isDir ? prefix : dirname(prefix);
                 const resolvedDir = resolve(dir);
-                const fragment = isDir ? '' : pathBasename(prefix).toLowerCase();
+                const fragment = isDir ? '' : basename(prefix).toLowerCase();
                 let entries: string[] = [];
                 try {
                   const dirents = await readdir(resolvedDir, { withFileTypes: true });
@@ -3467,7 +3480,7 @@ try {
                         d.isDirectory() &&
                         (fragment === '' || d.name.toLowerCase().startsWith(fragment))
                     )
-                    .map((d) => pathJoin(dir, d.name) + '/')
+                    .map((d) => join(dir, d.name) + '/')
                     .slice(0, 20);
                 } catch {
                   entries = [];
@@ -3484,8 +3497,6 @@ try {
                 const query = (
                   (msg as { type: 'file_complete'; query: string }).query ?? ''
                 ).toLowerCase();
-                const { readdir } = await import('node:fs/promises');
-                const { join, relative } = await import('node:path');
                 const root = activeSession().sessionManager.getCwd() || cwd;
                 const entries: string[] = [];
                 const queue: Array<{ dir: string; depth: number }> = [{ dir: root, depth: 0 }];

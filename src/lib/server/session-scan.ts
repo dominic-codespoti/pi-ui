@@ -364,9 +364,11 @@ export async function scanAllSessions(
     throw err;
   }
   let files: string[] = [];
-  for (const dir of dirs) {
-    files.push(...(await jsonlFilesIn(dir)));
-  }
+  // Project dirs are independent — read them concurrently (the per-file stat
+  // cache keeps the work cheap, but serial readdirs add latency on cold scans
+  // with many projects).
+  const dirFileLists = await Promise.all(dirs.map((dir) => jsonlFilesIn(dir)));
+  for (const list of dirFileLists) files.push(...list);
   const skipPaths = opts?.skipPaths;
   if (skipPaths?.size) files = files.filter((f) => !skipPaths.has(f));
   // Drop cache entries for files that vanished so the cache can't grow
