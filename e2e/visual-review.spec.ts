@@ -55,6 +55,11 @@ async function loginViaCookie(page: import('@playwright/test').Page) {
 
 test.describe('Extension component visual review', () => {
   test('screenshot all features', async ({ page }) => {
+    // ~12 sequential screenshot sections, each with a 2s settle wait — the
+    // fixed waits alone approach the default 30s test timeout on slower
+    // (mobile-emulated) runs. Give the spec an explicit budget.
+    test.setTimeout(120_000);
+
     // ── 1. Clean state ────────────────────────────────────────────────────
     await page.routeWebSocket('/ws', (ws) => {
       ws.onMessage(() => {});

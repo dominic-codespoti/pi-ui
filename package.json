@@ -1,6 +1,6 @@
 {
   "name": "@thed24/pi-ui",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "description": "Web UI for the pi coding agent — runs in your browser, served from a Raspberry Pi or any Bun-capable machine.",
   "type": "module",
   "license": "MIT",
@@ -64,43 +64,52 @@
     "prepublishOnly": "bun run build && bun run build:server"
   },
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "0.83.0",
-    "@earendil-works/pi-tui": "^0.83.0"
+    "@earendil-works/pi-coding-agent": "0.84.1",
+    "@earendil-works/pi-tui": "0.84.1"
+  },
+  "overrides": {
+    "brace-expansion": "5.0.9",
+    "nanoid": "3.3.18",
+    "protobufjs": "7.6.5"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "0.83.0",
+    "@earendil-works/pi-ai": "0.84.1",
     "@eslint/js": "^10.0.1",
-    "@lucide/svelte": "^1.28.0",
+    "@lucide/svelte": "^1.31.0",
     "@playwright/test": "^1.62.1",
     "@sveltejs/kit": "^2.70.2",
-    "@sveltejs/vite-plugin-svelte": "^7.2.0",
+    "@sveltejs/vite-plugin-svelte": "^7.3.0",
     "@tailwindcss/vite": "^4.3.3",
-    "@testing-library/jest-dom": "^7.0.0",
+    "@testing-library/jest-dom": "^7.0.1",
     "@types/bun": "^1.3.14",
-    "@typescript/native": "npm:typescript@7",
+    "@typescript/native": "npm:typescript@^7.0.2",
     "@vitest/coverage-v8": "^4.1.10",
     "bits-ui": "^2.18.1",
     "clsx": "^2.1.1",
-    "daisyui": "^5.7.14",
-    "eslint": "^10.8.0",
+    "daisyui": "^5.7.16",
+    "eslint": "^10.8.1",
     "eslint-config-prettier": "^10.1.8",
-    "eslint-plugin-svelte": "^3.22.0",
-    "globals": "^17.9.0",
-    "highlight.js": "^11.11.1",
+    "eslint-plugin-svelte": "^3.23.0",
+    "globals": "^17.11.0",
+    "highlight.js": "^11.12.0",
     "jsdom": "^30.0.1",
-    "marked": "^18.0.7",
+    "marked": "^18.0.9",
     "playwright": "^1.62.1",
     "prettier": "^3.9.6",
     "prettier-plugin-svelte": "^4.1.1",
-    "svelte": "^5.56.8",
+    "svelte": "^5.56.9",
     "svelte-adapter-bun": "^1.0.1",
-    "svelte-check": "^4.7.4",
+    "svelte-check": "^4.7.6",
     "tailwind-merge": "^3.6.0",
     "tailwind-variants": "^3.3.1",
     "tailwindcss": "^4.3.3",
-    "typescript": "~6",
-    "typescript-eslint": "^8.65.0",
-    "vite": "^8.2.0",
+    "typescript": "~6.0.3",
+    "typescript-eslint": "^8.67.0",
+    "vite": "^8.2.1",
     "vitest": "^4.1.10"
-  }
+  },
+  "trustedDependencies": [
+    "@google/genai",
+    "protobufjs"
+  ]
 }
