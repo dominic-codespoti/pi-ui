@@ -222,7 +222,15 @@ function wsInit(ws: { send: (msg: string) => void }) {
 
 async function openProjectsSidebar(page: Page) {
   const search = page.locator('input[aria-label="Filter projects and sessions"]');
+  // Sidebar content is lazily mounted (module loads on first open) and the
+  // panel is a fixed off-canvas drawer on mobile — never wait for the element,
+  // judge existence + actual position instead.
   const isOpen = async () => {
+    try {
+      await search.waitFor({ state: 'attached', timeout: 300 });
+    } catch {
+      return false;
+    }
     const box = await search.boundingBox();
     return !!box && box.width > 0 && box.x >= -1;
   };

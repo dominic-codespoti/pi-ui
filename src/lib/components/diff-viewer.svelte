@@ -49,7 +49,9 @@
   /** Cache of highlighted lines — hljs is expensive and re-renders re-run highlightLine.
    *  Plain (non-reactive) maps: the previous $state counter was mutated during
    *  render, which Svelte forbids. */
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity -- plain caches: the previous $state counter was mutated during render, which Svelte forbids
   const _highlightCache = new Map<string, string>();
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity -- plain counter, never read reactively
   const _highlightCounts = new Map<string, number>();
 
   function highlightLine(content: string, lang: string, filePath: string): string {

@@ -72,6 +72,13 @@ class ProjectsState {
   collapsed = new SvelteSet<string>(loadCollapsed());
   /** Projects whose full session list is expanded past the preview limit. */
   expandedGroups = new SvelteSet<string>();
+  /**
+   * When the server last pushed a full list (all_sessions_list/projects_list).
+   * Guards `refresh()`: the server now pushes coalesced session_updated
+   * deltas during turns, so re-requesting both full lists on every sidebar
+   * open is redundant — skip when a full list arrived recently.
+   */
+  private lastFullListAt = 0;
 
   /** Projects merged with their sessions. Pinned first, then recent. */
   groups = $derived.by<ProjectGroup[]>(() => {
@@ -155,8 +162,13 @@ class ProjectsState {
     if (payload.sessions !== undefined) this.allSessions = payload.sessions;
   }
 
-  /** Refresh both lists — called on connect and when the sidebar opens. */
-  refresh(): void {
+  /** Refresh both lists — called on connect (force) and when the sidebar opens. */
+  refresh(opts?: { force?: boolean }): void {
+    const fresh =
+      !opts?.force &&
+      Date.now() - this.lastFullListAt < 2000 &&
+      (this.projects.length > 0 || this.allSessions.length > 0);
+    if (fresh) return;
     this.send({ type: 'get_projects' });
     this.send({ type: 'get_all_sessions' });
   }
@@ -169,10 +181,28 @@ class ProjectsState {
     switch (msg.type) {
       case 'projects_list':
         this.applyState({ projects: (msg.projects as ProjectInfo[]) ?? [] });
+        this.lastFullListAt = Date.now();
         return true;
       case 'all_sessions_list':
         this.applyState({ sessions: (msg.sessions as SessionSummary[]) ?? [] });
+        this.lastFullListAt = Date.now();
         return true;
+      case 'session_updated': {
+        // Live delta for one pooled session (coalesced server-side). Upsert by
+        // id — the derived groups re-sort by recency automatically.
+        const s = msg.session as SessionSummary | undefined;
+        if (s && typeof s.id === 'string') {
+          const idx = this.allSessions.findIndex((x) => x.id === s.id);
+          if (idx === -1) {
+            this.allSessions = [...this.allSessions, s];
+          } else if (this.allSessions[idx] !== s) {
+            const next = this.allSessions.slice();
+            next[idx] = s;
+            this.allSessions = next;
+          }
+        }
+        return true;
+      }
       case 'sessions_list':
         // all_sessions_list is the source of truth — just clear transient state.
         this.error = null;

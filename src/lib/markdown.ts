@@ -101,11 +101,19 @@ function escHtml(s: string) {
 
 /** When true, code blocks are escaped without hljs — used while a message is streaming. */
 let _skipHighlight = false;
+/** Notified when a render encounters a fence language that is still loading
+ *  lazily — lets callers re-render just the messages that need it once the
+ *  grammar registers (see `renderMarkdown` opts). */
+let _onUnresolvedLang: ((lang: string) => void) | null = null;
 
 /** Highlight code or fall back to plain-escaped text if language unknown. */
 function highlight(code: string, lang: string): string {
   // Kick off lazy dynamic import for less common languages
-  if (lang) ensureLang(lang);
+  if (lang) {
+    const lazyPending = !hljs.getLanguage(lang) && lang in _lazyLangs;
+    ensureLang(lang);
+    if (lazyPending) _onUnresolvedLang?.(lang);
+  }
   if (lang && hljs.getLanguage(lang)) {
     try {
       return hljs.highlight(code, { language: lang, ignoreIllegals: true }).value;
@@ -330,17 +338,30 @@ const MAX_MARKDOWN_CHARS = 150_000;
  * Synchronous (no async extension loaded). Oversized inputs are rendered as
  * escaped plain text instead of parsed markdown.
  */
-export function renderMarkdown(src: string, opts?: { skipHighlight?: boolean }): string {
+export function renderMarkdown(src: string, opts?: { skipHighlight?: boolean; onUnresolvedLang?: (lang: string) => void }): string {
   if (src.length > MAX_MARKDOWN_CHARS) {
     return `<pre class="whitespace-pre-wrap break-words">${escHtml(src)}</pre>`;
   }
   const prev = _skipHighlight;
+  const prevLangHook = _onUnresolvedLang;
   _skipHighlight = opts?.skipHighlight ?? false;
+  _onUnresolvedLang = opts?.onUnresolvedLang ?? null;
   try {
     return marked.parse(src) as string;
   } finally {
     _skipHighlight = prev;
+    _onUnresolvedLang = prevLangHook;
   }
+}
+
+/**
+ * Streaming preview — escaped plain text with preserved whitespace. Parsing
+ * the full accumulated markdown on every token delta (the streaming hot spot)
+ * stalls the main thread on long responses; this is O(n) escaping that the
+ * final render (message_end) replaces with full highlighted markdown.
+ */
+export function renderStreamingPreview(src: string): string {
+  return `<pre class="whitespace-pre-wrap break-words">${escHtml(src)}</pre>`;
 }
 
 /**

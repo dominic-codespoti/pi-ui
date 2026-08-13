@@ -153,6 +153,49 @@ describe('ProjectsState', () => {
       projectsState.handleMessage({ type: 'dir_completions', entries: ['/a/', '/b/'] } as { type: string } & Record<string, unknown>);
       expect(projectsState.dirCompletions).toEqual(['/a/', '/b/']);
     });
+
+    it('appends a new session from session_updated', () => {
+      projectsState.handleMessage({ type: 'session_updated', session: { id: 'new1', path: '/p/new1.jsonl', cwd: '/p', name: '', created: 1, modified: 5, messageCount: 3, firstMessage: 'hi' } } as { type: string } & Record<string, unknown>);
+      expect(projectsState.allSessions).toHaveLength(1);
+      expect(projectsState.allSessions[0].id).toBe('new1');
+    });
+
+    it('replaces an existing session by id from session_updated', () => {
+      projectsState.allSessions = [
+        { id: 's1', path: '/p/s1.jsonl', cwd: '/p', name: 'old name', created: 1, modified: 2, messageCount: 1, firstMessage: 'before' },
+      ];
+      projectsState.handleMessage({ type: 'session_updated', session: { id: 's1', path: '/p/s1.jsonl', cwd: '/p', name: 'renamed', created: 1, modified: 9, messageCount: 12, firstMessage: 'after' } } as { type: string } & Record<string, unknown>);
+      expect(projectsState.allSessions).toHaveLength(1);
+      expect(projectsState.allSessions[0]).toMatchObject({ name: 'renamed', messageCount: 12 });
+    });
+
+    it('keeps the list fresh-guarded after a full list arrives', () => {
+      const send = vi.fn().mockReturnValue(true);
+      projectsState.send = send;
+      projectsState.handleMessage({ type: 'all_sessions_list', sessions: [{ id: 's1' }] } as { type: string } & Record<string, unknown>);
+      projectsState.refresh(); // fresh — must not re-request
+      expect(send).not.toHaveBeenCalled();
+    });
+
+    it('refresh() skips when fresh and has data, force bypasses', () => {
+      const send = vi.fn().mockReturnValue(true);
+      projectsState.send = send;
+      projectsState.handleMessage({ type: 'all_sessions_list', sessions: [] } as { type: string } & Record<string, unknown>);
+      projectsState.handleMessage({ type: 'projects_list', projects: [] } as { type: string } & Record<string, unknown>);
+      // projects.length === 0 — freshness guard needs data, so this fetches
+      expect(send).toHaveBeenCalledTimes(0);
+      projectsState.refresh();
+      expect(send).toHaveBeenCalledTimes(2);
+      // Now data exists and the list just arrived — skip
+      projectsState.handleMessage({ type: 'all_sessions_list', sessions: [{ id: 's1' }] } as { type: string } & Record<string, unknown>);
+      projectsState.handleMessage({ type: 'projects_list', projects: [{ cwd: '/p' }] } as { type: string } & Record<string, unknown>);
+      send.mockClear();
+      projectsState.refresh();
+      expect(send).not.toHaveBeenCalled();
+      // force bypasses the guard
+      projectsState.refresh({ force: true });
+      expect(send).toHaveBeenCalledTimes(2);
+    });
   });
 
   describe('actions', () => {

@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import { renderMarkdown, highlightCode, onLangRegistered, whenLangReady } from '../markdown';
+import {
+  renderMarkdown,
+  renderStreamingPreview,
+  highlightCode,
+  onLangRegistered,
+  whenLangReady,
+} from '../markdown';
 
 describe('renderMarkdown', () => {
   it('renders plain text', () => {
@@ -61,6 +67,46 @@ describe('renderMarkdown', () => {
   it('breaks lines on single newline (breaks: true)', () => {
     const result = renderMarkdown('line1\nline2');
     expect(result).toContain('<br>');
+  });
+});
+
+describe('renderStreamingPreview', () => {
+  it('escapes HTML and preserves whitespace as plain text', () => {
+    const result = renderStreamingPreview('<script>alert(1)</script>\n\n**bold**');
+    expect(result).toContain('&lt;script&gt;');
+    expect(result).not.toContain('<script>');
+    expect(result).not.toContain('<strong>'); // no markdown parsing
+    expect(result).toContain('whitespace-pre-wrap');
+    expect(result).toContain('**bold**'); // raw markdown visible during stream
+  });
+});
+
+describe('renderMarkdown unresolved-lang hook', () => {
+  it('reports fence languages still loading lazily', async () => {
+    // 'go' is lazy-loaded; nothing else in this file uses it, so the first
+    // render must report it as unresolved.
+    const seen: string[] = [];
+    const result = renderMarkdown('```go\nfunc main() {}\n```', {
+      onUnresolvedLang: (lang) => seen.push(lang),
+    });
+    expect(seen).toContain('go');
+    expect(result).toContain('func main()');
+
+    await whenLangReady('go');
+
+    const seen2: string[] = [];
+    renderMarkdown('```go\nfunc main() {}\n```', {
+      onUnresolvedLang: (lang) => seen2.push(lang),
+    });
+    expect(seen2).not.toContain('go');
+  });
+
+  it('does not report eager or unknown languages', () => {
+    const seen: string[] = [];
+    renderMarkdown('```js\nconst x = 1;\n```\n```nosuch\ncode\n```', {
+      onUnresolvedLang: (lang) => seen.push(lang),
+    });
+    expect(seen).toEqual([]);
   });
 });
 

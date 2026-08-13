@@ -131,10 +131,25 @@
         truncatedUserMsgs[msgId] = node.scrollHeight > node.clientHeight + 2;
       }
     };
-    const ro = new ResizeObserver(update);
-    ro.observe(node);
-    update();
-    return { destroy() { ro.disconnect(); } };
+    // ResizeObservers are per-mounted user message (up to MAX_MOUNTED_MESSAGES)
+    // — attach lazily only once the row is near the viewport, so off-screen
+    // history rows don't keep a live observer each.
+    let ro: ResizeObserver | null = null;
+    const io = new IntersectionObserver((entries) => {
+      if (!entries[0]?.isIntersecting) return;
+      if (!ro) {
+        ro = new ResizeObserver(update);
+        ro.observe(node);
+      }
+      update();
+    });
+    io.observe(node);
+    return {
+      destroy() {
+        io.disconnect();
+        ro?.disconnect();
+      },
+    };
   }
 
 
@@ -309,12 +324,13 @@
       </div>
     {/if}
 
-    {#each visibleMessages as msg (msg.id)}
+    {#each visibleMessages as msg, i (msg.id)}
+      {@const isNewest = i === visibleMessages.length - 1}
 
       <!-- ── User message ───────────────────────────────────────────────── -->
       {#if msg.role === 'user'}
         {@const isExpanded = expandedUserMsgs[msg.id] ?? false}
-        <div class="group msg-in sticky top-0 z-20 bg-base-100 relative pt-2 -mx-4 md:-mx-6">
+        <div class="group sticky top-0 z-20 bg-base-100 relative pt-2 -mx-4 md:-mx-6" class:msg-in={isNewest}>
           <div class="absolute bottom-0 left-0 right-0 h-5 bg-gradient-to-b from-base-100 to-transparent pointer-events-none"></div>
           <div class="flex justify-end px-4 md:px-6">
           <div class="max-w-[82%] space-y-0.5">
@@ -414,7 +430,7 @@
       <!-- ── Assistant message ─────────────────────────────────────────── -->
       {:else if msg.role === 'assistant'}
         {@const isLastInTurn = isLastInTurnMap[msg.id] ?? false}
-        <div class="group msg-in trace-step">
+        <div class="group trace-step" class:msg-in={isNewest}>
           {#if msg.streaming}
             {#if msg.thinking && msg.thinking.length > 0}
               <!-- Streaming thinking: flat flex row -->
@@ -544,7 +560,7 @@
         {@const meta = getToolMeta(msg.toolName)}
         {@const detail = cleanDetail(msg.toolInput ?? '')}
         {@const hasOutput = !!(msg.content || msg.diff || msg.images?.length || msg.renderedResultHtml?.length)}
-        <div class="msg-in flex flex-col trace-step tool-step">
+        <div class="flex flex-col trace-step tool-step" class:msg-in={isNewest}>
           <!-- Flat flex row: [status][icon][label][detail][time] -->
           <button
             onclick={() => { if (hasOutput) onToggleTool(msg); }}
@@ -611,7 +627,7 @@
 
       <!-- ── Diagnostic ───────────────────────────────────────────────── -->
       {:else if msg.role === 'diagnostic'}
-        <div class="msg-in my-1.5">
+        <div class="my-1.5" class:msg-in={isNewest}>
           <div
             class="rounded-xl border-l-4 px-3.5 py-2.5 text-sm leading-relaxed select-text {(!msg.level || msg.level === 'info') ? 'border-info bg-info/[0.03]' : ''} {msg.level === 'warning' ? 'border-warning bg-warning/[0.04]' : ''} {msg.level === 'error' ? 'border-error bg-error/[0.04]' : ''} {msg.level === 'success' ? 'border-success bg-success/[0.04]' : ''}"
           >
@@ -649,7 +665,7 @@
       <!-- ── Notice ────────────────────────────────────────────────────── -->
       {:else if msg.role === 'notice'}
         {#if msg.noticeKind === 'toast'}
-          <div class="msg-in my-1.5 flex items-start gap-2.5">
+          <div class="my-1.5 flex items-start gap-2.5" class:msg-in={isNewest}>
             <div
               class="flex-1 rounded-xl border-l-4 px-3.5 py-2.5 text-sm leading-relaxed select-text {(!msg.level || msg.level === 'info') ? 'border-info bg-info/[0.03]' : ''} {msg.level === 'warning' ? 'border-warning bg-warning/[0.04]' : ''} {msg.level === 'error' ? 'border-error bg-error/[0.04]' : ''}"
             >
@@ -667,13 +683,13 @@
             </div>
           </div>
         {:else if msg.customType === 'slash_result'}
-          <div class="msg-in my-2 px-4 py-3 bg-base-content/[0.04] border border-base-content/[0.06] rounded-xl font-mono text-[11px] leading-relaxed text-base-content/70 whitespace-pre-wrap break-words overflow-hidden select-text shadow-inner shadow-black/5">{msg.content}</div>
+          <div class="my-2 px-4 py-3 bg-base-content/[0.04] border border-base-content/[0.06] rounded-xl font-mono text-[11px] leading-relaxed text-base-content/70 whitespace-pre-wrap break-words overflow-hidden select-text shadow-inner shadow-black/5" class:msg-in={isNewest}>{msg.content}</div>
         {:else if msg.renderedNoticeHtml}
-          <div class="msg-in my-2 px-4 py-3 bg-base-content/[0.04] border border-base-content/[0.06] rounded-xl font-mono text-[11px] leading-relaxed text-base-content/70 whitespace-pre-wrap break-words overflow-hidden select-text shadow-inner shadow-black/5">
+          <div class="my-2 px-4 py-3 bg-base-content/[0.04] border border-base-content/[0.06] rounded-xl font-mono text-[11px] leading-relaxed text-base-content/70 whitespace-pre-wrap break-words overflow-hidden select-text shadow-inner shadow-black/5" class:msg-in={isNewest}>
             {#each msg.renderedNoticeHtml as line, i (i)}<div>{@html line || '&nbsp;'}</div>{/each}
           </div>
         {:else}
-          <div class="msg-in flex items-center gap-2.5 text-[10px] text-base-content/45 select-none py-1">
+          <div class="flex items-center gap-2.5 text-[10px] text-base-content/45 select-none py-1" class:msg-in={isNewest}>
             <span class="flex-1 h-px bg-gradient-to-r from-transparent to-base-content/15"></span>
             <span class="flex items-center gap-1 shrink-0">
               {#if msg.streaming}

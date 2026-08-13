@@ -8,12 +8,15 @@ import type { Page } from '@playwright/test';
 
 async function openProjectsSidebar(page: Page) {
   const search = page.locator('input[aria-label="Filter projects and sessions"]');
-  // The panel is a fixed off-canvas drawer on mobile: it keeps a non-empty
-  // bounding box (translateX(-100%)) even when closed, so `:visible` cannot
-  // detect openness. Judge by actual position/size instead, then toggle via
-  // the real header button (opens the drawer on mobile, the inline sidebar on
-  // desktop).
+  // Sidebar content is lazily mounted (module loads on first open) and the
+  // panel is a fixed off-canvas drawer on mobile — never wait for the element,
+  // judge existence + actual position instead.
   const isOpen = async () => {
+    try {
+      await search.waitFor({ state: 'attached', timeout: 300 });
+    } catch {
+      return false;
+    }
     const box = await search.boundingBox();
     return !!box && box.width > 0 && box.x >= -1;
   };

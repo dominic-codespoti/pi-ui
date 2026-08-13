@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy, tick } from 'svelte';
   import { dev } from '$app/environment';
+  import { resolve } from '$app/paths';
   import { SvelteMap } from 'svelte/reactivity';
 
   import type {
@@ -20,7 +21,7 @@
     ConnectedMessage,
   } from '$lib/ws/protocol';
   import type { PiEvent } from '$lib/ws/protocol';
-  import { renderMarkdown, onLangRegistered } from '$lib/markdown';
+  import { renderMarkdown, renderStreamingPreview, onLangRegistered } from '$lib/markdown';
   import { providerColor, versionText, fmtTokens, fmtCost, fmtDuration } from '$lib/utils';
   import type { ParsedComponent } from '$lib/tui-stubs';
   import { projectsState } from '$lib/state/projects-state.svelte';
@@ -43,13 +44,10 @@
   import { ScrollArea } from '$lib/components/ui/scroll-area';
   import * as Card from '$lib/components/ui/card';
   import SidebarPanel from '$lib/components/sidebar-panel.svelte';
-  import FileViewerModal from '$lib/components/file-viewer-modal.svelte';
-  import ProjectsSidebar from '$lib/components/projects/projects-sidebar.svelte';
+  import ProjectsSidebar from '$lib/components/projects/lazy-projects-sidebar.svelte';
   import MessageList from '$lib/components/chat/message-list.svelte';
-  import RightPanel from '$lib/components/panels/right-panel.svelte';
+  import RightPanel from '$lib/components/panels/lazy-right-panel.svelte';
   import ExtensionComponent from '$lib/components/ui/extension-component.svelte';
-  import ForkDialog from '$lib/components/dialogs/fork-dialog.svelte';
-  import SessionTreeModal from '$lib/components/dialogs/session-tree-modal.svelte';
   import ConfirmDialog from '$lib/components/dialogs/confirm-dialog.svelte';
 
   import ChevronRight from '@lucide/svelte/icons/chevron-right';
@@ -1106,10 +1104,30 @@
     if (showSessionPanel) projectsState.refresh();
   });
 
+  // ── Right-panel data fetch TTLs ───────────────────────────────────────────
+  // Panel content changes rarely while the server is running; caching avoids
+  // re-requesting (and resetting to skeletons) on every tab open. Cleared on
+  // reconnect so a fresh server is always re-read.
+  const PANEL_FETCH_TTL_MS = 60_000;
+  let lastProvidersFetch = $state(0);
+  let lastToolsFetch = $state(0);
+  let lastResourcesFetch = $state(0);
+  function resetPanelFetchCache() {
+    lastProvidersFetch = 0;
+    lastToolsFetch = 0;
+    lastResourcesFetch = 0;
+  }
+
   // ── Load providers when models tab is active ──────────────────────────────────
 
   $effect(() => {
-    if (showRightPanel && rightPanelTab === 'models' && wsState === 'open') {
+    if (
+      showRightPanel &&
+      rightPanelTab === 'models' &&
+      wsState === 'open' &&
+      Date.now() - lastProvidersFetch > PANEL_FETCH_TTL_MS
+    ) {
+      lastProvidersFetch = Date.now();
       send({ type: 'get_providers' });
       modelFilter = '';
     }
@@ -1118,7 +1136,13 @@
   // ── Load tools when tools tab is active ─────────────────────────────────────
 
   $effect(() => {
-    if (showRightPanel && rightPanelTab === 'tools' && wsState === 'open') {
+    if (
+      showRightPanel &&
+      rightPanelTab === 'tools' &&
+      wsState === 'open' &&
+      Date.now() - lastToolsFetch > PANEL_FETCH_TTL_MS
+    ) {
+      lastToolsFetch = Date.now();
       send({ type: 'get_tools' });
     }
   });
@@ -1126,7 +1150,12 @@
   // ── Load resources when skills tab is active ─────────────────────────────────
 
   $effect(() => {
-    if (showRightPanel && rightPanelTab === 'skills') {
+    if (
+      showRightPanel &&
+      rightPanelTab === 'skills' &&
+      Date.now() - lastResourcesFetch > PANEL_FETCH_TTL_MS
+    ) {
+      lastResourcesFetch = Date.now();
       resourcesLoaded = false;
       send({ type: 'get_resources' });
     }
@@ -1488,12 +1517,31 @@
   // Same for the extension UI store (modal answers need to send responses).
   extensionUiState.send = send;
 
+  // ── Editor mirror (extension getEditorText) ──────────────────────────────
+  // Every keystroke sends the full composer value — debounce it so fast typing
+  // doesn't flood the WS. Extensions read the mirror on demand (dialogs,
+  // widgets, terminal input), so every extension interaction flushes first.
+  let _editorMirrorTimer: ReturnType<typeof setTimeout> | null = null;
+  function flushEditorMirror() {
+    if (!_editorMirrorTimer) return;
+    clearTimeout(_editorMirrorTimer);
+    _editorMirrorTimer = null;
+    if (wsState === 'open' && _wsHandshakeComplete && sessionId) {
+      send({ type: 'extension_editor_text_change', text: input, sessionId });
+    }
+  }
+
   $effect(() => {
     const text = input;
+    const sid = sessionId;
     // Same handshake gate as the bridge: before `connected` the stale
     // sessionId would write the previous session's editor mirror.
-    if (wsState === 'open' && _wsHandshakeComplete && sessionId) {
-      send({ type: 'extension_editor_text_change', text, sessionId });
+    if (wsState === 'open' && _wsHandshakeComplete && sid) {
+      if (_editorMirrorTimer) clearTimeout(_editorMirrorTimer);
+      _editorMirrorTimer = setTimeout(() => {
+        _editorMirrorTimer = null;
+        send({ type: 'extension_editor_text_change', text, sessionId: sid });
+      }, 150);
     }
   });
 
@@ -1536,6 +1584,7 @@
       const raw = (payload.messages as unknown[]) ?? [];
       const streamingMessage = payload.streamingMessage;
       messages = rawMessagesToUI(streamingMessage === undefined ? raw : [...raw, streamingMessage]);
+      pruneUnresolvedLangs();
       activeStreamMsg = null;
       if (streamingMessage !== undefined && isStreaming) {
         for (let i = messages.length - 1; i >= 0; i--) {
@@ -1626,12 +1675,15 @@
     // just the active one). Gating it would freeze the background-session
     // dots forever — a finished background session would keep its "running"
     // dot and the "ready to check" marker could never appear.
+    // `session_updated` gets the same treatment: background sessions must
+    // keep their sidebar summaries (counts, name) fresh mid-turn.
     if (msg && typeof msg === 'object' && 'sessionId' in msg) {
       const msgType = (msg as Record<string, unknown>).type;
       if (
         msgType !== 'connected' &&
         msgType !== 'session_loaded' &&
-        msgType !== 'session_runtime'
+        msgType !== 'session_runtime' &&
+        msgType !== 'session_updated'
       ) {
         const sid = (msg as Record<string, unknown>).sessionId;
         if (typeof sid === 'string' && sid !== sessionId) {
@@ -1650,7 +1702,10 @@
         loadWebhookUrlFromServer(c.webhookUrl);
         sessionLoading = false;
         // Warm the project/session lists so pickers have data immediately.
-        projectsState.refresh();
+        // force: the freshness guard would otherwise skip the request right
+        // after a reconnect (stale pre-reconnect lists are not fresh).
+        projectsState.refresh({ force: true });
+        resetPanelFetchCache();
         updateAppBadge();
         // Request persisted UI settings from server (cross-device preferences)
         send({ type: 'get_settings' });
@@ -1854,8 +1909,14 @@
               }
             }
             // Final markdown render — full parse with hljs now that streaming is done
-            if (a.content) a.renderedContent = renderMarkdown(a.content);
-            if (a.thinking) a.renderedThinking = renderMarkdown(a.thinking);
+            if (a.content)
+              a.renderedContent = renderMarkdown(a.content, {
+                onUnresolvedLang: (lang) => recordUnresolvedLang(a, lang),
+              });
+            if (a.thinking)
+              a.renderedThinking = renderMarkdown(a.thinking, {
+                onUnresolvedLang: (lang) => recordUnresolvedLang(a, lang),
+              });
           }
         }
         activeStreamMsg = null;
@@ -2267,6 +2328,7 @@
       }
 
       case 'all_sessions_list':
+      case 'session_updated':
       case 'dir_completions': {
         projectsState.handleMessage(msg as PiEvent);
         break;
@@ -2494,16 +2556,19 @@
     value?: string
   ) {
     if (!modal || modal.method !== 'custom') return;
+    flushEditorMirror();
     send({ type: 'extension_component_event', id: modal.id, path, event, value });
   }
 
   function modalSubmitValue() {
+    flushEditorMirror();
     if (extensionUiState.answerSubmitValue(modalInput)) {
       modalInput = '';
     }
   }
 
   function modalCancel() {
+    flushEditorMirror();
     if (extensionUiState.answerCancel()) {
       modalInput = '';
     }
@@ -2537,6 +2602,7 @@
     if (data === null) return; // unsupported key — leave default browser behavior alone
     e.preventDefault();
     e.stopPropagation();
+    flushEditorMirror();
     send({ type: 'extension_custom_input', id: modal.id, data });
     // The hidden input is uncontrolled; clear anything it may have picked up.
     if (modalFocusEl instanceof HTMLInputElement) modalFocusEl.value = '';
@@ -2632,6 +2698,33 @@
   let _pendingRenderSet = new Set<UIMessage>();
   let _renderScheduled = false;
 
+  /**
+   * Fence languages still loading when a message was last rendered, keyed by
+   * message id. Lets the lazy-grammar-ready handler re-render ONLY the
+   * messages that actually need the new language (re-rendering every loaded
+   * message per registration is O(history × grammars)).
+   */
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity -- non-reactive tracking map, never rendered
+  const _unresolvedLangs = new Map<string, Set<string>>();
+
+  function recordUnresolvedLang(m: UIMessage, lang: string) {
+    let set = _unresolvedLangs.get(m.id);
+    if (!set) {
+      // eslint-disable-next-line svelte/prefer-svelte-reactivity -- plain set inside a non-reactive map
+      set = new Set();
+      _unresolvedLangs.set(m.id, set);
+    }
+    set.add(lang);
+  }
+
+  /** Prune tracking for messages that no longer exist (wholesale replacements). */
+  function pruneUnresolvedLangs() {
+    const live = new Set(messages.map((m) => m.id));
+    for (const id of _unresolvedLangs.keys()) {
+      if (!live.has(id)) _unresolvedLangs.delete(id);
+    }
+  }
+
   function scheduleContentRender(msg: UIMessage) {
     _pendingRenderSet.add(msg);
     if (_renderScheduled) return;
@@ -2639,13 +2732,22 @@
     requestAnimationFrame(() => {
       for (const m of _pendingRenderSet) {
         if (!messages.includes(m)) continue; // stale — evicted or replaced
-        // Skip hljs while the message is still streaming (per-frame re-highlight
-        // of the full accumulated text is the streaming hot spot); the finalize
-        // paths (message_end / sealStreaming) re-render with highlighting.
-        if (m.content)
-          m.renderedContent = renderMarkdown(m.content, { skipHighlight: m.streaming });
-        if (m.thinking)
-          m.renderedThinking = renderMarkdown(m.thinking, { skipHighlight: m.streaming });
+        if (m.streaming) {
+          // Escaped plain-text preview — full markdown parse per delta is the
+          // streaming hot spot (100k chars ≈ 24 ms parse, 60×/s); the
+          // message_end / sealStreaming finalize paths render real markdown.
+          if (m.content) m.renderedContent = renderStreamingPreview(m.content);
+          if (m.thinking) m.renderedThinking = renderStreamingPreview(m.thinking);
+        } else {
+          if (m.content)
+            m.renderedContent = renderMarkdown(m.content, {
+              onUnresolvedLang: (lang) => recordUnresolvedLang(m, lang),
+            });
+          if (m.thinking)
+            m.renderedThinking = renderMarkdown(m.thinking, {
+              onUnresolvedLang: (lang) => recordUnresolvedLang(m, lang),
+            });
+        }
       }
       _pendingRenderSet.clear();
       _renderScheduled = false;
@@ -2660,6 +2762,16 @@
         messages.splice(i, 1);
       } else if (m.streaming) {
         m.streaming = false;
+        // Finalize path for turns that ended without message_end (agent_error,
+        // abort): the streaming preview must be replaced with real markdown.
+        if (m.content)
+          m.renderedContent = renderMarkdown(m.content, {
+            onUnresolvedLang: (lang) => recordUnresolvedLang(m, lang),
+          });
+        if (m.thinking)
+          m.renderedThinking = renderMarkdown(m.thinking, {
+            onUnresolvedLang: (lang) => recordUnresolvedLang(m, lang),
+          });
       }
     }
   }
@@ -2935,17 +3047,61 @@
     });
   }
 
+  /** Max image dimension after in-browser attachment downscale. */
+  const MAX_IMAGE_DIM = 1600;
+  /** Max base64 image payload per attachment (keeps prompt messages under the
+   *  4 MB WS frame cap even with a couple of images attached). */
+  const MAX_IMAGE_PAYLOAD = 3 * 1024 * 1024;
+
+  /**
+   * Read an image attachment, downscaling oversized sources in-browser —
+   * full-res phone photos (12 MP+) inflate the WS payload ~4x as base64 and
+   * cost real tokens at the model. Falls back to the raw file when the
+   * browser can't decode it (createImageBitmap unsupported/unknown codec).
+   */
+  async function prepareImage(
+    file: File
+  ): Promise<{ data: string; mimeType: string } | null> {
+    try {
+      const bitmap = await createImageBitmap(file);
+      try {
+        const scale = Math.min(1, MAX_IMAGE_DIM / Math.max(bitmap.width, bitmap.height));
+        if (scale >= 1) return { data: await fileToBase64(file), mimeType: file.type };
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+        canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return { data: await fileToBase64(file), mimeType: file.type };
+        ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+        // Keep PNG/WebP (alpha channel); anything else re-encodes as JPEG.
+        const mimeType =
+          file.type === 'image/png' || file.type === 'image/webp' ? file.type : 'image/jpeg';
+        const dataUrl = canvas.toDataURL(mimeType, 0.85);
+        return { data: dataUrl.split(',')[1], mimeType };
+      } finally {
+        bitmap.close();
+      }
+    } catch {
+      return { data: await fileToBase64(file), mimeType: file.type };
+    }
+  }
+
   async function handleFileInput(e: Event) {
     const files = (e.target as HTMLInputElement).files;
     if (!files) return;
     for (const file of Array.from(files)) {
       if (file.type.startsWith('image/')) {
-        const data = await fileToBase64(file);
+        const prepared = await prepareImage(file);
+        if (!prepared) continue;
+        if (prepared.data.length > MAX_IMAGE_PAYLOAD) {
+          showChatNotice(`Image too large: ${file.name} (max 3MB encoded)`, 'warning');
+          continue;
+        }
         attachedImages.push({
-          data,
-          mimeType: file.type,
+          data: prepared.data,
+          mimeType: prepared.mimeType,
           name: file.name,
-          src: `data:${file.type};base64,${data}`,
+          src: `data:${prepared.mimeType};base64,${prepared.data}`,
         });
       } else {
         const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
@@ -3190,6 +3346,7 @@
 
   function submitMessage(asFollowUp = false) {
     if (wsState !== 'open' || sessionLoading) return;
+    flushEditorMirror();
     const text = input.trim();
 
     // Slash/bang commands are commands, not conversation text — dispatch
@@ -3331,6 +3488,7 @@
    *  B's socket closes. Comparing epochs (not a single mutable "discarding"
    *  flag) makes each entry's own capture point authoritative. */
   let terminalInputDiscardEpoch = 0;
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity -- non-reactive dispatch table, never rendered
   const pendingTerminalInputs = new Map<
     string,
     (verdict: { consumed: boolean; data?: string }, discard?: boolean) => void
@@ -3782,6 +3940,19 @@
     }
     connect();
     inputEl?.focus();
+    // Prefetch the lazily-loaded sidebar modules once the main thread is
+    // idle — first open is then instant while first paint stays untouched.
+    const idlePrefetch = (fn: () => void) => {
+      if (typeof requestIdleCallback === 'function') {
+        requestIdleCallback(fn, { timeout: 2000 });
+      } else {
+        setTimeout(fn, 1000);
+      }
+    };
+    idlePrefetch(() => {
+      import('$lib/components/panels/right-panel.svelte').catch(() => {});
+      import('$lib/components/projects/projects-sidebar.svelte').catch(() => {});
+    });
     // Web Share Target (static/manifest.webmanifest → share_target, method GET,
     // action "/") lands here as ?share_title=&share_text=&share_url= — fold
     // whatever's present into the composer, then scrub the params so a
@@ -3855,11 +4026,17 @@
     } catch {
       /* localStorage unavailable */
     }
-    // Re-render memoized markdown once a lazily-loaded hljs language
-    // registers — first-render code blocks in that language fall back to
-    // escaped plain text until this fires.
-    _unsubLangReady = onLangRegistered(() => {
-      for (const m of messages) scheduleContentRender(m);
+    // Re-render ONLY messages that could use the newly loaded grammar —
+    // fence-bearing messages tracked during their last render, plus expanded
+    // tool outputs (their highlightCode calls aren't tracked per-message).
+    // The old code re-rendered every loaded message per registration.
+    _unsubLangReady = onLangRegistered((lang) => {
+      for (const m of messages) {
+        const needsLang = _unresolvedLangs.get(m.id)?.has(lang);
+        const needsToolRehighlight = m.role === 'tool' && m.expanded && m.content;
+        if (needsLang || needsToolRehighlight) scheduleContentRender(m);
+      }
+      pruneUnresolvedLangs();
     });
   });
 
@@ -3867,6 +4044,10 @@
     releaseWakeLock();
     if (sendHoldTimer) clearTimeout(sendHoldTimer);
     if (_fileCompleteTimer) clearTimeout(_fileCompleteTimer);
+    if (_editorMirrorTimer) {
+      clearTimeout(_editorMirrorTimer);
+      _editorMirrorTimer = null;
+    }
     disconnect();
     document.removeEventListener('visibilitychange', _onVisibilityChange);
     if (_installPromptHandler)
@@ -5292,7 +5473,7 @@
             </nav>
             <div class="px-5 py-3 border-t border-base-content/8 space-y-1.5">
               <a
-                href="/logout"
+                href={resolve('/logout')}
                 class="w-full flex items-center gap-2 rounded-lg px-2 py-1.5 text-xs text-base-content/45 hover:text-base-content/85 hover:bg-base-content/[0.055] transition-colors"
               >
                 Sign out
@@ -6158,46 +6339,58 @@
 </Dialog.Root>
 
 <!-- ── Fork session dialog ──────────────────────────────────────────────────── -->
-<ForkDialog
-  open={showForkDialog}
-  loading={forkLoading}
-  {forkPoints}
-  {forkAt}
-  onClose={() => (showForkDialog = false)}
-/>
+{#if showForkDialog}
+  {#await import('$lib/components/dialogs/fork-dialog.svelte') then { default: ForkDialog }}
+    <ForkDialog
+      open={showForkDialog}
+      loading={forkLoading}
+      {forkPoints}
+      {forkAt}
+      onClose={() => (showForkDialog = false)}
+    />
+  {/await}
+{/if}
 
 <!-- ── Session tree modal ──────────────────────────────────────────────────── -->
-<SessionTreeModal
-  open={showTreeModal}
-  loading={treeLoading}
-  {treeData}
-  onClose={() => (showTreeModal = false)}
-/>
+{#if showTreeModal}
+  {#await import('$lib/components/dialogs/session-tree-modal.svelte') then { default: SessionTreeModal }}
+    <SessionTreeModal
+      open={showTreeModal}
+      loading={treeLoading}
+      {treeData}
+      onClose={() => (showTreeModal = false)}
+    />
+  {/await}
+{/if}
 
-<FileViewerModal
-  open={fileViewerOpen}
-  path={fileViewerPath}
-  line={fileViewerLine}
-  content={fileViewerContent}
-  loading={fileViewerLoading}
-  error={fileViewerError}
-  saving={fileSaving}
-  onclose={() => {
-    fileViewerOpen = false;
-  }}
-  onsave={handleFileSave}
-  oninsert={() => {
-    const ref = fileViewerPath.includes('/')
-      ? (fileViewerPath.split('/').pop() ?? fileViewerPath)
-      : fileViewerPath;
-    input = input + `@${ref} `;
-    fileViewerOpen = false;
-    tick().then(() => {
-      autoResizeTextarea();
-      inputEl?.focus();
-    });
-  }}
-/>
+{#if fileViewerOpen}
+  {#await import('$lib/components/file-viewer-modal.svelte') then { default: FileViewerModal }}
+    <FileViewerModal
+      open={fileViewerOpen}
+      path={fileViewerPath}
+      line={fileViewerLine}
+      content={fileViewerContent}
+      loading={fileViewerLoading}
+      error={fileViewerError}
+      saving={fileSaving}
+      onclose={() => {
+        fileViewerOpen = false;
+      }}
+      onsave={handleFileSave}
+      oninsert={() => {
+        const ref = fileViewerPath.includes('/')
+          ? (fileViewerPath.split('/').pop() ?? fileViewerPath)
+          : fileViewerPath;
+        input = input + `@${ref} `;
+        fileViewerOpen = false;
+        tick().then(() => {
+          autoResizeTextarea();
+          inputEl?.focus();
+        });
+      }}
+    />
+  {/await}
+{/if}
 
 <!-- ── Confirmation dialog (replaces window.confirm for delete/update/restart) ── -->
 <ConfirmDialog {pendingConfirm} onClose={() => (pendingConfirm = null)} />

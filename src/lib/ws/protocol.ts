@@ -245,6 +245,11 @@ export interface ConnectedMessage {
  *   { type: "session_loaded",          sessionId, isStreaming, thinkingLevel, model, availableModels, messages, contextUsage }
  *   { type: "sessions_list",           sessions: SessionSummary[] }
  *   { type: "all_sessions_list",       sessions: SessionSummary[] }
+ *   { type: "session_updated",         session: SessionSummary }
+ *     — coalesced live delta for ONE pooled session (message_end etc.).
+ *       Keeps the sidebar fresh during turns without re-broadcasting the full
+ *       list per message; full all_sessions_list still fires on connect,
+ *       switch, and structural changes (rename/remove/release).
  *   { type: "projects_list",           projects: ProjectInfo[] }
  *   { type: "dir_completions",         prefix: string; entries: string[] }
  *   { type: "file_completions",        query: string; entries: string[] }
@@ -367,6 +372,7 @@ export type ServerCustomEvent =
     }
   | { type: 'sessions_list'; sessions: SessionSummary[] }
   | { type: 'all_sessions_list'; sessions: SessionSummary[] }
+  | { type: 'session_updated'; session: SessionSummary }
   | { type: 'projects_list'; projects: ProjectInfo[] }
   | { type: 'dir_completions'; prefix: string; entries: string[] }
   | { type: 'file_completions'; query: string; entries: string[] }
