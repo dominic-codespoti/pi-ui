@@ -89,9 +89,17 @@ function ensureLang(lang: string): void {
   _lazyLoaders.set(lang, prom);
 }
 
-/** Escape HTML special characters for safe insertion into attribute values. */
+/** Escape HTML special characters for safe insertion into attribute values
+ *  AND element text. `<`/`>` must be escaped too — escAttr output is
+ *  interpolated into element context (e.g. the code-block language label),
+ *  where unescaped `<`/`>` would break out of the element (XSS). */
 function escAttr(s: string) {
-  return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/'/g, '&#39;');
 }
 
 /** Escape HTML special characters for safe insertion into element text. */

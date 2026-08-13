@@ -79,6 +79,10 @@ Options:
                              (or set PI_PASSWORD env var)
   -P, --port <port>          Port to listen on  (default: 3000)
                              (or set PORT env var)
+      --host <addr>          Address to bind  (default: 127.0.0.1)
+                             Set to 0.0.0.0 ONLY for deliberate remote
+                             access behind TLS — see Remote access below.
+                             (or set HOST env var)
       --cwd <dir>            Working directory for the pi session
                              (defaults to current working directory)
   -o, --open                 Open http://localhost:<port> in the browser
@@ -116,11 +120,13 @@ pi-ui update
 
 ## Environment variables
 
-| Variable      | Description                                | Default          |
-|---------------|--------------------------------------------|------------------|
-| `PI_PASSWORD` | Password for the web UI (required)         | —                |
-| `PORT`        | Port to listen on                          | `3000`           |
-| `PI_CWD`      | Working directory for the pi session       | `process.cwd()`  |
+| Variable           | Description                                             | Default           |
+|--------------------|---------------------------------------------------------|-------------------|
+| `PI_PASSWORD`      | Password for the web UI (required)                      | —                 |
+| `PORT`             | Port to listen on                                       | `3000`            |
+| `HOST`             | Address to bind (see Remote access)                     | `127.0.0.1`       |
+| `PI_CWD`           | Working directory for the pi session                    | `process.cwd()`   |
+| `PI_UI_JWT_SECRET` | Shared session signing secret (≥32 chars); only needed for multi-process runs; default is random per process (server restart signs everyone out) | random per process |
 
 CLI flags take precedence over environment variables when both are set.
 
@@ -168,13 +174,17 @@ sudo systemctl start pi-ui
 
 ## Remote access
 
-Do not expose the raw `pi-ui` port directly to the public internet. If you need
-remote access, put it behind a private tunnel and keep `PI_PASSWORD` strong and
-unique.
+pi-ui binds to `127.0.0.1` by default and serves plain HTTP — it is safe only
+for same-machine use. Do not expose the raw `pi-ui` port directly to the
+internet or LAN: there is no TLS, so on-path attackers could read the password
+and session traffic. If you need remote access, keep the default localhost
+binding and put it behind a private tunnel (recommended), or bind explicitly
+with `--host 0.0.0.0` only when a TLS-terminating reverse proxy sits in front.
 
 ### Cloudflare Tunnel example
 
-Start `pi-ui` locally on the Pi:
+Start `pi-ui` locally on the Pi (default localhost binding is fine — the
+tunnel connects to it):
 
 ```bash
 PI_PASSWORD='use-a-long-random-password' pi-ui --port 3000
@@ -214,6 +224,11 @@ bun run dev
 
 # Full local dev: Vite HMR plus Bun WebSocket server
 PI_PASSWORD=dev bun run dev:full
+
+# Standalone WS server (5174) + Vite (5173) run as separate commands — both
+# must share a JWT secret so login (Vite) and /ws auth (WS server) agree:
+#   PI_UI_JWT_SECRET=dev-ws-only-secret bun run dev
+#   bun run dev:ws
 
 # Build production assets
 bun run build

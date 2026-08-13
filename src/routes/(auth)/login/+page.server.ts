@@ -14,6 +14,14 @@ function isBehindProxy(request: Request): boolean {
   );
 }
 
+/** Only allow same-origin path redirects — blocks open redirects via the
+ *  `redirect` query param (e.g. `?redirect=https://evil.com` or
+ *  `//evil.com`, the protocol-relative form). */
+function safeRedirectTo(url: URL): string {
+  const target = url.searchParams.get('redirect') || '/';
+  return target.startsWith('/') && !target.startsWith('//') ? target : '/';
+}
+
 /** Cookie options shared by auth session writes. */
 function cookieOpts(request: Request): { path: string; httpOnly: boolean; sameSite: 'strict'; secure: boolean; maxAge: number } {
   return {
@@ -29,7 +37,7 @@ function cookieOpts(request: Request): { path: string; httpOnly: boolean; sameSi
 
 export const load: PageServerLoad = async ({ cookies, url }) => {
   const token = cookies.get(COOKIE_NAME);
-  const redirectTo = url.searchParams.get('redirect') || '/';
+  const redirectTo = safeRedirectTo(url);
   // Only redirect to / if the token is actually valid — avoids infinite redirect
   // loops when a stale/expired cookie exists but hooks rejects it.
   if (token && (await verifySessionToken(token))) {
@@ -89,7 +97,6 @@ export const actions: Actions = {
     const token = await createSessionToken();
     cookies.set(COOKIE_NAME, token, cookieOpts(request));
 
-    const redirectTo = url.searchParams.get('redirect') || '/';
-    redirect(302, redirectTo);
+    redirect(302, safeRedirectTo(url));
   },
 };

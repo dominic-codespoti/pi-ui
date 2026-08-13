@@ -4,6 +4,9 @@ import {
   verifyPassword,
   createSessionToken,
   verifySessionToken,
+  revokeToken,
+  isJtiRevoked,
+  getJwtSecret,
   getTokenFromCookies,
   isValidSessionCookie,
   COOKIE_NAME,
@@ -44,13 +47,6 @@ async function makeJWT(
   const k = await crypto.subtle.importKey('raw', toBuf(rawHmacKey), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
   const sig = b64url(await crypto.subtle.sign('HMAC', k, toBuf(signingInput)));
   return `${header}.${payloadB64}.${sig}`;
-}
-
-/** Replicate the deriveSecret() logic so tests can create tokens with custom payloads. */
-async function deriveTestSecret(password: string): Promise<Uint8Array> {
-  const enc = new TextEncoder();
-  const key = await crypto.subtle.importKey('raw', enc.encode(password), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-  return new Uint8Array(await crypto.subtle.sign('HMAC', key, enc.encode('pi-ui-session-v1')));
 }
 
 // ── initPassword / verifyPassword ────────────────────────────────────────────
@@ -103,9 +99,7 @@ describe('createSessionToken / verifySessionToken', () => {
   });
 
   it('rejects an expired token', async () => {
-    const secret = await deriveTestSecret(
-      process.env.PI_PASSWORD ?? 'dev-secret-replace-me-set-PI_PASSWORD',
-    );
+    const secret = await getJwtSecret();
     const expiredToken = await makeJWT(
       {
         pi: 1,
@@ -116,6 +110,58 @@ describe('createSessionToken / verifySessionToken', () => {
       secret,
     );
     expect(await verifySessionToken(expiredToken)).toBe(false);
+  });
+});
+
+describe('revokeToken / isJtiRevoked', () => {
+  it('revokes a JTI immediately', () => {
+    const jti = crypto.randomUUID();
+    expect(isJtiRevoked(jti)).toBe(false);
+    revokeToken(jti);
+    expect(isJtiRevoked(jti)).toBe(true);
+  });
+
+  it('verifySessionToken rejects a revoked token', async () => {
+    const token = await createSessionToken();
+    expect(await verifySessionToken(token)).toBe(true);
+    const payloadB64 = token.split('.')[1];
+    const payload = JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(payloadB64.replace(/-/g, '+').replace(/_/g, '/')), (c) => c.charCodeAt(0))));
+    revokeToken(payload.jti as string, payload.exp as number);
+    expect(await verifySessionToken(token)).toBe(false);
+    expect(isJtiRevoked(payload.jti as string)).toBe(true);
+  });
+
+  it('prunes expired revocation entries', () => {
+    const jti = crypto.randomUUID();
+    revokeToken(jti, Math.floor(Date.now() / 1000) - 1);
+    expect(isJtiRevoked(jti)).toBe(false);
+  });
+});
+
+describe('JWT secret', () => {
+  it('is random per process (not derivable from the password)', async () => {
+    const secret = await getJwtSecret();
+    expect(secret.length).toBe(32);
+    // The old scheme derived the key deterministically from the password via
+    // HMAC-SHA256(password, 'pi-ui-session-v1') — that must no longer verify.
+    const enc = new TextEncoder();
+    const key = await crypto.subtle.importKey('raw', enc.encode('hunter2'), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+    const oldDerivation = new Uint8Array(await crypto.subtle.sign('HMAC', key, enc.encode('pi-ui-session-v1')));
+    expect(secret).not.toEqual(oldDerivation);
+  });
+
+  it('honors PI_UI_JWT_SECRET for multi-process deployments', async () => {
+    delete (globalThis as Record<string, unknown>).__piJwtSecret;
+    const saved = process.env.PI_UI_JWT_SECRET;
+    try {
+      process.env.PI_UI_JWT_SECRET = 'a'.repeat(32) + 'multi-process-shared-secret';
+      const secret = await getJwtSecret();
+      expect(new TextDecoder().decode(secret)).toBe(process.env.PI_UI_JWT_SECRET);
+    } finally {
+      delete (globalThis as Record<string, unknown>).__piJwtSecret;
+      if (saved === undefined) delete process.env.PI_UI_JWT_SECRET;
+      else process.env.PI_UI_JWT_SECRET = saved;
+    }
   });
 });
 

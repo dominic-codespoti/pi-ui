@@ -13,6 +13,7 @@
  * Build first: bun run build
  */
 
+import type { Server } from 'bun';
 import type * as PiSDKNS from '@earendil-works/pi-coding-agent';
 import type {
   AgentSession,
@@ -32,6 +33,8 @@ import {
   initPassword,
   isValidSessionCookie,
   extractTokenExp,
+  extractJti,
+  isJtiRevoked,
   getTokenFromCookies,
 } from './src/lib/auth/password.ts';
 import {
@@ -3035,59 +3038,133 @@ async function setActiveSession(
 
 const PORT = parseInt(Bun.env.PORT ?? '3000');
 
+/** Bind address — localhost by default; set HOST=0.0.0.0 (or a LAN IP) only
+ *  when remote access is intended. Remote exposure without TLS lets on-path
+ *  attackers read the password and session cookie in plaintext. */
+const HOSTNAME = Bun.env.HOST ?? '127.0.0.1';
+
+/** Match svelte-adapter-bun's BODY_SIZE_LIMIT — bounds per-request memory on
+ *  unauthenticated endpoints (e.g. /login form parsing) against the 128 MB
+ *  Bun default. */
+const MAX_REQUEST_BODY_BYTES = 512 * 1024;
+
 /** Bun pub/sub topic shared by all connected WebSocket clients. */
 const WS_TOPIC = 'pi';
+
+/**
+ * Browser hardening headers for every HTTP response. No CSP existed before;
+ * its absence turned the markdown XSS into a full RCE chain. The app is
+ * self-contained (assets from same origin; images may be remote https/http
+ * or data: URIs for pasted pictures; the microphone is used for STT).
+ */
+const SECURITY_HEADERS: Record<string, string> = {
+  'Content-Security-Policy':
+    "default-src 'self'; " +
+    "script-src 'self'; " +
+    "style-src 'self' 'unsafe-inline'; " +
+    "img-src 'self' data: blob: http: https:; " +
+    "connect-src 'self' ws: wss:; " +
+    "font-src 'self' data:; " +
+    "object-src 'none'; " +
+    "frame-ancestors 'none'; " +
+    "base-uri 'self'; " +
+    "form-action 'self'",
+  'X-Frame-Options': 'DENY',
+  // NOT 'no-referrer': Chromium suppresses the Origin header to `null` on
+  // form navigations under that policy, which breaks the login action's
+  // origin check. 'strict-origin-when-cross-origin' keeps full URLs
+  // same-origin and sends only the origin cross-origin — same privacy win.
+  'Referrer-Policy': 'strict-origin-when-cross-origin',
+  'Permissions-Policy': 'camera=(), geolocation=(), payment=()',
+};
+
+/** Build the hardening headers; HSTS only when the request is TLS-terminated
+ *  (browsers ignore it over plain HTTP, so the header cannot break HTTP
+ *  access while still applying to HTTPS deployments). */
+function securityHeaders(isTls: boolean): Headers {
+  const headers = new Headers(SECURITY_HEADERS);
+  if (isTls) headers.set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  return headers;
+}
 
 /** Per-connection WebSocket data. */
 interface WSData {
   connectedAt: number;
   /** JWT expiry (seconds since epoch) — checked periodically to close expired sockets. */
   tokenExp: number;
+  /** JTI of the session token — checked periodically and per message so a
+   *  revoked (logged-out) token cannot keep driving an established socket. */
+  jti?: string;
   /** Periodic expiry-check interval (60s), cleared on close. */
   _expTimer?: Timer;
   /** True once the close handler ran — guards the async open() against installing timers on a dead socket. */
   closed?: boolean;
 }
 
-let server: ReturnType<typeof Bun.serve>;
+let server: Server<WSData>;
 try {
   server = Bun.serve<WSData>({
     port: PORT,
+    hostname: HOSTNAME,
+    maxRequestBodySize: MAX_REQUEST_BODY_BYTES,
 
     async fetch(req, server) {
       const url = new URL(req.url);
+      const isTls =
+        url.protocol === 'https:' || req.headers.get('x-forwarded-proto') === 'https';
 
       if (url.pathname === '/ws') {
         const cookieHeader = req.headers.get('cookie') ?? '';
         if (!(await isValidSessionCookie(cookieHeader))) {
-          return new Response('Unauthorized', { status: 401 });
+          return new Response('Unauthorized', { status: 401, headers: securityHeaders(isTls) });
         }
         // Origin validation — prevent cross-origin WebSocket hijacking.
+        // SameSite=strict ignores ports, so even localhost origins must match
+        // the Host header's port: a page served from another localhost port
+        // would otherwise hijack the authenticated socket (CSWSH).
         const origin = req.headers.get('origin');
         if (origin) {
           try {
             const originUrl = new URL(origin);
-            if (!['localhost', '127.0.0.1', '::1'].includes(originUrl.hostname)) {
-              const host = req.headers.get('host');
-              if (host && originUrl.host !== host) {
-                return new Response('Origin mismatch', { status: 403 });
+            const host = req.headers.get('host');
+            if (host) {
+              const hostPort = new URL(`${originUrl.protocol}//${host}`).port;
+              if (originUrl.port !== hostPort) {
+                return new Response('Origin mismatch', { status: 403, headers: securityHeaders(isTls) });
+              }
+              if (
+                !['localhost', '127.0.0.1', '::1'].includes(originUrl.hostname) &&
+                originUrl.host !== host
+              ) {
+                return new Response('Origin mismatch', { status: 403, headers: securityHeaders(isTls) });
               }
             }
           } catch {
-            return new Response('Invalid origin', { status: 400 });
+            return new Response('Invalid origin', { status: 400, headers: securityHeaders(isTls) });
           }
         }
-        // Extract token expiry for periodic revalidation.
+        // Extract token identity for periodic revalidation (expiry + revocation).
         const token = getTokenFromCookies(cookieHeader) ?? '';
         const tokenExp = extractTokenExp(token) ?? Infinity;
-        const ok = server.upgrade(req, { data: { connectedAt: Date.now(), tokenExp } });
+        const jti = await extractJti(token);
+        const ok = server.upgrade(req, { data: { connectedAt: Date.now(), tokenExp, jti } });
         if (ok) return undefined as unknown as Response;
-        return new Response('WebSocket upgrade failed', { status: 400 });
+        return new Response('WebSocket upgrade failed', { status: 400, headers: securityHeaders(isTls) });
       }
 
-      return DEV_WS_ONLY
+      const res = DEV_WS_ONLY
         ? new Response('Use Vite dev server for HTTP in dev mode', { status: 404 })
-        : (await getSvelteHandler())(req, server);
+        : ((await (await getSvelteHandler())(req, server)) as Response);
+      // Merge hardening headers into the SvelteKit response. `new Headers(res.headers)`
+      // copies the full list including Set-Cookie (the iterator may omit it).
+      const headers = new Headers(res.headers);
+      for (const [name, value] of Object.entries(SECURITY_HEADERS)) {
+        if (!headers.has(name)) headers.set(name, value);
+      }
+      if (isTls && !headers.has('Strict-Transport-Security')) {
+        headers.set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+      }
+      return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
     },
 
     websocket: {
@@ -3190,10 +3267,10 @@ try {
             broadcastSessionRuntime(sid, entry);
           }
 
-          // Periodic token expiry check (every 60s) — closes expired sockets
-          // even when the client is idle.
+          // Periodic token check (every 60s) — closes expired or revoked
+          // sockets even when the client is idle.
           ws.data._expTimer = setInterval(() => {
-            if (Date.now() / 1000 > ws.data.tokenExp) {
+            if ((ws.data.jti && isJtiRevoked(ws.data.jti)) || Date.now() / 1000 > ws.data.tokenExp) {
               clearInterval(ws.data._expTimer!);
               try {
                 ws.close(4001, 'Session expired');
@@ -3213,10 +3290,10 @@ try {
       },
 
       async message(ws, raw) {
-        // Periodic auth revalidation — close expired sockets so revoked/logged-out
-        // sessions cannot continue using an established WebSocket.
+        // Per-message auth revalidation — close sockets whose token expired or
+        // was revoked (logged out) so they cannot continue using the socket.
         const wsData = ws.data as WSData;
-        if (wsData.tokenExp && Date.now() / 1000 > wsData.tokenExp) {
+        if ((wsData.jti && isJtiRevoked(wsData.jti)) || (wsData.tokenExp && Date.now() / 1000 > wsData.tokenExp)) {
           try {
             ws.close(4001, 'Session expired');
           } catch {

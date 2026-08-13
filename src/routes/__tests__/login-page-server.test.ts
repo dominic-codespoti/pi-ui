@@ -187,6 +187,23 @@ describe('login actions', () => {
     }
   });
 
+  it('blocks external redirect targets (open redirect)', async () => {
+    vi.mocked(verifyPassword).mockResolvedValue(true);
+    vi.mocked(createSessionToken).mockResolvedValue('t');
+    const actions = await getActions();
+    for (const bad of ['https://evil.com', '//evil.com', 'http://evil.com/', 'https://evil.com/steal']) {
+      const ctx = mockRequest({ password: 'correct', origin: 'http://localhost', host: 'localhost', redirect: bad });
+      try {
+        await actions(ctx);
+        expect.unreachable('should have redirected');
+      } catch (err) {
+        const e = err as { status: number; location: string };
+        expect(e.status).toBe(302);
+        expect(e.location).toBe('/');
+      }
+    }
+  });
+
   it('blocks when rate limit exceeded', async () => {
     vi.mocked(checkRateLimit).mockReturnValue({ blocked: true, remaining: 0, retryAfterSecs: 300 });
     const actions = await getActions();

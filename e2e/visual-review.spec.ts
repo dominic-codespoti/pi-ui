@@ -27,10 +27,13 @@ function sendInit(ws: WsHandle) {
   ws.send(JSON.stringify({ type: 'all_sessions_list', sessions: [] }));
 }
 
-/** Generate a valid session JWT by importing the server's auth code. */
+/** Generate a valid session JWT by importing the server's auth code.
+ *  Must run with the same PI_UI_JWT_SECRET as the e2e server (see
+ *  playwright.config.ts) — the secret is random per process by default,
+ *  so a subprocess-generated token would be rejected by the server. */
 function generateSessionToken(): string {
   const token = execSync(
-    'PI_PASSWORD=test-password bun -e "import { createSessionToken } from \'./src/lib/auth/password.ts\'; console.log(await createSessionToken())"',
+    'PI_PASSWORD=test-password PI_UI_JWT_SECRET=test-e2e-jwt-secret-0123456789abcdef bun -e "import { createSessionToken } from \'./src/lib/auth/password.ts\'; console.log(await createSessionToken())"',
     { cwd: process.cwd(), encoding: 'utf-8', timeout: 10_000 },
   ).trim();
   return token;

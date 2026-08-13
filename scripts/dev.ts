@@ -18,6 +18,17 @@
 const env: Record<string, string> = {
   ...process.env as Record<string, string>,
   PI_PASSWORD: (process.env.PI_PASSWORD ?? 'dev'),
+  // Login runs in the Vite process and /ws auth in the WS process — both must
+  // verify the same session tokens, so share one random JWT secret between
+  // them. Random per run: dev tokens cannot be forged from the known 'dev'
+  // password and die on restart.
+  PI_UI_JWT_SECRET:
+    process.env.PI_UI_JWT_SECRET ??
+    Array.from(crypto.getRandomValues(new Uint8Array(32)))
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join(''),
+  // Localhost only — dev servers must not be reachable from the LAN.
+  HOST: process.env.HOST ?? '127.0.0.1',
 };
 
 // WS-only server — handles /ws, rejects all other HTTP (Vite serves those).

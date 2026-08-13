@@ -9,6 +9,7 @@
  * Options:
  *   -p, --password <password>  Password to protect the UI (or set PI_PASSWORD env var)
  *   -P, --port <port>          Port to listen on (default: 3000, or PORT env var)
+ *       --host <addr>          Address to bind (default: 127.0.0.1, or HOST env var)
  *       --cwd <dir>            Working directory for the pi session (default: cwd)
  *   -o, --open                 Open the browser after startup
  *   -h, --help                 Show this help message
@@ -124,6 +125,7 @@ const { values, positionals } = parseArgs({
   options: {
     password: { type: 'string',  short: 'p' },
     port:     { type: 'string',  short: 'P' },
+    host:     { type: 'string' },
     cwd:      { type: 'string' },
     open:     { type: 'boolean', short: 'o', default: false },
     daemon:   { type: 'boolean', short: 'd', default: false },
@@ -158,6 +160,11 @@ Options:
                              (or set PI_PASSWORD env var)
   -P, --port <port>          Port to listen on (default: 3000)
                              (or set PORT env var)
+      --host <addr>          Address to bind (default: 127.0.0.1).
+                             Set to 0.0.0.0 ONLY for deliberate remote
+                             access behind TLS; direct exposure lets
+                             on-path attackers read the password.
+                             (or set HOST env var)
       --cwd <dir>            Working directory for the pi session
                              (defaults to current directory)
   -o, --open                 Open http://localhost:<port> in the browser
@@ -224,6 +231,8 @@ if (!password) {
 process.env.PI_PASSWORD = password;
 
 if (values.port) process.env.PORT = values.port;
+
+if (values.host) process.env.HOST = values.host;
 
 if (values.cwd) process.env.PI_CWD = resolve(values.cwd);
 

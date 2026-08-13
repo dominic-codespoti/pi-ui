@@ -24,7 +24,11 @@ export default defineConfig({
   ],
   webServer: [
     {
-      command: 'bun run build && PI_PASSWORD=test-password PORT=3000 bun run start',
+      // PI_UI_JWT_SECRET is shared with e2e/visual-review.spec.ts, which
+      // generates a session token in a separate process (the default random
+      // per-process secret would reject it).
+      command:
+        'bun run build && PI_PASSWORD=test-password PI_UI_JWT_SECRET=test-e2e-jwt-secret-0123456789abcdef PORT=3000 bun run start',
       url: 'http://127.0.0.1:3000',
       reuseExistingServer: !process.env.CI,
       timeout: 120_000,

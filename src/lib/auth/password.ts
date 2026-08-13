@@ -3,18 +3,29 @@ export const COOKIE_NAME = 'pi-session';
 const g = globalThis as Record<string, unknown>;
 
 // ── JWT secret ────────────────────────────────────────────────────────────────
-// Derived deterministically from the password so every process in a given
-// run can verify the same session tokens.
+// Random per process by default so session tokens cannot outlive a server
+// restart (restart = global sign-out) and so knowing the login password can
+// never be used to forge tokens offline. Multi-process deployments (e.g. the
+// dev:full split of login on Vite and /ws on the standalone server) share a
+// secret by setting PI_UI_JWT_SECRET (≥32 chars) in both processes' env.
 
-/** Derive a 256-bit JWT signing key from the password. */
+/** Resolve the 256-bit JWT signing key for this process. */
 async function deriveSecret(): Promise<Uint8Array> {
   if (g.__piJwtSecret) return g.__piJwtSecret as Uint8Array;
-  const password = process.env.PI_PASSWORD ?? 'dev-secret-replace-me-set-PI_PASSWORD';
-  const enc = new TextEncoder();
-  const key = await crypto.subtle.importKey('raw', enc.encode(password), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-  const sig = await crypto.subtle.sign('HMAC', key, enc.encode('pi-ui-session-v1'));
-  g.__piJwtSecret = new Uint8Array(sig);
-  return g.__piJwtSecret as Uint8Array;
+  const envSecret = process.env.PI_UI_JWT_SECRET;
+  let secret: Uint8Array;
+  if (envSecret && envSecret.length >= 32) {
+    secret = new TextEncoder().encode(envSecret);
+  } else {
+    secret = crypto.getRandomValues(new Uint8Array(32));
+  }
+  g.__piJwtSecret = secret;
+  return secret;
+}
+
+/** Test/observability accessor for the current process JWT secret. */
+export async function getJwtSecret(): Promise<Uint8Array> {
+  return deriveSecret();
 }
 
 // ── Token revocation ──────────────────────────────────────────────────────────
@@ -29,6 +40,19 @@ function revokedMap(): Map<string, number> {
  *  pruned once their expiry passes, so logout churn cannot grow unbounded. */
 export function revokeToken(jti: string, exp?: number): void {
   revokedMap().set(jti, exp ?? Math.floor(Date.now() / 1000) + TOKEN_EXPIRY_S);
+}
+
+/** True when the JTI is currently revoked. Prunes expired entries. Used for
+ *  cheap per-message revalidation on established WebSocket connections. */
+export function isJtiRevoked(jti: string): boolean {
+  const revoked = revokedMap();
+  const revokeExp = revoked.get(jti);
+  if (revokeExp === undefined) return false;
+  if (Date.now() / 1000 > revokeExp) {
+    revoked.delete(jti);
+    return false;
+  }
+  return true;
 }
 
 // ── Password hashing ────────────────────────────────────────────────────────
@@ -149,14 +173,7 @@ export async function verifySessionToken(token: string): Promise<boolean> {
     if (payload.exp && Date.now() / 1000 > payload.exp) return false;
 
     // Check revocation — prune expired entries while we're here.
-    if (payload.jti) {
-      const revoked = revokedMap();
-      const revokeExp = revoked.get(payload.jti);
-      if (revokeExp !== undefined) {
-        if (Date.now() / 1000 > revokeExp) revoked.delete(payload.jti);
-        else return false;
-      }
-    }
+    if (payload.jti && isJtiRevoked(payload.jti)) return false;
 
     return true;
   } catch {

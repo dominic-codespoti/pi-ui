@@ -32,6 +32,27 @@ describe('renderMarkdown', () => {
     expect(result).toContain('code-block');
   });
 
+  it('escapes HTML in the fence language label (XSS breakout)', () => {
+    // The fence info string is interpolated into element context — a crafted
+    // label must never produce a raw <svg/onload> element (the legitimate
+    // copy-button icon in the header does contain a benign <svg>, so match
+    // the payload specifically).
+    const md = '```</span><svg/onload=alert(1)>\ncode\n```';
+    const result = renderMarkdown(md);
+    // Pre-fix output contained the raw breakout `</span><svg/onload=...>`;
+    // escaped output contains neither of those raw sequences.
+    expect(result).not.toContain('</span><svg');
+    expect(result).toContain('&lt;/span&gt;');
+    expect(result).toContain('&lt;svg/onload');
+  });
+
+  it('escapes quotes in the fence language label', () => {
+    const md = '```x" onmouseover="alert(1)\ncode\n```';
+    const result = renderMarkdown(md);
+    expect(result).not.toContain('onmouseover');
+    expect(result).toContain('&quot;');
+  });
+
   it('renders inline code', () => {
     const result = renderMarkdown('use `code` here');
     expect(result).toContain('<code>');
