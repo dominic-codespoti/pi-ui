@@ -145,6 +145,15 @@ import { existsSync, realpathSync } from 'node:fs';
  *  loaded on demand. Keeps the WS payload small and the client render fast. */
 const MAX_INITIAL_MESSAGES = 100;
 
+/**
+ * Per-prefix file_complete cache — the composer re-sends the same query while
+ * typing/backspacing; a depth-3 walk per keystroke is wasted I/O on large
+ * repos. 5 s TTL bounds staleness; the map is capped and evicts oldest-first.
+ */
+const FILE_COMPLETE_TTL_MS = 5_000;
+const FILE_COMPLETE_CACHE_MAX = 50;
+const fileCompleteCache = new Map<string, { at: number; entries: string[] }>();
+
 /** Truncate messages for initial payload — keeps the WS + client render fast.
  *  Oversized text/thinking blocks are additionally size-capped for transfer. */
 function initialMessages(
@@ -2157,7 +2166,15 @@ function sessionsRoot(): string {
 
 const sessionCatalog = new SessionCatalog(sessionsRoot);
 
-sessionCatalog.onChange(() => scheduleSessionListRefresh());
+sessionCatalog.onChange(() => {
+  // Pooled-session upserts (message_end per message in a turn) are broadcast
+  // as coalesced session_updated deltas by the runtime subscription — a full
+  // merged-list rescan + serialize per message is the O(sessions) churn this
+  // avoids. Structural changes (rename/remove/release) still need the full
+  // list pushed to every client.
+  if (sessionCatalog.lastPatch === 'upsert') return;
+  scheduleSessionListRefresh();
+});
 
 // Merged project list: persisted registry + live session counts (see
 // project-catalog.ts). Mutations flow through projectCatalog.apply(); the
@@ -2444,6 +2461,9 @@ function registerSession(sid: string, sess: AgentSession, cwdV: string, bindExt:
       // stale entry's state for a live session (or a removed one).
       if (sessionPool.get(sid) !== entry) return;
       broadcastSessionRuntime(sid, entry);
+      // Live summary delta — keeps the sidebar's counts/name/firstMessage
+      // fresh without re-serializing the full session list per message.
+      broadcast({ type: 'session_updated', session: serializeSession(poolSummary(sess, entry)), ...stampOwner(sid) });
     }, 300);
   });
 
@@ -2592,6 +2612,10 @@ function broadcastSessionLoaded(sess: AgentSession): void {
   });
 }
 let _sessionListRefreshTimer: Timer | null = null;
+/** Last serialized all_sessions_list payload — identical re-broadcasts are
+ *  skipped (mutations that don't change the merged output, e.g. no-op renames
+ *  or touch-only patches, would otherwise re-push the whole list). */
+let _lastSessionListJson: string | null = null;
 
 /**
  * Refresh sidebar data after the active session is visible.
@@ -2610,7 +2634,14 @@ async function refreshSessionLists(): Promise<void> {
   if (connectedClients === 0) return;
   try {
     const all = await sessionCatalog.list();
-    broadcast({ type: 'all_sessions_list', sessions: all.map(serializeSession) });
+    const payload: ServerMessage = {
+      type: 'all_sessions_list',
+      sessions: all.map(serializeSession),
+    };
+    const json = JSON.stringify(payload);
+    if (json === _lastSessionListJson) return;
+    _lastSessionListJson = json;
+    server.publish(WS_TOPIC, json);
   } catch (err) {
     log.error('[pifrontier] refreshSessionLists: failed to broadcast session list:', err);
   }
@@ -3498,6 +3529,18 @@ try {
                   (msg as { type: 'file_complete'; query: string }).query ?? ''
                 ).toLowerCase();
                 const root = activeSession().sessionManager.getCwd() || cwd;
+                // Per-prefix cache — the client re-sends the same query while
+                // typing/backspacing, and a depth-3 walk per keystroke is
+                // wasted I/O on large repos. 5 s TTL keeps results fresh enough
+                // for completion; the cache is bounded and evicts oldest-first.
+                const cacheKey = `${root}\u0000${query}`;
+                const cachedHit = fileCompleteCache.get(cacheKey);
+                if (cachedHit && Date.now() - cachedHit.at < FILE_COMPLETE_TTL_MS) {
+                  ws.send(
+                    JSON.stringify({ type: 'file_completions', query, entries: cachedHit.entries })
+                  );
+                  break;
+                }
                 const entries: string[] = [];
                 const queue: Array<{ dir: string; depth: number }> = [{ dir: root, depth: 0 }];
 
@@ -3524,6 +3567,19 @@ try {
                   }
                 }
 
+                // Store (bounded, oldest-evicted) so retypes hit the cache.
+                fileCompleteCache.set(cacheKey, { at: Date.now(), entries });
+                if (fileCompleteCache.size > FILE_COMPLETE_CACHE_MAX) {
+                  let oldestKey: string | null = null;
+                  let oldestAt = Infinity;
+                  for (const [k, v] of fileCompleteCache) {
+                    if (v.at < oldestAt) {
+                      oldestAt = v.at;
+                      oldestKey = k;
+                    }
+                  }
+                  if (oldestKey) fileCompleteCache.delete(oldestKey);
+                }
                 ws.send(JSON.stringify({ type: 'file_completions', query, entries }));
               } catch (err) {
                 log.error('[pifrontier] file_complete error:', err);

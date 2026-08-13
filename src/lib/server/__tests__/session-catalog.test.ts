@@ -112,6 +112,17 @@ describe('session-catalog', () => {
     expect(infos[0].messageCount).toBe(3);
   });
 
+  it('exposes the most recent patch kind (upsert vs structural)', async () => {
+    const cat = newCatalog();
+    expect(cat.lastPatch).toBeNull();
+    cat.apply({ kind: 'upsert', session: makeInfo({ id: 'mem-1' }) });
+    expect(cat.lastPatch).toBe('upsert');
+    cat.apply({ kind: 'rename', path: '/x.jsonl', name: 'new' });
+    expect(cat.lastPatch).toBe('rename');
+    cat.apply({ kind: 'release', id: 'mem-1' });
+    expect(cat.lastPatch).toBe('release');
+  });
+
   it('release hands back to disk truth, re-parsing changed files', async () => {
     const path = writeSession('a.jsonl', {
       id: 's1',

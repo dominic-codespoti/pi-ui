@@ -39,11 +39,21 @@ export class SessionCatalog {
   /** Promise-cached disk scan; dropped only on structural changes. */
   private scanPromise: Promise<SessionFileInfo[]> | null = null;
   private readonly listeners = new Set<() => void>();
+  /** Kind of the most recent patch — lets consumers distinguish live upserts
+   *  (pooled-session churn) from structural changes (rename/remove/release)
+   *  without re-reading the merged list. */
+  private lastPatchKind: SessionCatalogPatch['kind'] | null = null;
 
   constructor(private readonly sessionsRoot: () => string) {}
 
+  /** Kind of the most recent applied patch (null before the first patch). */
+  get lastPatch(): SessionCatalogPatch['kind'] | null {
+    return this.lastPatchKind;
+  }
+
   /** Single write chokepoint for all session-list mutations. */
   apply(patch: SessionCatalogPatch): void {
+    this.lastPatchKind = patch.kind;
     switch (patch.kind) {
       case 'upsert': {
         const prevCreated = this.createdById.get(patch.session.id);
