@@ -102,6 +102,86 @@ export interface PromptSummary {
   source: string;
 }
 
+export interface ExtensionFlagInfo {
+  name: string;
+  description?: string;
+  type: 'boolean' | 'string';
+  default?: boolean | string;
+  value?: boolean | string;
+}
+
+export interface ExtensionShortcutInfo {
+  shortcut: string;
+  description?: string;
+  source: string;
+}
+
+export interface ExtensionDiagnostic {
+  type: 'warning' | 'error' | 'collision';
+  message: string;
+  path?: string;
+}
+
+export type ProjectTrustDecision = 'trusted' | 'denied' | 'ask';
+
+export interface ProjectTrustInfo {
+  cwd: string;
+  decision: ProjectTrustDecision;
+  requiresDecision: boolean;
+  persisted: boolean;
+}
+
+export interface SessionStats {
+  sessionId: string;
+  sessionFile?: string;
+  userMessages: number;
+  assistantMessages: number;
+  toolCalls: number;
+  toolResults: number;
+  totalMessages: number;
+  tokens: {
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite: number;
+    total: number;
+  };
+  cost: number;
+}
+
+export interface ConfiguredPackageInfo {
+  source: string;
+  scope: 'user' | 'project';
+  filtered: boolean;
+  installedPath?: string;
+}
+
+export interface PackageUpdateInfo {
+  source: string;
+  displayName: string;
+  type: 'npm' | 'git';
+  scope: 'user' | 'project';
+}
+
+export interface PackageProgress {
+  phase: 'start' | 'progress' | 'complete' | 'error';
+  action: 'install' | 'remove' | 'update' | 'clone' | 'pull';
+  source: string;
+  message?: string;
+}
+
+export interface RuntimeDiagnostic {
+  type: 'info' | 'warning' | 'error';
+  message: string;
+}
+
+export interface ExtensionErrorNotice {
+  extensionPath: string;
+  event: string;
+  error: string;
+  stack?: string;
+}
+
 export interface ExtensionSummary {
   source: string;
   path: string;
@@ -109,7 +189,9 @@ export interface ExtensionSummary {
   origin: 'package' | 'top-level';
   tools: { name: string; description: string }[];
   commands: { name: string; description: string }[];
-  flags?: string[];
+  flags?: ExtensionFlagInfo[];
+  shortcuts?: ExtensionShortcutInfo[];
+  diagnostics?: ExtensionDiagnostic[];
 }
 
 export interface UpdatePackageStatus {
@@ -232,7 +314,12 @@ export interface ConnectedMessage {
   /** Full session-owned extension UI snapshot; replaces stale panels on connect/switch. */
   extensionUiState?: ExtensionUiStatePayload;
   /** Legacy widget-only snapshot accepted from older servers. */
-  widgets?: WidgetPayload[];
+  /** Project trust state used when loading project-scoped resources. */
+  projectTrust?: ProjectTrustInfo;
+  /** Runtime diagnostics collected during session/service creation. */
+  diagnostics?: RuntimeDiagnostic[];
+  /** SDK model fallback warning, if the saved model was unavailable. */
+  modelFallbackMessage?: string;
 }
 
 /**
@@ -366,9 +453,9 @@ export type ServerCustomEvent =
       uiVersion?: string;
       sessionMode?: 'in-memory' | 'persisted';
       sessionPath?: string;
-      contextUsage?: ContextUsage;
-      extensionUiState?: ExtensionUiStatePayload;
-      widgets?: WidgetPayload[];
+      projectTrust?: ProjectTrustInfo;
+      diagnostics?: RuntimeDiagnostic[];
+      modelFallbackMessage?: string;
     }
   | { type: 'sessions_list'; sessions: SessionSummary[] }
   | { type: 'all_sessions_list'; sessions: SessionSummary[] }
@@ -386,16 +473,23 @@ export type ServerCustomEvent =
       tools: Array<{ name: string; description: string; isBuiltin: boolean; origin?: string }>;
       activeToolNames: string[];
     }
-  | { type: 'resources_list'; skills: SkillSummary[]; prompts: PromptSummary[] }
+  | { type: 'project_trust'; trust: ProjectTrustInfo }
+  | { type: 'runtime_diagnostics'; diagnostics: RuntimeDiagnostic[] }
+  | { type: 'extension_error'; error: ExtensionErrorNotice }
   | {
       type: 'extensions_list';
       extensions: ExtensionSummary[];
       errors: Array<{ path: string; error: string }>;
     }
   | {
-      type: 'commands_list';
-      commands: Array<{ name: string; description?: string; source: string }>;
+      type: 'packages_list';
+      packages: ConfiguredPackageInfo[];
+      updates?: PackageUpdateInfo[];
     }
+  | { type: 'package_progress'; progress: PackageProgress }
+  | { type: 'package_result'; success: boolean; message: string }
+  | { type: 'session_stats'; stats: SessionStats }
+  | { type: 'export_result'; format: 'html' | 'jsonl'; path?: string; error?: string }
   | { type: 'skill_install_result'; success: boolean; name?: string; error?: string }
   | ({ type: 'update_status' } & UpdateStatus)
   | { type: 'update_progress'; target: UpdateTarget; command?: string; message: string }
@@ -460,10 +554,18 @@ export type ServerMessage = ConnectedMessage | ServerCustomEvent | PiEvent;
 // ── Browser → Server ─────────────────────────────────────────────────────────
 
 export type ClientMessage =
-  | { type: 'prompt'; message: string; images?: Array<{ data: string; mimeType: string }> }
-  | { type: 'steer'; message: string }
-  | { type: 'follow_up'; message: string }
+  | {
+      type: 'prompt';
+      message: string;
+      images?: Array<{ data: string; mimeType: string }>;
+      streamingBehavior?: 'steer' | 'followUp';
+    }
+  | { type: 'steer'; message: string; images?: Array<{ data: string; mimeType: string }> }
+  | { type: 'follow_up'; message: string; images?: Array<{ data: string; mimeType: string }> }
   | { type: 'abort' }
+  | { type: 'abort_compaction' }
+  | { type: 'abort_branch_summary' }
+  | { type: 'abort_retry' }
   | { type: 'set_thinking_level'; level: string }
   | { type: 'set_model'; provider: string; modelId: string }
   | { type: 'new_session'; targetCwd?: string }
@@ -543,9 +645,22 @@ export type ClientMessage =
   | { type: 'set_active_tools'; toolNames: string[] }
   /** Request skills and prompt templates. Server replies with resources_list. */
   | { type: 'get_resources' }
-  /** Request loaded extensions. Server replies with extensions_list. */
   | { type: 'get_extensions' }
-  /** Request registered slash commands (builtin + extension). Server replies with commands_list. */
+  | { type: 'get_project_trust'; cwd?: string }
+  | { type: 'set_project_trust'; cwd: string; decision: 'trusted' | 'denied' | 'ask' }
+  | { type: 'set_extension_flag'; name: string; value: boolean | string }
+  | { type: 'invoke_extension_shortcut'; shortcut: string }
+  | { type: 'get_packages' }
+  | {
+      type: 'install_package';
+      source: string;
+      scope: 'user' | 'project';
+      local?: boolean;
+    }
+  | { type: 'remove_package'; source: string; scope: 'user' | 'project'; local?: boolean }
+  | { type: 'update_packages'; source?: string }
+  | { type: 'check_package_updates' }
+  | { type: 'set_package_filter'; source: string; filter: Record<string, unknown> }
   | { type: 'get_commands' }
   /**
    * Fetch a skill markdown file from a URL (GitHub blob / raw / direct) and
@@ -563,9 +678,12 @@ export type ClientMessage =
   | { type: 'restart_server'; nonce?: string }
   /** Execute a built-in slash command in the server session context. */
   | { type: 'run_builtin'; command: string; args?: string }
+  /** Request aggregate counts, token usage, and cost for the active session. */
+  | { type: 'get_session_stats' }
+  /** Export the active session branch. */
+  | { type: 'export_session'; format: 'html' | 'jsonl' }
   /** Request the session tree data for visual display. Server replies with session_tree. */
   | { type: 'get_session_tree' }
-  /** Request file contents for the file viewer modal. */
   | { type: 'read_file'; path: string }
   /** Write file content from the file viewer modal's edit mode. */
   | { type: 'write_file'; path: string; content: string }

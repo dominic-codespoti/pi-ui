@@ -19,6 +19,12 @@
     UpdateStatus,
     UpdateTarget,
     ConnectedMessage,
+    ProjectTrustInfo,
+    RuntimeDiagnostic,
+    ConfiguredPackageInfo,
+    PackageUpdateInfo,
+    PackageProgress,
+    SessionStats,
   } from '$lib/ws/protocol';
   import type { PiEvent } from '$lib/ws/protocol';
   import { renderMarkdown, renderStreamingPreview, onLangRegistered } from '$lib/markdown';
@@ -57,6 +63,7 @@
   import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
   import PiIcon from '@lucide/svelte/icons/pi';
   import RefreshCw from '@lucide/svelte/icons/refresh-cw';
+  import PackageOpen from '@lucide/svelte/icons/package-open';
   import Bell from '@lucide/svelte/icons/bell';
   import Wrench from '@lucide/svelte/icons/wrench';
   import BookOpen from '@lucide/svelte/icons/book-open';
@@ -776,12 +783,12 @@
   let lastExtensionQuery = $state('');
   let lastFileCompleteQuery = '';
   let _fileCompleteTimer: ReturnType<typeof setTimeout> | null = null;
-
   const SETTINGS_SECTIONS = [
     { id: 'session', label: 'Session', icon: SlidersHorizontal },
     { id: 'notifications', label: 'Notifications', icon: Bell },
     { id: 'shortcuts', label: 'Shortcuts', icon: Keyboard },
     { id: 'extensions', label: 'Extensions', icon: Blocks },
+    { id: 'packages', label: 'Packages', icon: PackageOpen },
     { id: 'updates', label: 'Updates', icon: RefreshCw },
     { id: 'about', label: 'About', icon: PiIcon },
   ] as const;
@@ -913,13 +920,14 @@
   });
 
   function initSettingsSection():
-    'session' | 'notifications' | 'shortcuts' | 'extensions' | 'updates' | 'about' {
+    'session' | 'notifications' | 'shortcuts' | 'extensions' | 'packages' | 'updates' | 'about' {
     const v = urlParam('ss', 'session');
     const valid = [
       'session',
       'notifications',
       'shortcuts',
       'extensions',
+      'packages',
       'updates',
       'about',
     ] as const;
@@ -936,7 +944,18 @@
   let extensionsList = $state<ExtensionSummary[]>([]);
   let extensionErrors = $state<{ path: string; error: string }[]>([]);
   /** True once extensions_list has been received */
+  let projectTrust = $state<ProjectTrustInfo | null>(null);
+  let runtimeDiagnostics = $state<RuntimeDiagnostic[]>([]);
+  let packagesList = $state<ConfiguredPackageInfo[]>([]);
+  let packageUpdates = $state<PackageUpdateInfo[]>([]);
+  let packagesLoaded = $state(false);
+  let packageSource = $state('');
+  let packageScope = $state<'user' | 'project'>('user');
+  let packageBusy = $state(false);
+  let packageProgress = $state<PackageProgress | null>(null);
   let extensionsLoaded = $state(false);
+  let sessionStats = $state<SessionStats | null>(null);
+  let exportFeedback = $state<string | null>(null);
 
   /** Update tab state */
   let updateStatus = $state<UpdateStatus | null>(null);
@@ -1180,6 +1199,17 @@
     if (showSettingsPanel && settingsSection === 'extensions') {
       extensionsLoaded = false;
       send({ type: 'get_extensions' });
+    }
+  });
+  $effect(() => {
+    if (showSettingsPanel && settingsSection === 'packages' && wsState === 'open') {
+      packagesLoaded = false;
+      send({ type: 'get_packages' });
+    }
+  });
+  $effect(() => {
+    if (showSettingsPanel && settingsSection === 'about' && wsState === 'open') {
+      send({ type: 'get_session_stats' });
     }
   });
 
@@ -1680,10 +1710,10 @@
     if (msg && typeof msg === 'object' && 'sessionId' in msg) {
       const msgType = (msg as Record<string, unknown>).type;
       if (
-        msgType !== 'connected' &&
-        msgType !== 'session_loaded' &&
         msgType !== 'session_runtime' &&
-        msgType !== 'session_updated'
+        msgType !== 'session_updated' &&
+        msgType !== 'connected' &&
+        msgType !== 'session_loaded'
       ) {
         const sid = (msg as Record<string, unknown>).sessionId;
         if (typeof sid === 'string' && sid !== sessionId) {
@@ -1695,12 +1725,16 @@
       case 'connected': {
         const c = msg as ConnectedMessage;
         applySessionState(c as unknown as Record<string, unknown>);
+        projectTrust = c.projectTrust ?? null;
+        runtimeDiagnostics = c.diagnostics ?? [];
         resyncEditorMirror();
         sessionStartTime = Date.now();
         if (c.piVersion) piVersion = c.piVersion;
         if (c.sessionMode) sessionMode = c.sessionMode;
         loadWebhookUrlFromServer(c.webhookUrl);
         sessionLoading = false;
+        send({ type: 'get_project_trust' });
+        send({ type: 'get_packages' });
         // Warm the project/session lists so pickers have data immediately.
         // force: the freshness guard would otherwise skip the request right
         // after a reconnect (stale pre-reconnect lists are not fresh).
@@ -1730,6 +1764,8 @@
       case 'session_loaded': {
         const sl = msg as Record<string, unknown>;
         applySessionState(sl);
+        projectTrust = (sl.projectTrust as ProjectTrustInfo | undefined) ?? null;
+        runtimeDiagnostics = (sl.diagnostics as RuntimeDiagnostic[] | undefined) ?? [];
         resyncEditorMirror();
         sessionStartTime = Date.now();
         if (sl.piVersion) piVersion = sl.piVersion as string;
@@ -2252,6 +2288,40 @@
         extensionsLoaded = true;
         break;
       }
+      case 'project_trust':
+        projectTrust = msg.trust as ProjectTrustInfo;
+        break;
+
+      case 'runtime_diagnostics':
+        runtimeDiagnostics = (msg.diagnostics as RuntimeDiagnostic[] | undefined) ?? [];
+        break;
+
+      case 'packages_list':
+        packagesList = (msg.packages as ConfiguredPackageInfo[] | undefined) ?? [];
+        packageUpdates = (msg.updates as PackageUpdateInfo[] | undefined) ?? [];
+        packagesLoaded = true;
+        break;
+
+      case 'package_progress':
+        packageProgress = msg.progress as PackageProgress;
+        packageBusy = packageProgress.phase !== 'complete' && packageProgress.phase !== 'error';
+        break;
+
+      case 'package_result':
+        packageBusy = false;
+        packageProgress = null;
+        if (msg.success) send({ type: 'get_packages' });
+        break;
+      case 'session_stats':
+        sessionStats = msg.stats as SessionStats;
+        break;
+
+      case 'export_result':
+        exportFeedback = msg.error
+          ? `Export failed: ${msg.error as string}`
+          : `Exported to ${msg.path as string}`;
+        break;
+
 
       case 'commands_list': {
         extensionCommands =
@@ -5534,8 +5604,9 @@
                 {#if settingsSection === 'session'}Defaults and behavior for session runs{:else if settingsSection === 'notifications'}Configure
                   PWA push and page notifications{:else if settingsSection === 'shortcuts'}Keyboard
                   shortcuts available in the chat UI{:else if settingsSection === 'extensions'}Loaded
-                  extensions and their tools/commands{:else if settingsSection === 'updates'}Check
-                  and apply pi-ui or SDK updates{:else}Runtime information and server controls{/if}
+                  extensions and their tools/commands{:else if settingsSection === 'packages'}Manage
+                  SDK extension packages{:else if settingsSection === 'updates'}Check and apply
+                  pi-ui or SDK updates{:else}Runtime information and server controls{/if}
               </Dialog.Description>
             </header>
 
@@ -5599,6 +5670,45 @@
                       </div>
                     </div>
                   </Card.Root>
+                  <Card.Root size="sm" class="py-0 overflow-hidden bg-base-100/60 border-base-content/10">
+                    <div class="px-4 py-3 space-y-3">
+                      <div>
+                        <p class="text-sm text-base-content/75">Project trust</p>
+                        <p class="text-xs text-base-content/35 mt-0.5">
+                          Project extensions, skills, prompts, and packages load only when trusted.
+                        </p>
+                      </div>
+                      <div class="flex flex-wrap items-center gap-2">
+                        <span class="text-xs font-mono text-base-content/55">{projectTrust?.decision ?? 'ask'}</span>
+                        {#each [['trusted', 'Trust project'], ['denied', 'Block project'], ['ask', 'Ask next time']] as [decision, label] (decision)}
+                          <Button
+                            size="sm"
+                            variant={projectTrust?.decision === decision ? 'default' : 'outline'}
+                            disabled={wsState !== 'open'}
+                            onclick={() => send({
+                              type: 'set_project_trust',
+                              cwd: projectTrust?.cwd ?? cwd,
+                              decision: decision as 'trusted' | 'denied' | 'ask',
+                            })}
+                          >{label}</Button>
+                        {/each}
+                      </div>
+                    </div>
+                  </Card.Root>
+                  {#if runtimeDiagnostics.length > 0}
+                    <Card.Root size="sm" class="py-0 overflow-hidden bg-base-100/60 border-base-content/10">
+                      <div class="px-4 py-3">
+                        <p class="text-sm text-base-content/75">Runtime diagnostics</p>
+                        <div class="mt-2 space-y-1.5">
+                          {#each runtimeDiagnostics as diagnostic (diagnostic.message)}
+                            <p class="text-xs {diagnostic.type === 'error' ? 'text-error/75' : diagnostic.type === 'warning' ? 'text-warning/75' : 'text-base-content/50'}">
+                              {diagnostic.message}
+                            </p>
+                          {/each}
+                        </div>
+                      </div>
+                    </Card.Root>
+                  {/if}
                 {:else if settingsSection === 'notifications'}
                   <Card.Root
                     size="sm"
@@ -5750,7 +5860,8 @@
                             {#each Object.entries(bySource).filter((e): e is [string, ExtensionSummary[]] => !!e[1]) as [source, exts] (source)}
                               {@const allTools = exts.flatMap((e) => e.tools)}
                               {@const allCommands = exts.flatMap((e) => e.commands)}
-                              {@const allFlags = [...new Set(exts.flatMap((e) => e.flags ?? []))]}
+                              {@const allFlags = [...new Map(exts.flatMap((e) => e.flags ?? []).map((flag) => [flag.name, flag])).values()]}
+                              {@const allShortcuts = exts.flatMap((e) => e.shortcuts ?? [])}
                               <Card.Root
                                 size="sm"
                                 class="py-0 overflow-hidden bg-base-100/60 border-base-content/10"
@@ -5845,13 +5956,48 @@
                                       </div>
                                     </details>
                                   {/if}
-                                  {#if allFlags.length > 0}
-                                    <div class="px-4 py-2 flex flex-wrap gap-1">
-                                      {#each allFlags as flag (flag)}
-                                        <span
-                                          class="px-1.5 py-0.5 text-[10px] font-mono rounded-full bg-primary/8 text-primary/60"
-                                          >{flag}</span
+                                  {#if allShortcuts.length > 0}
+                                    <div class="px-4 py-2 space-y-1.5">
+                                      <p class="text-[11px] font-medium text-base-content/45">Shortcuts</p>
+                                      {#each allShortcuts as shortcut (shortcut.shortcut)}
+                                        <button
+                                          class="w-full flex items-center justify-between gap-3 text-left text-xs hover:text-primary transition-colors"
+                                          onclick={() => send({ type: 'invoke_extension_shortcut', shortcut: shortcut.shortcut })}
                                         >
+                                          <span class="font-mono text-base-content/65">{shortcut.shortcut}</span>
+                                          <span class="text-base-content/40 truncate">{shortcut.description ?? ''}</span>
+                                        </button>
+                                      {/each}
+                                    </div>
+                                  {/if}
+                                  {#if allFlags.length > 0}
+                                    <div class="px-4 py-2 space-y-2">
+                                      {#each allFlags as flag (flag.name)}
+                                        <div class="flex items-center gap-3">
+                                          <div class="min-w-0 flex-1">
+                                            <p class="text-xs font-mono text-base-content/65">{flag.name}</p>
+                                            {#if flag.description}
+                                              <p class="text-[11px] text-base-content/40">{flag.description}</p>
+                                            {/if}
+                                          </div>
+                                          {#if flag.type === 'boolean'}
+                                            <Switch
+                                              checked={flag.value === true}
+                                              onCheckedChange={(value) => send({ type: 'set_extension_flag', name: flag.name, value })}
+                                              aria-label={`Toggle ${flag.name}`}
+                                            />
+                                          {:else}
+                                            <input
+                                              class="w-36 rounded border border-base-content/12 bg-base-200/50 px-2 py-1 text-xs font-mono"
+                                              value={String(flag.value ?? flag.default ?? '')}
+                                              onchange={(event) => send({
+                                                type: 'set_extension_flag',
+                                                name: flag.name,
+                                                value: (event.currentTarget as HTMLInputElement).value,
+                                              })}
+                                            />
+                                          {/if}
+                                        </div>
                                       {/each}
                                     </div>
                                   {/if}
@@ -5881,6 +6027,73 @@
                       </details>
                     {/if}
                   {/if}
+                {:else if settingsSection === 'packages'}
+                  <div class="space-y-4">
+                    <Card.Root size="sm" class="py-0 overflow-hidden bg-base-100/60 border-base-content/10">
+                      <div class="px-4 py-3 space-y-3">
+                        <div>
+                          <p class="text-sm text-base-content/75">Configured packages</p>
+                          <p class="text-xs text-base-content/35 mt-0.5">Install or remove SDK extension packages.</p>
+                        </div>
+                        <div class="flex flex-col sm:flex-row gap-2">
+                          <input
+                            class="min-w-0 flex-1 rounded-lg border border-base-content/12 bg-base-200/50 px-3 py-2 text-xs font-mono outline-none focus:border-primary/50"
+                            placeholder="npm package or git URL"
+                            bind:value={packageSource}
+                            disabled={packageBusy}
+                          />
+                          <Select.Root type="single" value={packageScope} onValueChange={(v: string) => (packageScope = v as 'user' | 'project')}>
+                            <Select.Trigger size="sm" class="w-28">{packageScope}</Select.Trigger>
+                            <Select.Content>
+                              <Select.Item value="user">user</Select.Item>
+                              <Select.Item value="project" disabled={projectTrust?.decision !== 'trusted'}>project</Select.Item>
+                            </Select.Content>
+                          </Select.Root>
+                          <Button
+                            size="sm"
+                            disabled={!packageSource.trim() || packageBusy || (packageScope === 'project' && projectTrust?.decision !== 'trusted')}
+                            onclick={() => {
+                              packageBusy = true;
+                              send({ type: 'install_package', source: packageSource.trim(), scope: packageScope });
+                            }}
+                          >Install</Button>
+                        </div>
+                        {#if packageProgress}
+                          <p class="text-xs text-base-content/45">{packageProgress.message ?? packageProgress.phase}</p>
+                        {/if}
+                      </div>
+                    </Card.Root>
+                    {#if !packagesLoaded}
+                      <p class="text-sm text-base-content/45">Loading packages…</p>
+                    {:else if packagesList.length === 0}
+                      <p class="text-sm text-base-content/45">No configured packages.</p>
+                    {:else}
+                      <Card.Root size="sm" class="py-0 overflow-hidden bg-base-100/60 border-base-content/10">
+                        <div class="divide-y divide-base-content/8">
+                          {#each packagesList as pkg (`${pkg.scope}:${pkg.source}`)}
+                            <div class="flex items-center gap-3 px-4 py-3">
+                              <div class="min-w-0 flex-1">
+                                <p class="text-xs font-mono text-base-content/70 truncate">{pkg.source}</p>
+                                <p class="text-[11px] text-base-content/35">{pkg.scope}{pkg.filtered ? ' · filtered' : ''}</p>
+                              </div>
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                disabled={packageBusy}
+                                onclick={() => {
+                                  packageBusy = true;
+                                  send({ type: 'remove_package', source: pkg.source, scope: pkg.scope });
+                                }}
+                              >Remove</Button>
+                            </div>
+                          {/each}
+                        </div>
+                      </Card.Root>
+                    {/if}
+                    {#if packageUpdates.length > 0}
+                      <p class="text-xs text-warning/75">{packageUpdates.length} package update(s) available.</p>
+                    {/if}
+                  </div>
                 {:else if settingsSection === 'updates'}
                   <div class="space-y-4">
                     <Card.Root
@@ -6129,6 +6342,26 @@
                           aria-label="Restart server">Restart</button
                         >
                       </div>
+                      {#if sessionStats}
+                        <div class="px-4 py-3">
+                          <div class="flex items-center justify-between gap-3">
+                            <p class="text-sm text-base-content/75">Session usage</p>
+                            <div class="flex gap-1.5">
+                              <Button size="sm" variant="ghost" onclick={() => send({ type: 'export_session', format: 'html' })}>HTML</Button>
+                              <Button size="sm" variant="ghost" onclick={() => send({ type: 'export_session', format: 'jsonl' })}>JSONL</Button>
+                            </div>
+                          </div>
+                          <div class="mt-2 grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
+                            <span class="text-base-content/50">Messages <b class="text-base-content/75">{sessionStats.totalMessages}</b></span>
+                            <span class="text-base-content/50">Tools <b class="text-base-content/75">{sessionStats.toolCalls}</b></span>
+                            <span class="text-base-content/50">Tokens <b class="text-base-content/75">{sessionStats.tokens.total.toLocaleString()}</b></span>
+                            <span class="text-base-content/50">Cost <b class="text-base-content/75">{fmtCost(sessionStats.cost)}</b></span>
+                          </div>
+                          {#if exportFeedback}
+                            <p class="mt-2 text-[11px] text-base-content/45">{exportFeedback}</p>
+                          {/if}
+                        </div>
+                      {/if}
                     </div>
                   </Card.Root>
                 {/if}

@@ -28,6 +28,13 @@ export const CONNECTED_PAYLOAD = {
   uiVersion: '0.3.8',
   sessionMode: 'persisted',
   contextUsage: { tokens: 1500, contextWindow: 128_000, percent: 1.2 },
+  projectTrust: {
+    cwd: '/home/user/project',
+    decision: 'ask',
+    requiresDecision: true,
+    persisted: false,
+  },
+  diagnostics: [],
 };
 
 export const SESSION_LOADED_PAYLOAD = {

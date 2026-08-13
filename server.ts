@@ -19,7 +19,10 @@ import type {
   ExtensionUIContext,
   ExtensionUIDialogOptions,
   TerminalInputHandler,
+  ExtensionCommandContextActions,
+  ExtensionError,
 } from '@earendil-works/pi-coding-agent';
+import type { AutocompleteProvider } from '@earendil-works/pi-tui';
 import type { AuthEvent, AuthInteraction, AuthPrompt } from '@earendil-works/pi-ai';
 import { rm, mkdir, writeFile, readdir } from 'node:fs/promises';
 import { join, resolve, basename, sep, dirname, relative } from 'node:path';
@@ -68,6 +71,10 @@ import {
   type SkillSummary,
   type PromptSummary,
   type ExtensionSummary,
+  type ProjectTrustInfo,
+  type ProjectTrustDecision,
+  type RuntimeDiagnostic,
+  type PackageUpdateInfo,
   type UpdatePackageStatus,
   type UpdateStatus,
   type UpdateTarget,
@@ -1061,6 +1068,7 @@ function flattenParsedText(parsed: ParsedComponent | null): string {
   }
   return '';
 }
+type AutocompleteProviderFactory = (current: AutocompleteProvider) => AutocompleteProvider;
 
 type ServerExtensionUIContext = Omit<
   ExtensionUIContext,
@@ -1086,10 +1094,15 @@ type ServerExtensionUIContext = Omit<
   | 'setEditorText'
   | 'diagnostic'
   | 'getEditorComponent'
-  | 'setToolsExpanded'
   | 'getToolsExpanded'
+  | 'setToolsExpanded'
+  | 'addAutocompleteProvider'
 > & {
   getEditorText(ownerSessionId?: string | null): string;
+  addAutocompleteProvider(
+    factory: AutocompleteProviderFactory,
+    ownerSessionId?: string | null
+  ): void;
   onTerminalInput(handler: TerminalInputHandler, ownerSessionId?: string | null): () => void;
   setWidget(
     key: string,
@@ -1693,11 +1706,14 @@ const uiContext: ServerExtensionUIContext = {
     return uiStateFor(owner).editorText;
   },
 
-  addAutocompleteProvider(factory) {
-    if (factory) {
-      autocompleteProviderWrappers.push(factory);
-      chainAutocompleteProviders();
-    }
+  addAutocompleteProvider(factory, ownerSessionId) {
+    if (!factory) return;
+    const owner = ownerSessionId ?? activeSessionId;
+    if (!owner) return;
+    const providers = autocompleteProviderWrappers.get(owner) ?? [];
+    providers.push(factory);
+    autocompleteProviderWrappers.set(owner, providers);
+    chainAutocompleteProviders(owner);
   },
   setEditorComponent(factory, ownerSessionId) {
     const owner = ownerSessionId ?? activeSessionId ?? null;
@@ -1792,6 +1808,8 @@ function uiContextForSession(sid: string): ExtensionUIContext {
     custom: (arg1?: unknown, arg2?: unknown, arg3?: unknown) =>
       uiContext.custom(arg1, arg2, arg3, sid),
     getEditorText: () => uiContext.getEditorText(sid),
+    addAutocompleteProvider: (factory: AutocompleteProviderFactory) =>
+      uiContext.addAutocompleteProvider(factory, sid),
     onTerminalInput: (handler: TerminalInputHandler) => uiContext.onTerminalInput(handler, sid),
   } as unknown as ExtensionUIContext;
 }
@@ -2006,33 +2024,43 @@ function tickWidgetFactory(key: string, owner: string | null): void {
 // (bare Bun + auth). First connection may wait ~10 s during SDK + session init.
 
 let _sdk: typeof PiSDKNS | null = null;
+let _projectTrustStore: PiSDKNS.ProjectTrustStore | null = null;
 
 // ── Autocomplete provider wrappers (extension-registered) ─────────────────
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-type AutocompleteProviderFactory = (current: any) => any;
-const autocompleteProviderWrappers: AutocompleteProviderFactory[] = [];
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-let chainedAutocompleteProvider: any = null;
+// Providers belong to the session that registered them. This prevents a
+// background session from replacing the active session's completion chain.
+const autocompleteProviderWrappers = new Map<string, AutocompleteProviderFactory[]>();
+const chainedAutocompleteProviders = new Map<string, AutocompleteProvider>();
 
-function chainAutocompleteProviders() {
-  // Start with a no-op base provider
-  let provider = {
+function chainAutocompleteProviders(sid: string) {
+  const provider: AutocompleteProvider = {
     async getSuggestions() {
       return null;
     },
-    applyCompletion(lines: string[], cursorLine: number, cursorCol: number) {
+    applyCompletion(lines, cursorLine, cursorCol) {
       return { lines, cursorLine, cursorCol };
     },
   };
-  for (const wrap of autocompleteProviderWrappers) {
+  let chained: AutocompleteProvider = provider;
+  for (const wrap of autocompleteProviderWrappers.get(sid) ?? []) {
     try {
-      provider = wrap(provider);
-    } catch {
-      /* ignore broken providers */
+      chained = wrap(chained);
+    } catch (err) {
+      log.warn(`[pifrontier] autocomplete provider failed for ${sid}:`, err);
     }
   }
-  chainedAutocompleteProvider = provider;
+  chainedAutocompleteProviders.set(sid, chained);
 }
+
+function autocompleteProviderFor(sid: string): AutocompleteProvider | null {
+  return chainedAutocompleteProviders.get(sid) ?? null;
+}
+
+function clearAutocompleteProviders(sid: string): void {
+  autocompleteProviderWrappers.delete(sid);
+  chainedAutocompleteProviders.delete(sid);
+}
+
 async function getSDK(): Promise<typeof PiSDKNS> {
   if (!_sdk) {
     log.info('[pifrontier] Loading pi SDK (first connection)…');
@@ -2064,13 +2092,6 @@ async function getSDK(): Promise<typeof PiSDKNS> {
   return _sdk!;
 }
 
-// ── Multi-session pool ──────────────────────────────────────────────────────────
-//
-// Sessions are created and kept alive in the pool. Only the "active" session
-// forwards events to the browser. Inactive sessions remain live (and their
-// agent continues running if mid-stream). Switching back broadcasts a fresh
-// snapshot from the live in-memory session.
-
 interface ManagedSession {
   session: AgentSession;
   /** Unsubscribe from the active-event-forwarding subscription (null when inactive). */
@@ -2090,6 +2111,13 @@ interface ManagedSession {
   disposeTimer: Timer | null;
   /** Pending coalesced session_runtime broadcast timer (null when none scheduled). */
   runtimeBroadcastTimer: Timer | null;
+  /** Diagnostics from service/session creation. */
+  diagnostics: RuntimeDiagnostic[];
+  /** Whether the host contract has completed for this session. */
+  hostBound: boolean;
+  /** Pending graceful extension shutdown request. */
+  shutdownRequested: boolean;
+  modelFallbackMessage?: string;
 }
 
 /** Grace before a navigated-away idle session is dropped from memory. Long
@@ -2235,6 +2263,303 @@ function findManagedSessionByPath(path: string): ManagedSession | undefined {
   }
   return undefined;
 }
+function extensionFlagValuesFor(): Map<string, boolean | string> {
+  const stored = readSettings().extensionFlags;
+  if (!stored || typeof stored !== 'object' || Array.isArray(stored)) return new Map();
+  return new Map(
+    Object.entries(stored as Record<string, unknown>).filter(
+      (entry): entry is [string, boolean | string] =>
+        typeof entry[1] === 'boolean' || typeof entry[1] === 'string'
+    )
+  );
+}
+
+function persistExtensionFlag(name: string, value: boolean | string): void {
+  const stored = readSettings().extensionFlags;
+  const flags =
+    stored && typeof stored === 'object' && !Array.isArray(stored)
+      ? { ...(stored as Record<string, unknown>) }
+      : {};
+  flags[name] = value;
+  updateSettings({ extensionFlags: flags });
+}
+
+function trustStore(): PiSDKNS.ProjectTrustStore {
+  if (!_sdk) throw new Error('Pi SDK is not loaded');
+  return (_projectTrustStore ??= new _sdk.ProjectTrustStore(_sdk.getAgentDir()));
+}
+function projectTrustInfoFor(targetCwd: string): ProjectTrustInfo {
+  if (!_sdk) {
+    return { cwd: targetCwd, decision: 'ask', requiresDecision: true, persisted: false };
+  }
+  const stored = trustStore().get(targetCwd);
+  return {
+    cwd: targetCwd,
+    decision: stored === true ? 'trusted' : stored === false ? 'denied' : 'ask',
+    requiresDecision: _sdk.hasTrustRequiringProjectResources(targetCwd),
+    persisted: stored !== null,
+  };
+}
+
+async function resolveProjectTrust(
+  targetCwd: string,
+  settingsManager: PiSDKNS.SettingsManager,
+  ownerSessionId: string | null
+): Promise<boolean> {
+  const info = projectTrustInfoFor(targetCwd);
+  if (!info.requiresDecision) {
+    settingsManager.setProjectTrusted(true);
+    return true;
+  }
+  const stored = trustStore().get(targetCwd);
+  if (stored !== null) {
+    settingsManager.setProjectTrusted(stored);
+    return stored;
+  }
+  const selection = await uiContext.select(
+    `Trust project resources in ${targetCwd}?`,
+    ['Trust project and remember', 'Trust for this session', 'Continue without project resources'],
+    undefined,
+    ownerSessionId
+  );
+  const trusted = selection !== 'Continue without project resources';
+  if (selection === 'Trust project and remember') trustStore().set(targetCwd, true);
+  if (selection === 'Continue without project resources') trustStore().set(targetCwd, false);
+  settingsManager.setProjectTrusted(trusted);
+  broadcast({ type: 'project_trust', trust: projectTrustInfoFor(targetCwd) });
+  return trusted;
+}
+
+interface CreatedSdkSession {
+  session: AgentSession;
+  diagnostics: RuntimeDiagnostic[];
+  modelFallbackMessage?: string;
+}
+
+async function createSdkSession(
+  targetCwd: string,
+  sessionManager: PiSDKNS.SessionManager,
+  reason: PiSDKNS.SessionStartEvent['reason'],
+  previousSessionFile?: string
+): Promise<CreatedSdkSession> {
+  const sdk = await getSDK();
+  const source = activeSessionOrNull();
+  const settingsManager = sdk.SettingsManager.create(targetCwd, sdk.getAgentDir(), {
+    projectTrusted: false,
+  });
+  const services = await sdk.createAgentSessionServices({
+    cwd: targetCwd,
+    agentDir: sdk.getAgentDir(),
+    settingsManager,
+    modelRuntime: source?.modelRuntime,
+    extensionFlagValues: extensionFlagValuesFor(),
+    resourceLoaderReloadOptions: {
+      resolveProjectTrust: async () =>
+        resolveProjectTrust(targetCwd, settingsManager, activeSessionId),
+    },
+  });
+  const result = await sdk.createAgentSessionFromServices({
+    services,
+    sessionManager,
+    sessionStartEvent: {
+      type: 'session_start',
+      reason,
+      ...(previousSessionFile ? { previousSessionFile } : {}),
+    },
+  });
+  const diagnostics: RuntimeDiagnostic[] = [...services.diagnostics];
+  for (const error of result.extensionsResult.errors) {
+    diagnostics.push({ type: 'error', message: `${error.path}: ${error.error}` });
+  }
+  if (result.modelFallbackMessage) {
+    diagnostics.push({ type: 'warning', message: result.modelFallbackMessage });
+  }
+  return {
+    session: result.session,
+    diagnostics,
+    modelFallbackMessage: result.modelFallbackMessage,
+  };
+}
+
+type HostReplacementContext = PiSDKNS.ExtensionCommandContext & {
+  sendMessage: AgentSession['sendCustomMessage'];
+  sendUserMessage: AgentSession['sendUserMessage'];
+};
+
+function replacementContextFor(session: AgentSession): HostReplacementContext {
+  const commandContext = session.extensionRunner.createCommandContext();
+  return {
+    ...commandContext,
+    sendMessage: (message: Parameters<AgentSession['sendCustomMessage']>[0], options: Parameters<AgentSession['sendCustomMessage']>[1]) =>
+      session.sendCustomMessage(message, options),
+    sendUserMessage: (
+      content: Parameters<AgentSession['sendUserMessage']>[0],
+      options: Parameters<AgentSession['sendUserMessage']>[1]
+    ) => session.sendUserMessage(content, options),
+  } as unknown as HostReplacementContext;
+}
+
+function requestExtensionShutdown(sid: string): void {
+  const entry = sessionPool.get(sid);
+  if (!entry || entry.shutdownRequested) return;
+  entry.shutdownRequested = true;
+  const finish = () => {
+    if (sessionPool.get(sid) !== entry) return;
+    broadcast({ type: 'shutdown_requested', sessionId: sid });
+    void _shutdown();
+  };
+  if (entry.session.isIdle) finish();
+  else void entry.session.waitForIdle().then(finish, finish);
+}
+
+function commandContextActionsFor(
+  sid: string,
+  session: AgentSession
+): ExtensionCommandContextActions {
+  return {
+    waitForIdle: () => session.waitForIdle(),
+    newSession: async (options) => {
+      const sdk = await getSDK();
+      const previousSessionFile = session.sessionFile;
+      const targetCwd = session.sessionManager.getCwd() || cwd;
+      const manager = sdk.SessionManager.create(targetCwd);
+      await options?.setup?.(manager);
+      const created = await createSdkSession(targetCwd, manager, 'new', previousSessionFile);
+      await bindRpcHost(created.session);
+      await setActiveSession(created.session, targetCwd, created);
+      await options?.withSession?.(replacementContextFor(created.session));
+      return { cancelled: false };
+    },
+    fork: async (entryId, options) => {
+      const sessionFile = session.sessionFile;
+      if (!sessionFile) throw new Error('Cannot fork an in-memory session');
+      const manager = sdkOrThrow().SessionManager.open(sessionFile);
+      const forkPath = manager.createBranchedSession(entryId);
+      if (!forkPath) throw new Error('Failed to create branched session');
+      const forkManager = sdkOrThrow().SessionManager.open(forkPath);
+      const created = await createSdkSession(
+        forkManager.getCwd() || session.sessionManager.getCwd() || cwd,
+        forkManager,
+        'fork',
+        session.sessionFile
+      );
+      await bindRpcHost(created.session);
+      await setActiveSession(created.session, forkManager.getCwd(), created);
+      await options?.withSession?.(replacementContextFor(created.session));
+      return { cancelled: false };
+    },
+    navigateTree: (targetId, options) => session.navigateTree(targetId, options),
+    switchSession: async (sessionPath, options) => {
+      const target = findManagedSessionByPath(resolve(sessionPath));
+      if (target) {
+        await setActiveSession(target.session, target.cwd);
+        await options?.withSession?.(replacementContextFor(target.session));
+        return { cancelled: false };
+      }
+      const known = await sessionCatalog.list();
+      const resolvedPath = resolve(sessionPath);
+      if (!known.some((item) => item.path === resolvedPath)) {
+        throw new Error('Session not found');
+      }
+      const manager = sdkOrThrow().SessionManager.open(resolvedPath);
+      const created = await createSdkSession(
+        manager.getCwd() || cwd,
+        manager,
+        'resume',
+        session.sessionFile
+      );
+      await bindRpcHost(created.session);
+      await setActiveSession(created.session, manager.getCwd(), created);
+      await options?.withSession?.(replacementContextFor(created.session));
+      return { cancelled: false };
+    },
+    reload: async () => {
+      await reloadSessionHost(sid, session);
+    },
+  };
+}
+
+function sdkOrThrow(): typeof PiSDKNS {
+  if (!_sdk) throw new Error('Pi SDK is not loaded');
+  return _sdk;
+}
+
+async function bindRpcHost(session: AgentSession): Promise<void> {
+  const sid = session.sessionId;
+  await session.bindExtensions({
+    mode: 'rpc',
+    uiContext: uiContextForSession(sid),
+    commandContextActions: commandContextActionsFor(sid, session),
+    abortHandler: () => {
+      void session.abort();
+    },
+    shutdownHandler: () => requestExtensionShutdown(sid),
+    onError: (error: ExtensionError) => {
+      broadcast({ type: 'extension_error', error });
+      uiContext.diagnostic(
+        error.error,
+        'error',
+        error.stack,
+        `${error.extensionPath}:${error.event}`,
+        sid
+      );
+    },
+  });
+}
+
+async function reloadSessionHost(sid: string, session: AgentSession): Promise<void> {
+  terminalInputRegistry.clear(sid);
+  clearAutocompleteProviders(sid);
+  broadcast({ type: 'extension_terminal_input_active', active: false, ...stampOwner(sid) });
+  await session.reload();
+  const entry = sessionPool.get(sid);
+  if (entry) {
+    entry.diagnostics = session.resourceLoader.getExtensions().errors.map((error) => ({
+      type: 'error',
+      message: `${error.path}: ${error.error}`,
+    }));
+    entry.hostBound = true;
+  }
+  broadcastSessionLoaded(session);
+  broadcast({ type: 'runtime_diagnostics', diagnostics: entry?.diagnostics ?? [] });
+  broadcast({ type: 'commands_list', commands: extensionCommandsFor(session) });
+  broadcast({
+    type: 'tools_list',
+    tools: session.getAllTools().map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      isBuiltin: tool.sourceInfo.source === 'builtin',
+      origin: tool.sourceInfo.source,
+    })),
+    activeToolNames: session.getActiveToolNames(),
+  });
+}
+function packageManagerFor(session: AgentSession): {
+  manager: PackageManagerWithUpdates;
+  settings: PiSDKNS.SettingsManager;
+} {
+  const sdk = sdkOrThrow();
+  const targetCwd = session.sessionManager.getCwd() || cwd;
+  const settings = sdk.SettingsManager.create(targetCwd, sdk.getAgentDir(), {
+    projectTrusted: session.settingsManager.isProjectTrusted(),
+  });
+  const manager = new sdk.DefaultPackageManager({
+    cwd: targetCwd,
+    agentDir: sdk.getAgentDir(),
+    settingsManager: settings,
+  });
+  return { manager, settings };
+}
+function packageSourceName(source: PiSDKNS.PackageSource): string {
+  return typeof source === 'string' ? source : source.source;
+}
+type PackageManagerWithUpdates = PiSDKNS.PackageManager & {
+  checkForAvailableUpdates(): Promise<PackageUpdateInfo[]>;
+};
+
+
+
+
 
 /**
  * Initialise (or return) the active pi session. Loads the SDK and creates a
@@ -2261,23 +2586,17 @@ async function ensureSession(): Promise<AgentSession> {
       const sdk = await getSDK();
       log.info(`[pifrontier] Starting pi session in ${cwd} …`);
       const sm = sdk.SessionManager.continueRecent(cwd);
-      const result = await sdk.createAgentSession({
-        cwd,
-        sessionManager: sm,
-      });
-      const sess = result.session;
+      const created = await createSdkSession(cwd, sm, 'startup');
+      const sess = created.session;
+      await bindRpcHost(sess);
       projectCatalog.apply({ kind: 'touch', path: sess.sessionManager.getCwd() || cwd });
       log.info(
         `[pifrontier] Pi session ready: ${sess.sessionId} (${sm.isPersisted() ? 'persisted' : 'in-memory'})`
       );
-      await sess.bindExtensions({ uiContext: uiContextForSession(sess.sessionId) });
-      log.info('[pifrontier] Extension UI context bound.');
-      patchHasUI(sess);
 
-      // Store in pool and mark active
       const sid = sess.sessionId;
       const cwdV = sess.sessionManager.getCwd() || cwd;
-      registerSession(sid, sess, cwdV, false);
+      registerSession(sid, sess, cwdV, false, created);
       activeSessionId = sid;
       syncWidgetFactories(sid);
 
@@ -2360,8 +2679,14 @@ function makeEventForwarder(
     }
   };
 }
-/** Register a session in the pool, subscribe runtime tracking, and optionally bind extensions. */
-function registerSession(sid: string, sess: AgentSession, cwdV: string, bindExt: boolean) {
+/** Register a session in the pool after its RPC host binding completed. */
+function registerSession(
+  sid: string,
+  sess: AgentSession,
+  cwdV: string,
+  _bindExt: boolean,
+  created?: CreatedSdkSession
+) {
   const path = sess.sessionManager.getSessionFile() ?? null;
   const entry: ManagedSession = {
     session: sess,
@@ -2375,6 +2700,10 @@ function registerSession(sid: string, sess: AgentSession, cwdV: string, bindExt:
     lastActivity: Date.now(),
     disposeTimer: null,
     runtimeBroadcastTimer: null,
+    diagnostics: created?.diagnostics ?? [],
+    hostBound: _bindExt || created !== undefined,
+    shutdownRequested: false,
+    ...(created?.modelFallbackMessage ? { modelFallbackMessage: created.modelFallbackMessage } : {}),
   };
   sessionPool.set(sid, entry);
   // Pooled sessions are overlay-authoritative while resident — register the
@@ -2470,32 +2799,8 @@ function registerSession(sid: string, sess: AgentSession, cwdV: string, bindExt:
   // Subscribe event-forwarding (only active session gets this)
   entry.forwardingUnsub = sess.subscribe(makeEventForwarder(sid, sess));
 
-  if (bindExt) {
-    // Bind with our uiContext so ctx.ui.select() etc. still work for extension fallbacks
-    sess.bindExtensions({ uiContext: uiContextForSession(sid) }).catch((err) => {
-      log.error('[pifrontier] bindExtensions (non-fatal):', err);
-    });
-    // Patch hasUI to false so extensions use the fallback ui.select/ui.input path
-    // instead of the TUI custom() path which doesn't render well in the browser.
-    patchHasUI(sess);
-  }
-}
 
-/** Patch the extension runner's hasUI() to return false, so extensions use native browser dialogs. */
-function patchHasUI(sess: AgentSession) {
-  try {
-    const runner = (sess as unknown as { _extensionRunner?: { hasUI: () => boolean } })
-      ._extensionRunner;
-    if (runner) {
-      runner.hasUI = () => false;
-      // If the runner exposes createContext, the context's hasUI getter reads from runner.hasUI,
-      // so this patch propagates to all future contexts.
-    }
-  } catch {
-    // Non-fatal — some SDK versions may structure internals differently
-  }
 }
-
 /** Broadcast a runtime-status update for a single pooled session. */
 function broadcastSessionRuntime(sid: string, entry: ManagedSession) {
   broadcast({
@@ -2607,6 +2912,9 @@ function broadcastSessionLoaded(sess: AgentSession): void {
     sessionMode: sess.sessionManager.isPersisted() ? 'persisted' : 'in-memory',
     sessionPath: sess.sessionManager.getSessionFile() ?? undefined,
     contextUsage: sess.getContextUsage(),
+    projectTrust: projectTrustInfoFor(sess.sessionManager.getCwd() || cwd),
+    diagnostics: sessionPool.get(sess.sessionId)?.diagnostics ?? [],
+    modelFallbackMessage: sessionPool.get(sess.sessionId)?.modelFallbackMessage,
     extensionUiState: extensionUiStateForSession(sess.sessionId),
     widgets: widgetsForSession(sess.sessionId),
   });
@@ -2675,12 +2983,13 @@ function scheduleSessionListRefresh(): void {
   }, 300);
 }
 
-async function setActiveSession(newSession: AgentSession, newCwd?: string) {
+async function setActiveSession(
+  newSession: AgentSession,
+  newCwd?: string,
+  created?: CreatedSdkSession
+) {
   const newId = newSession.sessionId;
 
-  // Stop forwarding for the previously-active session and schedule its
-  // release from memory — the disk file is the source of truth; only
-  // running/queued/unseen/in-memory sessions must stay resident.
   if (activeSessionId && activeSessionId !== newId) {
     const prev = sessionPool.get(activeSessionId);
     if (prev?.forwardingUnsub) {
@@ -2690,69 +2999,35 @@ async function setActiveSession(newSession: AgentSession, newCwd?: string) {
     if (prev) scheduleNavOutDisposal(activeSessionId);
   }
 
-  // Register if first time seeing this session
   const alreadyPooled = sessionPool.has(newId);
   if (!alreadyPooled) {
-    registerSession(newId, newSession, newCwd || newSession.sessionManager.getCwd() || cwd, false);
+    if (!created) await bindRpcHost(newSession);
+    registerSession(
+      newId,
+      newSession,
+      newCwd || newSession.sessionManager.getCwd() || cwd,
+      true,
+      created
+    );
   }
-
-  // Clear extension autocomplete providers (extensions re-register via bindExtensions)
-  autocompleteProviderWrappers.length = 0;
-  chainedAutocompleteProvider = null;
 
   activeSessionId = newId;
   syncWidgetFactories(newId);
 
-  // Re-enable forwarding for the now-active session
   const entry = sessionPool.get(newId)!;
-  cancelNavOutDisposal(entry); // switched back within the grace window
+  cancelNavOutDisposal(entry);
   if (!entry.forwardingUnsub) {
     entry.forwardingUnsub = newSession.subscribe(makeEventForwarder(newId, newSession));
   }
-
-  // Clear unseen + update lastActivity when switching to this session
   entry.unseen = false;
   entry.lastActivity = Date.now();
 
   broadcastSessionLoaded(newSession);
-
-  // Send runtime snapshots for all pooled sessions so the client's sidebar
-  // state (running dots, unseen markers) converges after a switch — mirrors
-  // the connect-time resync. These target non-active sessions too, so the
-  // client exempts session_runtime from its per-session event gate.
   for (const [sid, pooledEntry] of sessionPool) {
     broadcastSessionRuntime(sid, pooledEntry);
   }
-
-  // Extension commands: broadcast the real list immediately when the session's
-  // extensions are already bound (pooled). For freshly-created sessions, bind
-  // extensions OFF the switch critical path — broadcast an empty list with the
-  // switch (so the palette never shows the PREVIOUS session's commands) and
-  // the real list once binding completes.
-  if (alreadyPooled) {
-    broadcast({ type: 'commands_list', commands: extensionCommandsFor(newSession) });
-  } else {
-    broadcast({ type: 'commands_list', commands: [] });
-    void (async () => {
-      try {
-        await newSession.bindExtensions({ uiContext: uiContextForSession(newId) });
-        patchHasUI(newSession);
-      } catch (err) {
-        log.error('[pifrontier] bindExtensions (non-fatal):', err);
-        broadcast({
-          type: 'agent_error',
-          error: `Extension install failed: ${err instanceof Error ? err.message : String(err)}`,
-        });
-      }
-      broadcast({ type: 'commands_list', commands: extensionCommandsFor(newSession) });
-    })();
-  }
-
-  // Register/touch the project for the session's directory.
+  broadcast({ type: 'commands_list', commands: extensionCommandsFor(newSession) });
   projectCatalog.apply({ kind: 'touch', path: newSession.sessionManager.getCwd() || cwd });
-
-  // Refresh sidebar session + project lists after the switch response. The
-  // session_loaded broadcast above is the latency-critical acknowledgement.
   scheduleSessionListRefresh();
 }
 
@@ -2860,10 +3135,10 @@ try {
                 queuedSteering: sess.getSteeringMessages(),
                 queuedFollowUp: sess.getFollowUpMessages(),
                 piVersion: PI_SDK_VERSION,
-                uiVersion: UI_VERSION,
-                sessionMode: sess.sessionManager.isPersisted() ? 'persisted' : 'in-memory',
-                sessionPath: sess.sessionManager.getSessionFile() ?? undefined,
                 contextUsage: sess.getContextUsage(),
+                projectTrust: projectTrustInfoFor(sess.sessionManager.getCwd() || cwd),
+                diagnostics: sessionPool.get(sess.sessionId)?.diagnostics ?? [],
+                modelFallbackMessage: sessionPool.get(sess.sessionId)?.modelFallbackMessage,
                 webhookUrl: getWebhookUrl() || undefined,
                 extensionUiState: extensionUiStateForSession(sess.sessionId),
                 widgets: widgetsForSession(sess.sessionId),
@@ -2962,46 +3237,42 @@ try {
             case 'prompt': {
               try {
                 const s = activeSession();
-                if (s.isStreaming) {
-                  // Agent is busy — route as steer/followUp instead of throwing
-                  if (msg.images?.length) {
-                    ws.send(
-                      JSON.stringify({
-                        type: 'agent_error',
-                        error:
-                          'Cannot send images while the agent is already processing. Wait for it to finish.',
-                      })
-                    );
-                    break;
-                  }
-                  await s.steer(msg.message);
-                } else if (_promptsInFlight.has(s.sessionId)) {
-                  // Another tab already started a prompt on THIS session; route as
-                  // steer to avoid an SDK concurrency violation.
+                const imageContent = msg.images?.length
+                  ? msg.images.map((img) => ({
+                      type: 'image' as const,
+                      data: img.data,
+                      mimeType: img.mimeType,
+                    }))
+                  : undefined;
+                const options = {
+                  ...(imageContent ? { images: imageContent } : {}),
+                  ...(s.isStreaming && msg.streamingBehavior
+                    ? { streamingBehavior: msg.streamingBehavior }
+                    : {}),
+                } satisfies Parameters<AgentSession['prompt']>[1];
+                if (s.isStreaming && !msg.streamingBehavior) {
                   ws.send(
                     JSON.stringify({
                       type: 'agent_error',
-                      error: 'Prompt already in progress on another tab — routing as steer.',
+                      error: 'Streaming input requires a steer or follow-up mode.',
                     })
                   );
-                  await s.steer(msg.message);
-                } else {
-                  _promptsInFlight.add(s.sessionId);
-                  try {
-                    const imageContent = msg.images?.length
-                      ? msg.images.map((img) => ({
-                          type: 'image' as const,
-                          data: img.data,
-                          mimeType: img.mimeType,
-                        }))
-                      : undefined;
-                    await s.prompt(
-                      msg.message,
-                      imageContent ? { images: imageContent } : undefined
-                    );
-                  } finally {
-                    _promptsInFlight.delete(s.sessionId);
-                  }
+                  break;
+                }
+                if (_promptsInFlight.has(s.sessionId) && !s.isStreaming) {
+                  ws.send(
+                    JSON.stringify({
+                      type: 'agent_error',
+                      error: 'Prompt already in progress on another tab.',
+                    })
+                  );
+                  break;
+                }
+                _promptsInFlight.add(s.sessionId);
+                try {
+                  await s.prompt(msg.message, options);
+                } finally {
+                  _promptsInFlight.delete(s.sessionId);
                 }
               } catch (err) {
                 log.error('[pifrontier] prompt error:', err);
@@ -3013,15 +3284,17 @@ try {
             case 'steer': {
               try {
                 const s = activeSession();
-                // `steer()` always queues in the SDK. If the browser's
-                // streaming state was stale and the turn already ended, start
-                // a normal prompt instead of leaving text stranded in a queue.
+                const images = msg.images?.map((img) => ({
+                  type: 'image' as const,
+                  data: img.data,
+                  mimeType: img.mimeType,
+                }));
                 if (s.isStreaming || _promptsInFlight.has(s.sessionId)) {
-                  await s.steer(msg.message);
+                  await s.steer(msg.message, images);
                 } else {
                   _promptsInFlight.add(s.sessionId);
                   try {
-                    await s.prompt(msg.message);
+                    await s.prompt(msg.message, images ? { images } : undefined);
                   } finally {
                     _promptsInFlight.delete(s.sessionId);
                   }
@@ -3033,14 +3306,30 @@ try {
               break;
             }
 
-            case 'follow_up':
+            case 'follow_up': {
               try {
-                await activeSession().followUp(msg.message);
+                const s = activeSession();
+                const images = msg.images?.map((img) => ({
+                  type: 'image' as const,
+                  data: img.data,
+                  mimeType: img.mimeType,
+                }));
+                if (s.isStreaming) {
+                  await s.followUp(msg.message, images);
+                } else {
+                  _promptsInFlight.add(s.sessionId);
+                  try {
+                    await s.prompt(msg.message, images ? { images } : undefined);
+                  } finally {
+                    _promptsInFlight.delete(s.sessionId);
+                  }
+                }
               } catch (err) {
                 log.error('[pifrontier] followUp error:', err);
                 ws.send(JSON.stringify({ type: 'agent_error', error: String(err) }));
               }
               break;
+            }
 
             case 'abort': {
               const s = activeSession();
@@ -3092,18 +3381,13 @@ try {
                 // Create the directory if it doesn't exist (brand new folder).
                 await mkdir(targetCwd, { recursive: true });
                 const sm = _sdk!.SessionManager.create(targetCwd);
-                const src = activeSessionOrNull();
-                // No `model:` override here — createAgentSession() restores the
-                // model from this session's own persisted history (falling back to
-                // the global settings default when there's none), so switching
-                // sessions restores each session's own last-used model instead of
-                // inheriting whatever the previously-active session had selected.
-                const { session: newSession } = await _sdk!.createAgentSession({
-                  cwd: targetCwd,
-                  sessionManager: sm,
-                  modelRuntime: src?.modelRuntime ?? (await ensureSession()).modelRuntime,
-                });
-                await setActiveSession(newSession);
+                const created = await createSdkSession(
+                  targetCwd,
+                  sm,
+                  'new',
+                  activeSessionOrNull()?.sessionFile
+                );
+                await setActiveSession(created.session, targetCwd, created);
               } catch (err) {
                 log.error('[pifrontier] new_session error:', err);
                 ws.send(JSON.stringify({ type: 'sessions_error', message: String(err) }));
@@ -3135,22 +3419,19 @@ try {
                   break;
                 }
                 const sm = _sdk!.SessionManager.open(resolvedPath);
-                const src = activeSessionOrNull();
-                // No `model:` override here — see the matching comment in
-                // 'new_session' above.
-                const { session: newSession } = await _sdk!.createAgentSession({
-                  cwd: sm.getCwd() || cwd,
-                  sessionManager: sm,
-                  modelRuntime: src?.modelRuntime ?? (await ensureSession()).modelRuntime,
-                });
-                await setActiveSession(newSession);
+                const created = await createSdkSession(
+                  sm.getCwd() || cwd,
+                  sm,
+                  'resume',
+                  activeSessionOrNull()?.sessionFile
+                );
+                await setActiveSession(created.session, sm.getCwd() || cwd, created);
               } catch (err) {
                 log.error('[pifrontier] switch_session error:', err);
                 ws.send(JSON.stringify({ type: 'sessions_error', message: String(err) }));
               }
               break;
             }
-
             case 'extension_ui_response': {
               const owner = pendingRequestOwners.get(msg.id) ?? null;
               const pending = existingUiStateFor(owner)?.pendingDialogs.get(msg.id);
@@ -3587,9 +3868,7 @@ try {
               }
               break;
             }
-
             case 'get_extension_autocomplete': {
-              // Declared outside the try so the finally below can always clear it.
               let timeoutId: Timer | undefined;
               try {
                 const { trigger, query } = msg as {
@@ -3597,45 +3876,38 @@ try {
                   trigger: string;
                   query: string;
                 };
-                if (!chainedAutocompleteProvider) {
+                const provider = activeSessionId ? autocompleteProviderFor(activeSessionId) : null;
+                if (!provider) {
                   ws.send(
                     JSON.stringify({ type: 'extension_completions', trigger, query, items: [] })
                   );
                   break;
                 }
-                // Synthesize lines/cursor from the trigger + query
                 const inputText = `${trigger}${query ?? ''}`;
-                const lines = [inputText];
-                const cursorLine = 0;
-                const cursorCol = inputText.length;
                 const controller = new AbortController();
                 timeoutId = setTimeout(() => controller.abort(), 2000);
-                const result = await chainedAutocompleteProvider.getSuggestions(
-                  lines,
-                  cursorLine,
-                  cursorCol,
-                  {
-                    signal: controller.signal,
-                  }
+                const result = await provider.getSuggestions([inputText], 0, inputText.length, {
+                  signal: controller.signal,
+                });
+                ws.send(
+                  JSON.stringify({
+                    type: 'extension_completions',
+                    trigger,
+                    query,
+                    items: result?.items ?? [],
+                  })
                 );
-                const items = result?.items ?? [];
-                ws.send(JSON.stringify({ type: 'extension_completions', trigger, query, items }));
               } catch (err) {
                 log.error('[pifrontier] get_extension_autocomplete error:', err);
-                const { trigger: fallbackTrigger = '', query: fallbackQuery = '' } = msg as {
+                const { trigger = '', query = '' } = msg as {
                   trigger?: string;
                   query?: string;
                 };
                 ws.send(
-                  JSON.stringify({
-                    type: 'extension_completions',
-                    trigger: fallbackTrigger,
-                    query: fallbackQuery,
-                    items: [],
-                  })
+                  JSON.stringify({ type: 'extension_completions', trigger, query, items: [] })
                 );
               } finally {
-                if (timeoutId) clearTimeout(timeoutId);
+                clearTimeout(timeoutId);
               }
               break;
             }
@@ -3997,68 +4269,39 @@ try {
                       sendSlashResult(ws, command, 'Usage: ! <command>', 'warning');
                       break;
                     }
-                    const MAX_SHELL_OUTPUT = 100 * 1024;
-                    const SHELL_TIMEOUT_MS = 30_000;
-                    const proc = Bun.spawn(['bash', '-c', args], {
-                      cwd: activeSessionOrNull()?.sessionManager.getCwd() || cwd,
-                      env: { ...(process.env as Record<string, string>), PI_CWD: cwd },
-                    });
-                    let wasTimedOut = false;
-                    const timeoutId = setTimeout(() => {
-                      wasTimedOut = true;
-                      try {
-                        proc.kill();
-                      } catch {
-                        /* already exited */
-                      }
-                    }, SHELL_TIMEOUT_MS);
-                    async function readCapped(
-                      stream: ReadableStream<Uint8Array> | undefined
-                    ): Promise<{ text: string; atLimit: boolean }> {
-                      if (!stream) return { text: '', atLimit: false };
-                      const reader = stream.getReader();
-                      const decoder = new TextDecoder();
-                      let text = '';
-                      let total = 0;
-                      let atLimit = false;
-                      while (true) {
-                        const { done, value } = await reader.read();
-                        if (done) break;
-                        const remaining = MAX_SHELL_OUTPUT - total;
-                        if (remaining <= 0) {
-                          atLimit = true;
-                          continue;
-                        }
-                        const chunk = value.slice(0, remaining);
-                        text += decoder.decode(chunk, { stream: true });
-                        total += chunk.byteLength;
-                      }
-                      decoder.decode();
-                      return { text, atLimit };
+                    try {
+                      const sess = activeSession();
+                      const result = await sess.executeBash(
+                        args,
+                        (chunk) =>
+                          broadcast({
+                            type: 'bash_execution_update',
+                            id: `shell-${sess.sessionId}`,
+                            delta: chunk,
+                            sessionId: sess.sessionId,
+                          }),
+                        { id: `shell-${sess.sessionId}`, excludeFromContext: false }
+                      );
+                      const output = result.output.trim() || '(no output)';
+                      sendSlashResult(
+                        ws,
+                        command,
+                        output +
+                          (result.truncated ? '\n… (output truncated)' : '') +
+                          (result.cancelled
+                            ? '\n(process cancelled)'
+                            : result.exitCode !== undefined && result.exitCode !== 0
+                              ? `\nexit code: ${result.exitCode}`
+                              : ''),
+                        result.cancelled ||
+                          (result.exitCode !== undefined && result.exitCode !== 0)
+                          ? 'error'
+                          : 'info'
+                      );
+                    } catch (err) {
+                      log.error('[pifrontier] shell error:', err);
+                      sendSlashResult(ws, command, String(err), 'error');
                     }
-                    const [stdout, stderr] = await Promise.all([
-                      readCapped(proc.stdout),
-                      readCapped(proc.stderr),
-                    ]);
-                    const exitCode = await proc.exited;
-                    clearTimeout(timeoutId);
-                    let shellOutput = stdout.text;
-                    if (stderr.text) shellOutput += '\n' + stderr.text;
-                    if (stdout.atLimit || stderr.atLimit) {
-                      shellOutput += `\n… (output truncated at ${(MAX_SHELL_OUTPUT / 1024).toFixed(0)} KB)`;
-                    }
-                    if (wasTimedOut) {
-                      shellOutput += `\n(process timed out after ${SHELL_TIMEOUT_MS / 1000}s)`;
-                    } else if (exitCode !== 0 && exitCode !== null) {
-                      shellOutput += `\nexit code: ${exitCode}`;
-                    }
-                    shellOutput = shellOutput.trim() || '(no output)';
-                    sendSlashResult(
-                      ws,
-                      command,
-                      shellOutput,
-                      exitCode === 0 && !wasTimedOut ? 'info' : 'error'
-                    );
                     break;
                   }
                   case 'extension':
@@ -4082,6 +4325,33 @@ try {
               } catch (err) {
                 log.error(`[pifrontier] run_builtin ${command} error:`, err);
                 sendSlashResult(ws, command, String(err), 'error');
+              }
+              break;
+            }
+
+            case 'get_session_stats': {
+              try {
+                ws.send(JSON.stringify({ type: 'session_stats', stats: activeSession().getSessionStats() }));
+              } catch (err) {
+                log.error('[pifrontier] get_session_stats error:', err);
+                ws.send(JSON.stringify({ type: 'agent_error', error: String(err) }));
+              }
+              break;
+            }
+
+            case 'export_session': {
+              try {
+                const session = activeSession();
+                const path =
+                  msg.format === 'html'
+                    ? await session.exportToHtml()
+                    : session.exportToJsonl();
+                ws.send(JSON.stringify({ type: 'export_result', format: msg.format, path }));
+              } catch (err) {
+                log.error('[pifrontier] export_session error:', err);
+                ws.send(
+                  JSON.stringify({ type: 'export_result', format: msg.format, error: String(err) })
+                );
               }
               break;
             }
@@ -4144,26 +4414,23 @@ try {
 
             case 'get_resources': {
               try {
-                const sessionCwd = activeSession().sessionManager.getCwd() || cwd;
-                const agentDir = _sdk!.getAgentDir();
-                const loader = new _sdk!.DefaultResourceLoader({ cwd: sessionCwd, agentDir });
-                await loader.reload();
-                const { skills } = loader.getSkills();
-                const { prompts } = loader.getPrompts();
-                const skillSummaries: SkillSummary[] = skills.map((s) => ({
-                  name: s.name,
-                  description: s.description,
-                  scope: s.sourceInfo.scope,
-                  isBuiltin: s.sourceInfo.origin === 'package',
-                  source: s.sourceInfo.source,
+                const sess = activeSession();
+                const { skills } = sess.resourceLoader.getSkills();
+                const { prompts } = sess.resourceLoader.getPrompts();
+                const skillSummaries: SkillSummary[] = skills.map((skill) => ({
+                  name: skill.name,
+                  description: skill.description,
+                  scope: skill.sourceInfo.scope,
+                  isBuiltin: skill.sourceInfo.origin === 'package',
+                  source: skill.sourceInfo.source,
                 }));
-                const promptSummaries: PromptSummary[] = prompts.map((p) => ({
-                  name: p.name,
-                  description: p.description,
-                  argumentHint: p.argumentHint,
-                  scope: p.sourceInfo.scope,
-                  isBuiltin: p.sourceInfo.origin === 'package',
-                  source: p.sourceInfo.source,
+                const promptSummaries: PromptSummary[] = prompts.map((prompt) => ({
+                  name: prompt.name,
+                  description: prompt.description,
+                  argumentHint: prompt.argumentHint,
+                  scope: prompt.sourceInfo.scope,
+                  isBuiltin: prompt.sourceInfo.origin === 'package',
+                  source: prompt.sourceInfo.source,
                 }));
                 ws.send(
                   JSON.stringify({
@@ -4178,6 +4445,59 @@ try {
               }
               break;
             }
+            case 'get_project_trust': {
+              try {
+                const targetCwd = resolve(
+                  (msg as { type: 'get_project_trust'; cwd?: string }).cwd ??
+                    activeSession().sessionManager.getCwd() ??
+                    cwd
+                );
+                ws.send(JSON.stringify({ type: 'project_trust', trust: projectTrustInfoFor(targetCwd) }));
+              } catch (err) {
+                log.error('[pifrontier] get_project_trust error:', err);
+                ws.send(
+                  JSON.stringify({
+                    type: 'project_trust',
+                    trust: {
+                      cwd,
+                      decision: 'ask',
+                      requiresDecision: true,
+                      persisted: false,
+                    },
+                  })
+                );
+              }
+              break;
+            }
+
+            case 'set_project_trust': {
+              try {
+                const request = msg as {
+                  type: 'set_project_trust';
+                  cwd: string;
+                  decision: ProjectTrustDecision;
+                };
+                const targetCwd = resolve(request.cwd);
+                trustStore().set(
+                  targetCwd,
+                  request.decision === 'trusted'
+                    ? true
+                    : request.decision === 'denied'
+                      ? false
+                      : null
+                );
+                const sess = activeSession();
+                if (resolve(sess.sessionManager.getCwd() || cwd) === targetCwd) {
+                  await reloadSessionHost(sess.sessionId, sess);
+                }
+                broadcast({ type: 'project_trust', trust: projectTrustInfoFor(targetCwd) });
+              } catch (err) {
+                log.error('[pifrontier] set_project_trust error:', err);
+                ws.send(JSON.stringify({ type: 'agent_error', error: String(err) }));
+              }
+              break;
+            }
+
 
             case 'get_command_completions': {
               try {
@@ -4186,15 +4506,11 @@ try {
                   command: string;
                   prefix: string;
                 };
-                const sessionCwd = activeSession().sessionManager.getCwd() || cwd;
-                const agentDir = _sdk!.getAgentDir();
-                const loader = new _sdk!.DefaultResourceLoader({ cwd: sessionCwd, agentDir });
-                await loader.reload();
-                const { extensions } = loader.getExtensions();
-                for (const ext of extensions) {
-                  const cmd = ext.commands.get(command);
-                  if (cmd?.getArgumentCompletions) {
-                    const items = await cmd.getArgumentCompletions(prefix);
+                const { extensions } = activeSession().resourceLoader.getExtensions();
+                for (const extension of extensions) {
+                  const registered = extension.commands.get(command);
+                  if (registered?.getArgumentCompletions) {
+                    const items = await registered.getArgumentCompletions(prefix);
                     ws.send(
                       JSON.stringify({
                         type: 'command_completions',
@@ -4225,33 +4541,204 @@ try {
 
             case 'get_extensions': {
               try {
-                const sessionCwd = activeSession().sessionManager.getCwd() || cwd;
-                const agentDir = _sdk!.getAgentDir();
-                const loader = new _sdk!.DefaultResourceLoader({ cwd: sessionCwd, agentDir });
-                await loader.reload();
-                const { extensions, errors } = loader.getExtensions();
-                const summaries: ExtensionSummary[] = extensions.map((e) => ({
-                  source: e.sourceInfo.source,
-                  path: e.sourceInfo.path,
-                  scope: e.sourceInfo.scope,
-                  origin: e.sourceInfo.origin,
-                  tools: [...e.tools.values()].map((t) => ({
-                    name: t.definition.name,
-                    description: t.definition.description ?? '',
+                const sess = activeSession();
+                const { extensions, errors } = sess.resourceLoader.getExtensions();
+                const runner = sess.extensionRunner;
+                const diagnostics = [
+                  ...runner.getShortcutDiagnostics(),
+                  ...runner.getCommandDiagnostics(),
+                  ...sess.resourceLoader.getSkills().diagnostics,
+                  ...sess.resourceLoader.getPrompts().diagnostics,
+                ];
+                const shortcuts = runner.getShortcuts({}) as Map<
+                  string,
+                  PiSDKNS.ExtensionShortcut
+                >;
+                const summaries: ExtensionSummary[] = extensions.map((extension) => ({
+                  source: extension.sourceInfo.source,
+                  path: extension.sourceInfo.path,
+                  scope: extension.sourceInfo.scope,
+                  origin: extension.sourceInfo.origin,
+                  tools: [...extension.tools.values()].map((tool) => ({
+                    name: tool.definition.name,
+                    description: tool.definition.description ?? '',
                   })),
-                  commands: [...e.commands.values()].map((c) => ({
-                    name: c.name,
-                    description: c.description ?? '',
+                  commands: [...extension.commands.values()].map((command) => ({
+                    name: command.name,
+                    description: command.description ?? '',
                   })),
-                  flags: [...e.flags.keys()],
+                  flags: [...extension.flags.values()].map((flag) => ({
+                    name: flag.name,
+                    description: flag.description,
+                    type: flag.type,
+                    default: flag.default,
+                    value: runner.getFlagValues().get(flag.name),
+                  })),
+                  shortcuts: [...extension.shortcuts.values()].map((shortcut) => ({
+                    shortcut: String(shortcut.shortcut),
+                    description: shortcut.description,
+                    source: shortcut.extensionPath,
+                  })),
+                  diagnostics: diagnostics.filter((diagnostic) =>
+                    diagnostic.path ? diagnostic.path === extension.path : false
+                  ),
                 }));
                 ws.send(JSON.stringify({ type: 'extensions_list', extensions: summaries, errors }));
+                ws.send(
+                  JSON.stringify({
+                    type: 'runtime_diagnostics',
+                    diagnostics: sessionPool.get(sess.sessionId)?.diagnostics ?? [],
+                  })
+                );
+                void shortcuts;
               } catch (err) {
                 log.error('[pifrontier] get_extensions error:', err);
                 ws.send(JSON.stringify({ type: 'extensions_list', extensions: [], errors: [] }));
               }
               break;
             }
+            case 'get_packages': {
+              try {
+                const { manager } = packageManagerFor(activeSession());
+                const packages = manager.listConfiguredPackages().map((pkg) => ({
+                  source: pkg.source,
+                  scope: pkg.scope,
+                  filtered: pkg.filtered,
+                  installedPath: pkg.installedPath,
+                }));
+                const updates = await manager.checkForAvailableUpdates();
+                ws.send(JSON.stringify({ type: 'packages_list', packages, updates }));
+              } catch (err) {
+                log.error('[pifrontier] get_packages error:', err);
+                ws.send(JSON.stringify({ type: 'packages_list', packages: [], updates: [] }));
+              }
+              break;
+            }
+
+            case 'install_package':
+            case 'remove_package':
+            case 'update_packages': {
+              try {
+                const sess = activeSession();
+                const { manager } = packageManagerFor(sess);
+                manager.setProgressCallback((progress) =>
+                  broadcast({ type: 'package_progress', progress })
+                );
+                if (msg.type === 'install_package') {
+                  await manager.installAndPersist(msg.source, { local: msg.scope === 'project' });
+                } else if (msg.type === 'remove_package') {
+                  await manager.removeAndPersist(msg.source, { local: msg.scope === 'project' });
+                } else {
+                  await manager.update(msg.source);
+                }
+                await reloadSessionHost(sess.sessionId, sess);
+                ws.send(JSON.stringify({ type: 'package_result', success: true, message: 'Package operation completed.' }));
+              } catch (err) {
+                log.error('[pifrontier] package mutation error:', err);
+                ws.send(JSON.stringify({ type: 'package_result', success: false, message: String(err) }));
+              }
+              break;
+            }
+
+            case 'check_package_updates': {
+              try {
+                const { manager } = packageManagerFor(activeSession());
+                const updates = await manager.checkForAvailableUpdates();
+                ws.send(
+                  JSON.stringify({
+                    type: 'packages_list',
+                    packages: manager.listConfiguredPackages(),
+                    updates,
+                  })
+                );
+              } catch (err) {
+                log.error('[pifrontier] check_package_updates error:', err);
+                ws.send(JSON.stringify({ type: 'packages_list', packages: [], updates: [] }));
+              }
+              break;
+            }
+
+            case 'set_package_filter': {
+              try {
+                const sess = activeSession();
+                const { settings } = packageManagerFor(sess);
+                const projectScope = msg.source.startsWith('project:');
+                const packages = projectScope
+                  ? (settings.getProjectSettings().packages ?? [])
+                  : settings.getPackages();
+                const source = msg.source.replace(/^project:/, '');
+                const updated: PiSDKNS.PackageSource[] = packages.map(
+                  (pkg: PiSDKNS.PackageSource) =>
+                    packageSourceName(pkg) === source ? { source, ...msg.filter } : pkg
+                );
+                if (projectScope) settings.setProjectPackages(updated);
+                else settings.setPackages(updated);
+                await reloadSessionHost(sess.sessionId, sess);
+                ws.send(
+                  JSON.stringify({
+                    type: 'package_result',
+                    success: true,
+                    message: 'Package filter updated.',
+                  })
+                );
+              } catch (err) {
+                log.error('[pifrontier] set_package_filter error:', err);
+                ws.send(
+                  JSON.stringify({
+                    type: 'package_result',
+                    success: false,
+                    message: String(err),
+                  })
+                );
+              }
+              break;
+            }
+            case 'set_extension_flag': {
+              try {
+                const sess = activeSession();
+                const flag = sess.extensionRunner.getFlags().get(msg.name);
+                if (!flag) throw new Error(`Unknown extension flag: ${msg.name}`);
+                if (
+                  (flag.type === 'boolean' && typeof msg.value !== 'boolean') ||
+                  (flag.type === 'string' && typeof msg.value !== 'string')
+                ) {
+                  throw new Error(`Invalid value for ${msg.name}; expected ${flag.type}`);
+                }
+                sess.extensionRunner.setFlagValue(msg.name, msg.value);
+                persistExtensionFlag(msg.name, msg.value);
+                await reloadSessionHost(sess.sessionId, sess);
+                ws.send(
+                  JSON.stringify({
+                    type: 'extension_flag_result',
+                    name: msg.name,
+                    value: msg.value,
+                    success: true,
+                  })
+                );
+              } catch (err) {
+                log.error('[pifrontier] set_extension_flag error:', err);
+                ws.send(JSON.stringify({ type: 'agent_error', error: String(err) }));
+              }
+              break;
+            }
+
+            case 'invoke_extension_shortcut': {
+              try {
+                const sess = activeSession();
+                const shortcuts = sess.extensionRunner.getShortcuts({});
+                const shortcut = [...shortcuts.values()].find(
+                  (entry) => String(entry.shortcut) === msg.shortcut
+                );
+                if (!shortcut) throw new Error(`Shortcut not found: ${msg.shortcut}`);
+                await shortcut.handler(sess.extensionRunner.createContext());
+              } catch (err) {
+                log.error('[pifrontier] invoke_extension_shortcut error:', err);
+                ws.send(JSON.stringify({ type: 'agent_error', error: String(err) }));
+              }
+              break;
+            }
+
+
 
             case 'get_commands': {
               try {
@@ -4296,6 +4783,9 @@ try {
                 }
                 // redirect:'error' — the host whitelist above is checked pre-fetch only,
                 // so following redirects could smuggle content from arbitrary hosts.
+                if (msg.scope === 'project' && !activeSession().settingsManager.isProjectTrusted()) {
+                  throw new Error('Project resources are not trusted for this session.');
+                }
                 const res = await fetch(rawUrl, { redirect: 'error' });
                 if (!res.ok) {
                   ws.send(
@@ -4318,6 +4808,8 @@ try {
                 await mkdir(destDir, { recursive: true });
                 const destPath = join(destDir, safeFileName);
                 await writeFile(destPath, content, 'utf8');
+                const sess = activeSession();
+                await reloadSessionHost(sess.sessionId, sess);
                 // Extract skill name from frontmatter or filename
                 const nameMatch = content.match(/^---[\s\S]*?^name:\s*(.+)$/m);
                 const skillName = nameMatch
@@ -4348,13 +4840,13 @@ try {
                 const forkPath = sm.createBranchedSession(entryId);
                 if (!forkPath) throw new Error('Failed to create branched session');
                 const sm2 = _sdk!.SessionManager.open(forkPath);
-                const { session: forkedSession } = await _sdk!.createAgentSession({
-                  cwd: activeCwd(),
-                  sessionManager: sm2,
-                  modelRuntime: activeSession().modelRuntime,
-                  model: activeSession().model,
-                });
-                await setActiveSession(forkedSession);
+                const created = await createSdkSession(
+                  activeCwd(),
+                  sm2,
+                  'fork',
+                  activeSession().sessionFile
+                );
+                await setActiveSession(created.session, activeCwd(), created);
               } catch (err) {
                 log.error('[pifrontier] fork_session error:', err);
                 ws.send(JSON.stringify({ type: 'sessions_error', message: String(err) }));

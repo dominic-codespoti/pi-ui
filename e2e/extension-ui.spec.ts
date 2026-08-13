@@ -199,6 +199,69 @@ test.describe('Extension UI modals', () => {
 
     await expect(page.getByText('Operation complete')).toBeVisible({ timeout: 3000 });
   });
+test('exposes project trust controls', async ({ page }) => {
+  const clientMessages: Record<string, unknown>[] = [];
+  await page.routeWebSocket('/ws', (ws) => {
+    ws.onMessage((data) => {
+      const msg = JSON.parse(String(data)) as Record<string, unknown>;
+      clientMessages.push(msg);
+      if (msg.type === 'get_project_trust') {
+        ws.send(
+          JSON.stringify({
+            type: 'project_trust',
+            trust: {
+              cwd: '/home/user/project',
+              decision: 'ask',
+              requiresDecision: true,
+              persisted: false,
+            },
+          })
+        );
+      }
+      if (msg.type === 'set_project_trust') {
+        ws.send(
+          JSON.stringify({
+            type: 'project_trust',
+            trust: {
+              cwd: '/home/user/project',
+              decision: msg.decision,
+              requiresDecision: true,
+              persisted: msg.decision !== 'ask',
+            },
+          })
+        );
+      }
+      if (msg.type === 'get_session_stats') {
+        ws.send(
+          JSON.stringify({
+            type: 'session_stats',
+            stats: {
+              sessionId: 's1',
+              userMessages: 1,
+              assistantMessages: 1,
+              toolCalls: 0,
+              toolResults: 0,
+              totalMessages: 2,
+              tokens: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, total: 15 },
+              cost: 0.001,
+            },
+          })
+        );
+      }
+    });
+    ws.send(JSON.stringify({ ...CONNECTED_PAYLOAD, sessionId: 's1' }));
+    ws.send(JSON.stringify({ type: 'projects_list', projects: [] }));
+    ws.send(JSON.stringify({ type: 'all_sessions_list', sessions: [] }));
+  });
+
+  await page.getByRole('button', { name: 'Open settings' }).click();
+  await expect(page.getByText('Project trust')).toBeVisible();
+  await page.getByRole('button', { name: 'Trust project' }).click();
+  expect(clientMessages.some((msg) => msg.type === 'set_project_trust' && msg.decision === 'trusted')).toBe(
+    true
+  );
+
+});
 });
 
 // ── Extension component widget tests ────────────────────────────────────────
