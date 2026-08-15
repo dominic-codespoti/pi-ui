@@ -9,8 +9,11 @@
  * browser — localStorage access is still guarded for svelte-check.
  */
 
+import { untrack } from 'svelte';
 import { SvelteMap, SvelteSet } from 'svelte/reactivity';
-import type { ClientMessage, ProjectInfo, SessionSummary } from '$lib/ws/protocol';
+import { goto } from '$app/navigation';
+import { page } from '$app/state';
+import type { ClientMessage, ProjectInfo, SessionSummary } from '#lib/ws/protocol.js';
 
 /** A project with its sessions attached — the unit the UI renders. */
 export interface ProjectGroup extends ProjectInfo {
@@ -131,7 +134,12 @@ class ProjectsState {
             (s.firstMessage ?? '').toLowerCase().includes(q)
         ),
       }))
-      .filter((g) => g.sessions.length > 0 || g.name.toLowerCase().includes(q) || g.cwd.toLowerCase().includes(q));
+      .filter(
+        (g) =>
+          g.sessions.length > 0 ||
+          g.name.toLowerCase().includes(q) ||
+          g.cwd.toLowerCase().includes(q)
+      );
   });
 
   /** The project group for the active session's cwd, when known. */
@@ -154,10 +162,7 @@ class ProjectsState {
    * through this single method makes the relationship explicit and ensures any
    * future cross-field invariants are enforced in one place.
    */
-  applyState(payload: {
-    projects?: ProjectInfo[];
-    sessions?: SessionSummary[];
-  }): void {
+  applyState(payload: { projects?: ProjectInfo[]; sessions?: SessionSummary[] }): void {
     if (payload.projects !== undefined) this.projects = payload.projects;
     if (payload.sessions !== undefined) this.allSessions = payload.sessions;
   }
@@ -241,21 +246,31 @@ class ProjectsState {
     this.sessionLoading = true;
     const s = this.allSessions.find((s) => s.path === path);
     if (s) this.uncheckedSessions.delete(s.id);
+    const url = new URL(window.location.href);
+    url.searchParams.set('session', path);
+    // Shallow navigation — updates the URL bar (and page.state) without
+    // navigating or re-running load. `replace` keeps a single history entry
+    // per session switch; `state` preserves the current page state (e.g. the
+    // mobile drawer marker) instead of resetting it — read untracked so
+    // effect-driven callers don't subscribe to page.state. The read is also
+    // guarded because the server/test variant of `$app/state` throws outside
+    // request context.
+    let state: App.PageState = {};
     try {
-      const url = new URL(window.location.href);
-      url.searchParams.set('session', path);
-      // Raw DOM API, deliberately not $app/navigation's replaceState: this
-      // must work with no dependency on SvelteKit's router having started
-      // (replaceState() throws "Cannot call replaceState(...) before router
-      // is initialized" otherwise). This never navigates; it only keeps the
-      // URL bar in sync.
-      history.replaceState(null, '', url.pathname + url.search);
-    } catch { /* window may not be available during SSR */ }
+      state = untrack(() => page.state);
+    } catch {
+      /* not in a browser context — nothing to preserve */
+    }
+    goto(url, { shallow: true, replace: true, state }).catch(() => {
+      /* best-effort URL sync — never block session switching */
+    });
   }
 
   newSession(targetCwd?: string): void {
     if (this.pendingNewSession || this.sessionLoading) return;
-    const sent = this.send(targetCwd ? { type: 'new_session', targetCwd } : { type: 'new_session' });
+    const sent = this.send(
+      targetCwd ? { type: 'new_session', targetCwd } : { type: 'new_session' }
+    );
     if (sent) {
       this.pendingNewSession = true;
       this.sessionLoading = true;

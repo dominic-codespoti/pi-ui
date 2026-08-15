@@ -1,12 +1,12 @@
 <script lang="ts">
-  import { Button } from '$lib/components/ui/button';
-  import * as Tabs from '$lib/components/ui/tabs';
-  import { ScrollArea } from '$lib/components/ui/scroll-area';
-  import SidebarPanel from '$lib/components/sidebar-panel.svelte';
+  import { Button } from '#lib/components/ui/button/index.js';
+  import * as Tabs from '#lib/components/ui/tabs/index.js';
+  import { ScrollArea } from '#lib/components/ui/scroll-area/index.js';
+  import SidebarPanel from '#lib/components/sidebar-panel.svelte';
   import CornerDownLeft from '@lucide/svelte/icons/corner-down-left';
   import Sparkles from '@lucide/svelte/icons/sparkles';
-  import type { ModelInfo, ProviderInfo, SkillSummary, PromptSummary } from '$lib/ws/protocol';
-  import { providerColor, sourceLabel, canRemove } from '$lib/utils';
+  import type { ModelInfo, ProviderInfo, SkillSummary, PromptSummary } from '#lib/ws/protocol.js';
+  import { providerColor, sourceLabel, canRemove } from '#lib/utils.js';
 
   let {
     open,

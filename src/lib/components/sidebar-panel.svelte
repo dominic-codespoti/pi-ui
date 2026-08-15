@@ -42,7 +42,7 @@
   const resizeCursorClass = $derived(side === 'left' ? 'cursor-col-resize' : 'cursor-col-resize');
   const panelStyle = $derived(
     isMobile
-      ? `width: min(${width}px, calc(100vw - 1rem)); transform: translateX(${open ? '0' : translateClosed}); transition: transform 220ms cubic-bezier(0.33,1,0.68,1); padding-top: env(safe-area-inset-top, 0px); padding-bottom: env(safe-area-inset-bottom, 0px);`
+      ? `width: min(${width}px, calc(100vw - 1rem)); transform: translateX(${open ? '0' : translateClosed}); transition: transform ${open ? '300ms cubic-bezier(0.34,1.56,0.64,1)' : '220ms cubic-bezier(0.33,1,0.68,1)'}; padding-top: env(safe-area-inset-top, 0px); padding-bottom: env(safe-area-inset-bottom, 0px);`
       : `width: ${open ? width + 'px' : '0'}; transition: ${resizing ? 'none' : 'width 220ms cubic-bezier(0.33,1,0.68,1)'};`
   );
   const surfaceClass = $derived(
@@ -65,22 +65,40 @@
 <div
   role="complementary"
   aria-label={title}
-  class={isMobile ? `fixed inset-y-0 ${fixedSideClass} z-40 flex flex-col` : 'relative shrink-0 overflow-hidden'}
+  class={isMobile
+    ? `fixed inset-y-0 ${fixedSideClass} z-40 flex flex-col`
+    : 'relative shrink-0 overflow-hidden'}
   style={panelStyle}
   aria-hidden={!open}
 >
-  <div class="w-full h-full {surfaceClass} {borderClass} {isMobile ? mobileRoundClass : ''} flex flex-col overflow-hidden">
+  <div
+    class="w-full h-full {surfaceClass} {borderClass} {isMobile
+      ? mobileRoundClass
+      : ''} flex flex-col overflow-hidden"
+  >
     {#if header}
       {@render header()}
     {:else}
-      <div class="shrink-0 px-4 py-3 border-b border-base-content/10 flex items-center justify-between bg-base-content/[0.025]">
-        <span class="text-sm text-base-content/60 uppercase tracking-[0.16em] font-medium truncate">{title}</span>
+      <div
+        class="shrink-0 px-4 py-3 border-b border-base-content/10 flex items-center justify-between bg-base-content/[0.025]"
+      >
+        <span class="text-sm text-base-content/60 uppercase tracking-[0.16em] font-medium truncate"
+          >{title}</span
+        >
         <button
           onclick={onClose}
           class="w-9 h-9 flex items-center justify-center text-base-content/45 hover:text-base-content/80 hover:bg-base-content/8 rounded-xl transition-colors shrink-0"
           aria-label={closeLabel}
           tabindex={open ? 0 : -1}
-        ><svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+          ><svg
+            class="w-4 h-4"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12" /></svg
+          ></button
+        >
       </div>
     {/if}
 

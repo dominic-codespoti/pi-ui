@@ -1,9 +1,12 @@
 import { fail, redirect } from '@sveltejs/kit';
 import type { Actions, PageServerLoad } from './$types';
 import {
-  verifyPassword, verifySessionToken, createSessionToken, COOKIE_NAME,
-} from '$lib/auth/password';
-import { checkRateLimit, recordFailure, clearRecord, getClientIp } from '$lib/auth/rate-limiter';
+  verifyPassword,
+  verifySessionToken,
+  createSessionToken,
+  COOKIE_NAME,
+} from '#lib/auth/password.js';
+import { checkRateLimit, recordFailure, clearRecord, getClientIp } from '#lib/auth/rate-limiter.js';
 
 /** Detect if we're behind a reverse proxy (Cloudflare Tunnel, nginx, etc.). */
 function isBehindProxy(request: Request): boolean {
@@ -23,7 +26,13 @@ function safeRedirectTo(url: URL): string {
 }
 
 /** Cookie options shared by auth session writes. */
-function cookieOpts(request: Request): { path: string; httpOnly: boolean; sameSite: 'strict'; secure: boolean; maxAge: number } {
+function cookieOpts(request: Request): {
+  path: string;
+  httpOnly: boolean;
+  sameSite: 'strict';
+  secure: boolean;
+  maxAge: number;
+} {
   return {
     path: '/',
     httpOnly: true,
@@ -88,7 +97,12 @@ export const actions: Actions = {
           error: `Too many failed attempts. Try again in ${mins} minute${mins !== 1 ? 's' : ''}.`,
         });
       }
-      const hint = after.remaining === 1 ? ' (1 attempt left)' : after.remaining <= 3 ? ` (${after.remaining} attempts left)` : '';
+      const hint =
+        after.remaining === 1
+          ? ' (1 attempt left)'
+          : after.remaining <= 3
+            ? ` (${after.remaining} attempts left)`
+            : '';
       return fail(401, { error: `Incorrect password${hint}` });
     }
 

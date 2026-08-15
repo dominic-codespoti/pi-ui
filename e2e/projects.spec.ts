@@ -1,5 +1,9 @@
 import { test, expect } from './fixtures';
-import { PROJECTS_LIST_PAYLOAD, ALL_SESSIONS_LIST_PAYLOAD, SESSION_LOADED_PAYLOAD } from './mocks/payloads';
+import {
+  PROJECTS_LIST_PAYLOAD,
+  ALL_SESSIONS_LIST_PAYLOAD,
+  SESSION_LOADED_PAYLOAD,
+} from './mocks/payloads';
 import type { Page } from '@playwright/test';
 
 async function openProjectsSidebar(page: Page) {
@@ -46,12 +50,62 @@ test.describe('Projects sidebar', () => {
           ws.send(JSON.stringify(ALL_SESSIONS_LIST_PAYLOAD));
         }
       });
-      ws.send(JSON.stringify({ type: 'connected', sessionId: 's1', isStreaming: false, thinkingLevel: 'medium', model: null, availableModels: [], messages: [] }));
+      ws.send(
+        JSON.stringify({
+          type: 'connected',
+          sessionId: 's1',
+          isStreaming: false,
+          thinkingLevel: 'medium',
+          model: null,
+          availableModels: [],
+          messages: [],
+        })
+      );
     });
 
     await openProjectsSidebar(page);
 
     await expect(page.getByText('project-a')).toBeVisible({ timeout: 3000 });
+  });
+
+  test('session switch updates URL without reloading', async ({ page }) => {
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.onMessage((data) => {
+        const msg = JSON.parse(String(data));
+        if (msg.type === 'get_projects') {
+          ws.send(JSON.stringify(PROJECTS_LIST_PAYLOAD));
+        }
+        if (msg.type === 'get_all_sessions') {
+          ws.send(JSON.stringify(ALL_SESSIONS_LIST_PAYLOAD));
+        }
+      });
+      ws.send(
+        JSON.stringify({
+          type: 'connected',
+          sessionId: 's1',
+          isStreaming: false,
+          thinkingLevel: 'medium',
+          model: null,
+          availableModels: [],
+          messages: [],
+        })
+      );
+    });
+
+    // Reload marker — a real navigation would lose it.
+    await page.evaluate(() => {
+      (window as unknown as Record<string, unknown>).__piNoReload = true;
+    });
+
+    await openProjectsSidebar(page);
+    await page.getByRole('button', { name: /Bug fix/ }).click();
+
+    // The shallow goto must persist the session path to the URL bar…
+    await expect(page).toHaveURL(/session=%2Fhome%2Fuser%2Fproject-a%2Fs1\.jsonl/);
+    // …without navigating: the page was never reloaded.
+    expect(
+      await page.evaluate(() => (window as unknown as Record<string, unknown>).__piNoReload)
+    ).toBe(true);
   });
 
   test('search filters projects', async ({ page }) => {
@@ -65,11 +119,23 @@ test.describe('Projects sidebar', () => {
           ws.send(JSON.stringify(ALL_SESSIONS_LIST_PAYLOAD));
         }
       });
-      ws.send(JSON.stringify({ type: 'connected', sessionId: 's1', isStreaming: false, thinkingLevel: 'medium', model: null, availableModels: [], messages: [] }));
+      ws.send(
+        JSON.stringify({
+          type: 'connected',
+          sessionId: 's1',
+          isStreaming: false,
+          thinkingLevel: 'medium',
+          model: null,
+          availableModels: [],
+          messages: [],
+        })
+      );
     });
 
     await openProjectsSidebar(page);
-    await page.locator('input[aria-label="Filter projects and sessions"]:visible').fill('nonexistent');
+    await page
+      .locator('input[aria-label="Filter projects and sessions"]:visible')
+      .fill('nonexistent');
     await expect(page.getByText('No match')).toBeVisible({ timeout: 3000 });
   });
 
@@ -84,16 +150,28 @@ test.describe('Projects sidebar', () => {
           ws.send(JSON.stringify(ALL_SESSIONS_LIST_PAYLOAD));
         }
       });
-      ws.send(JSON.stringify({ type: 'connected', sessionId: 's1', isStreaming: false, thinkingLevel: 'medium', model: null, availableModels: [], messages: [] }));
+      ws.send(
+        JSON.stringify({
+          type: 'connected',
+          sessionId: 's1',
+          isStreaming: false,
+          thinkingLevel: 'medium',
+          model: null,
+          availableModels: [],
+          messages: [],
+        })
+      );
       // Send a runtime update for a background session
       setTimeout(() => {
-        ws.send(JSON.stringify({
-          type: 'session_runtime',
-          sessionId: 's3',
-          isRunning: true,
-          unseen: false,
-          lastActivity: Date.now(),
-        }));
+        ws.send(
+          JSON.stringify({
+            type: 'session_runtime',
+            sessionId: 's3',
+            isRunning: true,
+            unseen: false,
+            lastActivity: Date.now(),
+          })
+        );
       }, 100);
     });
 
@@ -124,7 +202,17 @@ test.describe('Projects sidebar', () => {
           }, 250);
         }
       });
-      ws.send(JSON.stringify({ type: 'connected', sessionId: 's1', isStreaming: false, thinkingLevel: 'medium', model: null, availableModels: [], messages: [] }));
+      ws.send(
+        JSON.stringify({
+          type: 'connected',
+          sessionId: 's1',
+          isStreaming: false,
+          thinkingLevel: 'medium',
+          model: null,
+          availableModels: [],
+          messages: [],
+        })
+      );
     });
 
     await openProjectsSidebar(page);

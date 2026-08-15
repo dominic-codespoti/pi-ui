@@ -2,25 +2,29 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { RequestEvent, ServerLoadEvent } from '@sveltejs/kit';
 
 /** Event types pinned to the login route id so they satisfy the generated $types. */
-type LoginLoadEvent = ServerLoadEvent<Record<string, never>, Record<string, never>, '/(auth)/login'>;
+type LoginLoadEvent = ServerLoadEvent<
+  Record<string, never>,
+  Record<string, never>,
+  '/(auth)/login'
+>;
 type LoginRequestEvent = RequestEvent<Record<string, never>, '/(auth)/login'>;
 
-vi.mock('$lib/auth/password', () => ({
+vi.mock('#lib/auth/password.js', () => ({
   verifyPassword: vi.fn(),
   verifySessionToken: vi.fn(),
   createSessionToken: vi.fn(),
   COOKIE_NAME: 'pi-session',
 }));
 
-vi.mock('$lib/auth/rate-limiter', () => ({
+vi.mock('#lib/auth/rate-limiter.js', () => ({
   checkRateLimit: vi.fn(),
   recordFailure: vi.fn(),
   clearRecord: vi.fn(),
   getClientIp: vi.fn(),
 }));
 
-import { verifyPassword, verifySessionToken, createSessionToken } from '$lib/auth/password';
-import { checkRateLimit, recordFailure, getClientIp } from '$lib/auth/rate-limiter';
+import { verifyPassword, verifySessionToken, createSessionToken } from '#lib/auth/password.js';
+import { checkRateLimit, recordFailure, getClientIp } from '#lib/auth/rate-limiter.js';
 
 async function getLoad() {
   const mod = await import('../(auth)/login/+page.server');
@@ -44,7 +48,9 @@ function mockRequest(options: {
   if (options.password !== undefined) formData.append('password', options.password);
   const proto = options.host?.includes('example.com') ? 'https' : 'http';
   const base = options.host ? `${proto}://${options.host}/login` : 'http://localhost/login';
-  const urlStr = options.redirect ? `${base}?redirect=${encodeURIComponent(options.redirect)}` : base;
+  const urlStr = options.redirect
+    ? `${base}?redirect=${encodeURIComponent(options.redirect)}`
+    : base;
   return {
     request: {
       method: options.method ?? 'POST',
@@ -81,7 +87,10 @@ describe('login page load', () => {
   it('redirects to / when valid token exists', async () => {
     vi.mocked(verifySessionToken).mockResolvedValue(true);
     const load = await getLoad();
-    const ctx = { cookies: { get: vi.fn().mockReturnValue('valid-token') }, url: new URL('http://localhost/login') } as unknown as LoginLoadEvent;
+    const ctx = {
+      cookies: { get: vi.fn().mockReturnValue('valid-token') },
+      url: new URL('http://localhost/login'),
+    } as unknown as LoginLoadEvent;
     try {
       await load(ctx);
       expect.unreachable('should have redirected');
@@ -95,7 +104,10 @@ describe('login page load', () => {
   it('redirects to redirect param when valid token exists', async () => {
     vi.mocked(verifySessionToken).mockResolvedValue(true);
     const load = await getLoad();
-    const ctx = { cookies: { get: vi.fn().mockReturnValue('valid-token') }, url: new URL('http://localhost/login?redirect=%2F%3Ffoo%3Dbar') } as unknown as LoginLoadEvent;
+    const ctx = {
+      cookies: { get: vi.fn().mockReturnValue('valid-token') },
+      url: new URL('http://localhost/login?redirect=%2F%3Ffoo%3Dbar'),
+    } as unknown as LoginLoadEvent;
     try {
       await load(ctx);
       expect.unreachable('should have redirected');
@@ -108,7 +120,10 @@ describe('login page load', () => {
 
   it('does not redirect when token is absent', async () => {
     const load = await getLoad();
-    const ctx = { cookies: { get: vi.fn().mockReturnValue(null) }, url: new URL('http://localhost/login') } as unknown as LoginLoadEvent;
+    const ctx = {
+      cookies: { get: vi.fn().mockReturnValue(null) },
+      url: new URL('http://localhost/login'),
+    } as unknown as LoginLoadEvent;
     const result = await load(ctx);
     expect(result).toBeUndefined();
   });
@@ -116,7 +131,10 @@ describe('login page load', () => {
   it('does not redirect for expired tokens', async () => {
     vi.mocked(verifySessionToken).mockResolvedValue(false);
     const load = await getLoad();
-    const ctx = { cookies: { get: vi.fn().mockReturnValue('stale-token') }, url: new URL('http://localhost/login') } as unknown as LoginLoadEvent;
+    const ctx = {
+      cookies: { get: vi.fn().mockReturnValue('stale-token') },
+      url: new URL('http://localhost/login'),
+    } as unknown as LoginLoadEvent;
     const result = await load(ctx);
     expect(result).toBeUndefined();
   });
@@ -126,29 +144,37 @@ describe('login actions', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(getClientIp).mockReturnValue('127.0.0.1');
-    vi.mocked(checkRateLimit).mockReturnValue({ blocked: false, remaining: 5, retryAfterSecs: null });
+    vi.mocked(checkRateLimit).mockReturnValue({
+      blocked: false,
+      remaining: 5,
+      retryAfterSecs: null,
+    });
   });
 
   it('returns 400 when password is missing', async () => {
     const actions = await getActions();
     const ctx = mockRequest({ password: '' });
-    const result = await actions(ctx) as { status: number };
+    const result = (await actions(ctx)) as { status: number };
     expect(result.status).toBe(400);
   });
 
   it('returns 403 on origin mismatch', async () => {
     const actions = await getActions();
     const ctx = mockRequest({ password: 'secret', origin: 'http://evil.com', host: 'localhost' });
-    const result = await actions(ctx) as { status: number };
+    const result = (await actions(ctx)) as { status: number };
     expect(result.status).toBe(403);
   });
 
   it('returns 401 on wrong password', async () => {
     vi.mocked(verifyPassword).mockResolvedValue(false);
-    vi.mocked(recordFailure).mockReturnValue({ blocked: false, remaining: 4, retryAfterSecs: null });
+    vi.mocked(recordFailure).mockReturnValue({
+      blocked: false,
+      remaining: 4,
+      retryAfterSecs: null,
+    });
     const actions = await getActions();
     const ctx = mockRequest({ password: 'wrong', origin: 'http://localhost', host: 'localhost' });
-    const result = await actions(ctx) as { status: number };
+    const result = (await actions(ctx)) as { status: number };
     expect(result.status).toBe(401);
   });
 
@@ -176,7 +202,12 @@ describe('login actions', () => {
     vi.mocked(verifyPassword).mockResolvedValue(true);
     vi.mocked(createSessionToken).mockResolvedValue('t');
     const actions = await getActions();
-    const ctx = mockRequest({ password: 'correct', origin: 'http://localhost', host: 'localhost', redirect: '/?foo=bar' });
+    const ctx = mockRequest({
+      password: 'correct',
+      origin: 'http://localhost',
+      host: 'localhost',
+      redirect: '/?foo=bar',
+    });
     try {
       await actions(ctx);
       expect.unreachable('should have redirected');
@@ -191,8 +222,18 @@ describe('login actions', () => {
     vi.mocked(verifyPassword).mockResolvedValue(true);
     vi.mocked(createSessionToken).mockResolvedValue('t');
     const actions = await getActions();
-    for (const bad of ['https://evil.com', '//evil.com', 'http://evil.com/', 'https://evil.com/steal']) {
-      const ctx = mockRequest({ password: 'correct', origin: 'http://localhost', host: 'localhost', redirect: bad });
+    for (const bad of [
+      'https://evil.com',
+      '//evil.com',
+      'http://evil.com/',
+      'https://evil.com/steal',
+    ]) {
+      const ctx = mockRequest({
+        password: 'correct',
+        origin: 'http://localhost',
+        host: 'localhost',
+        redirect: bad,
+      });
       try {
         await actions(ctx);
         expect.unreachable('should have redirected');
@@ -208,7 +249,7 @@ describe('login actions', () => {
     vi.mocked(checkRateLimit).mockReturnValue({ blocked: true, remaining: 0, retryAfterSecs: 300 });
     const actions = await getActions();
     const ctx = mockRequest({ password: 'any', origin: 'http://localhost', host: 'localhost' });
-    const result = await actions(ctx) as { status: number };
+    const result = (await actions(ctx)) as { status: number };
     expect(result.status).toBe(429);
   });
 
@@ -217,7 +258,12 @@ describe('login actions', () => {
     vi.mocked(verifyPassword).mockResolvedValue(true);
     vi.mocked(createSessionToken).mockResolvedValue('t');
     const actions = await getActions();
-    const ctx = mockRequest({ password: 'correct', origin: 'https://example.com', host: 'example.com', ip: '203.0.113.5' });
+    const ctx = mockRequest({
+      password: 'correct',
+      origin: 'https://example.com',
+      host: 'example.com',
+      ip: '203.0.113.5',
+    });
     try {
       await actions(ctx);
     } catch (err) {

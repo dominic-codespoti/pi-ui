@@ -1,7 +1,7 @@
 <script lang="ts">
   import '../../app.css';
   import type { Snippet } from 'svelte';
-  import { registerServiceWorker } from '$lib/register-service-worker';
+  import { registerServiceWorker } from '#lib/register-service-worker.js';
 
   let { children }: { children: Snippet } = $props();
 

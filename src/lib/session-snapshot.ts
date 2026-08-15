@@ -12,7 +12,7 @@
  * payloads always overwrite hydrated state wholesale.
  */
 
-import type { UIMessage } from '$lib/client-messages';
+import type { UIMessage } from '#lib/client-messages.js';
 
 export interface SessionSnapshot {
   /** Schema version — bump to invalidate incompatible stored snapshots. */

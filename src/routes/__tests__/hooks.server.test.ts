@@ -6,12 +6,12 @@ import type { Mock } from 'vitest';
 type MockRequestEvent = RequestEvent & { resolve: Mock };
 
 // Mock the password module before importing hooks
-vi.mock('$lib/auth/password', () => ({
+vi.mock('#lib/auth/password.js', () => ({
   verifySessionToken: vi.fn(),
   getTokenFromCookies: vi.fn(),
 }));
 
-import { verifySessionToken, getTokenFromCookies } from '$lib/auth/password';
+import { verifySessionToken, getTokenFromCookies } from '#lib/auth/password.js';
 
 // We need to re-import the handle function after mocking
 async function getHandle() {

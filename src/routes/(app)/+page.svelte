@@ -1,6 +1,8 @@
 <script lang="ts">
-  import { onMount, onDestroy, tick } from 'svelte';
-  import { dev } from '$app/environment';
+  import { onMount, onDestroy, tick, untrack } from 'svelte';
+  import { dev } from '$app/env';
+  import { goto } from '$app/navigation';
+  import { page } from '$app/state';
   import { resolve } from '$app/paths';
   import { SvelteMap } from 'svelte/reactivity';
 
@@ -25,13 +27,13 @@
     PackageUpdateInfo,
     PackageProgress,
     SessionStats,
-  } from '$lib/ws/protocol';
-  import type { PiEvent } from '$lib/ws/protocol';
-  import { renderMarkdown, renderStreamingPreview, onLangRegistered } from '$lib/markdown';
-  import { providerColor, versionText, fmtTokens, fmtCost, fmtDuration } from '$lib/utils';
-  import type { ParsedComponent } from '$lib/tui-stubs';
-  import { projectsState } from '$lib/state/projects-state.svelte';
-  import { extensionUiState } from '$lib/state/extension-ui-state.svelte';
+  } from '#lib/ws/protocol.js';
+  import type { PiEvent } from '#lib/ws/protocol.js';
+  import { renderMarkdown, renderStreamingPreview, onLangRegistered } from '#lib/markdown.js';
+  import { providerColor, versionText, fmtTokens, fmtCost, fmtDuration } from '#lib/utils.js';
+  import type { ParsedComponent } from '#lib/tui-stubs.js';
+  import { projectsState } from '#lib/state/projects-state.svelte.js';
+  import { extensionUiState } from '#lib/state/extension-ui-state.svelte.js';
   import {
     rawMessagesToUI,
     uid,
@@ -39,22 +41,22 @@
     extractTextContent,
     reconnectDelay,
     type UIMessage,
-  } from '$lib/client-messages';
-  import { saveSnapshot, loadSnapshot } from '$lib/session-snapshot';
-  import { encodeTerminalKey, wrapBracketedPaste } from '$lib/terminal-key-encoder';
-  import * as Tooltip from '$lib/components/ui/tooltip';
-  import { Switch } from '$lib/components/ui/switch';
-  import * as Dialog from '$lib/components/ui/dialog';
-  import { Button } from '$lib/components/ui/button';
-  import * as Select from '$lib/components/ui/select';
-  import { ScrollArea } from '$lib/components/ui/scroll-area';
-  import * as Card from '$lib/components/ui/card';
-  import SidebarPanel from '$lib/components/sidebar-panel.svelte';
-  import ProjectsSidebar from '$lib/components/projects/lazy-projects-sidebar.svelte';
-  import MessageList from '$lib/components/chat/message-list.svelte';
-  import RightPanel from '$lib/components/panels/lazy-right-panel.svelte';
-  import ExtensionComponent from '$lib/components/ui/extension-component.svelte';
-  import ConfirmDialog from '$lib/components/dialogs/confirm-dialog.svelte';
+  } from '#lib/client-messages.js';
+  import { saveSnapshot, loadSnapshot } from '#lib/session-snapshot.js';
+  import { encodeTerminalKey, wrapBracketedPaste } from '#lib/terminal-key-encoder.js';
+  import * as Tooltip from '#lib/components/ui/tooltip/index.js';
+  import { Switch } from '#lib/components/ui/switch/index.js';
+  import * as Dialog from '#lib/components/ui/dialog/index.js';
+  import { Button } from '#lib/components/ui/button/index.js';
+  import * as Select from '#lib/components/ui/select/index.js';
+  import { ScrollArea } from '#lib/components/ui/scroll-area/index.js';
+  import * as Card from '#lib/components/ui/card/index.js';
+  import SidebarPanel from '#lib/components/sidebar-panel.svelte';
+  import ProjectsSidebar from '#lib/components/projects/lazy-projects-sidebar.svelte';
+  import MessageList from '#lib/components/chat/message-list.svelte';
+  import RightPanel from '#lib/components/panels/lazy-right-panel.svelte';
+  import ExtensionComponent from '#lib/components/ui/extension-component.svelte';
+  import ConfirmDialog from '#lib/components/dialogs/confirm-dialog.svelte';
 
   import ChevronRight from '@lucide/svelte/icons/chevron-right';
   import X from '@lucide/svelte/icons/x';
@@ -67,6 +69,7 @@
   import Bell from '@lucide/svelte/icons/bell';
   import Wrench from '@lucide/svelte/icons/wrench';
   import BookOpen from '@lucide/svelte/icons/book-open';
+  import ShieldQuestion from '@lucide/svelte/icons/shield-question';
 
   // ── Builtin slash commands ───────────────────────────────────────────────────
 
@@ -113,8 +116,18 @@
   ] as const;
 
   const SNIPPET_SHORTCUTS = [
-    { label: 'review', description: 'Ask for a concise code review', insert: '#review ' },
-    { label: 'fix', description: 'Ask pi to diagnose and fix an issue', insert: '#fix ' },
+    {
+      label: 'review',
+      description: 'Ask for a concise code review',
+      insert: '#review ',
+    },
+
+    {
+      label: 'fix',
+      description: 'Ask pi to diagnose and fix an issue',
+      insert: '#fix ',
+    },
+
     {
       label: 'explain',
       description: 'Ask pi to explain selected code or output',
@@ -123,7 +136,7 @@
   ] as const;
 
   // ── UI message model ────────────────────────────────────────────────────────
-  // (MsgUsage and UIMessage types imported from $lib/client-messages)
+  // (MsgUsage and UIMessage types imported from #lib/client-messages)
 
   // ── Extension UI modal state ─────────────────────────────────────────────────
 
@@ -151,6 +164,7 @@
   function parsedComponentIsDisplayOnly(comp: ParsedComponent | undefined): boolean {
     if (!comp) return false;
     if (comp.kind === 'container') return comp.children.every(parsedComponentIsDisplayOnly);
+
     return (
       comp.kind === 'text' ||
       comp.kind === 'markdown' ||
@@ -314,6 +328,11 @@
   // ── Mobile detection ──────────────────────────────────────────────────────
 
   let isMobile = $state(false);
+
+  /** autocorrect is a real attribute but missing from Svelte's HTML typings. */
+  function autoCorrectOff(node: HTMLElement) {
+    node.setAttribute('autocorrect', 'off');
+  }
   let _mq: MediaQueryList | null = null;
   let _mqHandler: ((e: MediaQueryListEvent) => void) | null = null;
 
@@ -330,7 +349,26 @@
   function handleTouchEnd(e: TouchEvent) {
     const dx = e.changedTouches[0].clientX - touchStartX;
     const dy = Math.abs(e.changedTouches[0].clientY - touchStartY);
-    if (dy > 40 || Math.abs(dx) < 50) return;
+    if (dy > 40) return;
+    const absDx = Math.abs(dx);
+    if (absDx < 50) return;
+
+    // Drag-to-close: a horizontal drag on an open drawer toward its closed
+    // edge closes it (left drawer slides out left, right drawer slides out
+    // right). Only counts when the gesture starts on the drawer surface.
+    const drawerW = Math.min(
+      showSessionPanel ? sessionPanelWidth : showRightPanel ? rightPanelWidth : 0,
+      window.innerWidth - 16
+    );
+    if (showSessionPanel && dx < -70 && touchStartX < drawerW) {
+      showSessionPanel = false;
+      return;
+    }
+    if (showRightPanel && dx > 70 && touchStartX > window.innerWidth - drawerW) {
+      showRightPanel = false;
+      return;
+    }
+
     if (dx > 0 && touchStartX < 40) {
       // Swipe right from left edge → open session panel
       showSessionPanel = true;
@@ -340,6 +378,97 @@
       openTab('models');
     }
   }
+
+  /** Micro-haptic feedback — Android touch devices only (iOS Safari has no vibrate). */
+  function haptic(pattern: number | number[] = 8) {
+    try {
+      if (window.matchMedia('(pointer: coarse)').matches && navigator.vibrate) {
+        navigator.vibrate(pattern);
+      }
+    } catch {
+      /* vibrate unsupported */
+    }
+  }
+
+  // ── iOS keyboard inset ────────────────────────────────────────────────────
+  // iOS Safari never resizes the layout viewport for the software keyboard
+  // (WebKit bug 259770): the keyboard overlays the page. The visualViewport
+  // delta (layout − visual height) is the portable keyboard signal:
+  //   · iOS:     innerHeight stays, visual shrinks   → delta > 0 → pad layout
+  //   · Chromium: resizes-content meta shrinks both  → delta ≈ 0 → no-op
+  // The padding is applied to the main column so the composer stays pinned
+  // above the keyboard instead of Safari's crude auto-pan.
+  let keyboardInset = $state(0);
+
+  $effect(() => {
+    const vv = window.visualViewport;
+    if (!vv) return;
+    const onResize = () => {
+      const delta = window.innerHeight - vv.height;
+      keyboardInset = delta > 0 ? Math.round(delta) : 0;
+    };
+    vv.addEventListener('resize', onResize);
+    return () => vv.removeEventListener('resize', onResize);
+  });
+
+  // ── Android back: close open drawers before leaving ──────────────────────
+  // A same-URL history marker is pushed while a drawer is open; the system
+  // back gesture pops it, we swallow the pop and close the drawer. SvelteKit's
+  // router ignores same-URL pops, so no navigation happens.
+  $effect(() => {
+    // popstate.state describes the entry becoming active, not the one being
+    // popped — so the marker can't be inspected here. The sync effect below
+    // keeps the marker on top whenever a drawer is open, making ANY pop with a
+    // drawer open a back gesture on it: swallow by closing the drawer.
+    const onPop = () => {
+      if (showSessionPanel || showRightPanel) {
+        showSessionPanel = false;
+        showRightPanel = false;
+      }
+    };
+    window.addEventListener('popstate', onPop);
+    return () => window.removeEventListener('popstate', onPop);
+  });
+
+  $effect(() => {
+    if (!isMobile) return;
+    const anyOpen = showSessionPanel || showRightPanel;
+    const marked = page.state.piUiDrawer === true;
+    if (anyOpen && !marked) {
+      // Shallow navigation pushes a same-URL history entry carrying the
+      // marker; Android back pops it and the listener above swallows the
+      // pop by closing the drawer. SvelteKit reapplies page.state on the
+      // pop, which clears the marker.
+      goto(window.location.href, {
+        shallow: true,
+        state: { ...page.state, piUiDrawer: true },
+      }).catch(() => {
+        /* marker is best-effort — the drawer still opens without it */
+      });
+    } else if (!anyOpen && marked) {
+      history.back();
+    }
+  });
+
+  // ── Service-worker messages (notification clicks) ─────────────────────────
+  $effect(() => {
+    if (!('serviceWorker' in navigator)) return;
+    const onSwMessage = (e: MessageEvent) => {
+      const d = e.data as { type?: string; sessionPath?: string } | undefined;
+      if (!d?.type) return;
+      if (d.type === 'pi_focus_session' && typeof d.sessionPath === 'string') {
+        const target = projectsState.allSessions.find((s) => s.path === d.sessionPath);
+        if (target && target.id !== projectsState.activeSessionId) {
+          projectsState.switchSession(d.sessionPath);
+        }
+      } else if (d.type === 'pi_steer') {
+        haptic();
+        tick().then(() => inputEl?.focus());
+      }
+    };
+    navigator.serviceWorker.addEventListener('message', onSwMessage);
+    return () => navigator.serviceWorker.removeEventListener('message', onSwMessage);
+  });
 
   // ── Sidebar resize handlers (desktop only, pointer capture) ──────────────────
 
@@ -401,8 +530,8 @@
   // ── Extension UI state ───────────────────────────────────────────────────────
 
   const AGENT_SUMMARY_WIDGET_KEYS = new Set(['agents', 'subagents']);
-  const FLEET_WIDGET_KEY = 'fleet';
 
+  const FLEET_WIDGET_KEY = 'fleet';
   let visibleExtensionStatuses = $derived(
     Object.entries(extensionUiState.statuses).filter(([, value]) => Boolean(value))
   );
@@ -566,7 +695,9 @@
           description: 'workspace file',
           insert: `@${path} `,
         })),
+
         ...(cwd ? [{ label: '@current', description: cwd, insert: `@${cwd} ` }] : []),
+
         ...projectsState.groups.map((p) => ({
           label: `@${p.name}`,
           description: p.cwd,
@@ -726,6 +857,7 @@
   // ── Panel state ──────────────────────────────────────────────────────────────
 
   let showRightPanel = $state(urlParam('rp', '') === '1');
+
   let rightPanelTab = $state<'models' | 'tools' | 'skills'>(
     (['models', 'tools', 'skills'] as const).includes(
       urlParam('rpt', '') as 'models' | 'tools' | 'skills'
@@ -733,6 +865,7 @@
       ? (urlParam('rpt', '') as 'models' | 'tools' | 'skills')
       : 'models'
   );
+
   function setTheme(t: string) {
     selectedTheme = t;
     document.documentElement.setAttribute('data-theme', t);
@@ -901,6 +1034,125 @@
     }
   });
 
+  // ── Post-run permission nudge ─────────────────────────────────────────────
+  // Asking right after a completed turn (when the value is obvious) converts
+  // far better than the Settings toggle. Shown once; permission requests MUST
+  // come from a user gesture, so the banner's Enable button does the asking.
+  const NOTIF_NUDGE_SEEN_KEY = 'pifrontier:notif-nudge-seen';
+  let showNotifNudge = $state(false);
+  let notifNudgeSeen = $state(false);
+  try {
+    notifNudgeSeen = localStorage.getItem(NOTIF_NUDGE_SEEN_KEY) === '1';
+  } catch {
+    /* ignore */
+  }
+  function enableNotifications() {
+    showNotifNudge = false;
+    notifNudgeSeen = true;
+    try {
+      localStorage.setItem(NOTIF_NUDGE_SEEN_KEY, '1');
+    } catch {
+      /* ignore */
+    }
+    if ('Notification' in window && Notification.permission === 'default') {
+      void Notification.requestPermission()
+        .then((p) => {
+          if (p === 'granted' && connectedPushVapidKey && wsState === 'open') {
+            void syncPushSubscription();
+          }
+        })
+        .catch(() => {});
+    }
+  }
+  function dismissNotifNudge() {
+    showNotifNudge = false;
+    notifNudgeSeen = true;
+    try {
+      localStorage.setItem(NOTIF_NUDGE_SEEN_KEY, '1');
+    } catch {
+      /* ignore */
+    }
+  }
+
+  // ── Web Push subscription sync ────────────────────────────────────────────
+  // One subscription per browser, mirroring it to the server so closed-app
+  // notifications (agent_end pushes) can reach this device. Subscribe when
+  // notifications are enabled + permission granted; unsubscribe otherwise.
+  let connectedPushVapidKey = $state<string | null>(null);
+  let _pushSyncInFlight = false;
+
+  /** VAPID public keys arrive base64url-encoded; pushManager wants bytes. */
+  function urlBase64ToUint8Array(base64url: string): Uint8Array<ArrayBuffer> {
+    const pad = base64url.replace(/-/g, '+').replace(/_/g, '/');
+    const binary = atob(pad + '='.repeat((4 - (pad.length % 4)) % 4));
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  }
+
+  async function syncPushSubscription() {
+    if (_pushSyncInFlight) return;
+    _pushSyncInFlight = true;
+    try {
+      const reg = await navigator.serviceWorker.ready;
+      const existing = await reg.pushManager.getSubscription();
+      if (existing) {
+        const json = existing.toJSON();
+        if (json.keys?.p256dh && json.keys.auth) {
+          send({
+            type: 'push_subscribe',
+            endpoint: existing.endpoint,
+            keys: { p256dh: json.keys.p256dh, auth: json.keys.auth },
+            expirationTime: existing.expirationTime ?? null,
+          });
+        }
+        return;
+      }
+      if (!connectedPushVapidKey) return;
+      const sub = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(connectedPushVapidKey),
+      });
+      const json = sub.toJSON();
+      send({
+        type: 'push_subscribe',
+        endpoint: sub.endpoint,
+        keys: { p256dh: json.keys?.p256dh ?? '', auth: json.keys?.auth ?? '' },
+        expirationTime: sub.expirationTime ?? null,
+      });
+    } catch (err) {
+      // Permission revoked, push unavailable, or a malformed VAPID key —
+      // notifications just stay page-only. Log for diagnosability.
+      console.warn('[pi-ui] push subscribe failed:', err);
+    } finally {
+      _pushSyncInFlight = false;
+    }
+  }
+
+  async function unsubscribePush() {
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
+    try {
+      const reg = await navigator.serviceWorker.ready;
+      const sub = await reg.pushManager.getSubscription();
+      if (sub) {
+        send({ type: 'push_unsubscribe', endpoint: sub.endpoint });
+        await sub.unsubscribe();
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  $effect(() => {
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
+    if (!connectedPushVapidKey || wsState !== 'open') return;
+    if (notificationPrefs.enabled && Notification.permission === 'granted') {
+      void syncPushSubscription();
+    } else {
+      void unsubscribePush();
+    }
+  });
+
   /** Webhook notification URL (ntfy.sh/Pushover/Gotify) — persisted server-side. */
   let notificationWebhookUrl = $state('');
   function loadWebhookUrlFromServer(url?: string) {
@@ -945,6 +1197,10 @@
   let extensionErrors = $state<{ path: string; error: string }[]>([]);
   /** True once extensions_list has been received */
   let projectTrust = $state<ProjectTrustInfo | null>(null);
+  /** True while the active project's trust is undecided — shows the trust strip. */
+  const trustPromptVisible = $derived(
+    wsState === 'open' && projectTrust?.requiresDecision === true && projectTrust.decision === 'ask'
+  );
   let runtimeDiagnostics = $state<RuntimeDiagnostic[]>([]);
   let packagesList = $state<ConfiguredPackageInfo[]>([]);
   let packageUpdates = $state<PackageUpdateInfo[]>([]);
@@ -1045,6 +1301,7 @@
         ? Math.round((effectiveContextTokens / model.contextWindow) * 100)
         : 0
   );
+
   /** Display name of the active project (custom name → directory basename). */
   const activeProjectName = $derived(projectsState.activeProjectName);
 
@@ -1447,12 +1704,14 @@
   function setSessionParam(path: string): void {
     const url = new URL(window.location.href);
     url.searchParams.set('session', path);
-    // Raw DOM API, deliberately not $app/navigation's replaceState: this
-    // must work at any point (WS message handlers, early effects) with no
-    // dependency on SvelteKit's router having started — replaceState()
-    // throws "Cannot call replaceState(...) before router is initialized"
-    // otherwise. This never navigates; it only keeps the URL bar in sync.
-    history.replaceState(null, '', url.pathname + url.search);
+    // Shallow navigation keeps the URL bar in sync without navigating or
+    // re-running load. `replace` avoids history spam on rapid session
+    // switches; `state` preserves the current page state (e.g. the mobile
+    // drawer marker) instead of resetting it — read untracked so effect-
+    // driven callers don't subscribe to page.state (see setUrlParams).
+    goto(url, { shallow: true, replace: true, state: untrack(() => page.state) }).catch(() => {
+      /* best-effort URL sync — never fail the WS flow */
+    });
   }
 
   /** Read a URL param with a default fallback. */
@@ -1471,8 +1730,13 @@
       if (value == null) url.searchParams.delete(key);
       else url.searchParams.set(key, value);
     }
-    // See setSessionParam() above for why this bypasses $app/navigation.
-    history.replaceState(null, '', url.pathname + url.search);
+    // See setSessionParam() for the goto rationale. `untrack` is required:
+    // this runs from a layout-sync $effect, and reading `page.state` there
+    // would subscribe the effect to it — goto's state write then re-triggers
+    // the effect, looping forever.
+    goto(url, { shallow: true, replace: true, state: untrack(() => page.state) }).catch(() => {
+      /* best-effort URL sync */
+    });
   }
 
   /** Gracefully close the WS without reconnecting. */
@@ -1726,6 +1990,7 @@
         const c = msg as ConnectedMessage;
         applySessionState(c as unknown as Record<string, unknown>);
         projectTrust = c.projectTrust ?? null;
+        connectedPushVapidKey = c.pushVapidKey ?? null;
         runtimeDiagnostics = c.diagnostics ?? [];
         resyncEditorMirror();
         sessionStartTime = Date.now();
@@ -1867,7 +2132,20 @@
         releaseWakeLock();
         updateAppBadge();
         if (notificationPrefs.onComplete && document.hidden && !willRetry) {
-          notifyPiEvent('Response Complete', 'pi finished responding.', 'pi-agent-end');
+          notifyPiEvent('Response Complete', 'pi finished responding.', 'pi-agent-end', {
+            kind: 'response_complete',
+          });
+        }
+        // Contextual permission nudge — once, after the first completed turn.
+        if (
+          !willRetry &&
+          !showNotifNudge &&
+          !notifNudgeSeen &&
+          notificationPrefs.enabled &&
+          'Notification' in window &&
+          Notification.permission === 'default'
+        ) {
+          showNotifNudge = true;
         }
         saveSnapshot(sessionPath, sessionName, messages);
         break;
@@ -2010,10 +2288,16 @@
           t.isError = (msg.isError as boolean | undefined) ?? false;
           const result = msg.result as
             | {
-                content?: { type: string; text?: string; data?: string; mimeType?: string }[];
+                content?: {
+                  type: string;
+                  text?: string;
+                  data?: string;
+                  mimeType?: string;
+                }[];
                 details?: { diff?: string; patch?: string };
               }
             | undefined;
+
           if (result?.content) {
             t.content = extractTextContent(result.content);
             const imgBlocks = result.content.filter(
@@ -2119,6 +2403,20 @@
           });
         }
 
+        // Blocking request — pi is waiting on the user. Ping when the tab is
+        // hidden so the blocking question isn't discovered on return.
+        if (
+          document.hidden &&
+          ['confirm', 'input', 'select', 'editor', 'custom'].includes(method)
+        ) {
+          notifyPiEvent(
+            'pi needs your input',
+            (msg.title as string | undefined) || 'An extension is asking for a response.',
+            `pi-ui-request-${String(msg.id ?? '')}`,
+            { kind: 'ui_request' }
+          );
+        }
+
         break;
       }
 
@@ -2165,11 +2463,13 @@
       case 'queue_update': {
         queuedSteering = (msg.steering as string[] | undefined) ?? [];
         queuedFollowUp = (msg.followUp as string[] | undefined) ?? [];
+
         break;
       }
 
       case 'queue_restored': {
         const restoredText = (msg.text as string | undefined) ?? '';
+
         if (restoredText) {
           // Append restored queued text to the composer so the user can re-submit it.
           const prefix = input.trim() ? input + '\n\n' : '';
@@ -2223,6 +2523,7 @@
         const max = (msg.maxAttempts as number | undefined) ?? 1;
         const delayS = Math.round(((msg.delayMs as number | undefined) ?? 0) / 1000);
         const errMsg = (msg.errorMessage as string | undefined) ?? '';
+
         messages.push({
           id: uid(),
           role: 'notice',
@@ -2269,9 +2570,16 @@
       case 'tools_list': {
         toolsList =
           (msg.tools as
-            | { name: string; description: string; isBuiltin: boolean; origin?: string }[]
+            | {
+                name: string;
+                description: string;
+                isBuiltin: boolean;
+                origin?: string;
+              }[]
             | undefined) ?? [];
+
         activeToolNames = (msg.activeToolNames as string[] | undefined) ?? [];
+
         break;
       }
 
@@ -2322,11 +2630,11 @@
           : `Exported to ${msg.path as string}`;
         break;
 
-
       case 'commands_list': {
         extensionCommands =
           (msg.commands as { name: string; description?: string; source: string }[] | undefined) ??
           [];
+
         break;
       }
 
@@ -2349,6 +2657,7 @@
 
       case 'update_status': {
         const status = { ...(msg as unknown as UpdateStatus & { type?: string }) };
+
         delete status.type;
         updateStatus = status;
         updateLoading = false;
@@ -2567,10 +2876,12 @@
           rt.sessionId !== sessionId &&
           document.hidden
         ) {
+          const sessPath = projectsState.allSessions.find((s) => s.id === rt.sessionId)?.path;
           notifyPiEvent(
             'Session Finished',
             `Session ${rt.sessionId.slice(0, 8)} has new results.`,
-            `pi-session-${rt.sessionId}`
+            `pi-session-${rt.sessionId}`,
+            sessPath ? { kind: 'session_finished', sessionPath: sessPath } : undefined
           );
         }
         updateAppBadge();
@@ -2656,7 +2967,7 @@
   }
   /** Handles keydown on the hidden input in the interactive custom overlay.
    *  Encodes it as a real terminal byte sequence and forwards it to the
-   *  extension's pi-tui component — see `$lib/terminal-key-encoder`. */
+   *  extension's pi-tui component — see `#lib/terminal-key-encoder.js`. */
   function overlayKeydown(e: KeyboardEvent) {
     if (modal?.method !== 'custom' || !modal.interactive) return;
     // Let the IME finish composing; `overlayCompositionEnd` forwards the
@@ -2961,6 +3272,13 @@
   function handleMessageAreaClick(e: MouseEvent) {
     handleCodeCopy(e);
     handleFileLink(e);
+    // Native chat behavior: tapping the conversation dismisses the keyboard.
+    if (inputEl && document.activeElement === inputEl) {
+      const target = e.target as HTMLElement | null;
+      if (target && !target.closest('button, a, input, textarea, select, [role="button"], label')) {
+        inputEl.blur();
+      }
+    }
   }
 
   /** Global keyboard shortcut handler — runs on every keydown in the document. */
@@ -3129,9 +3447,7 @@
    * cost real tokens at the model. Falls back to the raw file when the
    * browser can't decode it (createImageBitmap unsupported/unknown codec).
    */
-  async function prepareImage(
-    file: File
-  ): Promise<{ data: string; mimeType: string } | null> {
+  async function prepareImage(file: File): Promise<{ data: string; mimeType: string } | null> {
     try {
       const bitmap = await createImageBitmap(file);
       try {
@@ -3277,7 +3593,9 @@
         text += r[0].transcript;
         if (r.isFinal) hadFinalResult = true;
       }
+
       const prefix = baseInput ? (baseInput.endsWith(' ') ? baseInput : baseInput + ' ') : '';
+
       input = prefix + text;
     };
 
@@ -3436,11 +3754,13 @@
 
     if (isStreaming) {
       if (!text) return;
+      haptic();
       steerAgent();
       return;
     }
 
     if (!text && attachedImages.length === 0 && attachedFiles.length === 0) return;
+    haptic();
 
     const imgs =
       attachedImages.length > 0
@@ -3466,7 +3786,11 @@
     if (asFollowUp && attachedImages.length === 0 && attachedFiles.length === 0) {
       send({ type: 'follow_up', message: text });
     } else {
-      send({ type: 'prompt', message: fullText, ...(imgs ? { images: imgs } : {}) });
+      send({
+        type: 'prompt',
+        message: fullText,
+        ...(imgs ? { images: imgs } : {}),
+      });
     }
     input = '';
     attachedImages = [];
@@ -3750,9 +4074,10 @@
       return;
     }
     if (handleComposerKey(e)) return;
-    if (e.key === 'Enter')
-      insertComposerText('\n'); // Shift+Enter newline
-    else if (e.key.length === 1) insertComposerText(e.key);
+
+    if (e.key === 'Enter') insertComposerText('\n');
+    else // Shift+Enter newline
+    if (e.key.length === 1) insertComposerText(e.key);
     else if (e.key === 'Escape') {
       // The awaited tier preventDefault+stopPropagation'd this key, so the
       // window handler (close panels, dismiss modal) never saw it — replay it.
@@ -3877,6 +4202,7 @@
   }
 
   function abortGeneration() {
+    haptic();
     send({ type: 'abort' });
   }
 
@@ -4020,8 +4346,8 @@
       }
     };
     idlePrefetch(() => {
-      import('$lib/components/panels/right-panel.svelte').catch(() => {});
-      import('$lib/components/projects/projects-sidebar.svelte').catch(() => {});
+      import('#lib/components/panels/right-panel.svelte').catch(() => {});
+      import('#lib/components/projects/projects-sidebar.svelte').catch(() => {});
     });
     // Web Share Target (static/manifest.webmanifest → share_target, method GET,
     // action "/") lands here as ?share_title=&share_text=&share_url= — fold
@@ -4167,12 +4493,8 @@
   }
 </script>
 
-<svelte:head>
-  <title>pi UI</title>
-</svelte:head>
-
+<svelte:head><title>pi UI</title></svelte:head>
 <svelte:window onkeydown={handleGlobalKeydown} />
-
 <!--
   Root: flex-row — three columns:
     [session panel] [main content] [model picker panel]
@@ -4207,10 +4529,12 @@
           >
             <span
               class="text-sm text-base-content/60 uppercase tracking-[0.16em] font-medium truncate"
-              >{projectsState.groups.length
-                ? `projects (${projectsState.groups.length})`
-                : 'projects'}</span
             >
+              {projectsState.groups.length
+                ? `projects (${projectsState.groups.length})`
+                : 'projects'}
+            </span>
+
             <button
               onclick={() => (showSessionPanel = false)}
               class="w-9 h-9 flex items-center justify-center text-base-content/45 hover:text-base-content/80 hover:bg-base-content/8 rounded-xl transition-colors shrink-0"
@@ -4221,9 +4545,9 @@
                 fill="none"
                 stroke="currentColor"
                 stroke-width="2"
-                stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12" /></svg
-              ></button
-            >
+                stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"></path></svg
+              >
+            </button>
           </div>
         {/if}
       {/snippet}
@@ -4242,6 +4566,7 @@
     <!-- ── MAIN COLUMN ──────────────────────────────────────────────────────── -->
     <div
       class="flex-1 flex flex-col min-w-0 bg-[color-mix(in_oklch,var(--color-base-200)_86%,black_8%)] relative"
+      style="padding-bottom: {keyboardInset}px;"
     >
       <!-- Top tab bar -->
       <header
@@ -4260,7 +4585,9 @@
                     showRightPanel = false;
                     showSettingsPanel = false;
                   }}
-                  class="h-9 w-9 flex items-center justify-center rounded-lg transition-colors {showSessionPanel
+                  class="{isMobile
+                    ? 'h-10 w-10'
+                    : 'h-9 w-9'} flex items-center justify-center rounded-lg transition-colors {showSessionPanel
                     ? 'text-primary bg-primary/12'
                     : 'text-base-content/60 hover:text-base-content/90 hover:bg-base-content/8'}"
                   aria-label="Toggle session panel"
@@ -4273,9 +4600,11 @@
                     stroke-width="2"
                     stroke-linecap="round"
                     stroke-linejoin="round"
-                    ><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M9 4v16" /></svg
-                  ></button
-                >
+                  >
+                    <rect x="3" y="4" width="18" height="16" rx="2"></rect>
+                    <path d="M9 4v16"></path>
+                  </svg>
+                </button>
               {/snippet}
             </Tooltip.Trigger>
             <Tooltip.Content side="bottom">Sessions</Tooltip.Content>
@@ -4423,7 +4752,7 @@
                 >
               {/snippet}
             </Tooltip.Trigger>
-            <Tooltip.Content side="bottom">Skills &amp; Prompts</Tooltip.Content>
+            <Tooltip.Content side="bottom">Skills & Prompts</Tooltip.Content>
           </Tooltip.Root>
           <Tooltip.Root>
             <Tooltip.Trigger>
@@ -4431,7 +4760,9 @@
                 <button
                   {...props}
                   onclick={() => openTab('tools')}
-                  class="h-9 w-9 flex items-center justify-center rounded-lg transition-colors {showRightPanel &&
+                  class="{isMobile
+                    ? 'h-10 w-10'
+                    : 'h-9 w-9'} flex items-center justify-center rounded-lg transition-colors {showRightPanel &&
                   rightPanelTab === 'tools'
                     ? 'text-primary bg-primary/12'
                     : 'text-base-content/45 hover:text-base-content/75 hover:bg-base-content/8'}"
@@ -4460,9 +4791,12 @@
                       stroke-width="2"
                       stroke-linecap="round"
                       stroke-linejoin="round"
-                      ><path d="M12 3v13" /><path d="m5 13 7 7 7-7" /><path d="M5 21h14" /></svg
-                    ></button
-                  >
+                    >
+                      <path d="M12 3v13"></path>
+                      <path d="m5 13 7 7 7-7"></path>
+                      <path d="M5 21h14"></path>
+                    </svg>
+                  </button>
                 {/snippet}
               </Tooltip.Trigger>
               <Tooltip.Content side="bottom">Install App</Tooltip.Content>
@@ -4478,7 +4812,9 @@
                     showRightPanel = false;
                     showSessionPanel = false;
                   }}
-                  class="h-9 w-9 flex items-center justify-center rounded-lg transition-colors {showSettingsPanel
+                  class="{isMobile
+                    ? 'h-10 w-10'
+                    : 'h-9 w-9'} flex items-center justify-center rounded-lg transition-colors {showSettingsPanel
                     ? 'text-primary bg-primary/12'
                     : 'text-base-content/45 hover:text-base-content/75 hover:bg-base-content/8'}"
                   aria-label="Open settings"
@@ -4491,11 +4827,14 @@
                     stroke-width="2"
                     stroke-linecap="round"
                     stroke-linejoin="round"
-                    ><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z" /><path
+                  >
+                    <path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"></path>
+
+                    <path
                       d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 .6 1.7 1.7 0 0 0-.4 1.1V21a2 2 0 1 1-4 0v-.09A1.7 1.7 0 0 0 8.6 19.4a1.7 1.7 0 0 0-1.88.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-.6-1 1.7 1.7 0 0 0-1.1-.4H3a2 2 0 1 1 0-4h.09A1.7 1.7 0 0 0 4.6 8.6a1.7 1.7 0 0 0-.34-1.88l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-.6 1.7 1.7 0 0 0 .4-1.1V3a2 2 0 1 1 4 0v.09A1.7 1.7 0 0 0 15.4 4.6a1.7 1.7 0 0 0 1.88-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.7 1.7 0 0 0 19.4 9c.4.2.7.5.9.9.2.3.4.7.4 1.1V11a2 2 0 1 1 0 4h-.09A1.7 1.7 0 0 0 19.4 15Z"
-                    /></svg
-                  ></button
-                >
+                    ></path>
+                  </svg>
+                </button>
               {/snippet}
             </Tooltip.Trigger>
             <Tooltip.Content side="bottom">Settings</Tooltip.Content>
@@ -4520,10 +4859,12 @@
                     stroke-width="2"
                     stroke-linecap="round"
                     stroke-linejoin="round"
-                    ><path d="M4 5h16" /><path d="M7 5v11a2 2 0 0 0 2 2h2" /><path
-                      d="M13 5v11a2 2 0 0 0 2 2h2"
-                    /></svg
                   >
+                    <path d="M4 5h16"></path>
+                    <path d="M7 5v11a2 2 0 0 0 2 2h2"></path>
+                    <path d="M13 5v11a2 2 0 0 0 2 2h2"></path>
+                  </svg>
+
                   <span
                     class="absolute top-0.5 right-0.5 w-2 h-2 rounded-full border border-base-100 {wsState ===
                     'open'
@@ -4585,11 +4926,13 @@
           aria-live="polite"
         >
           <span class="w-1.5 h-1.5 rounded-full bg-error animate-pulse"></span>
+
           <span
             >disconnected{reconnectCountdown > 0
               ? ` — reconnecting in ${reconnectCountdown}s`
               : ''}</span
           >
+
           <button
             onclick={connect}
             class="ml-auto shrink-0 px-2 py-0.5 rounded-md font-semibold text-error/90 hover:text-error hover:bg-error/15 transition-colors"
@@ -4609,6 +4952,60 @@
               <span class="tabular-nums ml-0.5">({reconnectCountdown}s)</span>
             {/if}
           </span>
+        </div>
+      {/if}
+
+      {#if trustPromptVisible && projectTrust}
+        <div
+          class="shrink-0 flex items-center gap-2 px-3 py-1.5 text-xs bg-warning/10 text-warning/85 border-b border-warning/15"
+          role="status"
+          aria-live="polite"
+        >
+          <ShieldQuestion class="w-3.5 h-3.5 shrink-0" />
+          <span class="flex-1 min-w-0 truncate">
+            Project resources in
+            <span class="font-mono text-warning/70">{projectTrust?.cwd}</span>
+            aren't trusted
+          </span>
+          <button
+            class="shrink-0 px-2 py-0.5 rounded-md font-semibold text-warning/90 hover:text-warning hover:bg-warning/15 transition-colors"
+            onclick={() =>
+              send({
+                type: 'set_project_trust',
+                cwd: projectTrust?.cwd ?? '',
+                decision: 'trusted',
+              })}>Trust project</button
+          >
+          <button
+            class="shrink-0 px-2 py-0.5 rounded-md font-semibold text-warning/90 hover:text-warning hover:bg-warning/15 transition-colors"
+            onclick={() =>
+              send({
+                type: 'set_project_trust',
+                cwd: projectTrust?.cwd ?? '',
+                decision: 'session',
+              })}>Trust this session</button
+          >
+        </div>
+      {/if}
+
+      {#if showNotifNudge}
+        <div
+          class="shrink-0 flex items-center gap-2 px-3 py-1.5 text-xs bg-primary/[0.08] text-base-content/80 border-b border-primary/15"
+          role="status"
+        >
+          <Bell class="w-3.5 h-3.5 shrink-0 text-primary/80" />
+          <span class="flex-1 min-w-0 truncate"
+            >Get a notification when pi finishes — even with the app closed.</span
+          >
+          <button
+            class="shrink-0 px-2 py-0.5 rounded-md font-semibold text-primary hover:text-primary/90 hover:bg-primary/12 transition-colors"
+            onclick={enableNotifications}>Enable</button
+          >
+          <button
+            class="shrink-0 px-2 py-0.5 rounded-md text-base-content/50 hover:text-base-content/80 hover:bg-base-content/8 transition-colors"
+            onclick={dismissNotifNudge}
+            aria-label="Dismiss notification prompt"><X class="w-3 h-3" /></button
+          >
         </div>
       {/if}
 
@@ -4653,7 +5050,7 @@
           {copiedTurnId}
           {isStreaming}
           {expandedUserMsgs}
-          {truncatedUserMsgs}
+          bind:truncatedUserMsgs
           workingVisible={extensionUiState.workingVisible}
           hiddenThinkingLabel={extensionUiState.hiddenThinkingLabel}
           workingIndicatorFrames={extensionUiState.workingIndicatorFrames}
@@ -4688,6 +5085,7 @@
           }}
           onEditMessage={editMessage}
           onDismissNotice={dismissChatNotice}
+          onHaptic={haptic}
         />
       </main>
 
@@ -4727,9 +5125,9 @@
             stroke="currentColor"
             stroke-width="2"
             stroke-linecap="round"
-            stroke-linejoin="round"><path d="M12 5v14m0 0-7-7m7 7 7-7" /></svg
-          ></button
-        >
+            stroke-linejoin="round"><path d="M12 5v14m0 0-7-7m7 7 7-7"></path></svg
+          >
+        </button>
       </div>
 
       <!-- Input bar — elevated surface to distinguish from chat -->
@@ -4754,7 +5152,7 @@
                     stroke="currentColor"
                     stroke-width="2.5"
                     stroke-linecap="round"
-                    stroke-linejoin="round"><path d="M5 12h14M12 5l7 7-7 7" /></svg
+                    stroke-linejoin="round"><path d="M5 12h14M12 5l7 7-7 7"></path></svg
                   >
                   <span class="truncate">{m}</span>
                 </span>
@@ -4772,8 +5170,10 @@
                     stroke-width="2"
                     stroke-linecap="round"
                     stroke-linejoin="round"
-                    ><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" /></svg
                   >
+                    <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+                  </svg>
+
                   <span class="truncate">{m}</span>
                 </span>
               {/each}
@@ -4984,10 +5384,14 @@
                           stroke-width="1.5"
                           stroke-linecap="round"
                           stroke-linejoin="round"
-                          ><path
-                            d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"
-                          /><polyline points="14 2 14 8 20 8" /></svg
                         >
+                          <path
+                            d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"
+                          ></path>
+
+                          <polyline points="14 2 14 8 20 8"></polyline>
+                        </svg>
+
                         <span
                           class="text-[10px] text-base-content/40 leading-tight truncate max-w-full"
                           >{f.name}</span
@@ -5024,6 +5428,9 @@
                 aria-label="Message to pi"
                 disabled={wsState !== 'open' || sessionLoading}
                 class="w-full min-h-10 sm:min-h-12 mt-0 sm:mt-1 bg-transparent resize-none outline-none placeholder-base-content/45 disabled:opacity-40 leading-relaxed max-h-40 sm:max-h-48 overflow-y-auto transition-opacity text-base"
+                autocapitalize="off"
+                spellcheck={false}
+                use:autoCorrectOff
                 style="field-sizing: content"></textarea>
 
               {#if isStreaming}
@@ -5044,9 +5451,9 @@
                               stroke="currentColor"
                               stroke-width="2"
                               stroke-linecap="round"
-                              stroke-linejoin="round"><path d="M5 12h14M12 5l7 7-7 7" /></svg
-                            ></button
-                          >
+                              stroke-linejoin="round"><path d="M5 12h14M12 5l7 7-7 7"></path></svg
+                            >
+                          </button>
                         {/snippet}
                       </Tooltip.Trigger>
                       <Tooltip.Content>Steer after the current turn (Enter)</Tooltip.Content>
@@ -5060,10 +5467,11 @@
                           onclick={abortGeneration}
                           class="w-9 h-9 flex items-center justify-center text-base-content/60 hover:text-base-content/90 hover:bg-base-content/8 rounded-full transition-colors"
                           aria-label="Abort generation"
-                          ><svg class="w-4 h-4" viewBox="0 0 24 24" fill="currentColor"
-                            ><rect x="5" y="5" width="14" height="14" rx="2" /></svg
-                          ></button
                         >
+                          <svg class="w-4 h-4" viewBox="0 0 24 24" fill="currentColor"
+                            ><rect x="5" y="5" width="14" height="14" rx="2"></rect></svg
+                          >
+                        </button>
                       {/snippet}
                     </Tooltip.Trigger>
                     <Tooltip.Content>Abort</Tooltip.Content>
@@ -5090,9 +5498,9 @@
                             stroke-linejoin="round"
                             ><path
                               d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"
-                            /></svg
-                          ></button
-                        >
+                            ></path>
+                          </svg>
+                        </button>
                       {/snippet}
                     </Tooltip.Trigger>
                     <Tooltip.Content>Attach file</Tooltip.Content>
@@ -5107,7 +5515,7 @@
                         fill="none"
                         stroke="currentColor"
                         stroke-width="2.5"
-                        stroke-linecap="round"><path d="M21 12a9 9 0 1 1-6.219-8.56" /></svg
+                        stroke-linecap="round"><path d="M21 12a9 9 0 1 1-6.219-8.56"></path></svg
                       >
                     </span>
                   {:else}
@@ -5128,14 +5536,12 @@
                               stroke-width="2"
                               stroke-linecap="round"
                               stroke-linejoin="round"
-                              ><polyline points="21 8 21 21 3 21 3 8" /><rect
-                                x="1"
-                                y="3"
-                                width="22"
-                                height="5"
-                              /><line x1="10" y1="12" x2="14" y2="12" /></svg
-                            ></button
-                          >
+                            >
+                              <polyline points="21 8 21 21 3 21 3 8"></polyline>
+                              <rect x="1" y="3" width="22" height="5"></rect>
+                              <line x1="10" y1="12" x2="14" y2="12"></line>
+                            </svg>
+                          </button>
                         {/snippet}
                       </Tooltip.Trigger>
                       <Tooltip.Content>Compact context</Tooltip.Content>
@@ -5166,13 +5572,16 @@
                             stroke-width="2"
                             stroke-linecap="round"
                             stroke-linejoin="round"
-                            ><path d="M3 18v-6a9 9 0 0 1 18 0v6" /><path
-                              d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3z"
-                            /><path
-                              d="M3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"
-                            /></svg
-                          ></button
-                        >
+                          >
+                            <path d="M3 18v-6a9 9 0 0 1 18 0v6"></path>
+
+                            <path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3z"
+                            ></path>
+
+                            <path d="M3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"
+                            ></path>
+                          </svg>
+                        </button>
                       {/snippet}
                     </Tooltip.Trigger>
                     <Tooltip.Content
@@ -5200,11 +5609,13 @@
                             stroke-width="2"
                             stroke-linecap="round"
                             stroke-linejoin="round"
-                            ><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z" /><path
-                              d="M19 10v2a7 7 0 0 1-14 0v-2"
-                            /><line x1="12" y1="19" x2="12" y2="22" /></svg
-                          ></button
-                        >
+                          >
+                            <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"></path>
+
+                            <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+                            <line x1="12" y1="19" x2="12" y2="22"></line>
+                          </svg>
+                        </button>
                       {/snippet}
                     </Tooltip.Trigger>
                     <Tooltip.Content
@@ -5271,7 +5682,7 @@
                                   : 100}; transition: stroke-dashoffset {sendHolding
                                   ? '550ms linear'
                                   : '150ms ease-out'};"
-                              />
+                              ></circle>
                             </svg>
                           {/if}
                           <svg
@@ -5281,7 +5692,7 @@
                             stroke="currentColor"
                             stroke-width="2.5"
                             stroke-linecap="round"
-                            stroke-linejoin="round"><path d="M12 19V5m0 0-7 7m7-7 7 7" /></svg
+                            stroke-linejoin="round"><path d="M12 19V5m0 0-7 7m7-7 7 7"></path></svg
                           >
                         </button>
                       {/snippet}
@@ -5322,9 +5733,11 @@
                   <Tooltip.Trigger
                     class="min-w-0 truncate cursor-help text-left text-base-content/50 transition-colors hover:text-base-content/75"
                     aria-label="Extension statuses"
+                    >{visibleExtensionStatuses
+                      .map((entry) => entry[1])
+                      .join(' · ')}</Tooltip.Trigger
                   >
-                    {visibleExtensionStatuses.map((entry) => entry[1]).join(' · ')}
-                  </Tooltip.Trigger>
+
                   <Tooltip.Content sideOffset={6} class="max-w-[min(22rem,calc(100vw-2rem))]">
                     <div class="flex min-w-[12rem] flex-col gap-1.5">
                       <p class="text-[10px] uppercase tracking-[0.16em] text-background/50">
@@ -5543,7 +5956,7 @@
             </nav>
             <div class="px-5 py-3 border-t border-base-content/8 space-y-1.5">
               <a
-                href={resolve('/logout')}
+                href={resolve('logout')}
                 class="w-full flex items-center gap-2 rounded-lg px-2 py-1.5 text-xs text-base-content/45 hover:text-base-content/85 hover:bg-base-content/[0.055] transition-colors"
               >
                 Sign out
@@ -5596,7 +6009,7 @@
                     fill="none"
                     stroke="currentColor"
                     stroke-width="2"
-                    stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12" /></svg
+                    stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"></path></svg
                   >
                 </Button>
               </div>
@@ -5670,7 +6083,10 @@
                       </div>
                     </div>
                   </Card.Root>
-                  <Card.Root size="sm" class="py-0 overflow-hidden bg-base-100/60 border-base-content/10">
+                  <Card.Root
+                    size="sm"
+                    class="py-0 overflow-hidden bg-base-100/60 border-base-content/10"
+                  >
                     <div class="px-4 py-3 space-y-3">
                       <div>
                         <p class="text-sm text-base-content/75">Project trust</p>
@@ -5679,29 +6095,41 @@
                         </p>
                       </div>
                       <div class="flex flex-wrap items-center gap-2">
-                        <span class="text-xs font-mono text-base-content/55">{projectTrust?.decision ?? 'ask'}</span>
+                        <span class="text-xs font-mono text-base-content/55"
+                          >{projectTrust?.decision ?? 'ask'}</span
+                        >
                         {#each [['trusted', 'Trust project'], ['denied', 'Block project'], ['ask', 'Ask next time']] as [decision, label] (decision)}
                           <Button
                             size="sm"
                             variant={projectTrust?.decision === decision ? 'default' : 'outline'}
                             disabled={wsState !== 'open'}
-                            onclick={() => send({
-                              type: 'set_project_trust',
-                              cwd: projectTrust?.cwd ?? cwd,
-                              decision: decision as 'trusted' | 'denied' | 'ask',
-                            })}
-                          >{label}</Button>
+                            onclick={() =>
+                              send({
+                                type: 'set_project_trust',
+                                cwd: projectTrust?.cwd ?? cwd,
+                                decision: decision as 'trusted' | 'denied' | 'ask',
+                              })}>{label}</Button
+                          >
                         {/each}
                       </div>
                     </div>
                   </Card.Root>
                   {#if runtimeDiagnostics.length > 0}
-                    <Card.Root size="sm" class="py-0 overflow-hidden bg-base-100/60 border-base-content/10">
+                    <Card.Root
+                      size="sm"
+                      class="py-0 overflow-hidden bg-base-100/60 border-base-content/10"
+                    >
                       <div class="px-4 py-3">
                         <p class="text-sm text-base-content/75">Runtime diagnostics</p>
                         <div class="mt-2 space-y-1.5">
                           {#each runtimeDiagnostics as diagnostic (diagnostic.message)}
-                            <p class="text-xs {diagnostic.type === 'error' ? 'text-error/75' : diagnostic.type === 'warning' ? 'text-warning/75' : 'text-base-content/50'}">
+                            <p
+                              class="text-xs {diagnostic.type === 'error'
+                                ? 'text-error/75'
+                                : diagnostic.type === 'warning'
+                                  ? 'text-warning/75'
+                                  : 'text-base-content/50'}"
+                            >
                               {diagnostic.message}
                             </p>
                           {/each}
@@ -5860,7 +6288,13 @@
                             {#each Object.entries(bySource).filter((e): e is [string, ExtensionSummary[]] => !!e[1]) as [source, exts] (source)}
                               {@const allTools = exts.flatMap((e) => e.tools)}
                               {@const allCommands = exts.flatMap((e) => e.commands)}
-                              {@const allFlags = [...new Map(exts.flatMap((e) => e.flags ?? []).map((flag) => [flag.name, flag])).values()]}
+                              {@const allFlags = [
+                                ...new Map(
+                                  exts
+                                    .flatMap((e) => e.flags ?? [])
+                                    .map((flag) => [flag.name, flag])
+                                ).values(),
+                              ]}
                               {@const allShortcuts = exts.flatMap((e) => e.shortcuts ?? [])}
                               <Card.Root
                                 size="sm"
@@ -5880,12 +6314,13 @@
                                       {/if}
                                       <span
                                         class="px-1.5 py-0.5 text-[10px] font-mono rounded bg-base-content/10 text-base-content/45"
-                                        >{scope === 'user'
+                                      >
+                                        {scope === 'user'
                                           ? 'User'
                                           : scope === 'project'
                                             ? 'Project'
-                                            : 'Temporary'}</span
-                                      >
+                                            : 'Temporary'}
+                                      </span>
                                     </div>
                                     {#if exts.length === 1}
                                       <p
@@ -5958,14 +6393,24 @@
                                   {/if}
                                   {#if allShortcuts.length > 0}
                                     <div class="px-4 py-2 space-y-1.5">
-                                      <p class="text-[11px] font-medium text-base-content/45">Shortcuts</p>
+                                      <p class="text-[11px] font-medium text-base-content/45">
+                                        Shortcuts
+                                      </p>
                                       {#each allShortcuts as shortcut (shortcut.shortcut)}
                                         <button
                                           class="w-full flex items-center justify-between gap-3 text-left text-xs hover:text-primary transition-colors"
-                                          onclick={() => send({ type: 'invoke_extension_shortcut', shortcut: shortcut.shortcut })}
+                                          onclick={() =>
+                                            send({
+                                              type: 'invoke_extension_shortcut',
+                                              shortcut: shortcut.shortcut,
+                                            })}
                                         >
-                                          <span class="font-mono text-base-content/65">{shortcut.shortcut}</span>
-                                          <span class="text-base-content/40 truncate">{shortcut.description ?? ''}</span>
+                                          <span class="font-mono text-base-content/65"
+                                            >{shortcut.shortcut}</span
+                                          >
+                                          <span class="text-base-content/40 truncate"
+                                            >{shortcut.description ?? ''}</span
+                                          >
                                         </button>
                                       {/each}
                                     </div>
@@ -5975,26 +6420,37 @@
                                       {#each allFlags as flag (flag.name)}
                                         <div class="flex items-center gap-3">
                                           <div class="min-w-0 flex-1">
-                                            <p class="text-xs font-mono text-base-content/65">{flag.name}</p>
+                                            <p class="text-xs font-mono text-base-content/65">
+                                              {flag.name}
+                                            </p>
                                             {#if flag.description}
-                                              <p class="text-[11px] text-base-content/40">{flag.description}</p>
+                                              <p class="text-[11px] text-base-content/40">
+                                                {flag.description}
+                                              </p>
                                             {/if}
                                           </div>
                                           {#if flag.type === 'boolean'}
                                             <Switch
                                               checked={flag.value === true}
-                                              onCheckedChange={(value) => send({ type: 'set_extension_flag', name: flag.name, value })}
+                                              onCheckedChange={(value) =>
+                                                send({
+                                                  type: 'set_extension_flag',
+                                                  name: flag.name,
+                                                  value,
+                                                })}
                                               aria-label={`Toggle ${flag.name}`}
                                             />
                                           {:else}
                                             <input
                                               class="w-36 rounded border border-base-content/12 bg-base-200/50 px-2 py-1 text-xs font-mono"
                                               value={String(flag.value ?? flag.default ?? '')}
-                                              onchange={(event) => send({
-                                                type: 'set_extension_flag',
-                                                name: flag.name,
-                                                value: (event.currentTarget as HTMLInputElement).value,
-                                              })}
+                                              onchange={(event) =>
+                                                send({
+                                                  type: 'set_extension_flag',
+                                                  name: flag.name,
+                                                  value: (event.currentTarget as HTMLInputElement)
+                                                    .value,
+                                                })}
                                             />
                                           {/if}
                                         </div>
@@ -6029,11 +6485,16 @@
                   {/if}
                 {:else if settingsSection === 'packages'}
                   <div class="space-y-4">
-                    <Card.Root size="sm" class="py-0 overflow-hidden bg-base-100/60 border-base-content/10">
+                    <Card.Root
+                      size="sm"
+                      class="py-0 overflow-hidden bg-base-100/60 border-base-content/10"
+                    >
                       <div class="px-4 py-3 space-y-3">
                         <div>
                           <p class="text-sm text-base-content/75">Configured packages</p>
-                          <p class="text-xs text-base-content/35 mt-0.5">Install or remove SDK extension packages.</p>
+                          <p class="text-xs text-base-content/35 mt-0.5">
+                            Install or remove SDK extension packages.
+                          </p>
                         </div>
                         <div class="flex flex-col sm:flex-row gap-2">
                           <input
@@ -6042,24 +6503,40 @@
                             bind:value={packageSource}
                             disabled={packageBusy}
                           />
-                          <Select.Root type="single" value={packageScope} onValueChange={(v: string) => (packageScope = v as 'user' | 'project')}>
+
+                          <Select.Root
+                            type="single"
+                            value={packageScope}
+                            onValueChange={(v: string) => (packageScope = v as 'user' | 'project')}
+                          >
                             <Select.Trigger size="sm" class="w-28">{packageScope}</Select.Trigger>
                             <Select.Content>
                               <Select.Item value="user">user</Select.Item>
-                              <Select.Item value="project" disabled={projectTrust?.decision !== 'trusted'}>project</Select.Item>
+                              <Select.Item
+                                value="project"
+                                disabled={projectTrust?.decision !== 'trusted'}>project</Select.Item
+                              >
                             </Select.Content>
                           </Select.Root>
                           <Button
                             size="sm"
-                            disabled={!packageSource.trim() || packageBusy || (packageScope === 'project' && projectTrust?.decision !== 'trusted')}
+                            disabled={!packageSource.trim() ||
+                              packageBusy ||
+                              (packageScope === 'project' && projectTrust?.decision !== 'trusted')}
                             onclick={() => {
                               packageBusy = true;
-                              send({ type: 'install_package', source: packageSource.trim(), scope: packageScope });
-                            }}
-                          >Install</Button>
+                              send({
+                                type: 'install_package',
+                                source: packageSource.trim(),
+                                scope: packageScope,
+                              });
+                            }}>Install</Button
+                          >
                         </div>
                         {#if packageProgress}
-                          <p class="text-xs text-base-content/45">{packageProgress.message ?? packageProgress.phase}</p>
+                          <p class="text-xs text-base-content/45">
+                            {packageProgress.message ?? packageProgress.phase}
+                          </p>
                         {/if}
                       </div>
                     </Card.Root>
@@ -6068,13 +6545,20 @@
                     {:else if packagesList.length === 0}
                       <p class="text-sm text-base-content/45">No configured packages.</p>
                     {:else}
-                      <Card.Root size="sm" class="py-0 overflow-hidden bg-base-100/60 border-base-content/10">
+                      <Card.Root
+                        size="sm"
+                        class="py-0 overflow-hidden bg-base-100/60 border-base-content/10"
+                      >
                         <div class="divide-y divide-base-content/8">
                           {#each packagesList as pkg (`${pkg.scope}:${pkg.source}`)}
                             <div class="flex items-center gap-3 px-4 py-3">
                               <div class="min-w-0 flex-1">
-                                <p class="text-xs font-mono text-base-content/70 truncate">{pkg.source}</p>
-                                <p class="text-[11px] text-base-content/35">{pkg.scope}{pkg.filtered ? ' · filtered' : ''}</p>
+                                <p class="text-xs font-mono text-base-content/70 truncate">
+                                  {pkg.source}
+                                </p>
+                                <p class="text-[11px] text-base-content/35">
+                                  {pkg.scope}{pkg.filtered ? ' · filtered' : ''}
+                                </p>
                               </div>
                               <Button
                                 size="sm"
@@ -6082,16 +6566,22 @@
                                 disabled={packageBusy}
                                 onclick={() => {
                                   packageBusy = true;
-                                  send({ type: 'remove_package', source: pkg.source, scope: pkg.scope });
-                                }}
-                              >Remove</Button>
+                                  send({
+                                    type: 'remove_package',
+                                    source: pkg.source,
+                                    scope: pkg.scope,
+                                  });
+                                }}>Remove</Button
+                              >
                             </div>
                           {/each}
                         </div>
                       </Card.Root>
                     {/if}
                     {#if packageUpdates.length > 0}
-                      <p class="text-xs text-warning/75">{packageUpdates.length} package update(s) available.</p>
+                      <p class="text-xs text-warning/75">
+                        {packageUpdates.length} package update(s) available.
+                      </p>
                     {/if}
                   </div>
                 {:else if settingsSection === 'updates'}
@@ -6347,15 +6837,39 @@
                           <div class="flex items-center justify-between gap-3">
                             <p class="text-sm text-base-content/75">Session usage</p>
                             <div class="flex gap-1.5">
-                              <Button size="sm" variant="ghost" onclick={() => send({ type: 'export_session', format: 'html' })}>HTML</Button>
-                              <Button size="sm" variant="ghost" onclick={() => send({ type: 'export_session', format: 'jsonl' })}>JSONL</Button>
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                onclick={() => send({ type: 'export_session', format: 'html' })}
+                                >HTML</Button
+                              >
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                onclick={() => send({ type: 'export_session', format: 'jsonl' })}
+                                >JSONL</Button
+                              >
                             </div>
                           </div>
                           <div class="mt-2 grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
-                            <span class="text-base-content/50">Messages <b class="text-base-content/75">{sessionStats.totalMessages}</b></span>
-                            <span class="text-base-content/50">Tools <b class="text-base-content/75">{sessionStats.toolCalls}</b></span>
-                            <span class="text-base-content/50">Tokens <b class="text-base-content/75">{sessionStats.tokens.total.toLocaleString()}</b></span>
-                            <span class="text-base-content/50">Cost <b class="text-base-content/75">{fmtCost(sessionStats.cost)}</b></span>
+                            <span class="text-base-content/50"
+                              >Messages <b class="text-base-content/75"
+                                >{sessionStats.totalMessages}</b
+                              ></span
+                            >
+                            <span class="text-base-content/50"
+                              >Tools <b class="text-base-content/75">{sessionStats.toolCalls}</b
+                              ></span
+                            >
+                            <span class="text-base-content/50"
+                              >Tokens <b class="text-base-content/75"
+                                >{sessionStats.tokens.total.toLocaleString()}</b
+                              ></span
+                            >
+                            <span class="text-base-content/50"
+                              >Cost <b class="text-base-content/75">{fmtCost(sessionStats.cost)}</b
+                              ></span
+                            >
                           </div>
                           {#if exportFeedback}
                             <p class="mt-2 text-[11px] text-base-content/45">{exportFeedback}</p>
@@ -6520,6 +7034,9 @@
         bind:this={modalFocusEl}
         bind:value={modalInput}
         rows={8}
+        autocapitalize="off"
+        spellcheck={false}
+        use:autoCorrectOff
         class="dialog-input mx-5 mb-5 w-[calc(100%-2.5rem)] rounded-xl p-3.5 text-sm leading-relaxed resize-none transition-colors"
       ></textarea>
     {:else if modal?.method === 'custom'}
@@ -6573,7 +7090,7 @@
 
 <!-- ── Fork session dialog ──────────────────────────────────────────────────── -->
 {#if showForkDialog}
-  {#await import('$lib/components/dialogs/fork-dialog.svelte') then { default: ForkDialog }}
+  {#await import('#lib/components/dialogs/fork-dialog.svelte') then { default: ForkDialog }}
     <ForkDialog
       open={showForkDialog}
       loading={forkLoading}
@@ -6586,7 +7103,7 @@
 
 <!-- ── Session tree modal ──────────────────────────────────────────────────── -->
 {#if showTreeModal}
-  {#await import('$lib/components/dialogs/session-tree-modal.svelte') then { default: SessionTreeModal }}
+  {#await import('#lib/components/dialogs/session-tree-modal.svelte') then { default: SessionTreeModal }}
     <SessionTreeModal
       open={showTreeModal}
       loading={treeLoading}
@@ -6597,7 +7114,7 @@
 {/if}
 
 {#if fileViewerOpen}
-  {#await import('$lib/components/file-viewer-modal.svelte') then { default: FileViewerModal }}
+  {#await import('#lib/components/file-viewer-modal.svelte') then { default: FileViewerModal }}
     <FileViewerModal
       open={fileViewerOpen}
       path={fileViewerPath}
@@ -6626,4 +7143,5 @@
 {/if}
 
 <!-- ── Confirmation dialog (replaces window.confirm for delete/update/restart) ── -->
+
 <ConfirmDialog {pendingConfirm} onClose={() => (pendingConfirm = null)} />

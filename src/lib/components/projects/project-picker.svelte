@@ -5,8 +5,8 @@
    * existing session happens via the projects sidebar.
    */
   import DirectoryPicker from './directory-picker.svelte';
-  import { projectsState, type ProjectGroup } from '$lib/state/projects-state.svelte';
-  import { formatRelativeDate } from '$lib/utils';
+  import { projectsState, type ProjectGroup } from '#lib/state/projects-state.svelte.js';
+  import { formatRelativeDate } from '#lib/utils.js';
 
   import Folder from '@lucide/svelte/icons/folder';
   import FolderOpen from '@lucide/svelte/icons/folder-open';
@@ -23,10 +23,11 @@
   const filteredGroups = $derived.by(() => {
     const q = query.trim().toLowerCase();
     if (!q) return ps.groups;
-    return ps.groups.filter((g) =>
-      g.name.toLowerCase().includes(q) ||
-      g.cwd.toLowerCase().includes(q) ||
-      g.sessions.some((s) => (s.name ?? s.firstMessage ?? '').toLowerCase().includes(q))
+    return ps.groups.filter(
+      (g) =>
+        g.name.toLowerCase().includes(q) ||
+        g.cwd.toLowerCase().includes(q) ||
+        g.sessions.some((s) => (s.name ?? s.firstMessage ?? '').toLowerCase().includes(q))
     );
   });
 
@@ -50,7 +51,9 @@
   aria-label="Select project"
 >
   <div class="p-2.5 sm:p-3 space-y-2 min-h-0 flex-1 flex flex-col">
-    <div class="flex items-center gap-2 rounded-[1.35rem] border border-base-content/10 bg-base-content/[0.04] px-3 sm:px-3.5 py-2.5 sm:py-3 shadow-inner shadow-black/10 focus-within:border-base-content/45">
+    <div
+      class="flex items-center gap-2 rounded-[1.35rem] border border-base-content/10 bg-base-content/[0.04] px-3 sm:px-3.5 py-2.5 sm:py-3 shadow-inner shadow-black/10 focus-within:border-base-content/45"
+    >
       <Search class="w-4 h-4 shrink-0 text-base-content/35" />
       <!-- svelte-ignore a11y_autofocus -->
       <input
@@ -62,24 +65,38 @@
         aria-label="Search projects"
       />
       {#if query}
-        <button onclick={() => (query = '')} class="rounded-full p-1.5 text-base-content/35 hover:bg-base-content/8 hover:text-base-content/70" aria-label="Clear project search">
+        <button
+          onclick={() => (query = '')}
+          class="rounded-full p-1.5 text-base-content/35 hover:bg-base-content/8 hover:text-base-content/70"
+          aria-label="Clear project search"
+        >
           <X class="w-3.5 h-3.5" />
         </button>
       {/if}
     </div>
 
-    <div class="min-h-0 flex-1 overflow-y-auto overscroll-contain rounded-2xl bg-base-content/[0.035] border border-base-content/6 p-1.5" role="listbox" aria-label="Projects">
+    <div
+      class="min-h-0 flex-1 overflow-y-auto overscroll-contain rounded-2xl bg-base-content/[0.035] border border-base-content/6 p-1.5"
+      role="listbox"
+      aria-label="Projects"
+    >
       {#if ps.groups.length === 0}
-        <p class="px-3 py-4 text-center text-xs text-base-content/35">No projects yet — open a folder below.</p>
+        <p class="px-3 py-4 text-center text-xs text-base-content/35">
+          No projects yet — open a folder below.
+        </p>
       {:else if filteredGroups.length === 0}
-        <p class="px-3 py-4 text-center text-xs text-base-content/35">No project matches “{query}”.</p>
+        <p class="px-3 py-4 text-center text-xs text-base-content/35">
+          No project matches “{query}”.
+        </p>
       {:else}
         {#each filteredGroups as g (g.cwd)}
           {@const isActive = g.cwd === ps.cwd}
           <button
             onclick={() => pick(g)}
             disabled={!g.exists || ps.pendingNewSession || ps.sessionLoading}
-            class="group w-full rounded-xl px-3 py-2.5 sm:py-2.5 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-45 {isActive ? 'bg-primary/[0.09] text-primary' : 'text-base-content/70 hover:bg-base-content/[0.075] hover:text-base-content'}"
+            class="group w-full rounded-xl px-3 py-2.5 sm:py-2.5 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-45 {isActive
+              ? 'bg-primary/[0.09] text-primary'
+              : 'text-base-content/70 hover:bg-base-content/[0.075] hover:text-base-content'}"
             role="option"
             aria-selected={isActive}
             title={g.exists ? `New session in ${g.cwd}` : `${g.cwd} no longer exists`}
@@ -88,7 +105,9 @@
               {#if isActive}
                 <FolderOpen class="mt-0.5 w-4 h-4 shrink-0 text-primary" />
               {:else}
-                <Folder class="mt-0.5 w-4 h-4 shrink-0 text-base-content/32 group-hover:text-base-content/55" />
+                <Folder
+                  class="mt-0.5 w-4 h-4 shrink-0 text-base-content/32 group-hover:text-base-content/55"
+                />
               {/if}
               <div class="min-w-0 flex-1">
                 <p class="flex items-center gap-1.5 text-sm font-medium">
@@ -99,9 +118,13 @@
                 <p class="truncate font-mono text-[11px] text-base-content/32">{g.cwd}</p>
               </div>
               <div class="hidden sm:block shrink-0 text-right">
-                <p class="text-[10px] uppercase tracking-[0.12em] text-base-content/25">{g.sessions.length || 'no'} session{g.sessions.length === 1 ? '' : 's'}</p>
+                <p class="text-[10px] uppercase tracking-[0.12em] text-base-content/25">
+                  {g.sessions.length || 'no'} session{g.sessions.length === 1 ? '' : 's'}
+                </p>
                 {#if g.lastActivity > 0}
-                  <p class="text-[10px] text-base-content/22">{formatRelativeDate(g.lastActivity)}</p>
+                  <p class="text-[10px] text-base-content/22">
+                    {formatRelativeDate(g.lastActivity)}
+                  </p>
                 {/if}
               </div>
             </div>
@@ -112,11 +135,11 @@
   </div>
 
   <div class="border-t border-base-content/8 p-2.5 sm:p-3 bg-base-300/20 shrink-0">
-    <p class="px-1 pb-2 text-[10px] uppercase tracking-[0.18em] text-base-content/32 flex items-center gap-1"><Plus class="w-2.5 h-2.5" />open another folder</p>
-    <DirectoryPicker
-      placeholder="~/path/to/project"
-      onSubmit={openPath}
-      onCancel={onClose}
-    />
+    <p
+      class="px-1 pb-2 text-[10px] uppercase tracking-[0.18em] text-base-content/32 flex items-center gap-1"
+    >
+      <Plus class="w-2.5 h-2.5" />open another folder
+    </p>
+    <DirectoryPicker placeholder="~/path/to/project" onSubmit={openPath} onCancel={onClose} />
   </div>
 </div>

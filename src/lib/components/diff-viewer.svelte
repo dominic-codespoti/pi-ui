@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { highlightCode } from '$lib/markdown';
-  import { parseDiff } from '$lib/diff-parser';
+  import { highlightCode } from '#lib/markdown.js';
+  import { parseDiff } from '#lib/diff-parser.js';
   import { SvelteSet } from 'svelte/reactivity';
 
   const { diff }: { diff: string } = $props();
@@ -33,11 +33,25 @@
   function detectLang(path: string): string {
     const ext = path.split('.').pop()?.toLowerCase() ?? '';
     const map: Record<string, string> = {
-      ts: 'typescript', tsx: 'typescript', js: 'javascript', jsx: 'javascript',
-      py: 'python', sh: 'bash', bash: 'bash', json: 'json',
-      yaml: 'yaml', yml: 'yaml', html: 'html', xml: 'xml',
-      css: 'css', sql: 'sql', md: 'markdown', rs: 'rust',
-      go: 'go', cs: 'csharp', svelte: 'html',
+      ts: 'typescript',
+      tsx: 'typescript',
+      js: 'javascript',
+      jsx: 'javascript',
+      py: 'python',
+      sh: 'bash',
+      bash: 'bash',
+      json: 'json',
+      yaml: 'yaml',
+      yml: 'yaml',
+      html: 'html',
+      xml: 'xml',
+      css: 'css',
+      sql: 'sql',
+      md: 'markdown',
+      rs: 'rust',
+      go: 'go',
+      cs: 'csharp',
+      svelte: 'html',
     };
     return map[ext] ?? '';
   }
@@ -79,7 +93,9 @@
   function copyDiff() {
     navigator.clipboard.writeText(diff);
     copied = true;
-    setTimeout(() => { copied = false; }, 1500);
+    setTimeout(() => {
+      copied = false;
+    }, 1500);
   }
 
   function truncateLabel(path: string): string {
@@ -104,15 +120,28 @@
         <span class="text-error/70">-{totalDeletions}</span>
       {/if}
     </div>
-    <button
-      class="copy-btn"
-      onclick={copyDiff}
-      title="Copy diff"
-    >
+    <button class="copy-btn" onclick={copyDiff} title="Copy diff">
       {#if copied}
-        <svg class="w-3.5 h-3.5 text-success" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6 9 17l-5-5"/></svg>
+        <svg
+          class="w-3.5 h-3.5 text-success"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"><path d="M20 6 9 17l-5-5" /></svg
+        >
       {:else}
-        <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+        <svg
+          class="w-3.5 h-3.5"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          ><rect x="9" y="9" width="13" height="13" rx="2" /><path
+            d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"
+          /></svg
+        >
       {/if}
     </button>
   </div>
@@ -125,8 +154,11 @@
         <svg
           class="w-3.5 h-3.5 shrink-0 text-base-content/40 transition-transform duration-150"
           class:rotate-90={expandedFiles.has(file.newPath)}
-          viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-        ><path d="m9 18 6-6-6-6"/></svg>
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"><path d="m9 18 6-6-6-6" /></svg
+        >
         <span class="truncate">{truncateLabel(file.newPath)}</span>
         <span class="ml-auto shrink-0 flex items-center gap-2">
           {#if file.additions > 0}
@@ -156,8 +188,16 @@
                 >
                   <span class="line-num">{line.oldLineNumber ?? ''}</span>
                   <span class="line-num">{line.newLineNumber ?? ''}</span>
-                  <span class="line-sign">{line.type === 'add' ? '+' : line.type === 'delete' ? '-' : ' '}</span>
-                  <span class="line-content">{@html highlightLine(line.content, detectLang(file.newPath), file.newPath)}</span>
+                  <span class="line-sign"
+                    >{line.type === 'add' ? '+' : line.type === 'delete' ? '-' : ' '}</span
+                  >
+                  <span class="line-content"
+                    >{@html highlightLine(
+                      line.content,
+                      detectLang(file.newPath),
+                      file.newPath
+                    )}</span
+                  >
                 </div>
               {/if}
             {/each}
@@ -293,7 +333,13 @@
   }
 
   /* Syntax highlight overrides inside diff lines — keep it subtle */
-  .line-content :global(.hljs-keyword) { opacity: 0.8; }
-  .line-content :global(.hljs-string) { opacity: 0.75; }
-  .line-content :global(.hljs-number) { opacity: 0.75; }
+  .line-content :global(.hljs-keyword) {
+    opacity: 0.8;
+  }
+  .line-content :global(.hljs-string) {
+    opacity: 0.75;
+  }
+  .line-content :global(.hljs-number) {
+    opacity: 0.75;
+  }
 </style>

@@ -1,9 +1,14 @@
 <script lang="ts">
-  import { Button } from '$lib/components/ui/button';
-  import * as Dialog from '$lib/components/ui/dialog';
-  import type { TreeNode } from '$lib/ws/protocol';
+  import { Button } from '#lib/components/ui/button/index.js';
+  import * as Dialog from '#lib/components/ui/dialog/index.js';
+  import type { TreeNode } from '#lib/ws/protocol.js';
 
-  let { open, loading, treeData, onClose }: {
+  let {
+    open,
+    loading,
+    treeData,
+    onClose,
+  }: {
     open: boolean;
     loading: boolean;
     treeData: TreeNode[];
@@ -16,7 +21,9 @@
     <div class="flex items-start gap-2" style="padding-left: {depth * 1.25}rem;">
       {#if node.children.length > 0}
         <span class="text-base-content/30 shrink-0 mt-0.5 select-none">
-          <svg class="w-3 h-3" viewBox="0 0 24 24" fill="currentColor"><path d="M9 5l7 7-7 7"/></svg>
+          <svg class="w-3 h-3" viewBox="0 0 24 24" fill="currentColor"
+            ><path d="M9 5l7 7-7 7" /></svg
+          >
         </span>
       {:else}
         <span class="w-3 shrink-0"></span>
@@ -57,7 +64,14 @@
 
     {#if loading}
       <div class="flex items-center justify-center py-6 text-muted-foreground text-sm gap-2">
-        <svg class="w-4 h-4 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>
+        <svg
+          class="w-4 h-4 animate-spin"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2.5"
+          stroke-linecap="round"><path d="M21 12a9 9 0 1 1-6.219-8.56" /></svg
+        >
         loading…
       </div>
     {:else if treeData.length === 0}

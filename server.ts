@@ -42,6 +42,12 @@ import {
   setWebhookUrl,
   sendWebhookNotification,
 } from './src/lib/server/notification-webhook.ts';
+import {
+  addPushSubscription,
+  ensureVapidKeys,
+  removePushSubscription,
+  sendPushNotification,
+} from './src/lib/server/push-notifications.ts';
 import { persistProviderApiKey } from './src/lib/server/provider-auth.ts';
 import {
   serializeModel,
@@ -2291,14 +2297,29 @@ function trustStore(): PiSDKNS.ProjectTrustStore {
   if (!_sdk) throw new Error('Pi SDK is not loaded');
   return (_projectTrustStore ??= new _sdk.ProjectTrustStore(_sdk.getAgentDir()));
 }
+
 function projectTrustInfoFor(targetCwd: string): ProjectTrustInfo {
   if (!_sdk) {
     return { cwd: targetCwd, decision: 'ask', requiresDecision: true, persisted: false };
   }
   const stored = trustStore().get(targetCwd);
+  // Session-only trust ("trust this session") lives on the in-memory settings
+  // manager of the active session — surface it so the UI reflects it.
+  const sess = activeSessionOrNull();
+  const sessionTrusted =
+    sess !== null &&
+    resolve(sess.sessionManager.getCwd() || cwd) === resolve(targetCwd) &&
+    sess.settingsManager.isProjectTrusted();
   return {
     cwd: targetCwd,
-    decision: stored === true ? 'trusted' : stored === false ? 'denied' : 'ask',
+    decision:
+      stored === true
+        ? 'trusted'
+        : stored === false
+          ? 'denied'
+          : sessionTrusted
+            ? 'trusted'
+            : 'ask',
     requiresDecision: _sdk.hasTrustRequiringProjectResources(targetCwd),
     persisted: stored !== null,
   };
@@ -2306,8 +2327,7 @@ function projectTrustInfoFor(targetCwd: string): ProjectTrustInfo {
 
 async function resolveProjectTrust(
   targetCwd: string,
-  settingsManager: PiSDKNS.SettingsManager,
-  ownerSessionId: string | null
+  settingsManager: PiSDKNS.SettingsManager
 ): Promise<boolean> {
   const info = projectTrustInfoFor(targetCwd);
   if (!info.requiresDecision) {
@@ -2319,18 +2339,11 @@ async function resolveProjectTrust(
     settingsManager.setProjectTrusted(stored);
     return stored;
   }
-  const selection = await uiContext.select(
-    `Trust project resources in ${targetCwd}?`,
-    ['Trust project and remember', 'Trust for this session', 'Continue without project resources'],
-    undefined,
-    ownerSessionId
-  );
-  const trusted = selection !== 'Continue without project resources';
-  if (selection === 'Trust project and remember') trustStore().set(targetCwd, true);
-  if (selection === 'Continue without project resources') trustStore().set(targetCwd, false);
-  settingsManager.setProjectTrusted(trusted);
-  broadcast({ type: 'project_trust', trust: projectTrustInfoFor(targetCwd) });
-  return trusted;
+  // Undecided — keep project resources out for now and let the client's
+  // trust banner (decision 'ask') offer Trust project / Trust this session.
+  // Deliberately non-blocking: never gate session creation on a dialog here.
+  settingsManager.setProjectTrusted(false);
+  return false;
 }
 
 interface CreatedSdkSession {
@@ -2357,8 +2370,7 @@ async function createSdkSession(
     modelRuntime: source?.modelRuntime,
     extensionFlagValues: extensionFlagValuesFor(),
     resourceLoaderReloadOptions: {
-      resolveProjectTrust: async () =>
-        resolveProjectTrust(targetCwd, settingsManager, activeSessionId),
+      resolveProjectTrust: async () => resolveProjectTrust(targetCwd, settingsManager),
     },
   });
   const result = await sdk.createAgentSessionFromServices({
@@ -2393,8 +2405,10 @@ function replacementContextFor(session: AgentSession): HostReplacementContext {
   const commandContext = session.extensionRunner.createCommandContext();
   return {
     ...commandContext,
-    sendMessage: (message: Parameters<AgentSession['sendCustomMessage']>[0], options: Parameters<AgentSession['sendCustomMessage']>[1]) =>
-      session.sendCustomMessage(message, options),
+    sendMessage: (
+      message: Parameters<AgentSession['sendCustomMessage']>[0],
+      options: Parameters<AgentSession['sendCustomMessage']>[1]
+    ) => session.sendCustomMessage(message, options),
     sendUserMessage: (
       content: Parameters<AgentSession['sendUserMessage']>[0],
       options: Parameters<AgentSession['sendUserMessage']>[1]
@@ -2560,10 +2574,6 @@ type PackageManagerWithUpdates = PiSDKNS.PackageManager & {
   checkForAvailableUpdates(): Promise<PackageUpdateInfo[]>;
 };
 
-
-
-
-
 /**
  * Initialise (or return) the active pi session. Loads the SDK and creates a
  * session on demand. Concurrent calls share the same initialisation promise.
@@ -2706,7 +2716,9 @@ function registerSession(
     diagnostics: created?.diagnostics ?? [],
     hostBound: _bindExt || created !== undefined,
     shutdownRequested: false,
-    ...(created?.modelFallbackMessage ? { modelFallbackMessage: created.modelFallbackMessage } : {}),
+    ...(created?.modelFallbackMessage
+      ? { modelFallbackMessage: created.modelFallbackMessage }
+      : {}),
   };
   sessionPool.set(sid, entry);
   // Pooled sessions are overlay-authoritative while resident — register the
@@ -2723,11 +2735,35 @@ function registerSession(
         // A run started (e.g. queued follow-up) — keep the session in memory.
         cancelNavOutDisposal(entry);
         break;
-      case 'agent_end':
+      case 'agent_end': {
         entry.isRunning = false;
-        if (activeSessionId !== sid) entry.unseen = true;
+        const backgroundEnd = activeSessionId !== sid;
+        if (backgroundEnd) entry.unseen = true;
         entry.lastActivity = Date.now();
+        // Closed-app notification (Web Push). The SW suppresses pushes when a
+        // page is visible, and tags dedupe against the page's own hidden-tab
+        // notifications — payloads carry no message text.
+        void sendPushNotification(
+          backgroundEnd
+            ? {
+                kind: 'session_finished',
+                title: 'Session Finished',
+                body: `Session ${sid.slice(0, 8)} has new results.`,
+                tag: `pi-session-${sid}`,
+                sessionId: sid,
+                ...(entry.path ? { sessionPath: entry.path } : {}),
+              }
+            : {
+                kind: 'response_complete',
+                title: 'Response Complete',
+                body: 'pi finished responding.',
+                tag: 'pi-agent-end',
+                sessionId: sid,
+                ...(entry.path ? { sessionPath: entry.path } : {}),
+              }
+        );
         break;
+      }
       case 'message_end':
         entry.lastActivity = Date.now();
         if (activeSessionId !== sid) entry.unseen = true;
@@ -2795,14 +2831,16 @@ function registerSession(
       broadcastSessionRuntime(sid, entry);
       // Live summary delta — keeps the sidebar's counts/name/firstMessage
       // fresh without re-serializing the full session list per message.
-      broadcast({ type: 'session_updated', session: serializeSession(poolSummary(sess, entry)), ...stampOwner(sid) });
+      broadcast({
+        type: 'session_updated',
+        session: serializeSession(poolSummary(sess, entry)),
+        ...stampOwner(sid),
+      });
     }, 300);
   });
 
   // Subscribe event-forwarding (only active session gets this)
   entry.forwardingUnsub = sess.subscribe(makeEventForwarder(sid, sess));
-
-
 }
 /** Broadcast a runtime-status update for a single pooled session. */
 function broadcastSessionRuntime(sid: string, entry: ManagedSession) {
@@ -3110,8 +3148,7 @@ try {
 
     async fetch(req, server) {
       const url = new URL(req.url);
-      const isTls =
-        url.protocol === 'https:' || req.headers.get('x-forwarded-proto') === 'https';
+      const isTls = url.protocol === 'https:' || req.headers.get('x-forwarded-proto') === 'https';
 
       if (url.pathname === '/ws') {
         const cookieHeader = req.headers.get('cookie') ?? '';
@@ -3122,21 +3159,31 @@ try {
         // SameSite=strict ignores ports, so even localhost origins must match
         // the Host header's port: a page served from another localhost port
         // would otherwise hijack the authenticated socket (CSWSH).
+        // In dev (DEV_WS_ONLY) the page legitimately comes from the Vite dev
+        // server (localhost:5173 by default) while /ws runs on 5174, so port
+        // equality is relaxed there — the loopback hostname check below still
+        // blocks foreign-origin hijacking.
         const origin = req.headers.get('origin');
         if (origin) {
           try {
             const originUrl = new URL(origin);
             const host = req.headers.get('host');
             if (host) {
-              const hostPort = new URL(`${originUrl.protocol}//${host}`).port;
-              if (originUrl.port !== hostPort) {
-                return new Response('Origin mismatch', { status: 403, headers: securityHeaders(isTls) });
+              const isLoopback = ['localhost', '127.0.0.1', '::1'].includes(originUrl.hostname);
+              if (!DEV_WS_ONLY) {
+                const hostPort = new URL(`${originUrl.protocol}//${host}`).port;
+                if (originUrl.port !== hostPort) {
+                  return new Response('Origin mismatch', {
+                    status: 403,
+                    headers: securityHeaders(isTls),
+                  });
+                }
               }
-              if (
-                !['localhost', '127.0.0.1', '::1'].includes(originUrl.hostname) &&
-                originUrl.host !== host
-              ) {
-                return new Response('Origin mismatch', { status: 403, headers: securityHeaders(isTls) });
+              if (!isLoopback && originUrl.host !== host) {
+                return new Response('Origin mismatch', {
+                  status: 403,
+                  headers: securityHeaders(isTls),
+                });
               }
             }
           } catch {
@@ -3149,12 +3196,17 @@ try {
         const jti = await extractJti(token);
         const ok = server.upgrade(req, { data: { connectedAt: Date.now(), tokenExp, jti } });
         if (ok) return undefined as unknown as Response;
-        return new Response('WebSocket upgrade failed', { status: 400, headers: securityHeaders(isTls) });
+        return new Response('WebSocket upgrade failed', {
+          status: 400,
+          headers: securityHeaders(isTls),
+        });
       }
 
       const res = DEV_WS_ONLY
         ? new Response('Use Vite dev server for HTTP in dev mode', { status: 404 })
-        : ((await (await getSvelteHandler())(req, server)) as Response);
+        : ((await (
+            await getSvelteHandler()
+          )(req, server)) as Response);
       // Merge hardening headers into the SvelteKit response. `new Headers(res.headers)`
       // copies the full list including Set-Cookie (the iterator may omit it).
       const headers = new Headers(res.headers);
@@ -3211,6 +3263,7 @@ try {
                 autoRetryEnabled: sess.autoRetryEnabled,
                 queuedSteering: sess.getSteeringMessages(),
                 queuedFollowUp: sess.getFollowUpMessages(),
+                pushVapidKey: ensureVapidKeys().publicKey,
                 piVersion: PI_SDK_VERSION,
                 contextUsage: sess.getContextUsage(),
                 projectTrust: projectTrustInfoFor(sess.sessionManager.getCwd() || cwd),
@@ -3270,7 +3323,10 @@ try {
           // Periodic token check (every 60s) — closes expired or revoked
           // sockets even when the client is idle.
           ws.data._expTimer = setInterval(() => {
-            if ((ws.data.jti && isJtiRevoked(ws.data.jti)) || Date.now() / 1000 > ws.data.tokenExp) {
+            if (
+              (ws.data.jti && isJtiRevoked(ws.data.jti)) ||
+              Date.now() / 1000 > ws.data.tokenExp
+            ) {
               clearInterval(ws.data._expTimer!);
               try {
                 ws.close(4001, 'Session expired');
@@ -3293,7 +3349,10 @@ try {
         // Per-message auth revalidation — close sockets whose token expired or
         // was revoked (logged out) so they cannot continue using the socket.
         const wsData = ws.data as WSData;
-        if ((wsData.jti && isJtiRevoked(wsData.jti)) || (wsData.tokenExp && Date.now() / 1000 > wsData.tokenExp)) {
+        if (
+          (wsData.jti && isJtiRevoked(wsData.jti)) ||
+          (wsData.tokenExp && Date.now() / 1000 > wsData.tokenExp)
+        ) {
           try {
             ws.close(4001, 'Session expired');
           } catch {
@@ -3664,7 +3723,16 @@ try {
             }
 
             case 'get_providers': {
-              ws.send(JSON.stringify({ type: 'providers_list', providers: await getProviders() }));
+              // Panel fetches can arrive as soon as the socket opens — before
+              // `connected`. Wait for session creation (including any pending
+              // project-trust prompt) instead of throwing "No active session".
+              const sess = await ensureSession();
+              ws.send(
+                JSON.stringify({
+                  type: 'providers_list',
+                  providers: await getProviders(sess.modelRuntime),
+                })
+              );
               break;
             }
 
@@ -4370,8 +4438,7 @@ try {
                             : result.exitCode !== undefined && result.exitCode !== 0
                               ? `\nexit code: ${result.exitCode}`
                               : ''),
-                        result.cancelled ||
-                          (result.exitCode !== undefined && result.exitCode !== 0)
+                        result.cancelled || (result.exitCode !== undefined && result.exitCode !== 0)
                           ? 'error'
                           : 'info'
                       );
@@ -4408,7 +4475,12 @@ try {
 
             case 'get_session_stats': {
               try {
-                ws.send(JSON.stringify({ type: 'session_stats', stats: activeSession().getSessionStats() }));
+                ws.send(
+                  JSON.stringify({
+                    type: 'session_stats',
+                    stats: (await ensureSession()).getSessionStats(),
+                  })
+                );
               } catch (err) {
                 log.error('[pifrontier] get_session_stats error:', err);
                 ws.send(JSON.stringify({ type: 'agent_error', error: String(err) }));
@@ -4420,9 +4492,7 @@ try {
               try {
                 const session = activeSession();
                 const path =
-                  msg.format === 'html'
-                    ? await session.exportToHtml()
-                    : session.exportToJsonl();
+                  msg.format === 'html' ? await session.exportToHtml() : session.exportToJsonl();
                 ws.send(JSON.stringify({ type: 'export_result', format: msg.format, path }));
               } catch (err) {
                 log.error('[pifrontier] export_session error:', err);
@@ -4460,8 +4530,9 @@ try {
 
             case 'get_tools': {
               try {
-                const allTools = activeSession().getAllTools();
-                const activeNames = activeSession().getActiveToolNames();
+                const sess = await ensureSession();
+                const allTools = sess.getAllTools();
+                const activeNames = sess.getActiveToolNames();
                 ws.send(
                   JSON.stringify({
                     type: 'tools_list',
@@ -4491,7 +4562,7 @@ try {
 
             case 'get_resources': {
               try {
-                const sess = activeSession();
+                const sess = await ensureSession();
                 const { skills } = sess.resourceLoader.getSkills();
                 const { prompts } = sess.resourceLoader.getPrompts();
                 const skillSummaries: SkillSummary[] = skills.map((skill) => ({
@@ -4529,7 +4600,9 @@ try {
                     activeSession().sessionManager.getCwd() ??
                     cwd
                 );
-                ws.send(JSON.stringify({ type: 'project_trust', trust: projectTrustInfoFor(targetCwd) }));
+                ws.send(
+                  JSON.stringify({ type: 'project_trust', trust: projectTrustInfoFor(targetCwd) })
+                );
               } catch (err) {
                 log.error('[pifrontier] get_project_trust error:', err);
                 ws.send(
@@ -4555,16 +4628,26 @@ try {
                   decision: ProjectTrustDecision;
                 };
                 const targetCwd = resolve(request.cwd);
-                trustStore().set(
-                  targetCwd,
-                  request.decision === 'trusted'
-                    ? true
-                    : request.decision === 'denied'
-                      ? false
-                      : null
-                );
-                const sess = activeSession();
-                if (resolve(sess.sessionManager.getCwd() || cwd) === targetCwd) {
+                // 'session' trusts the active session in memory only — the store
+                // is left untouched so the next startup still asks. 'ask' resets
+                // to undecided (store cleared + session untrusted).
+                if (request.decision !== 'session') {
+                  trustStore().set(
+                    targetCwd,
+                    request.decision === 'trusted'
+                      ? true
+                      : request.decision === 'denied'
+                        ? false
+                        : null
+                  );
+                }
+                const sess = activeSessionOrNull();
+                if (sess && resolve(sess.sessionManager.getCwd() || cwd) === targetCwd) {
+                  // Trust level is a per-session in-memory flag on the settings
+                  // manager; persisted decisions already landed in the store above.
+                  sess.settingsManager.setProjectTrusted(
+                    request.decision === 'trusted' || request.decision === 'session'
+                  );
                   await reloadSessionHost(sess.sessionId, sess);
                 }
                 broadcast({ type: 'project_trust', trust: projectTrustInfoFor(targetCwd) });
@@ -4574,7 +4657,6 @@ try {
               }
               break;
             }
-
 
             case 'get_command_completions': {
               try {
@@ -4618,7 +4700,7 @@ try {
 
             case 'get_extensions': {
               try {
-                const sess = activeSession();
+                const sess = await ensureSession();
                 const { extensions, errors } = sess.resourceLoader.getExtensions();
                 const runner = sess.extensionRunner;
                 const diagnostics = [
@@ -4627,10 +4709,7 @@ try {
                   ...sess.resourceLoader.getSkills().diagnostics,
                   ...sess.resourceLoader.getPrompts().diagnostics,
                 ];
-                const shortcuts = runner.getShortcuts({}) as Map<
-                  string,
-                  PiSDKNS.ExtensionShortcut
-                >;
+                const shortcuts = runner.getShortcuts({}) as Map<string, PiSDKNS.ExtensionShortcut>;
                 const summaries: ExtensionSummary[] = extensions.map((extension) => ({
                   source: extension.sourceInfo.source,
                   path: extension.sourceInfo.path,
@@ -4676,7 +4755,7 @@ try {
             }
             case 'get_packages': {
               try {
-                const { manager } = packageManagerFor(activeSession());
+                const { manager } = packageManagerFor(await ensureSession());
                 const packages = manager.listConfiguredPackages().map((pkg) => ({
                   source: pkg.source,
                   scope: pkg.scope,
@@ -4709,10 +4788,18 @@ try {
                   await manager.update(msg.source);
                 }
                 await reloadSessionHost(sess.sessionId, sess);
-                ws.send(JSON.stringify({ type: 'package_result', success: true, message: 'Package operation completed.' }));
+                ws.send(
+                  JSON.stringify({
+                    type: 'package_result',
+                    success: true,
+                    message: 'Package operation completed.',
+                  })
+                );
               } catch (err) {
                 log.error('[pifrontier] package mutation error:', err);
-                ws.send(JSON.stringify({ type: 'package_result', success: false, message: String(err) }));
+                ws.send(
+                  JSON.stringify({ type: 'package_result', success: false, message: String(err) })
+                );
               }
               break;
             }
@@ -4815,8 +4902,6 @@ try {
               break;
             }
 
-
-
             case 'get_commands': {
               try {
                 ws.send(
@@ -4860,7 +4945,10 @@ try {
                 }
                 // redirect:'error' — the host whitelist above is checked pre-fetch only,
                 // so following redirects could smuggle content from arbitrary hosts.
-                if (msg.scope === 'project' && !activeSession().settingsManager.isProjectTrusted()) {
+                if (
+                  msg.scope === 'project' &&
+                  !activeSession().settingsManager.isProjectTrusted()
+                ) {
                   throw new Error('Project resources are not trusted for this session.');
                 }
                 const res = await fetch(rawUrl, { redirect: 'error' });
@@ -5183,6 +5271,29 @@ try {
             }
             case 'get_settings': {
               ws.send(JSON.stringify({ type: 'settings', settings: readSettings() }));
+              break;
+            }
+            case 'push_subscribe': {
+              const { endpoint, keys } = msg as {
+                type: 'push_subscribe';
+                endpoint: string;
+                keys: { p256dh: string; auth: string };
+                expirationTime?: number | null;
+              };
+              if (
+                typeof endpoint === 'string' &&
+                endpoint.startsWith('https://') &&
+                keys &&
+                typeof keys.p256dh === 'string' &&
+                typeof keys.auth === 'string'
+              ) {
+                addPushSubscription({ endpoint, keys, expirationTime: msg.expirationTime ?? null });
+              }
+              break;
+            }
+            case 'push_unsubscribe': {
+              const { endpoint } = msg as { type: 'push_unsubscribe'; endpoint: string };
+              if (typeof endpoint === 'string') removePushSubscription(endpoint);
               break;
             }
             case 'set_settings': {

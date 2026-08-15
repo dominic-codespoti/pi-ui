@@ -1,8 +1,11 @@
 <script lang="ts">
-  import { Button } from '$lib/components/ui/button';
-  import * as Dialog from '$lib/components/ui/dialog';
+  import { Button } from '#lib/components/ui/button/index.js';
+  import * as Dialog from '#lib/components/ui/dialog/index.js';
 
-  let { pendingConfirm, onClose }: {
+  let {
+    pendingConfirm,
+    onClose,
+  }: {
     pendingConfirm: {
       title: string;
       message: string;
@@ -14,7 +17,12 @@
   } = $props();
 </script>
 
-<Dialog.Root open={pendingConfirm !== null} onOpenChange={(o) => { if (!o) onClose(); }}>
+<Dialog.Root
+  open={pendingConfirm !== null}
+  onOpenChange={(o) => {
+    if (!o) onClose();
+  }}
+>
   <Dialog.Content>
     <Dialog.Header>
       <Dialog.Title>{pendingConfirm?.title ?? 'Confirm'}</Dialog.Title>
@@ -23,10 +31,18 @@
     <Dialog.Footer>
       <Button variant="ghost" size="sm" onclick={onClose}>Cancel</Button>
       <Button
-        onclick={() => { pendingConfirm?.onConfirm(); onClose(); }}
+        onclick={() => {
+          pendingConfirm?.onConfirm();
+          onClose();
+        }}
         size="sm"
-        class={pendingConfirm?.variant === 'warning' ? 'bg-warning text-warning-content hover:brightness-110' : pendingConfirm?.variant === 'info' ? 'bg-primary text-primary-content hover:brightness-110' : 'bg-error text-error-content hover:brightness-110'}
-      >{pendingConfirm?.confirmLabel ?? 'Confirm'}</Button>
+        class={pendingConfirm?.variant === 'warning'
+          ? 'bg-warning text-warning-content hover:brightness-110'
+          : pendingConfirm?.variant === 'info'
+            ? 'bg-primary text-primary-content hover:brightness-110'
+            : 'bg-error text-error-content hover:brightness-110'}
+        >{pendingConfirm?.confirmLabel ?? 'Confirm'}</Button
+      >
     </Dialog.Footer>
   </Dialog.Content>
 </Dialog.Root>

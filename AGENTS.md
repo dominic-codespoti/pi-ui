@@ -18,7 +18,7 @@ Bun server bridges pi SDK events to browser over WebSocket. Key flow: CLI → se
 - Lazy SDK load (~136 MB) on first WS connect; lazy SvelteKit handler (~30 MB) on first HTTP
 - Session pool with LRU idle cleanup (30 min); navigated-away idle sessions are additionally released after a 2-min grace (`scheduleNavOutDisposal`) unless running/unseen/queued/in-memory — switching back re-opens from disk
 - Extension UI requests block session until response (5 min timeout)
-- CSRF disabled (`csrf.trustedOrigins: ['*']` in `svelte.config.js`) — Bun URL construction conflicts with SvelteKit's origin check; login server action has its own origin check.
+- CSRF disabled (`csrf.trustedOrigins: ['*']` in `vite.config.ts`) — Bun URL construction conflicts with SvelteKit's origin check; login server action has its own origin check.
 - Message editing via `edit_message` — rewinds session via `navigateTree()`, resends. See `pi-sdk-session-manipulation` skill.
 - History payloads (`connected`/`session_loaded`/`older_messages`) are size-bounded: last 100 messages, plus per-block 80 KB cap on text/thinking via `src/lib/server/wire-messages.ts`; a failed `connected` send retries without history instead of closing the socket
 - Session lists never use SDK `SessionManager.list/listAll` (they load every file fully and build `allMessagesText` — OOM risk at multi-hundred-MB stores). Listing goes through two catalogs in `src/lib/server/`: `session-catalog.ts` (merged session list — `session-scan.ts` streams line-by-line with a per-file (mtime,size) cache persisted to `~/.pi/agent/pi-ui-session-scan.json`; restarts are stat-only, composed with a live overlay for pooled sessions so the active session's file is never re-read after every message) and `project-catalog.ts` (merged project list — persisted registry + live session counts, debounced sync-write persistence). Both are singletons with a single `apply()` mutation chokepoint, a `list()` read, and `onChange()` change events; server.ts subscribes and broadcasts `all_sessions_list`/`projects_list` coalesced (300 ms)
@@ -70,7 +70,8 @@ PI_PASSWORD=secret bun run start          # CLI entry (prefers server.bundle.js)
 PI_PASSWORD=secret PORT=3000 bun run start
 
 # Quality
-bun run check             # svelte-kit sync + svelte-check
+bun run check             # svelte-kit sync + svelte-check (JS compiler — tsgo can't type #lib/*.svelte subpath imports)
+bun run check:sw          # tsc --noEmit on the service-worker project (src/service-worker/tsconfig.json)
 bun run check:server      # tsc --noEmit on server.ts + bin/
 bun run lint              # eslint (flat config)
 bun run format            # prettier --write .
@@ -84,7 +85,7 @@ bun run test:e2e          # playwright test (builds + starts server first)
 bun run test:e2e:debug    # playwright test --debug
 
 # CI
-bun run test:ci           # check + check:server + lint + test:unit + test:e2e
+bun run test:ci           # check + check:sw + check:server + lint + test:unit + test:e2e
 ```
 
 ---
@@ -112,7 +113,7 @@ bun run test:ci           # check + check:server + lint + test:unit + test:e2e
 - **shadcn-style UI primitives**: each component is a subdirectory with compound sub-components + `index.ts` that re-exports with both singular (`Root`) and prefixed names (`Button`, `DialogContent`)
 - **bits-ui wrapping**: Dialog, Select, Tabs, Tooltip, ScrollArea, Switch, Separator wrap `bits-ui` primitives
 - **`tailwind-variants`** (`tv()`): used for variant/size class generation (e.g., `buttonVariants`)
-- **`cn()` from `$lib/utils`**: Tailwind class merging via clsx + twMerge
+- **`cn()` from `#lib/utils.js`**: Tailwind class merging via clsx + twMerge
 - **Data attributes** like `data-slot="button"`, `data-size="sm"` drive internal styling
 - **No component unit tests** — UI is tested exclusively via Playwright E2E
 
@@ -195,8 +196,8 @@ bun run test:ci           # check + check:server + lint + test:unit + test:e2e
 - **Runtime**: Bun ≥1.0.0 (Node.js NOT supported)
 - **Package manager**: Bun (bun install, bun run, bun add)
 - **Module system**: ESM only (`"type": "module"`)
-- **Adapter**: `svelte-adapter-bun` (NOT `@sveltejs/adapter-node` — incompatible with WS)
-- **PWA**: Custom minimal service worker (`src/service-worker.ts`) — no Workbox, no chat-data caching
+- **Adapter**: vendored `svelte-adapter-bun` at `adapters/svelte-adapter-bun` (NOT `@sveltejs/adapter-node` — incompatible with WS). Vendored because upstream peers on kit ^2 and is unmaintained; the only change is `builder.config.kit.paths.base` → `builder.config.paths?.base ?? ''` for SvelteKit 3. Keep the `vite` `overrides` entry in package.json — vitest bundles its own nested Vite otherwise, and kit 3's `isRunnableDevEnvironment` instanceof check fails across instances.
+- **PWA**: Custom minimal service worker (`src/service-worker/index.ts` + `src/service-worker/tsconfig.json`, excluded from the root tsconfig) — no Workbox, no chat-data caching
   - Install: precaches immutable build chunks + static files (versioned cache `pi-ui-shell-<version>`), `self.skipWaiting()`
   - Activate: drops old-version caches, `clients.claim()`
   - Fetch: cache-first for **precached assets only** — navigations, `/ws`, and dynamic requests bypass the SW (auth redirects never staled)
@@ -217,7 +218,7 @@ Three layers: **Unit** (Vitest, jsdom), **E2E** (Playwright with mock WebSocket)
 ```bash
 bun run test:unit         # vitest run (jsdom)
 bun run test:e2e          # playwright test (builds + starts server)
-bun run test:ci           # check + check:server + lint + test:unit + test:e2e
+bun run test:ci           # check + check:sw + check:server + lint + test:unit + test:e2e
 ```
 
 **Key patterns:**

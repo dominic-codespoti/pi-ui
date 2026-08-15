@@ -3,7 +3,7 @@
  * Server forwards pi SDK events as-is, plus custom handshake/control messages.
  */
 
-import type { ParsedComponent } from '$lib/tui-stubs';
+import type { ParsedComponent } from '#lib/tui-stubs.js';
 /** Version of the extension-UI wire payloads (ExtensionUiStatePayload et al). Bump on breaking shape changes. */
 export const EXTENSION_UI_SCHEMA_VERSION = 1 as const;
 
@@ -122,7 +122,7 @@ export interface ExtensionDiagnostic {
   path?: string;
 }
 
-export type ProjectTrustDecision = 'trusted' | 'denied' | 'ask';
+export type ProjectTrustDecision = 'trusted' | 'denied' | 'session' | 'ask';
 
 export interface ProjectTrustInfo {
   cwd: string;
@@ -299,6 +299,8 @@ export interface ConnectedMessage {
   autoCompactionEnabled?: boolean;
   /** Whether auto-retry on transient errors is enabled. */
   autoRetryEnabled?: boolean;
+  /** VAPID public key for Web Push subscription (null when push is unavailable). */
+  pushVapidKey?: string | null;
   /** pi SDK version (e.g. "0.75.5"). */
   piVersion?: string;
   /** pi-ui server version (e.g. "0.1.6"). */
@@ -590,7 +592,7 @@ export type ClientMessage =
   | { type: 'get_extension_autocomplete'; trigger: string; query: string }
   /** Forward raw terminal input to an interactive custom component (ConversationViewer
    * etc). `data` is the exact byte sequence a real terminal would send for the
-   * keystroke/paste — see `$lib/terminal-key-encoder` — and is passed straight to
+   * keystroke/paste — see `#lib/terminal-key-encoder.js` — and is passed straight to
    * the component's `handleInput()`. */
   | { type: 'extension_custom_input'; id: string; data: string }
   /** Report the interactive custom overlay's live viewport so the server's headless terminal renders at the real size. */
@@ -647,7 +649,7 @@ export type ClientMessage =
   | { type: 'get_resources' }
   | { type: 'get_extensions' }
   | { type: 'get_project_trust'; cwd?: string }
-  | { type: 'set_project_trust'; cwd: string; decision: 'trusted' | 'denied' | 'ask' }
+  | { type: 'set_project_trust'; cwd: string; decision: ProjectTrustDecision }
   | { type: 'set_extension_flag'; name: string; value: boolean | string }
   | { type: 'invoke_extension_shortcut'; shortcut: string }
   | { type: 'get_packages' }
@@ -699,4 +701,13 @@ export type ClientMessage =
   /** Heartbeat — server replies with `{ type: 'pong' }`. Keeps the socket alive and detects zombies. */
   | { type: 'ping' }
   /** Set the notification webhook URL (ntfy.sh, Pushover, Gotify, etc.). Empty string clears. */
-  | { type: 'set_notification_webhook_url'; url: string };
+  | { type: 'set_notification_webhook_url'; url: string }
+  /** Register this device for Web Push (closed-app notifications). */
+  | {
+      type: 'push_subscribe';
+      endpoint: string;
+      keys: { p256dh: string; auth: string };
+      expirationTime?: number | null;
+    }
+  /** Deregister this device from Web Push. */
+  | { type: 'push_unsubscribe'; endpoint: string };

@@ -41,6 +41,7 @@ export default [
       'e2e/',
       'benchmark.ts',
       'server.bundle.js',
+      'adapters/',
     ],
   },
   {

@@ -1,7 +1,7 @@
-import { dev } from '$app/environment';
-import type { Handle } from '@sveltejs/kit';
+import type { Handle } from '@sveltejs/kit/hooks';
 import { redirect } from '@sveltejs/kit';
-import { verifySessionToken, getTokenFromCookies } from '$lib/auth/password';
+import { dev } from '$app/env';
+import { verifySessionToken, getTokenFromCookies } from '#lib/auth/password.js';
 
 const PUBLIC_PATHS = new Set(['/login']);
 

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { ModelInfo, ProviderInfo, SkillSummary, PromptSummary } from '$lib/ws/protocol';
+  import type { ModelInfo, ProviderInfo, SkillSummary, PromptSummary } from '#lib/ws/protocol.js';
 
   /**
    * Lazy-mounting wrapper for the right panel — the real component (and its
@@ -102,9 +102,7 @@
   let Cmp = $state<any>(null);
   $effect(() => {
     if (open && !Cmp) {
-      import('./right-panel.svelte')
-        .then((m) => (Cmp = m.default))
-        .catch(() => {});
+      import('./right-panel.svelte').then((m) => (Cmp = m.default)).catch(() => {});
     }
   });
 </script>

@@ -1,6 +1,6 @@
 import { join, resolve, sep } from 'node:path';
 import { homedir } from 'node:os';
-import type { ModelInfo, SessionSummary } from '$lib/ws/protocol';
+import type { ModelInfo, SessionSummary } from '#lib/ws/protocol.js';
 import type { Api, Model } from '@earendil-works/pi-ai';
 import type { SessionFileInfo } from './session-scan';
 
@@ -51,7 +51,12 @@ export function serializeSession(s: SessionSummaryInput): SessionSummary {
 }
 
 export function compareSemver(a: string, b: string): number {
-  const parse = (v: string) => v.replace(/^v/, '').split(/[.-]/).slice(0, 3).map((part) => Number.parseInt(part, 10) || 0);
+  const parse = (v: string) =>
+    v
+      .replace(/^v/, '')
+      .split(/[.-]/)
+      .slice(0, 3)
+      .map((part) => Number.parseInt(part, 10) || 0);
   const pa = parse(a);
   const pb = parse(b);
   for (let i = 0; i < 3; i += 1) {
@@ -82,14 +87,27 @@ export function formatCommand(args: string[]): string {
 
 export function ephemeralUpdateHint(root: string, packageName: string): string | null {
   const normalized = root.replaceAll('\\', '/');
-  if (normalized.includes('/.bun/install/cache/')) return `bunx ${packageName}@latest --password ...`;
-  if (normalized.includes('/.npm/_npx/') || normalized.includes('/_npx/')) return `npx -y ${packageName}@latest --password ...`;
-  if (normalized.includes('/pnpm/dlx/') || normalized.includes('/.pnpm/dlx/')) return `pnpm dlx ${packageName}@latest --password ...`;
+  if (normalized.includes('/.bun/install/cache/'))
+    return `bunx ${packageName}@latest --password ...`;
+  if (normalized.includes('/.npm/_npx/') || normalized.includes('/_npx/'))
+    return `npx -y ${packageName}@latest --password ...`;
+  if (normalized.includes('/pnpm/dlx/') || normalized.includes('/.pnpm/dlx/'))
+    return `pnpm dlx ${packageName}@latest --password ...`;
   if (normalized.includes('/yarn/dlx/')) return `yarn dlx ${packageName}@latest --password ...`;
   return null;
 }
 
-export const ALLOWED_SKILL_HOSTS = ['github.com', 'raw.githubusercontent.com', 'gist.githubusercontent.com'];
+export const ALLOWED_SKILL_HOSTS = [
+  'github.com',
+  'raw.githubusercontent.com',
+  'gist.githubusercontent.com',
+];
 
-export const SKIP_DIRS = new Set(['.git', 'node_modules', '.svelte-kit', 'build', 'dist', '.cache']);
-
+export const SKIP_DIRS = new Set([
+  '.git',
+  'node_modules',
+  '.svelte-kit',
+  'build',
+  'dist',
+  '.cache',
+]);

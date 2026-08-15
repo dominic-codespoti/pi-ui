@@ -1,10 +1,10 @@
-import type { ParsedComponent } from '$lib/tui-stubs';
+import type { ParsedComponent } from '#lib/tui-stubs.js';
 import {
   EXTENSION_UI_SCHEMA_VERSION,
   type ClientMessage,
   type ExtensionUiStatePayload,
   type WidgetContent,
-} from '$lib/ws/protocol';
+} from '#lib/ws/protocol.js';
 
 /** A modal dialog queued for the active session (queue head renders). */
 export type ModalState =

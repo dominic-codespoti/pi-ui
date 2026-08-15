@@ -6,7 +6,7 @@ import {
   extractTokenExp,
   getTokenFromCookies,
   revokeToken,
-} from '$lib/auth/password';
+} from '#lib/auth/password.js';
 
 /**
  * Sign out: revoke the session token in-memory and clear the cookie.
