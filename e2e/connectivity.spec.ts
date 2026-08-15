@@ -3,10 +3,17 @@ import { test, expect } from './fixtures';
 test.describe('Reconnect / connectivity', () => {
   test('shows connected state on initial connect', async ({ page, login }) => {
     await page.routeWebSocket('/ws', (ws) => {
-      ws.send(JSON.stringify({
-        type: 'connected', sessionId: 's1', isStreaming: false, thinkingLevel: 'medium',
-        model: null, availableModels: [], messages: [],
-      }));
+      ws.send(
+        JSON.stringify({
+          type: 'connected',
+          sessionId: 's1',
+          isStreaming: false,
+          thinkingLevel: 'medium',
+          model: null,
+          availableModels: [],
+          messages: [],
+        })
+      );
     });
     await login(page, 'test-password');
     // No disconnect or reconnect banners should appear
@@ -20,10 +27,17 @@ test.describe('Reconnect / connectivity', () => {
     let closeSocket: (() => void) | undefined;
     await page.routeWebSocket('/ws', (ws) => {
       closeSocket = () => ws.close();
-      ws.send(JSON.stringify({
-        type: 'connected', sessionId: 's1', isStreaming: false, thinkingLevel: 'medium',
-        model: null, availableModels: [], messages: [],
-      }));
+      ws.send(
+        JSON.stringify({
+          type: 'connected',
+          sessionId: 's1',
+          isStreaming: false,
+          thinkingLevel: 'medium',
+          model: null,
+          availableModels: [],
+          messages: [],
+        })
+      );
     });
     await login(page, 'test-password');
     await expect(page.locator('textarea')).toBeEnabled({ timeout: 3000 });
@@ -37,7 +51,9 @@ test.describe('Reconnect / connectivity', () => {
     if (closeSocket) closeSocket();
 
     // The status banner announces the reconnecting state and the composer locks
-    await expect(page.getByRole('status').filter({ hasText: /reconnecting/ })).toBeVisible({ timeout: 3000 });
+    await expect(page.getByRole('status').filter({ hasText: /reconnecting/ })).toBeVisible({
+      timeout: 3000,
+    });
     await expect(page.locator('textarea')).toBeDisabled();
   });
 
@@ -48,10 +64,17 @@ test.describe('Reconnect / connectivity', () => {
       if (first) {
         first = false;
         closeSocket = () => ws.close();
-        ws.send(JSON.stringify({
-          type: 'connected', sessionId: 's1', isStreaming: false, thinkingLevel: 'medium',
-          model: null, availableModels: [], messages: [],
-        }));
+        ws.send(
+          JSON.stringify({
+            type: 'connected',
+            sessionId: 's1',
+            isStreaming: false,
+            thinkingLevel: 'medium',
+            model: null,
+            availableModels: [],
+            messages: [],
+          })
+        );
         return;
       }
       // Fail every reconnect attempt so the backoff countdown stays on screen
@@ -63,7 +86,9 @@ test.describe('Reconnect / connectivity', () => {
     if (closeSocket) closeSocket();
 
     // Countdown renders inside the reconnecting banner, e.g. "reconnecting (2s)"
-    await expect(page.getByRole('status').filter({ hasText: /\(\d+s\)/ })).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByRole('status').filter({ hasText: /\(\d+s\)/ })).toBeVisible({
+      timeout: 10_000,
+    });
   });
 
   test('reconnects automatically after disconnect', async ({ page, login }) => {
@@ -71,10 +96,17 @@ test.describe('Reconnect / connectivity', () => {
 
     await page.routeWebSocket('/ws', (ws) => {
       connectionCount++;
-      ws.send(JSON.stringify({
-        type: 'connected', sessionId: 's1', isStreaming: false, thinkingLevel: 'medium',
-        model: null, availableModels: [], messages: [],
-      }));
+      ws.send(
+        JSON.stringify({
+          type: 'connected',
+          sessionId: 's1',
+          isStreaming: false,
+          thinkingLevel: 'medium',
+          model: null,
+          availableModels: [],
+          messages: [],
+        })
+      );
     });
 
     await login(page, 'test-password');
@@ -95,10 +127,17 @@ test.describe('Reconnect / connectivity', () => {
   test('shows connection status in tooltip', async ({ page, login, isMobile }) => {
     test.skip(isMobile, 'Tooltips are hover-only and intentionally disabled on touch devices');
     await page.routeWebSocket('/ws', (ws) => {
-      ws.send(JSON.stringify({
-        type: 'connected', sessionId: 's1', isStreaming: false, thinkingLevel: 'medium',
-        model: null, availableModels: [], messages: [],
-      }));
+      ws.send(
+        JSON.stringify({
+          type: 'connected',
+          sessionId: 's1',
+          isStreaming: false,
+          thinkingLevel: 'medium',
+          model: null,
+          availableModels: [],
+          messages: [],
+        })
+      );
     });
     await login(page, 'test-password');
     await expect(page.locator('textarea')).toBeEnabled({ timeout: 3000 });
@@ -147,10 +186,17 @@ test.describe('Reconnect / connectivity', () => {
     let closeSocket: (() => void) | undefined;
     await page.routeWebSocket('/ws', (ws) => {
       closeSocket = () => ws.close();
-      ws.send(JSON.stringify({
-        type: 'connected', sessionId: 's1', isStreaming: false, thinkingLevel: 'medium',
-        model: null, availableModels: [], messages: [],
-      }));
+      ws.send(
+        JSON.stringify({
+          type: 'connected',
+          sessionId: 's1',
+          isStreaming: false,
+          thinkingLevel: 'medium',
+          model: null,
+          availableModels: [],
+          messages: [],
+        })
+      );
     });
 
     await login(page, 'test-password');
@@ -169,10 +215,17 @@ test.describe('Reconnect / connectivity', () => {
     await page.routeWebSocket('/ws', (ws) => {
       wsOpened = true;
       closeSocket = () => ws.close();
-      ws.send(JSON.stringify({
-        type: 'connected', sessionId: 's1', isStreaming: false, thinkingLevel: 'medium',
-        model: null, availableModels: [], messages: [],
-      }));
+      ws.send(
+        JSON.stringify({
+          type: 'connected',
+          sessionId: 's1',
+          isStreaming: false,
+          thinkingLevel: 'medium',
+          model: null,
+          availableModels: [],
+          messages: [],
+        })
+      );
     });
 
     await login(page, 'test-password');
@@ -200,10 +253,17 @@ test.describe('Reconnect / connectivity', () => {
     let closeSocket: (() => void) | undefined;
     await page.routeWebSocket('/ws', (ws) => {
       closeSocket = () => ws.close();
-      ws.send(JSON.stringify({
-        type: 'connected', sessionId: 's1', isStreaming: false, thinkingLevel: 'medium',
-        model: null, availableModels: [], messages: [],
-      }));
+      ws.send(
+        JSON.stringify({
+          type: 'connected',
+          sessionId: 's1',
+          isStreaming: false,
+          thinkingLevel: 'medium',
+          model: null,
+          availableModels: [],
+          messages: [],
+        })
+      );
     });
     await login(page, 'test-password');
     await expect(page.locator('textarea')).toBeEnabled({ timeout: 3000 });
@@ -214,9 +274,66 @@ test.describe('Reconnect / connectivity', () => {
       window.dispatchEvent(new Event('offline'));
     });
     if (closeSocket) closeSocket();
-    await expect(page.getByRole('status').filter({ hasText: /reconnecting/ })).toBeVisible({ timeout: 3000 });
+    await expect(page.getByRole('status').filter({ hasText: /reconnecting/ })).toBeVisible({
+      timeout: 3000,
+    });
 
     // Send button should be disabled while the socket is down
     await expect(page.getByRole('button', { name: 'Send message' })).toBeDisabled();
+  });
+
+  test('ignores a late close from a superseded socket after resume', async ({ page, login }) => {
+    const mockSockets: Array<{ close: () => void }> = [];
+
+    await page.clock.install();
+    await page.routeWebSocket('/ws', (ws) => {
+      mockSockets.push({ close: () => ws.close() });
+      ws.onMessage((data) => {
+        const msg = JSON.parse(String(data));
+        // Answer the heartbeat so socket #1 stays open through the hidden
+        // period — the resume path then hits the force-close branch.
+        if (msg.type === 'ping') ws.send(JSON.stringify({ type: 'pong' }));
+      });
+      ws.send(
+        JSON.stringify({
+          type: 'connected',
+          sessionId: 's1',
+          isStreaming: false,
+          thinkingLevel: 'medium',
+          model: null,
+          availableModels: [],
+          messages: [],
+        })
+      );
+    });
+
+    await login(page, 'test-password');
+    await expect(page.locator('textarea')).toBeEnabled({ timeout: 3000 });
+    expect(mockSockets.length).toBe(1);
+
+    // Background the page past the server idle timeout (120s). On resume the
+    // client force-closes socket #1 and immediately opens socket #2.
+    await page.evaluate(() => {
+      Object.defineProperty(document, 'hidden', { configurable: true, get: () => true });
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    await page.clock.fastForward(130_000);
+    await page.evaluate(() => {
+      Object.defineProperty(document, 'hidden', { configurable: true, get: () => false });
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+
+    // Socket #2 connects and the composer unlocks again.
+    await expect(page.locator('textarea')).toBeEnabled({ timeout: 10_000 });
+    expect(mockSockets.length).toBe(2);
+
+    // Now deliver socket #1's close event — AFTER #2 is confirmed open. A
+    // stale close must not drop the live connection or start a reconnect
+    // storm (timers are clock-mocked, so a stray scheduleReconnect would
+    // wedge the UI in "reconnecting").
+    mockSockets[0].close();
+    await page.waitForTimeout(1000);
+    expect(mockSockets.length).toBe(2);
+    await expect(page.locator('textarea')).toBeEnabled();
   });
 });

@@ -1,24 +1,60 @@
 export const COOKIE_NAME = 'pi-session';
 
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { dirname, join } from 'node:path';
+
 const g = globalThis as Record<string, unknown>;
 
 // ── JWT secret ────────────────────────────────────────────────────────────────
-// Random per process by default so session tokens cannot outlive a server
-// restart (restart = global sign-out) and so knowing the login password can
-// never be used to forge tokens offline. Multi-process deployments (e.g. the
-// dev:full split of login on Vite and /ws on the standalone server) share a
-// secret by setting PI_UI_JWT_SECRET (≥32 chars) in both processes' env.
+// The signing key is persisted to ~/.pi/agent/pi-ui-jwt-secret (0600) on first
+// boot, so session tokens SURVIVE server restarts (restart ≠ sign-out — the
+// PWA's 30-day cookie stays valid across reboots/deploys). The key is random
+// and never derived from the login password, so knowing the password still
+// cannot forge tokens offline. Multi-process deployments (e.g. dev:full's
+// login on Vite and /ws on the standalone server) share a secret by setting
+// PI_UI_JWT_SECRET (≥32 chars) in both processes' env — env always wins.
+
+/** Secret file path — overridable so tests never touch the real one. */
+const SECRET_FILE =
+  process.env.PI_UI_JWT_SECRET_FILE ?? join(homedir(), '.pi', 'agent', 'pi-ui-jwt-secret');
+
+/** Load the persisted secret, or create it atomically. 'wx' makes the first
+ *  writer win so racing processes converge on a single key. */
+function loadOrCreateSecret(): Uint8Array {
+  try {
+    const existing = readFileSync(SECRET_FILE);
+    if (existing.length > 0) return existing;
+  } catch {
+    /* missing — generate below */
+  }
+  const fresh = crypto.getRandomValues(new Uint8Array(32));
+  try {
+    mkdirSync(dirname(SECRET_FILE), { recursive: true });
+    writeFileSync(SECRET_FILE, fresh, { flag: 'wx', mode: 0o600 });
+    return fresh;
+  } catch {
+    // A concurrent process created it between our read and write — adopt its
+    // key for cross-process consistency. If even the re-read fails, fall back
+    // to a per-process random key (old behavior).
+    try {
+      const winner = readFileSync(SECRET_FILE);
+      if (winner.length > 0) return winner;
+    } catch {
+      /* give up on persistence */
+    }
+    return fresh;
+  }
+}
 
 /** Resolve the 256-bit JWT signing key for this process. */
 async function deriveSecret(): Promise<Uint8Array> {
   if (g.__piJwtSecret) return g.__piJwtSecret as Uint8Array;
   const envSecret = process.env.PI_UI_JWT_SECRET;
-  let secret: Uint8Array;
-  if (envSecret && envSecret.length >= 32) {
-    secret = new TextEncoder().encode(envSecret);
-  } else {
-    secret = crypto.getRandomValues(new Uint8Array(32));
-  }
+  const secret =
+    envSecret && envSecret.length >= 32
+      ? new TextEncoder().encode(envSecret)
+      : loadOrCreateSecret();
   g.__piJwtSecret = secret;
   return secret;
 }
@@ -63,8 +99,18 @@ const hasBun = typeof Bun !== 'undefined';
 
 async function pbkdf2Hash(plain: string): Promise<string> {
   const salt = crypto.getRandomValues(new Uint8Array(16));
-  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(plain), { name: 'PBKDF2' }, false, ['deriveBits']);
-  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', salt, iterations: 600_000, hash: 'SHA-256' }, key, 256);
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(plain),
+    { name: 'PBKDF2' },
+    false,
+    ['deriveBits']
+  );
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt, iterations: 600_000, hash: 'SHA-256' },
+    key,
+    256
+  );
   const saltB64 = btoa(String.fromCharCode(...salt));
   const hashB64 = btoa(String.fromCharCode(...new Uint8Array(bits)));
   return `$pbkdf2$600000$${saltB64}$${hashB64}`;
@@ -74,9 +120,19 @@ async function pbkdf2Verify(plain: string, stored: string): Promise<boolean> {
   const parts = stored.split('$');
   if (parts.length !== 5 || parts[1] !== 'pbkdf2') return false;
   const iterations = parseInt(parts[2], 10);
-  const salt = Uint8Array.from(atob(parts[3]), c => c.charCodeAt(0));
-  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(plain), { name: 'PBKDF2' }, false, ['deriveBits']);
-  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', salt, iterations, hash: 'SHA-256' }, key, 256);
+  const salt = Uint8Array.from(atob(parts[3]), (c) => c.charCodeAt(0));
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(plain),
+    { name: 'PBKDF2' },
+    false,
+    ['deriveBits']
+  );
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt, iterations, hash: 'SHA-256' },
+    key,
+    256
+  );
   const expected = atob(parts[4]);
   const actual = String.fromCharCode(...new Uint8Array(bits));
   return expected === actual;
@@ -110,23 +166,31 @@ export async function verifyPassword(plain: string): Promise<boolean> {
 const JWT_ALG = 'HS256';
 
 function toBuf(view: Uint8Array | ArrayBuffer): ArrayBuffer {
-  return view instanceof Uint8Array ? view.buffer as ArrayBuffer : view;
+  return view instanceof Uint8Array ? (view.buffer as ArrayBuffer) : view;
 }
 
 function b64url(buf: Uint8Array | ArrayBuffer): string {
   const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
   return btoa(String.fromCharCode(...bytes))
-    .replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+    .replace(/=/g, '')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_');
 }
 
 function b64urlDecode(str: string): Uint8Array {
   str = str.replace(/-/g, '+').replace(/_/g, '/');
   while (str.length % 4) str += '=';
-  return Uint8Array.from(atob(str), c => c.charCodeAt(0));
+  return Uint8Array.from(atob(str), (c) => c.charCodeAt(0));
 }
 
 async function hmacSign(data: Uint8Array, secret: Uint8Array): Promise<Uint8Array> {
-  const key = await crypto.subtle.importKey('raw', toBuf(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const key = await crypto.subtle.importKey(
+    'raw',
+    toBuf(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
   return new Uint8Array(await crypto.subtle.sign('HMAC', key, toBuf(data)));
 }
 
@@ -162,8 +226,19 @@ export async function verifySessionToken(token: string): Promise<boolean> {
 
     // Verify signature
     const signingInput = new TextEncoder().encode(`${headerB64}.${payloadB64}`);
-    const sigKey = await crypto.subtle.importKey('raw', toBuf(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']);
-    const valid = await crypto.subtle.verify('HMAC', sigKey, toBuf(b64urlDecode(sigB64)), toBuf(signingInput));
+    const sigKey = await crypto.subtle.importKey(
+      'raw',
+      toBuf(secret),
+      { name: 'HMAC', hash: 'SHA-256' },
+      false,
+      ['verify']
+    );
+    const valid = await crypto.subtle.verify(
+      'HMAC',
+      sigKey,
+      toBuf(b64urlDecode(sigB64)),
+      toBuf(signingInput)
+    );
     if (!valid) return false;
 
     // Decode and validate payload

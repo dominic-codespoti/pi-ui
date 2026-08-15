@@ -1629,12 +1629,14 @@
     _wsHandshakeComplete = false;
 
     socket.onopen = () => {
+      if (ws !== socket) return;
       wsState = 'open';
       cancelReconnect();
       startHeartbeat();
     };
 
     socket.onmessage = ({ data }: MessageEvent<string>) => {
+      if (ws !== socket) return;
       _lastMsgAt = Date.now();
       try {
         const parsed = JSON.parse(data) as ServerMessage & Record<string, unknown>;
@@ -1657,6 +1659,10 @@
     };
 
     socket.onclose = (event) => {
+      // Stale-guard: a close event from a superseded socket (e.g. one torn
+      // down by the resume force-close) must not clobber the current
+      // connection's state or schedule spurious reconnects.
+      if (ws !== socket) return;
       flushPendingTerminalInputs();
       stopHeartbeat();
       if (_intentionalClose) return;
@@ -1683,6 +1689,7 @@
     };
 
     socket.onerror = () => {
+      if (ws !== socket) return;
       try {
         socket.close();
       } catch {
@@ -4386,6 +4393,9 @@
     window.addEventListener('appinstalled', _appInstalledHandler);
     // Visibility + online/offline for reconnection resilience
     document.addEventListener('visibilitychange', _onVisibilityChange);
+    // Some Android WebViews/OEM browsers resume without a visibilitychange
+    // event — focus is a reliable secondary resume signal.
+    window.addEventListener('focus', _onFocusResume);
     _onlineHandler = () => {
       if (wsState !== 'open') {
         cancelReconnect();
@@ -4446,6 +4456,7 @@
     }
     disconnect();
     document.removeEventListener('visibilitychange', _onVisibilityChange);
+    window.removeEventListener('focus', _onFocusResume);
     if (_installPromptHandler)
       window.removeEventListener('beforeinstallprompt', _installPromptHandler);
     if (_appInstalledHandler) window.removeEventListener('appinstalled', _appInstalledHandler);
@@ -4454,6 +4465,16 @@
     if (_mq && _mqHandler) _mq.removeEventListener('change', _mqHandler);
     if (_unsubLangReady) _unsubLangReady();
   });
+
+  /**
+   * Secondary resume signal: some Android WebViews/OEM browsers return from
+   * background without a visibilitychange event. Focus carries the same
+   * "user came back" meaning, so re-run the visibility resume path.
+   */
+  function _onFocusResume() {
+    if (document.hidden || _pageHiddenAt <= 0) return;
+    _onVisibilityChange();
+  }
 
   /** Single visibility-change handler: pause reconnection + manage wake lock. */
   function _onVisibilityChange() {
@@ -4479,10 +4500,17 @@
         } else if (wsState === 'open' && wasHidden > 120_000) {
           // Server idle timeout (120s) likely closed the socket — force reconnect
           _intentionalClose = false;
-          try {
-            ws?.close();
-          } catch {
-            /* ignore */
+          const old = ws;
+          if (old) {
+            // Detach first: the close event fires asynchronously and must not
+            // reach the onclose of a socket we're about to supersede.
+            old.onclose = null;
+            old.onerror = null;
+            try {
+              old.close();
+            } catch {
+              /* ignore */
+            }
           }
           ws = null;
           wsState = 'connecting';

@@ -120,7 +120,7 @@ bun run test:ci           # check + check:sw + check:server + lint + test:unit +
 ### Auth Patterns
 
 - **Password hashing**: `Bun.password.hash()` with bcrypt cost 10 (production); PBKDF2 600k iterations (Vite dev fallback)
-- **JWT via native crypto.subtle** — no `jose` or external library. HMAC-SHA256 signing, 24h expiry, in-memory JTI revocation
+- **JWT via native crypto.subtle** — no `jose` or external library. HMAC-SHA256 signing, 30-day expiry, in-memory JTI revocation. Signing key persisted to `~/.pi/agent/pi-ui-jwt-secret` (0600) on first boot so sessions survive server restarts; `PI_UI_JWT_SECRET` (≥32 chars) overrides the file for multi-process deployments (dev:full)
 - **Cookie**: `pi-session`, httpOnly, sameSite:strict, secure when behind proxy
 - **Rate limiter**: IP-based in-memory Map on `globalThis.__piRateLimit`; 5 fails/5min → 15min block
 - **`hooks.server.ts`**: SvelteKit `Handle` — exact matches `/login` bypass auth, all other paths validate JWT
