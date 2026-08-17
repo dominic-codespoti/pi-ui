@@ -224,4 +224,63 @@ test.describe('Projects sidebar', () => {
     await expect(page.getByPlaceholder('Opening session…')).toBeVisible();
     expect(newSessionCount).toBe(1);
   });
+  test('collapses the active project and previews three sessions', async ({ page }) => {
+    const sessions = [
+      ...ALL_SESSIONS_LIST_PAYLOAD.sessions,
+      {
+        id: 's4',
+        path: '/home/user/project-a/s4.jsonl',
+        cwd: '/home/user/project-a',
+        name: 'Third session',
+        created: Date.now() - 3 * 86400000,
+        modified: Date.now() - 3 * 3600000,
+        messageCount: 4,
+        firstMessage: 'Third session prompt',
+      },
+      {
+        id: 's5',
+        path: '/home/user/project-a/s5.jsonl',
+        cwd: '/home/user/project-a',
+        name: 'Overflow session',
+        created: Date.now() - 4 * 86400000,
+        modified: Date.now() - 4 * 3600000,
+        messageCount: 2,
+        firstMessage: 'Overflow session prompt',
+      },
+    ];
+
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.onMessage((data) => {
+        const msg = JSON.parse(String(data));
+        if (msg.type === 'get_projects') ws.send(JSON.stringify(PROJECTS_LIST_PAYLOAD));
+        if (msg.type === 'get_all_sessions') {
+          ws.send(JSON.stringify({ ...ALL_SESSIONS_LIST_PAYLOAD, sessions }));
+        }
+      });
+      ws.send(
+        JSON.stringify({
+          type: 'connected',
+          sessionId: 's1',
+          cwd: '/home/user/project-a',
+          isStreaming: false,
+          thinkingLevel: 'medium',
+          model: null,
+          availableModels: [],
+          messages: [],
+        })
+      );
+    });
+
+    await openProjectsSidebar(page);
+
+    const projectHeader = page.locator('button[aria-expanded][title="/home/user/project-a"]');
+    await expect(projectHeader).toHaveAttribute('aria-expanded', 'true');
+    await expect(page.getByRole('button', { name: /^Third session/ })).toBeVisible();
+    await expect(page.getByRole('button', { name: /^Overflow session/ })).toBeHidden();
+    await expect(page.getByRole('button', { name: 'Show 1 more sessions' })).toBeVisible();
+
+    await projectHeader.click();
+    await expect(projectHeader).toHaveAttribute('aria-expanded', 'false');
+    await expect(page.getByRole('button', { name: /^Bug fix/ })).toBeHidden();
+  });
 });

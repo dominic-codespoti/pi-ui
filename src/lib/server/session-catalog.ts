@@ -16,7 +16,7 @@
  * own their own broadcast scheduling — the catalog is transport-agnostic.
  */
 
-import { scanAllSessions, type SessionFileInfo } from './session-scan';
+import { scanAllSessions, sessionFileInfo, type SessionFileInfo } from './session-scan';
 
 export type SessionCatalogPatch =
   | { kind: 'upsert'; session: SessionFileInfo }
@@ -127,6 +127,16 @@ export class SessionCatalog {
   async listForCwd(cwd: string): Promise<SessionFileInfo[]> {
     const all = await this.list();
     return all.filter((s) => s.cwd === cwd);
+  }
+
+  /**
+   * True when `path` is a real session file on disk. Targeted stat + parse of
+   * the exact file — never a full-store rescan. Used to validate a switch
+   * target that missed the cached list (e.g. created by the pi TUI since the
+   * last scan) with the same security guarantee at O(1 file) cost.
+   */
+  async hasFile(path: string): Promise<boolean> {
+    return (await sessionFileInfo(path)) !== null;
   }
 
   /** Subscribe to list changes; returns an unsubscribe function. */

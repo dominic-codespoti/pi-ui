@@ -1,10 +1,13 @@
 <script lang="ts">
   /**
-   * Projects sidebar — first-class project tree with nested sessions.
+   * Projects sidebar — recency-first session list grouped under thin project
+   * headers. Projects sort by their most recent session (pinned first);
+   * sessions render flat (no nesting) in recency order.
    *
-   * Pinned projects float to the top. Projects can be renamed, pinned,
-   * collapsed (persisted), and forgotten (registry-only projects with no
-   * sessions). Sessions support switch / rename / fork / delete.
+   * The active project can be collapsed like any other; a search filter expands
+   * everything and shows every match. Projects can be renamed, pinned, collapsed
+   * (persisted), and forgotten (registry-only projects with no sessions).
+   * Sessions support switch / rename / fork / delete.
    */
   import { tick } from 'svelte';
   import { ScrollArea } from '#lib/components/ui/scroll-area/index.js';
@@ -133,9 +136,11 @@
 
 {#snippet projectGroup(g: ProjectGroup)}
   {@const isActive = g.cwd === ps.cwd}
-  {@const isCollapsed = ps.collapsed.has(g.cwd)}
+  {@const isCollapsed = !ps.filter && ps.collapsed.has(g.cwd)}
   {@const isRenaming = renamingProject === g.cwd}
-  {@const streaming = ps.isStreaming && isActive}
+  {@const anyRunning =
+    (ps.isStreaming && isActive) || g.sessions.some((s) => ps.runningSessions.has(s.id))}
+  {@const anyUnchecked = !anyRunning && g.sessions.some((s) => ps.uncheckedSessions.has(s.id))}
   <div
     class="group/dir relative rounded-2xl transition-colors duration-150 {isActive
       ? 'bg-base-content/[0.03]'
@@ -168,7 +173,7 @@
       <div class="flex items-center">
         <button
           onclick={() => ps.toggleCollapsed(g.cwd)}
-          class="flex-1 min-w-0 flex items-center gap-2 px-3 py-2.5 text-left transition-colors duration-150 rounded-2xl {isActive
+          class="flex-1 min-w-0 flex items-center gap-2 px-3 py-2 text-left transition-colors duration-150 rounded-2xl {isActive
             ? 'text-base-content font-semibold'
             : 'text-base-content/60 hover:text-base-content/85'}"
           tabindex={open ? 0 : -1}
@@ -194,10 +199,17 @@
               <TriangleAlert class="w-3 h-3" />missing
             </span>
           {/if}
-          {#if streaming}
+          {#if anyRunning}
             <span
               class="w-1.5 h-1.5 rounded-full bg-success glow-success animate-pulse shrink-0"
-              aria-label="Generating"
+              aria-hidden="true"
+              title="Generating"
+            ></span>
+          {:else if anyUnchecked}
+            <span
+              class="w-1.5 h-1.5 rounded-full bg-primary glow-primary shrink-0"
+              aria-hidden="true"
+              title="Unchecked results"
             ></span>
           {/if}
           {#if g.pinned}
@@ -253,9 +265,9 @@
       </div>
     {/if}
 
-    <!-- Sessions nested under this project -->
+    <!-- Sessions under this project — flat rows, no nested indent -->
     {#if !isCollapsed}
-      <div class="ml-3 pl-3 pt-0.5 pb-1.5 border-l border-base-content/8 space-y-1">
+      <div class="pt-0.5 pb-1.5 space-y-1">
         {#if g.sessions.length === 0}
           <p class="px-3 py-1.5 text-xs text-base-content/30">no sessions yet</p>
         {/if}
@@ -377,11 +389,11 @@
             {/if}
           </div>
         {/each}
-        {#if g.sessions.length > SESSION_PREVIEW_LIMIT}
+        {#if !ps.filter && g.sessions.length > SESSION_PREVIEW_LIMIT}
           {@const expanded = ps.expandedGroups.has(g.cwd)}
           <button
             onclick={() => ps.toggleExpandedGroup(g.cwd)}
-            class="w-full text-left pl-4 pr-3 py-1.5 text-xs text-base-content/32 hover:text-base-content/55 transition-colors"
+            class="w-full text-left px-3 py-1.5 text-xs text-base-content/32 hover:text-base-content/55 transition-colors"
             tabindex={open ? 0 : -1}
           >
             {expanded

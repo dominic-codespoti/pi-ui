@@ -22,8 +22,17 @@ export interface ProjectGroup extends ProjectInfo {
 
 const COLLAPSED_KEY = 'pifrontier:collapsed-projects';
 
-/** How many sessions a project shows before the "show more" toggle. */
-export const SESSION_PREVIEW_LIMIT = 5;
+/** How many sessions each project shows before the "show more" toggle. */
+export const SESSION_PREVIEW_LIMIT = 3;
+
+/**
+ * How long a new_session / switch_session may stay unanswered before the UI
+ * gives up and re-enables. The server normally replies with session_loaded in
+ * tens of ms, but a dropped socket or a busy SDK must not leave the sidebar
+ * and composer disabled forever — before this watchdog only a full reload
+ * healed a lost reply.
+ */
+export const SESSION_OP_TIMEOUT_MS = 20_000;
 
 function loadCollapsed(): string[] {
   try {
@@ -72,6 +81,8 @@ class ProjectsState {
   pendingSwitchPath: string | null = null;
   /** True while a session switch is in flight. Set by switchSession, cleared by session_loaded. */
   sessionLoading = $state(false);
+  /** Watchdog for in-flight new_session/switch_session — see SESSION_OP_TIMEOUT_MS. */
+  private opTimeout: ReturnType<typeof setTimeout> | null = null;
   collapsed = new SvelteSet<string>(loadCollapsed());
   /** Projects whose full session list is expanded past the preview limit. */
   expandedGroups = new SvelteSet<string>();
@@ -213,6 +224,7 @@ class ProjectsState {
         this.error = null;
         return true;
       case 'sessions_error':
+        this.clearOpTimeout();
         this.error = (msg.message as string) ?? 'Unknown error';
         this.pendingNewSession = false;
         this.sessionLoading = false;
@@ -230,6 +242,7 @@ class ProjectsState {
    * Returns true when this completed a pending new-session request.
    */
   onSessionLoaded(): boolean {
+    this.clearOpTimeout();
     const wasPending = this.pendingNewSession;
     this.pendingNewSession = false;
     this.sessionLoading = false;
@@ -238,12 +251,46 @@ class ProjectsState {
 
   // ── Actions ──────────────────────────────────────────────────────────────
 
+  /** Arm the in-flight-op watchdog — clears the loading flags if no reply comes. */
+  private startOpTimeout(): void {
+    this.clearOpTimeout();
+    this.opTimeout = setTimeout(() => {
+      this.opTimeout = null;
+      if (this.pendingNewSession || this.sessionLoading) {
+        this.pendingNewSession = false;
+        this.sessionLoading = false;
+        this.error = 'Opening the session took too long — check the connection and try again.';
+      }
+    }, SESSION_OP_TIMEOUT_MS);
+  }
+
+  private clearOpTimeout(): void {
+    if (this.opTimeout !== null) {
+      clearTimeout(this.opTimeout);
+      this.opTimeout = null;
+    }
+  }
+
+  /**
+   * Abort any in-flight session open. Called when the socket reconnects: the
+   * old request is orphaned (its reply would land on the dead socket), and
+   * the connected payload carries the server's real active session — so any
+   * half-applied flags and a stale pending switch path must not survive.
+   */
+  cancelPendingOps(): void {
+    this.clearOpTimeout();
+    this.pendingNewSession = false;
+    this.sessionLoading = false;
+    this.pendingSwitchPath = null;
+  }
+
   switchSession(path: string): void {
     if (this.pendingNewSession || this.sessionLoading) return;
     const sent = this.send({ type: 'switch_session', path });
     if (!sent) return;
     this.pendingSwitchPath = path;
     this.sessionLoading = true;
+    this.startOpTimeout();
     const s = this.allSessions.find((s) => s.path === path);
     if (s) this.uncheckedSessions.delete(s.id);
     const url = new URL(window.location.href);
@@ -274,6 +321,7 @@ class ProjectsState {
     if (sent) {
       this.pendingNewSession = true;
       this.sessionLoading = true;
+      this.startOpTimeout();
     }
     this.dirCompletions = [];
   }
@@ -332,7 +380,12 @@ class ProjectsState {
     else this.expandedGroups.add(cwd);
   }
 
+  /**
+   * Sessions visible for a project in the sidebar. A search filter shows every
+   * match; otherwise the preview limit applies until the user expands the group.
+   */
   visibleSessions(g: ProjectGroup): SessionSummary[] {
+    if (this.filter) return g.sessions;
     return this.expandedGroups.has(g.cwd) ? g.sessions : g.sessions.slice(0, SESSION_PREVIEW_LIMIT);
   }
 }

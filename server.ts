@@ -2475,7 +2475,10 @@ function commandContextActionsFor(
       }
       const known = await sessionCatalog.list();
       const resolvedPath = resolve(sessionPath);
-      if (!known.some((item) => item.path === resolvedPath)) {
+      if (
+        !known.some((item) => item.path === resolvedPath) &&
+        !(await sessionCatalog.hasFile(resolvedPath))
+      ) {
         throw new Error('Session not found');
       }
       const manager = sdkOrThrow().SessionManager.open(resolvedPath);
@@ -3542,13 +3545,15 @@ try {
                   break;
                 }
                 // Security: only open known session files — never raw client paths.
-                // Cache-miss falls back to a fresh scan — a session created moments
-                // ago (e.g. by the pi TUI) must not be rejected on a stale cache.
-                let knownSessions = await sessionCatalog.list();
-                if (!knownSessions.some((s) => s.path === resolvedPath)) {
-                  knownSessions = await sessionCatalog.list({ fresh: true });
-                }
-                if (!knownSessions.some((s) => s.path === resolvedPath)) {
+                // Cache-miss falls back to a targeted stat of the exact file — a
+                // session created moments ago (e.g. by the pi TUI) must not be
+                // rejected on a stale cache, but validating it must not re-scan
+                // the whole store either (seconds of lag on large stores).
+                const knownSessions = await sessionCatalog.list();
+                if (
+                  !knownSessions.some((s) => s.path === resolvedPath) &&
+                  !(await sessionCatalog.hasFile(resolvedPath))
+                ) {
                   ws.send(
                     JSON.stringify({ type: 'sessions_error', message: 'Session not found.' })
                   );

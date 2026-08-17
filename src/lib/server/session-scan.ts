@@ -310,6 +310,15 @@ async function fileInfo(filePath: string): Promise<SessionFileInfo | null> {
   return info;
 }
 
+/**
+ * Targeted lookup for ONE session file — stat + parse of a single path with
+ * the same per-file cache. Validates a switch target without forcing a full
+ * store rescan (the old fallback re-read every project directory).
+ */
+export async function sessionFileInfo(filePath: string): Promise<SessionFileInfo | null> {
+  return fileInfo(filePath);
+}
+
 async function collectInfos(files: string[]): Promise<SessionFileInfo[]> {
   const results: (SessionFileInfo | null)[] = new Array(files.length).fill(null);
   let next = 0;

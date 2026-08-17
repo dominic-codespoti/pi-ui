@@ -2005,6 +2005,10 @@
         if (c.sessionMode) sessionMode = c.sessionMode;
         loadWebhookUrlFromServer(c.webhookUrl);
         sessionLoading = false;
+        // A reconnect orphans any in-flight new_session/switch_session: its
+        // reply would land on the dead socket and the loading flags would
+        // stick forever (the connected payload below carries the real state).
+        projectsState.cancelPendingOps();
         send({ type: 'get_project_trust' });
         send({ type: 'get_packages' });
         // Warm the project/session lists so pickers have data immediately.
@@ -2020,10 +2024,9 @@
         // (the common resume path; keeps hydrated content on screen).
         const savedPath = getSessionParam();
         if (savedPath && savedPath !== sessionPath) {
-          projectsState.pendingSwitchPath = savedPath;
-          sessionLoading = true;
-          projectsState.sessionLoading = true;
-          send({ type: 'switch_session', path: savedPath });
+          // switchSession arms the op watchdog and syncs the URL — same
+          // semantics as the manual send it replaces.
+          projectsState.switchSession(savedPath);
         } else if (sessionPath) {
           // No saved URL param (or it already matches) — persist the current
           // session so future reloads work
