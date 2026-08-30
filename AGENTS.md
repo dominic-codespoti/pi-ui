@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-pi-ui (v0.16.2, `@thed24/pi-ui`) is a **self-hosted PWA frontend for the `pi` coding agent** — analogous to how OpenChamber fronts OpenCode. It runs as a standalone Bun server that bridges `pi` SDK events to a browser over a single WebSocket. Designed for low-memory environments (Raspberry Pi).
+pi-ui (v0.17.0, `@thed24/pi-ui`) is a **self-hosted PWA frontend for the `pi` coding agent** — analogous to how OpenChamber fronts OpenCode. It runs as a standalone Bun server that bridges `pi` SDK events to a browser over a single WebSocket. Designed for low-memory environments (Raspberry Pi).
 
 Key constraints: ESM-only, Bun ≥1.0.0, no TTS, no Workbox, no node-pty.
 
