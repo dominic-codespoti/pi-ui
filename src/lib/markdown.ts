@@ -1,4 +1,5 @@
 import { marked, type RendererObject, type TokenizerAndRendererExtension } from 'marked';
+import { renderLatex } from '@earendil-works/pi-tui/dist/latex.js';
 import type { LanguageFn } from 'highlight.js';
 import hljs from 'highlight.js/lib/core';
 import javascript from 'highlight.js/lib/languages/javascript';
@@ -329,10 +330,165 @@ const fileLinkExtension: TokenizerAndRendererExtension = {
   },
 };
 
+type LatexToken = {
+  type: 'latex' | 'latexBlock';
+  raw: string;
+  text: string;
+};
+
+type LatexMatch = {
+  raw: string;
+  text: string;
+  end: number;
+  display: boolean;
+};
+
+function isEscaped(source: string, index: number): boolean {
+  let backslashes = 0;
+  for (let position = index - 1; position >= 0 && source[position] === '\\'; position--) {
+    backslashes++;
+  }
+  return backslashes % 2 === 1;
+}
+
+function findClosingDelimiter(source: string, closing: string, start: number): number {
+  let index = source.indexOf(closing, start);
+  while (index >= 0 && isEscaped(source, index)) {
+    index = source.indexOf(closing, index + closing.length);
+  }
+  return index;
+}
+
+function matchInlineLatex(source: string, start: number): LatexMatch | undefined {
+  let opening: string;
+  let closing: string;
+  let display = false;
+
+  if (source.startsWith('$$', start)) {
+    opening = '$$';
+    closing = '$$';
+    display = true;
+  } else if (source.startsWith('\\(', start)) {
+    opening = '\\(';
+    closing = '\\)';
+  } else if (source.startsWith('\\[', start)) {
+    opening = '\\[';
+    closing = '\\]';
+    display = true;
+  } else if (source[start] === '$' && !isEscaped(source, start) && source[start + 1] !== '$') {
+    if (/\s/.test(source[start + 1] ?? '')) return undefined;
+    opening = '$';
+    closing = '$';
+  } else {
+    return undefined;
+  }
+
+  if (source[start] === '\\' && isEscaped(source, start)) return undefined;
+  const closingIndex = findClosingDelimiter(source, closing, start + opening.length);
+  if (closingIndex < 0) return undefined;
+
+  const text = source.slice(start + opening.length, closingIndex);
+  const after = source.slice(closingIndex + closing.length);
+  if (!text || text.includes('\n')) return undefined;
+  if (
+    opening === '$' &&
+    (/\s$/.test(text) ||
+      /^\d/.test(after) ||
+      (/^[A-Z_][A-Z0-9_]*(?:[^A-Za-z0-9_\s])?$/.test(text) &&
+        /^[A-Za-z_][A-Za-z0-9_]*/.test(after)) ||
+      text.includes('`'))
+  ) {
+    return undefined;
+  }
+
+  const end = closingIndex + closing.length;
+  return { raw: source.slice(start, end), text, end, display };
+}
+
+const latexBlockExtension: TokenizerAndRendererExtension = {
+  name: 'latexBlock',
+  level: 'block',
+  start(source) {
+    const match = /(?:^|\n) {0,3}(?:\$\$|\\\[)/.exec(source);
+    return match ? match.index + (match[0].startsWith('\n') ? 1 : 0) : undefined;
+  },
+  tokenizer(source) {
+    const dollarMatch = /^ {0,3}\$\$[ \t]*(?:\n)?([\s\S]*?)\$\$[ \t]*(?:\n|$)/.exec(source);
+    if (dollarMatch?.[1]) {
+      return { type: 'latexBlock', raw: dollarMatch[0], text: dollarMatch[1].trim() };
+    }
+    const bracketMatch = /^ {0,3}\\\[[ \t]*(?:\n)?([\s\S]*?)\\\][ \t]*(?:\n|$)/.exec(source);
+    if (bracketMatch?.[1]) {
+      return { type: 'latexBlock', raw: bracketMatch[0], text: bracketMatch[1].trim() };
+    }
+    return undefined;
+  },
+  renderer(token) {
+    const latex = token as unknown as LatexToken;
+    const raw = latex.raw.trim();
+    const rendered = renderLatex(latex.text, { display: true });
+    return `<div class="math-block whitespace-pre-wrap">${escHtml(rendered ?? raw)}</div>`;
+  },
+};
+
+const latexInlineExtension: TokenizerAndRendererExtension = {
+  name: 'latex',
+  level: 'inline',
+  start(source) {
+    const indices = [source.indexOf('$'), source.indexOf('\\('), source.indexOf('\\[')].filter(
+      (index) => index >= 0
+    );
+    return indices.length > 0 ? Math.min(...indices) : undefined;
+  },
+  tokenizer(source) {
+    const match = matchInlineLatex(source, 0);
+    if (!match) return undefined;
+    return { type: 'latex', raw: match.raw, text: match.text };
+  },
+  renderer(token) {
+    const latex = token as unknown as LatexToken;
+    return `<span class="math-inline">${escHtml(renderLatex(latex.text) ?? latex.raw)}</span>`;
+  },
+};
+
+/**
+ * Convert complete math expressions in the streaming fast path without
+ * parsing the rest of the Markdown. Code spans are copied verbatim so a
+ * literal `$...$` example does not change while the response streams.
+ */
+function renderCompleteLatex(source: string): string {
+  let result = '';
+  let index = 0;
+  while (index < source.length) {
+    if (source[index] === '`') {
+      const fence = /^`+/.exec(source.slice(index))?.[0];
+      if (fence) {
+        const close = source.indexOf(fence, index + fence.length);
+        if (close >= 0) {
+          const end = close + fence.length;
+          result += source.slice(index, end);
+          index = end;
+          continue;
+        }
+      }
+    }
+
+    const match = matchInlineLatex(source, index);
+    if (match) {
+      result += renderLatex(match.text, { display: match.display }) ?? match.raw;
+      index = match.end;
+      continue;
+    }
+    result += source[index];
+    index++;
+  }
+  return result;
+}
+
 marked.use({
   breaks: true,
   renderer,
-  extensions: [fileLinkExtension],
+  extensions: [fileLinkExtension, latexBlockExtension, latexInlineExtension],
 });
 
 /** Above this size, marked+hljs parsing stalls the main thread (seconds on
@@ -346,7 +502,10 @@ const MAX_MARKDOWN_CHARS = 150_000;
  * Synchronous (no async extension loaded). Oversized inputs are rendered as
  * escaped plain text instead of parsed markdown.
  */
-export function renderMarkdown(src: string, opts?: { skipHighlight?: boolean; onUnresolvedLang?: (lang: string) => void }): string {
+export function renderMarkdown(
+  src: string,
+  opts?: { skipHighlight?: boolean; onUnresolvedLang?: (lang: string) => void }
+): string {
   if (src.length > MAX_MARKDOWN_CHARS) {
     return `<pre class="whitespace-pre-wrap break-words">${escHtml(src)}</pre>`;
   }
@@ -362,14 +521,65 @@ export function renderMarkdown(src: string, opts?: { skipHighlight?: boolean; on
   }
 }
 
+/** FNV-1a 32-bit hash over string content. */
+function fnv1a(str: string): number {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < str.length; i++) {
+    hash ^= str.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return hash >>> 0;
+}
+
+const MAX_MEMO_ENTRIES = 300;
+const MAX_MEMO_CHARS = 4_000_000;
+const _memoCache = new Map<string, string>();
+let _memoTotalChars = 0;
+
+function evictOldest(): void {
+  const oldestKey = _memoCache.keys().next().value;
+  if (oldestKey === undefined) return;
+  const oldestVal = _memoCache.get(oldestKey);
+  _memoCache.delete(oldestKey);
+  if (oldestVal !== undefined) {
+    _memoTotalChars -= oldestVal.length;
+  }
+}
+
+/**
+ * Memoized markdown render wrapping `renderMarkdown`.
+ * Cache key is `${content.length}:${fnv1a(content)}`.
+ * LRU via Map delete+reinsert on hit.
+ * Bounds: max 300 entries AND max 4,000,000 total cached HTML chars.
+ */
+export function memoizedRenderMarkdown(content: string): string {
+  const key = `${content.length}:${fnv1a(content)}`;
+  const cached = _memoCache.get(key);
+  if (cached !== undefined) {
+    _memoCache.delete(key);
+    _memoCache.set(key, cached);
+    return cached;
+  }
+
+  const html = renderMarkdown(content);
+  _memoCache.set(key, html);
+  _memoTotalChars += html.length;
+
+  while (_memoCache.size > MAX_MEMO_ENTRIES || _memoTotalChars > MAX_MEMO_CHARS) {
+    evictOldest();
+  }
+
+  return html;
+}
+
 /**
  * Streaming preview — escaped plain text with preserved whitespace. Parsing
  * the full accumulated markdown on every token delta (the streaming hot spot)
- * stalls the main thread on long responses; this is O(n) escaping that the
- * final render (message_end) replaces with full highlighted markdown.
+ * stalls the main thread on long responses; this only resolves complete math
+ * expressions before escaping, leaving the rest as plain text until final render.
  */
 export function renderStreamingPreview(src: string): string {
-  return `<pre class="whitespace-pre-wrap break-words">${escHtml(src)}</pre>`;
+  return `<pre class="whitespace-pre-wrap break-words">${escHtml(renderCompleteLatex(src))}</pre>`;
 }
 
 /**

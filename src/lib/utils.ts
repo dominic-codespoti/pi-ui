@@ -1,5 +1,5 @@
-import { type ClassValue, clsx } from "clsx";
-import { twMerge } from "tailwind-merge";
+import { type ClassValue, clsx } from 'clsx';
+import { twMerge } from 'tailwind-merge';
 
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -26,10 +26,10 @@ export type WithElementRef<T, U extends HTMLElement = HTMLElement> = T & {
 };
 
 /** Strips the `children` snippet prop (mirrors bits-ui). */
-export type WithoutChildren<T> = T extends { children?: unknown } ? Omit<T, "children"> : T;
+export type WithoutChildren<T> = T extends { children?: unknown } ? Omit<T, 'children'> : T;
 
 /** Strips the `child` snippet prop (mirrors bits-ui). */
-export type WithoutChild<T> = T extends { child?: unknown } ? Omit<T, "child"> : T;
+export type WithoutChild<T> = T extends { child?: unknown } ? Omit<T, 'child'> : T;
 
 /** Strips both `children` and `child` snippet props (mirrors bits-ui). */
 export type WithoutChildrenOrChild<T> = WithoutChildren<WithoutChild<T>>;
@@ -68,12 +68,17 @@ export function versionText(version?: string): string {
 
 export function sourceLabel(source?: string): string | undefined {
   switch (source) {
-    case 'environment': return 'env';
+    case 'environment':
+      return 'env';
     case 'models_json_key':
-    case 'models_json_command': return 'config';
-    case 'fallback': return 'config';
-    case 'runtime': return 'runtime';
-    default: return undefined;
+    case 'models_json_command':
+      return 'config';
+    case 'fallback':
+      return 'config';
+    case 'runtime':
+      return 'runtime';
+    default:
+      return undefined;
   }
 }
 

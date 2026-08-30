@@ -29,11 +29,13 @@
     SessionStats,
   } from '#lib/ws/protocol.js';
   import type { PiEvent } from '#lib/ws/protocol.js';
+  import { parseServerMessage } from '#lib/ws/server-message-schema.js';
   import { renderMarkdown, renderStreamingPreview, onLangRegistered } from '#lib/markdown.js';
   import { providerColor, versionText, fmtTokens, fmtCost, fmtDuration } from '#lib/utils.js';
   import type { ParsedComponent } from '#lib/tui-stubs.js';
   import { projectsState } from '#lib/state/projects-state.svelte.js';
   import { extensionUiState } from '#lib/state/extension-ui-state.svelte.js';
+  import { SessionViewCache } from '#lib/session-view-cache.js';
   import {
     rawMessagesToUI,
     uid,
@@ -826,8 +828,33 @@
   $effect(() => {
     sessionLoading = projectsState.sessionLoading;
   });
-
-  /** Timestamp (epoch ms) when the current session was loaded — for elapsed display. */
+  // Optimistic new-chat: clear messages instantly when new_session is
+  // dispatched — waiting for the server's session_loaded (which can take
+  // seconds with 34 tools/extensions) makes "new chat" feel hung.
+  let _optimisticPrevMessages: typeof messages | null = null;
+  $effect(() => {
+    if (projectsState.pendingNewSession && !_optimisticPrevMessages) {
+      _optimisticPrevMessages = messages.slice();
+      messages = [];
+      totalRawMessagesLoaded = 0;
+      totalMessageCount = 0;
+      messagesTruncated = false;
+      activeStreamMsg = null;
+      isStreaming = false;
+      projectsState.isStreaming = false;
+      sessionName = undefined;
+      // Keep cwd until server confirms targetCwd; don't wipe model etc.
+    }
+  });
+  // If the optimistic new-chat times out or errors without a server reply,
+  // restore the previous messages. session_loaded and sessions_error handle
+  // the normal paths; this covers the watchdog timeout.
+  $effect(() => {
+    if (!projectsState.pendingNewSession && _optimisticPrevMessages && projectsState.error) {
+      messages = _optimisticPrevMessages;
+      _optimisticPrevMessages = null;
+    }
+  });
   let sessionStartTime = $state(0);
   /** Pending steered messages (queue_update) */
   let queuedSteering = $state<string[]>([]);
@@ -1410,13 +1437,17 @@
   });
 
   // ── Load tools when tools tab is active ─────────────────────────────────────
-
+  // Tools are now seeded from connected/session_loaded plus the async
+  // bindRpcHost push — no TTL polling. The tab only fetches when the list is
+  // still empty (cold shell connected with tools: []) and not recently tried,
+  // preventing duplicate get_tools storms from the old eager warmer.
   $effect(() => {
     if (
       showRightPanel &&
       rightPanelTab === 'tools' &&
       wsState === 'open' &&
-      Date.now() - lastToolsFetch > PANEL_FETCH_TTL_MS
+      toolsList.length === 0 &&
+      Date.now() - lastToolsFetch > 5000
     ) {
       lastToolsFetch = Date.now();
       send({ type: 'get_tools' });
@@ -1638,24 +1669,32 @@
     socket.onmessage = ({ data }: MessageEvent<string>) => {
       if (ws !== socket) return;
       _lastMsgAt = Date.now();
+      let raw: unknown;
       try {
-        const parsed = JSON.parse(data) as ServerMessage & Record<string, unknown>;
-        if (parsed.type === 'connected') {
-          _wsHandshakeComplete = true;
-          overlayResizeConnection++;
-          _reconnectAttempt = 0;
-          if (reloadAfterRestart) {
-            reloadAfterRestart = false;
-            if (_reloadPending) {
-              _reloadPending = false;
-              location.reload();
-            }
-          }
-        }
-        handleServer(parsed);
+        raw = JSON.parse(data);
       } catch (e) {
         console.warn('[pi-ui] Failed to parse WS message:', e);
+        return;
       }
+      const parsedResult = parseServerMessage(raw);
+      if (!parsedResult.ok) {
+        console.warn('[pi-ui] invalid WS payload', parsedResult.issues);
+        return;
+      }
+      const parsed = parsedResult.value as ServerMessage & Record<string, unknown>;
+      if (parsedResult.kind === 'connected' || parsed.type === 'connected') {
+        _wsHandshakeComplete = true;
+        overlayResizeConnection++;
+        _reconnectAttempt = 0;
+        if (reloadAfterRestart) {
+          reloadAfterRestart = false;
+          if (_reloadPending) {
+            _reloadPending = false;
+            location.reload();
+          }
+        }
+      }
+      handleServer(parsed);
     };
 
     socket.onclose = (event) => {
@@ -1816,6 +1855,12 @@
   // Give the shared projects store access to the live socket.
   projectsState.send = send;
   // Same for the extension UI store (modal answers need to send responses).
+  const viewCache = new SessionViewCache();
+  projectsState.onBeforeSwitch = () => {
+    if (sessionId) {
+      viewCache.save(sessionId, input, expandedUserMsgs, truncatedUserMsgs);
+    }
+  };
   extensionUiState.send = send;
 
   // ── Editor mirror (extension getEditorText) ──────────────────────────────
@@ -1863,8 +1908,22 @@
   function applySessionState(payload: Record<string, unknown>) {
     const prevSessionId = sessionId;
     if ('sessionId' in payload) {
-      sessionId = payload.sessionId as string;
-      if (payload.sessionId !== prevSessionId) {
+      const nextSessionId = payload.sessionId as string;
+      if (nextSessionId !== prevSessionId) {
+        if (prevSessionId) {
+          viewCache.save(prevSessionId, input, expandedUserMsgs, truncatedUserMsgs);
+        }
+        sessionId = nextSessionId;
+        const restored = viewCache.restore(nextSessionId);
+        if (restored) {
+          input = restored.draft;
+          expandedUserMsgs = restored.expandedUserMsgs;
+          truncatedUserMsgs = restored.truncatedUserMsgs;
+        } else {
+          input = '';
+          expandedUserMsgs = {};
+          truncatedUserMsgs = {};
+        }
         // A key round-trip for the previous session must never be applied to
         // or routed toward the new one (its late verdict would insert text or
         // even submit into the wrong composer).
@@ -1878,8 +1937,18 @@
     if (payload.availableModels !== undefined) {
       availableModels = (payload.availableModels as ModelInfo[]) ?? [];
     }
+    if (payload.tools !== undefined) {
+      toolsList =
+        (payload.tools as
+          | { name: string; description: string; isBuiltin: boolean; origin?: string }[]
+          | undefined) ?? [];
+      if (Array.isArray(payload.tools) && (payload.tools as unknown[]).length > 0)
+        lastToolsFetch = Date.now();
+    }
+    if (payload.activeToolNames !== undefined) {
+      activeToolNames = (payload.activeToolNames as string[] | undefined) ?? [];
+    }
     if (payload.cwd) cwd = payload.cwd as string;
-    if ('sessionName' in payload) sessionName = payload.sessionName as string | undefined;
     if ('sessionPath' in payload) sessionPath = payload.sessionPath as string | undefined;
     if ('messages' in payload) {
       const raw = (payload.messages as unknown[]) ?? [];
@@ -2016,8 +2085,12 @@
         // after a reconnect (stale pre-reconnect lists are not fresh).
         projectsState.refresh({ force: true });
         resetPanelFetchCache();
+        if (
+          Array.isArray((c as unknown as Record<string, unknown>).tools) &&
+          ((c as unknown as Record<string, unknown>).tools as unknown[]).length > 0
+        )
+          lastToolsFetch = Date.now();
         updateAppBadge();
-        // Request persisted UI settings from server (cross-device preferences)
         send({ type: 'get_settings' });
         // Restore persisted session from URL param — but skip the redundant
         // switch round trip when the server's active session already matches
@@ -2060,7 +2133,10 @@
           // Fork/clone/reload — persist the new session path so URL always matches
           setSessionParam(sessionPath);
         }
+        if (Array.isArray(sl.tools) && (sl.tools as unknown[]).length > 0) lastToolsFetch = Date.now();
         saveSnapshot(sessionPath, sessionName, messages);
+        // Optimistic new-chat succeeded — drop the stash
+        _optimisticPrevMessages = null;
         break;
       }
 
@@ -2088,6 +2164,11 @@
       case 'sessions_error': {
         const errMsg = (msg as Record<string, unknown>).message ?? 'Unknown session error';
         showChatNotice(errMsg as string, 'warning');
+        // Restore optimistic new-chat if it failed — don't leave empty chat
+        if (_optimisticPrevMessages) {
+          messages = _optimisticPrevMessages;
+          _optimisticPrevMessages = null;
+        }
         sessionLoading = false;
         projectsState.sessionLoading = false;
         projectsState.handleMessage(msg as PiEvent);
@@ -2525,6 +2606,22 @@
               ? `context compacted · ${result.tokensBefore.toLocaleString()} → ${result.estimatedTokensAfter.toLocaleString()} tokens`
               : 'context compacted';
         }
+        const compResult = (msg as Record<string, unknown>).result as
+          | { estimatedTokensAfter?: number; tokensBefore?: number }
+          | undefined;
+        const cu = (msg as Record<string, unknown>).contextUsage as
+          | { tokens?: number | null; contextWindow?: number }
+          | undefined;
+        if (cu?.tokens != null) {
+          applySessionState({ contextUsage: cu });
+        } else if (compResult?.estimatedTokensAfter != null) {
+          applySessionState({
+            contextUsage: {
+              tokens: compResult.estimatedTokensAfter,
+              contextWindow: contextUsageWindow || model?.contextWindow,
+            },
+          });
+        }
         break;
       }
 
@@ -2589,7 +2686,10 @@
             | undefined) ?? [];
 
         activeToolNames = (msg.activeToolNames as string[] | undefined) ?? [];
-
+        // Mark fetch time so tab-gated requests know tools are fresh — prevents
+        // duplicate get_tools after the server-seeded connected/session_loaded
+        // payloads plus the async bindRpcHost push.
+        lastToolsFetch = Date.now();
         break;
       }
 
@@ -3207,6 +3307,17 @@
     }
   }
 
+  function downloadText(text: string, name: string) {
+    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
   async function copyMessage(msg: UIMessage) {
     const text = msg.content || msg.thinking;
     if (!text) return;
@@ -3217,7 +3328,12 @@
         copiedId = null;
       }, 2000);
     } catch {
-      // clipboard not available (non-HTTPS or unsupported)
+      // clipboard failed — for large content offer download instead
+      if (text.length > 50000) downloadText(text, `message-${msg.id}.txt`);
+    }
+    // Fallback: even on success, very large copies may be truncated — offer download
+    if (text.length > 50000) {
+      // No auto-download; user can use the download button, but ensure clipboard attempt was made
     }
   }
   async function copyTurnMessages(msg: UIMessage) {

@@ -30,7 +30,10 @@ test.describe('Server smoke', () => {
       try {
         const ws = new WebSocket(`ws://${location.host}/ws`);
         await new Promise((resolve, reject) => {
-          ws.onopen = () => { ws.close(); resolve('opened'); };
+          ws.onopen = () => {
+            ws.close();
+            resolve('opened');
+          };
           ws.onerror = () => resolve('error');
           ws.onclose = (e) => resolve(`closed:${e.code}`);
         });

@@ -24,9 +24,7 @@
   let Cmp = $state<any>(null);
   $effect(() => {
     if (open && !Cmp) {
-      import('./projects-sidebar.svelte')
-        .then((m) => (Cmp = m.default))
-        .catch(() => {});
+      import('./projects-sidebar.svelte').then((m) => (Cmp = m.default)).catch(() => {});
     }
   });
 </script>

@@ -172,6 +172,88 @@ test.describe('Extension UI modals', () => {
     await expect(page.getByPlaceholder('Your name...')).toBeVisible();
   });
 
+  test('renders a wrapped, keyboard-accessible select dialog', async ({ page }) => {
+    const wsMessages: Record<string, unknown>[] = [];
+    const title = '[Powerup] If you got a random dev superpower, which are you picking?';
+    const options = [
+      '1. Instant Debug — See the root cause instantly, no logs needed',
+      '2. Time Warp — Gain an extra six hours today, no side effects',
+      '3. Code Whisperer — Any codebase becomes instantly readable',
+    ];
+
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.onMessage((data) => {
+        const msg = JSON.parse(String(data)) as Record<string, unknown>;
+        wsMessages.push(msg);
+        if (msg.type === 'prompt') {
+          ws.send(JSON.stringify(extensionSelectPayload('select-1', title, options)));
+        }
+      });
+      ws.send(JSON.stringify(CONNECTED_PAYLOAD));
+      ws.send(JSON.stringify(PROJECTS_LIST_PAYLOAD));
+      ws.send(JSON.stringify(ALL_SESSIONS_LIST_PAYLOAD));
+    });
+
+    await submitPrompt(page, 'Ask me a question');
+
+    const listbox = page.getByRole('listbox', { name: title });
+    await expect(listbox).toBeVisible({ timeout: 3000 });
+    const optionButtons = page.getByRole('option');
+    await expect(optionButtons).toHaveCount(3);
+    await expect(optionButtons.first()).toContainText('Instant Debug');
+
+    const fits = await optionButtons.first().evaluate((element) => ({
+      scrollWidth: element.scrollWidth,
+      clientWidth: element.clientWidth,
+    }));
+    expect(fits.scrollWidth).toBeLessThanOrEqual(fits.clientWidth);
+
+    await optionButtons.first().focus();
+    await page.keyboard.press('ArrowDown');
+    await expect(optionButtons.nth(1)).toBeFocused();
+    await page.keyboard.press('Enter');
+
+    await expect
+      .poll(
+        () =>
+          wsMessages.filter(
+            (message) => message.type === 'extension_ui_response' && message.id === 'select-1'
+          ).length
+      )
+      .toBe(1);
+    expect(wsMessages.find((message) => message.type === 'extension_ui_response')).toMatchObject({
+      id: 'select-1',
+      value: options[1],
+    });
+  });
+
+  test('filters large select lists without losing option layout', async ({ page }) => {
+    const options = Array.from(
+      { length: 15 },
+      (_, i) => `${i + 1}. Option ${i + 1} — A long description for option ${i + 1}`
+    );
+    const title = 'Choose from many options';
+
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.onMessage((data) => {
+        const msg = JSON.parse(String(data));
+        if (msg.type === 'prompt') {
+          ws.send(JSON.stringify(extensionSelectPayload('select-many', title, options)));
+        }
+      });
+      ws.send(JSON.stringify(CONNECTED_PAYLOAD));
+      ws.send(JSON.stringify(PROJECTS_LIST_PAYLOAD));
+      ws.send(JSON.stringify(ALL_SESSIONS_LIST_PAYLOAD));
+    });
+
+    await submitPrompt(page, 'Show many options');
+
+    await expect(page.getByLabel('Filter options')).toBeVisible({ timeout: 3000 });
+    await page.getByLabel('Filter options').fill('Option 14');
+    await expect(page.getByRole('option')).toHaveCount(1);
+    await expect(page.getByRole('option')).toContainText('Option 14');
+  });
+
   test('shows notify() message inline in chat', async ({ page }) => {
     await page.routeWebSocket('/ws', (ws) => {
       ws.onMessage((data) => {
@@ -557,6 +639,37 @@ test.describe('Extension component widgets', () => {
     await expect(page.getByText('Active subagents: 2')).toHaveCount(0, { timeout: 3000 });
   });
 
+  test('resets the document title when switching sessions', async ({ page }) => {
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.onMessage((data) => {
+        const msg = JSON.parse(String(data));
+        if (msg.type === 'get_projects') ws.send(JSON.stringify(PROJECTS_LIST_PAYLOAD));
+        if (msg.type === 'get_all_sessions') ws.send(JSON.stringify(ALL_SESSIONS_LIST_PAYLOAD));
+        if (msg.type === 'switch_session') {
+          ws.send(
+            JSON.stringify({ ...sessionLoadedFor(msg.path), sessionName: 'Current session' })
+          );
+        }
+      });
+      ws.send(JSON.stringify(CONNECTED_S1));
+      setTimeout(() => {
+        ws.send(
+          JSON.stringify({
+            type: 'extension_ui_request',
+            method: 'setTitle',
+            title: 'Previous session title',
+            sessionId: 's1',
+          })
+        );
+      }, 300);
+    });
+
+    await expect(page).toHaveTitle('Previous session title', { timeout: 3000 });
+    await openProjectsSidebar(page);
+    await page.getByRole('button', { name: /hello world/ }).click();
+    await expect(page).toHaveTitle('Current session', { timeout: 3000 });
+  });
+
   test('replays widgets from session state after loading a session', async ({ page }) => {
     await page.routeWebSocket('/ws', (ws) => {
       ws.onMessage(() => {});
@@ -862,6 +975,109 @@ test.describe('Extension custom modal with parsed components', () => {
     await expect(page.getByText('Claude')).toBeVisible();
   });
 
+  test('contains long custom extension content inside the modal', async ({ page }) => {
+    const parsed = {
+      kind: 'container',
+      direction: 'vertical',
+      children: Array.from({ length: 24 }, (_, i) => ({
+        kind: 'text',
+        label: '',
+        content: `Long extension row ${i + 1} — ${'content '.repeat(12)}`,
+      })),
+    };
+
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.onMessage((data) => {
+        const msg = JSON.parse(String(data));
+        if (msg.type === 'prompt') {
+          ws.send(
+            JSON.stringify(extensionCustomPayload('custom-long', 'Long extension content', parsed))
+          );
+        }
+      });
+      wsInit(ws);
+    });
+
+    await submitPrompt(page, 'Show long extension content');
+
+    const dialog = page.locator('[data-slot="dialog-content"]');
+    await expect(dialog).toBeVisible({ timeout: 3000 });
+    await expect(page.getByText('Long extension row 24')).toBeVisible();
+    await expect(dialog.getByRole('button', { name: 'Cancel' })).toBeVisible();
+
+    const metrics = await dialog.evaluate((element) => ({
+      scrollHeight: element.scrollHeight,
+      clientHeight: element.clientHeight,
+    }));
+    expect(metrics.scrollHeight).toBeLessThanOrEqual(metrics.clientHeight);
+  });
+
+  test('renders mixed custom component types without overflow', async ({ page }) => {
+    const parsed = {
+      kind: 'container',
+      direction: 'vertical',
+      children: [
+        {
+          kind: 'markdown',
+          content: '## Extension details\n\nA long description with **formatted** content.',
+        },
+        {
+          kind: 'input',
+          label: 'Notes',
+          placeholder: 'Write a note…',
+          multiline: true,
+        },
+        { kind: 'checkbox', label: 'Enable the optional step', checked: false },
+        {
+          kind: 'settings',
+          items: [
+            {
+              id: 'mode',
+              label: 'Mode',
+              description: 'Choose how aggressively to run this extension.',
+              currentValue: 'safe',
+              values: ['safe', 'fast'],
+            },
+          ],
+        },
+        { kind: 'progress', label: 'Progress', progress: 0.42 },
+        { kind: 'loader', label: 'Preparing', cancellable: true },
+        { kind: 'image', label: 'Preview', mimeType: 'image/png', data: 'invalid-base64' },
+        { kind: 'button', label: 'Continue', variant: 'primary' },
+      ],
+    };
+
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.onMessage((data) => {
+        const msg = JSON.parse(String(data));
+        if (msg.type === 'prompt') {
+          ws.send(
+            JSON.stringify(extensionCustomPayload('custom-mixed', 'Mixed extension UI', parsed))
+          );
+        }
+      });
+      wsInit(ws);
+    });
+
+    await submitPrompt(page, 'Show all extension controls');
+
+    const dialog = page.locator('[data-slot="dialog-content"]');
+    await expect(dialog).toBeVisible({ timeout: 3000 });
+    await expect(page.getByText('Extension details')).toBeVisible();
+    await expect(page.getByPlaceholder('Write a note…')).toBeVisible();
+    await expect(page.getByRole('checkbox', { name: 'Enable the optional step' })).toBeVisible();
+    await expect(page.getByRole('progressbar', { name: 'Progress' })).toBeVisible();
+    await expect(page.getByRole('status').filter({ hasText: 'Preparing' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Continue' })).toBeVisible();
+    await expect(page.getByText('Image unavailable')).toBeVisible();
+
+    const metrics = await dialog.evaluate((element) => ({
+      scrollHeight: element.scrollHeight,
+      clientHeight: element.clientHeight,
+    }));
+    expect(metrics.scrollHeight).toBeLessThanOrEqual(metrics.clientHeight);
+  });
+
   test('shows a custom modal with container of text and button', async ({ page }) => {
     const parsed = {
       kind: 'container',
@@ -995,6 +1211,44 @@ test.describe('Extension event visibility', () => {
 
     await expect(page.getByText('[ext] omp: quota_low')).toBeVisible({ timeout: 3000 });
     await expect(page.getByText('Only 3 requests remaining')).toBeVisible();
+  });
+
+  test('renders a live custom extension message in chat', async ({ page }) => {
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.onMessage((data) => {
+        const msg = JSON.parse(String(data));
+        if (msg.type === 'prompt') {
+          const messages = [
+            {
+              role: 'custom',
+              customType: 'status-update',
+              content: 'raw extension status',
+              display: true,
+              details: { phase: 'ready' },
+              timestamp: Date.now(),
+            },
+            {
+              role: 'custom',
+              customType: 'rendered-status',
+              content: 'raw rendered status',
+              display: true,
+              timestamp: Date.now(),
+              renderedNoticeHtml: ['<span>Rendered extension status</span>'],
+            },
+          ];
+          for (const message of messages) {
+            ws.send(JSON.stringify({ type: 'message_start', message }));
+            ws.send(JSON.stringify({ type: 'message_end', message }));
+          }
+        }
+      });
+      wsInit(ws);
+    });
+
+    await submitPrompt(page, 'Trigger custom message');
+
+    await expect(page.getByText('raw extension status')).toBeVisible({ timeout: 3000 });
+    await expect(page.getByText('Rendered extension status')).toBeVisible();
   });
 
   test('shows a chat notice for error extension_event', async ({ page }) => {

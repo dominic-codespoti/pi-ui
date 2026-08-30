@@ -57,7 +57,13 @@ const NAMED_FUNCTION_KEYS: Record<string, string> = {
 function rawCtrlChar(key: string): string | null {
   const char = key.toLowerCase();
   const code = char.charCodeAt(0);
-  if ((code >= 97 && code <= 122) || char === '[' || char === '\\' || char === ']' || char === '_') {
+  if (
+    (code >= 97 && code <= 122) ||
+    char === '[' ||
+    char === '\\' ||
+    char === ']' ||
+    char === '_'
+  ) {
     return String.fromCharCode(code & 0x1f);
   }
   if (char === '-') return String.fromCharCode(31);

@@ -10,7 +10,10 @@ function resetStore() {
 }
 
 // Manually inject a record into the shared store for time-travel tests.
-function injectRecord(ip: string, rec: { count: number; firstAttempt: number; blockedUntil: number | null }) {
+function injectRecord(
+  ip: string,
+  rec: { count: number; firstAttempt: number; blockedUntil: number | null }
+) {
   const map = (globalThis as Record<string, unknown>).__piRateLimit as Map<string, typeof rec>;
   map.set(ip, rec);
 }

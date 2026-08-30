@@ -94,21 +94,25 @@ describe('session-scan', () => {
     expect(firstTextContent({ content: '   ', thinking: 'Useful context' })).toBe('Useful context');
   });
 
-  it('sorts by last activity descending and skips invalid files', async () => {
-    writeSession('old.jsonl', {
+  it('sorts by file mtime descending and skips invalid files', async () => {
+    const oldPath = writeSession('old.jsonl', {
       id: 'old',
       ts: '2026-01-01T00:00:00.000Z',
-      messages: [{ role: 'user', text: 'a', ts: 1_000 }],
+      messages: [{ role: 'user', text: 'a', ts: 2_000 }],
     });
-    writeSession('new.jsonl', {
+    const newPath = writeSession('new.jsonl', {
       id: 'new',
       ts: '2026-01-01T00:00:00.000Z',
-      messages: [{ role: 'user', text: 'b', ts: 2_000 }],
+      messages: [{ role: 'user', text: 'b', ts: 1_000 }],
     });
+    // In-message timestamps are ignored for recency — stat mtime is the clock.
+    utimesSync(oldPath, new Date(1_000), new Date(1_000));
+    utimesSync(newPath, new Date(2_000), new Date(2_000));
     writeFileSync(join(DIR, 'junk.jsonl'), 'not json\n');
     writeFileSync(join(DIR, 'headerless.jsonl'), JSON.stringify({ type: 'message' }) + '\n');
     const infos = await scanAllSessions(ROOT);
     expect(infos.map((i) => i.id)).toEqual(['new', 'old']);
+    expect(infos[0].modified.getTime()).toBe(2_000);
   });
 
   it('excludes skipPaths files without touching them', async () => {
@@ -201,5 +205,38 @@ describe('session-scan', () => {
     const infos = await scanAllSessions(ROOT);
     expect(infos).toHaveLength(1);
     expect(infos[0].id).toBe('s1');
+  });
+
+  it('includes subagent task sessions from <stem>/tasks/ with their parentSession header', async () => {
+    writeSession('2026-01-01T00-00-00-000Z_parent.jsonl', {
+      id: 'parent-id',
+      ts: '2026-01-01T00:00:00.000Z',
+      messages: [{ role: 'user', text: 'run tasks' }],
+    });
+    // Task sessions live in a directory named after the parent file stem.
+    const stemDir = join(DIR, '2026-01-01T00-00-00-000Z_parent', 'tasks');
+    mkdirSync(stemDir, { recursive: true });
+    writeFileSync(
+      join(stemDir, 'task.jsonl'),
+      [
+        JSON.stringify({
+          type: 'session',
+          version: 3,
+          id: 'task-id',
+          timestamp: '2026-01-01T00:01:00.000Z',
+          cwd: CWD,
+          parentSession: 'parent-id',
+        }),
+        JSON.stringify({
+          type: 'message',
+          id: 'm1',
+          timestamp: '2026-01-01T00:01:01.000Z',
+          message: { role: 'user', content: [{ type: 'text', text: 'sub task' }] },
+        }),
+      ].join('\n') + '\n'
+    );
+    const infos = await scanAllSessions(ROOT);
+    expect(infos.map((i) => i.id).sort()).toEqual(['parent-id', 'task-id']);
+    expect(infos.find((i) => i.id === 'task-id')?.parentSessionPath).toBe('parent-id');
   });
 });

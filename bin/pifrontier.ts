@@ -30,7 +30,10 @@ import { fileURLToPath } from 'node:url';
 
 const pkgPath = new URL('../package.json', import.meta.url);
 const packageRoot = dirname(fileURLToPath(pkgPath));
-const pkg = JSON.parse(readFileSync(fileURLToPath(pkgPath), 'utf8')) as { name: string; version: string };
+const pkg = JSON.parse(readFileSync(fileURLToPath(pkgPath), 'utf8')) as {
+  name: string;
+  version: string;
+};
 
 type PackageManager = 'npm' | 'bun' | 'pnpm' | 'yarn';
 
@@ -41,9 +44,7 @@ function quoteCommand(args: string[]): string {
 }
 
 function shellCommand(command: string): string[] {
-  return process.platform === 'win32'
-    ? ['cmd', '/d', '/s', '/c', command]
-    : ['sh', '-lc', command];
+  return process.platform === 'win32' ? ['cmd', '/d', '/s', '/c', command] : ['sh', '-lc', command];
 }
 
 async function runUpdateStep(args: string[], cwd = packageRoot): Promise<void> {
@@ -61,15 +62,18 @@ async function runUpdateStep(args: string[], cwd = packageRoot): Promise<void> {
 function ephemeralUpdateHint(root: string): string | null {
   const normalized = root.replaceAll('\\', '/');
   if (normalized.includes('/.bun/install/cache/')) return `bunx ${pkg.name}@latest --password ...`;
-  if (normalized.includes('/.npm/_npx/') || normalized.includes('/_npx/')) return `npx -y ${pkg.name}@latest --password ...`;
-  if (normalized.includes('/pnpm/dlx/') || normalized.includes('/.pnpm/dlx/')) return `pnpm dlx ${pkg.name}@latest --password ...`;
+  if (normalized.includes('/.npm/_npx/') || normalized.includes('/_npx/'))
+    return `npx -y ${pkg.name}@latest --password ...`;
+  if (normalized.includes('/pnpm/dlx/') || normalized.includes('/.pnpm/dlx/'))
+    return `pnpm dlx ${pkg.name}@latest --password ...`;
   if (normalized.includes('/yarn/dlx/')) return `yarn dlx ${pkg.name}@latest --password ...`;
   return null;
 }
 
 function detectPackageManager(root: string): PackageManager {
   const override = process.env.PI_UI_PACKAGE_MANAGER?.toLowerCase();
-  if (override === 'npm' || override === 'bun' || override === 'pnpm' || override === 'yarn') return override;
+  if (override === 'npm' || override === 'bun' || override === 'pnpm' || override === 'yarn')
+    return override;
 
   const normalized = root.replaceAll('\\', '/');
   if (normalized.includes('/.bun/install/global/')) return 'bun';
@@ -85,11 +89,15 @@ function detectPackageManager(root: string): PackageManager {
 
 function packageManagerUpdateCommand(manager: PackageManager): string[] {
   switch (manager) {
-    case 'bun': return ['bun', 'install', '--global', `${pkg.name}@latest`];
-    case 'pnpm': return ['pnpm', 'add', '--global', `${pkg.name}@latest`];
-    case 'yarn': return ['yarn', 'global', 'add', `${pkg.name}@latest`];
+    case 'bun':
+      return ['bun', 'install', '--global', `${pkg.name}@latest`];
+    case 'pnpm':
+      return ['pnpm', 'add', '--global', `${pkg.name}@latest`];
+    case 'yarn':
+      return ['yarn', 'global', 'add', `${pkg.name}@latest`];
     case 'npm':
-    default: return ['npm', 'install', '--global', `${pkg.name}@latest`];
+    default:
+      return ['npm', 'install', '--global', `${pkg.name}@latest`];
   }
 }
 
@@ -111,7 +119,9 @@ async function updatePiUi(): Promise<void> {
 
   const hint = ephemeralUpdateHint(packageRoot);
   if (hint) {
-    throw new Error(`This pi-ui run looks ephemeral, so there is no durable install to update. Restart with: ${hint}`);
+    throw new Error(
+      `This pi-ui run looks ephemeral, so there is no durable install to update. Restart with: ${hint}`
+    );
   }
 
   const manager = detectPackageManager(packageRoot);
@@ -123,14 +133,14 @@ async function updatePiUi(): Promise<void> {
 const { values, positionals } = parseArgs({
   args: process.argv.slice(2),
   options: {
-    password: { type: 'string',  short: 'p' },
-    port:     { type: 'string',  short: 'P' },
-    host:     { type: 'string' },
-    cwd:      { type: 'string' },
-    open:     { type: 'boolean', short: 'o', default: false },
-    daemon:   { type: 'boolean', short: 'd', default: false },
-    help:     { type: 'boolean', short: 'h', default: false },
-    version:  { type: 'boolean', short: 'V', default: false },
+    password: { type: 'string', short: 'p' },
+    port: { type: 'string', short: 'P' },
+    host: { type: 'string' },
+    cwd: { type: 'string' },
+    open: { type: 'boolean', short: 'o', default: false },
+    daemon: { type: 'boolean', short: 'd', default: false },
+    help: { type: 'boolean', short: 'h', default: false },
+    version: { type: 'boolean', short: 'V', default: false },
   },
   strict: true,
   allowPositionals: true,
@@ -266,9 +276,10 @@ if (process.env.PI_DAEMONIZED) {
 // edits are possible there, so no staleness is possible either).
 const isSourceCheckout = existsSync(fileURLToPath(new URL('../.git', import.meta.url)));
 const bundlePath = new URL('../server.bundle.js', import.meta.url);
-const serverPath = !isSourceCheckout && (await Bun.file(bundlePath).exists())
-  ? bundlePath
-  : new URL('../server.ts', import.meta.url);
+const serverPath =
+  !isSourceCheckout && (await Bun.file(bundlePath).exists())
+    ? bundlePath
+    : new URL('../server.ts', import.meta.url);
 
 await import(serverPath.href);
 
@@ -276,11 +287,14 @@ await import(serverPath.href);
 
 if (values.open) {
   const port = values.port ?? process.env.PORT ?? '3000';
-  const url  = `http://localhost:${port}`;
+  const url = `http://localhost:${port}`;
   const platform = process.platform;
-  const cmd = platform === 'darwin'  ? ['open', url]
-            : platform === 'win32'   ? ['cmd', '/c', 'start', url]
-            :                         ['xdg-open', url];
+  const cmd =
+    platform === 'darwin'
+      ? ['open', url]
+      : platform === 'win32'
+        ? ['cmd', '/c', 'start', url]
+        : ['xdg-open', url];
 
   Bun.spawn(cmd, { stdout: 'ignore', stderr: 'ignore' });
 }

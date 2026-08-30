@@ -1,6 +1,10 @@
 import { test, expect } from './fixtures';
 import { generateKeyPairSync } from 'node:crypto';
-import { CONNECTED_PAYLOAD, PROJECTS_LIST_PAYLOAD } from './mocks/payloads';
+import {
+  ALL_SESSIONS_LIST_PAYLOAD,
+  CONNECTED_PAYLOAD,
+  PROJECTS_LIST_PAYLOAD,
+} from './mocks/payloads';
 
 /**
  * PWA notification coverage. Headless Chromium's shell cannot grant the
@@ -137,8 +141,23 @@ test.describe('PWA notifications', () => {
     });
 
     await page.evaluate(() => navigator.serviceWorker.ready);
-    const sw = context.serviceWorkers()[0];
+    let sw = context.serviceWorkers()[0];
     expect(sw).toBeTruthy();
+    // Headless Chromium stops an idle service worker after ~30 s, and a stopped
+    // worker's Playwright handle evaluates as 'Target … has been closed'. A
+    // heartbeat timer keeps this test's worker alive for the whole run.
+    await sw.evaluate(() => {
+      const scope = globalThis as unknown as { __piKeepAlive?: ReturnType<typeof setInterval> };
+      scope.__piKeepAlive ??= setInterval(() => {}, 10_000);
+    });
+    /** Chromium may still swap the worker (update check) — re-resolve the live
+     *  handle before sw.evaluate, or evaluate throws 'closed'. */
+    const refreshSw = async (): Promise<void> => {
+      await page.evaluate(() => navigator.serviceWorker.ready);
+      const workers = context.serviceWorkers();
+      if (workers.length > 0) sw = workers[workers.length - 1];
+      else sw = await context.waitForEvent('serviceworker', { timeout: 10_000 });
+    };
 
     await test.step('2 sw notification surface', async () => {
       await sw.evaluate(() => {
@@ -200,7 +219,7 @@ test.describe('PWA notifications', () => {
         });
       });
       await expect
-        .poll(() => wsMessages.some((m) => m.type === 'switch_session'), { timeout: 10_000 })
+        .poll(() => wsMessages.some((m) => m.type === 'switch_session'), { timeout: 15_000 })
         .toBe(true);
       expect(wsMessages.find((m) => m.type === 'switch_session')).toMatchObject({
         path: '/other',
@@ -208,6 +227,7 @@ test.describe('PWA notifications', () => {
     });
 
     await test.step('4 steer action', async () => {
+      await refreshSw();
       await page.evaluate(() => {
         void navigator.serviceWorker.ready.then((reg) => {
           reg.active?.postMessage({ type: 'click_simulate', action: 'steer', data: {} });
@@ -222,6 +242,7 @@ test.describe('PWA notifications', () => {
     });
 
     await test.step('5 push visibility gate', async () => {
+      await refreshSw();
       await sw.evaluate(() => {
         const scope = globalThis as unknown as SwScope;
         const shown: string[] = [];
@@ -275,5 +296,50 @@ test.describe('PWA notifications', () => {
       const sub = await reg.pushManager.getSubscription();
       if (sub) await sub.unsubscribe();
     });
+  });
+
+  test('deep-link intent survives a dropped socket', async ({ page, login }) => {
+    const wsMessages: Array<Record<string, unknown>> = [];
+    let initCount = 0;
+    let isFirstConnection = true;
+
+    await page.routeWebSocket('/ws', (ws) => {
+      if (isFirstConnection) {
+        // Kill the first socket shortly after boot so the tap below lands in
+        // the reconnect gap; the retry loop must bridge it.
+        isFirstConnection = false;
+        ws.onMessage((m) => wsMessages.push(JSON.parse(String(m))));
+        ws.send(JSON.stringify({ ...CONNECTED_PAYLOAD }));
+        setTimeout(() => ws.close(), 400);
+        return;
+      }
+      ws.onMessage((m) => {
+        const msg = JSON.parse(String(m)) as Record<string, unknown>;
+        wsMessages.push(msg);
+        if (msg.type === 'get_projects') ws.send(JSON.stringify(PROJECTS_LIST_PAYLOAD));
+        if (msg.type === 'get_all_sessions') ws.send(JSON.stringify(ALL_SESSIONS_LIST_PAYLOAD));
+      });
+      ws.send(JSON.stringify({ ...CONNECTED_PAYLOAD }));
+      initCount += 1;
+    });
+
+    await login(page, 'test-password');
+    await expect.poll(() => wsMessages.some((m) => m.type === 'get_all_sessions')).toBe(true);
+    // Past the 400 ms kill — the tap now lands while the socket is down and
+    // the client's reconnect backoff is still counting.
+    await page.waitForTimeout(600);
+    await page.evaluate(() => {
+      navigator.serviceWorker.dispatchEvent(
+        new MessageEvent('message', {
+          data: { type: 'pi_focus_session', sessionPath: '/other' },
+        })
+      );
+    });
+
+    await expect
+      .poll(() => wsMessages.some((m) => m.type === 'switch_session'), { timeout: 20_000 })
+      .toBe(true);
+    expect(wsMessages.find((m) => m.type === 'switch_session')).toMatchObject({ path: '/other' });
+    expect(initCount).toBeGreaterThanOrEqual(1);
   });
 });

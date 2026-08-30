@@ -94,6 +94,46 @@ test.describe('Chat / prompt streaming', () => {
     await expect(page.getByText('Hello world')).toBeVisible({ timeout: 5000 });
   });
 
+  test('shows provider failures when the assistant returns an error message', async ({ page }) => {
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.onMessage((data) => {
+        const msg = JSON.parse(String(data));
+        if (msg.type === 'prompt') {
+          const failure = {
+            role: 'assistant',
+            content: [{ type: 'text', text: '' }],
+            usage: { input: 0, output: 0, totalTokens: 0, cost: { total: 0 } },
+            stopReason: 'error',
+            errorMessage: '503 upstream overloaded',
+            timestamp: Date.now(),
+          };
+          ws.send(JSON.stringify(agentStartPayload()));
+          ws.send(JSON.stringify(assistantMessageStartPayload()));
+          ws.send(JSON.stringify({ type: 'message_end', message: failure }));
+          ws.send(JSON.stringify({ type: 'agent_end', messages: [failure], willRetry: false }));
+        }
+      });
+      ws.send(
+        JSON.stringify({
+          type: 'connected',
+          sessionId: 's1',
+          isStreaming: false,
+          thinkingLevel: 'medium',
+          model: null,
+          availableModels: [],
+          messages: [],
+        })
+      );
+    });
+    await page.goto('/');
+
+    await submitPrompt(page, 'Trigger provider failure');
+
+    await expect(page.getByText('Agent error: 503 upstream overloaded')).toBeVisible({
+      timeout: 3000,
+    });
+  });
+
   test('renders existing messages from connected payload', async ({ page }) => {
     await page.routeWebSocket('/ws', (ws) => {
       ws.send(
@@ -530,5 +570,60 @@ test.describe('Mobile native feel — custom payloads', () => {
     await expect(sheet.getByText('Copy entire turn')).toBeVisible();
     // No edit action for assistant messages
     await expect(sheet.getByText('Edit & resend')).not.toBeVisible();
+  });
+
+  test('long-pressing message text leaves native selection available', async ({
+    page,
+    login,
+    isMobile,
+  }) => {
+    test.skip(!isMobile, 'native text selection is a touch behavior');
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.send(
+        JSON.stringify({
+          type: 'connected',
+          sessionId: 's1',
+          isStreaming: false,
+          thinkingLevel: 'medium',
+          model: null,
+          availableModels: [],
+          messages: [
+            { id: 'u1', role: 'user', content: 'hello', streaming: false, createdAt: Date.now() },
+            {
+              id: 'a1',
+              role: 'assistant',
+              content: 'hi there',
+              streaming: false,
+              createdAt: Date.now(),
+            },
+          ],
+          cwd: '/home/user/project',
+          sessionName: 's',
+          isCompacting: false,
+        })
+      );
+    });
+    await login(page, 'test-password');
+
+    const text = page.locator('.msg-row-longpress').nth(1).locator('.trace-body.select-text');
+    await expect(text).toBeVisible();
+    await expect(text).toHaveCSS('user-select', 'text');
+    await text.dispatchEvent('pointerdown', {
+      pointerId: 1,
+      pointerType: 'touch',
+      clientX: 120,
+      clientY: 200,
+      bubbles: true,
+    });
+    await page.waitForTimeout(650);
+    await text.dispatchEvent('pointerup', {
+      pointerId: 1,
+      pointerType: 'touch',
+      clientX: 120,
+      clientY: 200,
+      bubbles: true,
+    });
+
+    await expect(page.getByRole('dialog')).not.toBeVisible();
   });
 });

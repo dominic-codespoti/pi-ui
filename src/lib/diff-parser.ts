@@ -89,16 +89,31 @@ export function parseDiff(raw: string): DiffFile[] {
     // Diff lines (must be inside a hunk)
     if (hunk && current) {
       if (line.startsWith('+')) {
-        hunk.lines.push({ type: 'add', oldLineNumber: null, newLineNumber: newLine, content: line.slice(1) });
+        hunk.lines.push({
+          type: 'add',
+          oldLineNumber: null,
+          newLineNumber: newLine,
+          content: line.slice(1),
+        });
         newLine++;
         current.additions++;
       } else if (line.startsWith('-')) {
-        hunk.lines.push({ type: 'delete', oldLineNumber: oldLine, newLineNumber: null, content: line.slice(1) });
+        hunk.lines.push({
+          type: 'delete',
+          oldLineNumber: oldLine,
+          newLineNumber: null,
+          content: line.slice(1),
+        });
         oldLine++;
         current.deletions++;
       } else if (line.startsWith(' ') || line === '') {
         // Context line (leading space) or empty line
-        hunk.lines.push({ type: 'context', oldLineNumber: oldLine, newLineNumber: newLine, content: line.slice(1) });
+        hunk.lines.push({
+          type: 'context',
+          oldLineNumber: oldLine,
+          newLineNumber: newLine,
+          content: line.slice(1),
+        });
         oldLine++;
         newLine++;
       } else if (line.startsWith('\\')) {

@@ -1,7 +1,13 @@
 import { describe, it, expect } from 'vitest';
 import {
-  expandTilde, isInsideWorkspace, serializeModel, serializeSession,
-  compareSemver, resolveGitHubRawUrl, formatCommand, ephemeralUpdateHint,
+  expandTilde,
+  isInsideWorkspace,
+  serializeModel,
+  serializeSession,
+  compareSemver,
+  resolveGitHubRawUrl,
+  formatCommand,
+  ephemeralUpdateHint,
 } from '../ws-helpers';
 
 describe('expandTilde', () => {
@@ -116,8 +122,9 @@ describe('compareSemver', () => {
 
 describe('resolveGitHubRawUrl', () => {
   it('converts github.com blob URL to raw', () => {
-    expect(resolveGitHubRawUrl('https://github.com/user/repo/blob/main/src/index.ts'))
-      .toBe('https://raw.githubusercontent.com/user/repo/main/src/index.ts');
+    expect(resolveGitHubRawUrl('https://github.com/user/repo/blob/main/src/index.ts')).toBe(
+      'https://raw.githubusercontent.com/user/repo/main/src/index.ts'
+    );
   });
 
   it('passes through raw.githubusercontent.com URLs', () => {

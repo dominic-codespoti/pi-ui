@@ -145,6 +145,17 @@ export class SessionCatalog {
     return () => this.listeners.delete(cb);
   }
 
+  /**
+   * Drop the cached disk scan — external processes appended session files
+   * (subagents, parallel CLI instances; see session-watcher.ts). The next
+   * list() re-scans, and changed files re-parse via the per-file stat cache.
+   * Not an apply() patch: pooled state is untouched, and callers own the
+   * refresh scheduling.
+   */
+  invalidateScan(): void {
+    this.scanPromise = null;
+  }
+
   /** Files the disk scan must skip — pooled sessions are overlay-authoritative. */
   private skipPaths(): Set<string> | undefined {
     const paths = new Set<string>();

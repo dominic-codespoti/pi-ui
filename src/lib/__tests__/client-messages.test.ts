@@ -1,7 +1,11 @@
 import { describe, it, expect } from 'vitest';
 import {
-  uid, extractTextContent, formatToolInput,
-  agentMsgToUI, rawMessagesToUI, reconnectDelay,
+  uid,
+  extractTextContent,
+  formatToolInput,
+  agentMsgToUI,
+  rawMessagesToUI,
+  reconnectDelay,
 } from '../client-messages';
 
 describe('uid', () => {
@@ -57,7 +61,9 @@ describe('formatToolInput', () => {
   });
 
   it('formats read with offset and limit', () => {
-    expect(formatToolInput('read', { path: 'src/main.ts', offset: 10, limit: 20 })).toBe('main.ts:10–29');
+    expect(formatToolInput('read', { path: 'src/main.ts', offset: 10, limit: 20 })).toBe(
+      'main.ts:10–29'
+    );
   });
 
   it('formats write file', () => {
@@ -69,7 +75,9 @@ describe('formatToolInput', () => {
   });
 
   it('formats edit with multiple edits', () => {
-    expect(formatToolInput('edit', { file_path: 'src/index.ts', edits: [{ old: 'a' }, { old: 'b' }] })).toBe('index.ts (2 edits)');
+    expect(
+      formatToolInput('edit', { file_path: 'src/index.ts', edits: [{ old: 'a' }, { old: 'b' }] })
+    ).toBe('index.ts (2 edits)');
   });
 
   it('formats grep with pattern', () => {
@@ -177,12 +185,15 @@ describe('agentMsgToUI', () => {
     const map = new Map<string, { name: string; input: Record<string, unknown> }>();
     map.set('call-1', { name: 'read', input: { path: 'file.ts' } });
 
-    const result = agentMsgToUI({
-      role: 'tool_result',
-      toolCallId: 'call-1',
-      content: [{ type: 'text', text: 'file content here' }],
-      isError: false,
-    }, map);
+    const result = agentMsgToUI(
+      {
+        role: 'tool_result',
+        toolCallId: 'call-1',
+        content: [{ type: 'text', text: 'file content here' }],
+        isError: false,
+      },
+      map
+    );
     expect(result).toHaveLength(1);
     expect(result[0].role).toBe('tool');
     expect(result[0].toolName).toBe('read');
@@ -190,15 +201,39 @@ describe('agentMsgToUI', () => {
     expect(result[0].content).toBe('file content here');
   });
 
-  it('converts custom extension message types', () => {
+  it('converts SDK-shaped custom extension messages', () => {
     const result = agentMsgToUI({
       role: 'custom',
       customType: 'mermaid',
-      display: '```mermaid\ngraph TD\n```',
+      content: '```mermaid\ngraph TD\n```',
+      display: true,
     });
     expect(result).toHaveLength(1);
     expect(result[0].role).toBe('notice');
     expect(result[0].customType).toBe('mermaid');
+    expect(result[0].content).toContain('graph TD');
+  });
+
+  it('extracts custom text blocks and skips display:false messages', () => {
+    const blocks = agentMsgToUI({
+      role: 'custom',
+      customType: 'status',
+      content: [
+        { type: 'text', text: 'one' },
+        { type: 'image', data: 'ignored' },
+        { type: 'text', text: 'two' },
+      ],
+      display: true,
+    });
+    expect(blocks[0].content).toBe('onetwo');
+    expect(
+      agentMsgToUI({
+        role: 'custom',
+        customType: 'hidden',
+        content: 'secret',
+        display: false,
+      })
+    ).toEqual([]);
   });
 
   it('returns empty array for unknown role without customType', () => {

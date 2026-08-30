@@ -120,12 +120,12 @@ pi-ui update
 
 ## Environment variables
 
-| Variable           | Description                                             | Default           |
-|--------------------|---------------------------------------------------------|-------------------|
-| `PI_PASSWORD`      | Password for the web UI (required)                      | —                 |
-| `PORT`             | Port to listen on                                       | `3000`            |
-| `HOST`             | Address to bind (see Remote access)                     | `127.0.0.1`       |
-| `PI_CWD`           | Working directory for the pi session                    | `process.cwd()`   |
+| Variable           | Description                                                                                                                                      | Default            |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------ |
+| `PI_PASSWORD`      | Password for the web UI (required)                                                                                                               | —                  |
+| `PORT`             | Port to listen on                                                                                                                                | `3000`             |
+| `HOST`             | Address to bind (see Remote access)                                                                                                              | `127.0.0.1`        |
+| `PI_CWD`           | Working directory for the pi session                                                                                                             | `process.cwd()`    |
 | `PI_UI_JWT_SECRET` | Shared session signing secret (≥32 chars); only needed for multi-process runs; default is random per process (server restart signs everyone out) | random per process |
 
 CLI flags take precedence over environment variables when both are set.

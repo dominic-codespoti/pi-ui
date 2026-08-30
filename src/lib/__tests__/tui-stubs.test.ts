@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import type { AgentSession } from '@earendil-works/pi-coding-agent';
 import {
   stripAnsi,
   ansiToHtml,
@@ -6,7 +7,11 @@ import {
   StubTui,
   HeadlessTerminal,
   parseComponentTree,
+  customEntriesForWire,
+  applyMarkdownTransformers,
   renderTerminalLines,
+  renderCustomMessage,
+  stubKeybindings,
   callFactoryAndParse,
   shouldUseInteractiveCustom,
 } from '../tui-stubs';
@@ -21,6 +26,8 @@ import {
   Image,
   Box,
   Spacer,
+  HStack,
+  VStack,
 } from '@earendil-works/pi-tui';
 
 const noop = (t: string) => t;
@@ -587,6 +594,64 @@ describe('parseComponentTree — real pi-tui component instances', () => {
   });
 });
 
+describe('parseComponentTree — pi-tui stacks', () => {
+  it('detects a real HStack as a horizontal container via layoutType', () => {
+    const stack = new HStack();
+    stack.addChild(new Text('left', 0, 0));
+    stack.addChild(new Text('right', 0, 0));
+    const result = parseComponentTree(stack as unknown as Record<string, unknown>);
+    expect(result.kind).toBe('container');
+    if (result.kind === 'container') {
+      expect(result.direction).toBe('horizontal');
+      expect(result.children).toHaveLength(2);
+    }
+  });
+
+  it('detects a real VStack as a vertical container', () => {
+    const stack = new VStack();
+    stack.addChild(new Text('top', 0, 0));
+    stack.addChild(new Text('bottom', 0, 0));
+    const result = parseComponentTree(stack as unknown as Record<string, unknown>);
+    expect(result.kind).toBe('container');
+    if (result.kind === 'container') {
+      expect(result.direction).toBe('vertical');
+      expect(result.children).toHaveLength(2);
+    }
+  });
+
+  it('keeps hand-rolled direction:"row" containers horizontal (back-compat)', () => {
+    const row = {
+      children: [
+        { text: 'a', paddingX: 0, paddingY: 0 },
+        { text: 'b', paddingX: 0, paddingY: 0 },
+      ],
+      addChild: () => {},
+      direction: 'row',
+    };
+    const result = parseComponentTree(row);
+    expect(result.kind).toBe('container');
+    if (result.kind === 'container') expect(result.direction).toBe('horizontal');
+  });
+
+  it('recurses into stacks nested inside Box containers', () => {
+    const box = new Box(0, 0);
+    const row = new HStack();
+    row.addChild(new Text('one', 0, 0));
+    row.addChild(new Text('two', 0, 0));
+    box.addChild(row);
+    box.addChild(new Text('tail', 0, 0));
+    const result = parseComponentTree(box as unknown as Record<string, unknown>);
+    expect(result.kind).toBe('container');
+    if (result.kind === 'container') {
+      expect(result.children).toHaveLength(2);
+      expect(result.children[0].kind).toBe('container');
+      if (result.children[0].kind === 'container') {
+        expect(result.children[0].direction).toBe('horizontal');
+      }
+    }
+  });
+});
+
 describe('callFactoryAndParse', () => {
   it('calls factory with stubs and parses result', async () => {
     const factory = (tui: StubTui) => {
@@ -613,5 +678,174 @@ describe('callFactoryAndParse', () => {
     if (result && 'label' in result) {
       expect((result as { label?: string }).label).toBe('My Title');
     }
+  });
+});
+
+describe('custom entries + markdown transformers', () => {
+  const fakeSess = (parts: {
+    entries?: unknown[];
+    entryRenderer?: unknown;
+    messageRenderer?: unknown;
+    transformers?: unknown[];
+  }) =>
+    ({
+      sessionManager: { getEntries: () => parts.entries ?? [] },
+      extensionRunner: {
+        getEntryRenderer: () => parts.entryRenderer,
+        getMessageRenderer: () => parts.messageRenderer,
+        getMarkdownTransformers: () => parts.transformers ?? [],
+      },
+    }) as unknown as AgentSession;
+
+  it('projects a rendered CustomEntry as a synthetic custom notice', () => {
+    const sess = fakeSess({
+      entryRenderer: () => ({ render: () => ['todo: 2 open'] }),
+      entries: [
+        {
+          type: 'custom',
+          customType: 'todos',
+          data: { open: 2 },
+          timestamp: '2026-08-25T10:00:00Z',
+        },
+      ],
+    });
+    const out = customEntriesForWire(sess, []);
+    expect(out).toHaveLength(1);
+    const msg = out[0] as Record<string, unknown>;
+    expect(msg.role).toBe('custom');
+    expect(msg.customType).toBe('todos');
+    expect(msg.fromEntry).toBe(true);
+    expect(msg.details).toEqual({ open: 2 });
+    expect(Array.isArray(msg.renderedNoticeHtml)).toBe(true);
+  });
+
+  it('hides renderer-less and empty-render entries (matches TUI behavior)', () => {
+    const sess = fakeSess({
+      entries: [
+        { type: 'custom', customType: 'state' },
+        { type: 'custom', customType: 'blank', timestamp: '2026-08-25T10:00:00Z' },
+      ],
+      entryRenderer: () => ({ render: () => [] }),
+    });
+    expect(customEntriesForWire(sess, [])).toHaveLength(0);
+  });
+
+  it('interleaves synthetic notices by timestamp between messages', () => {
+    const sess = fakeSess({
+      entryRenderer: () => ({ render: () => ['entry'] }),
+      entries: [{ type: 'custom', customType: 'note', timestamp: 2000 }],
+    });
+    const messages = [
+      { role: 'user', content: 'first', timestamp: 1000 },
+      { role: 'assistant', content: 'second', timestamp: 3000 },
+    ];
+    const out = customEntriesForWire(sess, messages);
+    expect(out.map((m) => (m as { role: string }).role)).toEqual(['user', 'custom', 'assistant']);
+  });
+
+  it('returns the input array identity when there is nothing to merge', () => {
+    const sess = fakeSess({});
+    const messages = [{ role: 'user', content: 'hi' }];
+    expect(customEntriesForWire(sess, messages)).toBe(messages);
+  });
+
+  it('never routes entry-derived notices through the message renderer', () => {
+    const sess = fakeSess({
+      entryRenderer: () => ({ render: () => ['entry html'] }),
+      messageRenderer: () => ({ render: () => ['WRONG'] }),
+      entries: [{ type: 'custom', customType: 'dup', timestamp: 1 }],
+    });
+    const [merged] = customEntriesForWire(sess, []);
+    const rendered = renderCustomMessage(sess, merged) as Record<string, unknown>;
+    expect(rendered.fromEntry).toBe(true);
+  });
+
+  it('applies transformers in order to string and block text', () => {
+    const sess = fakeSess({
+      transformers: [(md: string) => `<wrap>${md}</wrap>`, (md: string) => md.toUpperCase()],
+    });
+    const out = applyMarkdownTransformers(sess, { role: 'user', content: 'hello' }) as {
+      content: string;
+    };
+    expect(out.content).toBe('<WRAP>HELLO</WRAP>');
+
+    const blockOut = applyMarkdownTransformers(sess, {
+      role: 'assistant',
+      content: [
+        { type: 'text', text: 'a' },
+        { type: 'image', data: 'keep' },
+      ],
+      thinking: 'thought',
+    }) as { content: { type: string; text?: string; data?: string }[]; thinking: string };
+    expect(blockOut.content[0].text).toBe('<WRAP>A</WRAP>');
+    expect(blockOut.content[1].data).toBe('keep');
+    expect(blockOut.thinking.startsWith('<WRAP>')).toBe(true);
+  });
+
+  it('is copy-on-write and identity-preserving without transformers', () => {
+    const msg = { role: 'user', content: 'plain' };
+    expect(applyMarkdownTransformers(fakeSess({}), msg)).toBe(msg);
+    const throwing = fakeSess({
+      transformers: [
+        () => {
+          throw new Error('boom');
+        },
+      ],
+    });
+    expect(applyMarkdownTransformers(throwing, msg)).toBe(msg);
+  });
+});
+
+describe('callFactoryAndParse thirdArg (footer factories)', () => {
+  it('passes thirdArg instead of keybindings as the factory’s third argument', async () => {
+    const footerData = { getGitBranch: () => 'main' };
+    let seenThird: unknown;
+    const factory = (_tui: unknown, _theme: unknown, third: unknown) => {
+      seenThird = third;
+      return {
+        text: `branch: ${(third as typeof footerData).getGitBranch()}`,
+        paddingX: 0,
+        paddingY: 0,
+      };
+    };
+    const result = await callFactoryAndParse(factory, '', undefined, footerData);
+    expect(seenThird).toBe(footerData);
+    expect(result && 'content' in result ? result.content : '').toContain('branch: main');
+  });
+
+  it('defaults the third argument to the keybindings stub', async () => {
+    let seenThird: unknown;
+    await callFactoryAndParse((_tui: unknown, _theme: unknown, third: unknown) => {
+      seenThird = third;
+      return { text: 'x', paddingX: 0, paddingY: 0 };
+    }, '');
+    expect(seenThird).toBe(stubKeybindings);
+  });
+});
+
+describe('parseComponentTree — pi-tui Editor duck-type', () => {
+  it('parses a getText/setText/handleInput editor as an input with live value', () => {
+    const editor = {
+      getText: () => 'draft text',
+      setText: () => {},
+      handleInput: () => {},
+      render: (width: number) => ['x'.repeat(width)],
+    };
+    const result = parseComponentTree(editor);
+    expect(result.kind).toBe('input');
+    if (result.kind === 'input') expect(result.value).toBe('draft text');
+  });
+
+  it('still prefers getValue/setValue Input when both shapes are present', () => {
+    const hybrid = {
+      getValue: () => 'input-value',
+      setValue: () => {},
+      getText: () => 'editor-text',
+      setText: () => {},
+      handleInput: () => {},
+    };
+    const result = parseComponentTree(hybrid);
+    expect(result.kind).toBe('input');
+    if (result.kind === 'input') expect(result.value).toBe('input-value');
   });
 });

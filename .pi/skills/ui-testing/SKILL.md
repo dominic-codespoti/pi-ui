@@ -51,12 +51,16 @@ test('widget screenshot', async ({ page, login }) => {
   await page.routeWebSocket('/ws', (ws) => {
     ws.onMessage(() => {});
     ws.send(JSON.stringify(CONNECTED_PAYLOAD));
-    
+
     setTimeout(() => {
-      ws.send(JSON.stringify(extensionSetWidgetPayload('test', { kind: 'progress', label: 'Loading…', progress: 0.5 })));
+      ws.send(
+        JSON.stringify(
+          extensionSetWidgetPayload('test', { kind: 'progress', label: 'Loading…', progress: 0.5 })
+        )
+      );
     }, 500);
   });
-  
+
   // Navigate to pick up the new route
   await login(page);
   await page.waitForTimeout(1000);
@@ -91,8 +95,8 @@ Always use factories from `e2e/mocks/payloads.ts` instead of hardcoding JSON:
 
 ## Troubleshooting
 
-| Symptom | Cause | Fix |
-|---|---|---|
-| `chrome-error://chromewebdata/` | Login POST blocked by CSRF | Use `login` fixture or `loginViaCookie()` |
-| `page.routeWebSocket timed out` | WS not connected | Ensure mock sends `CONNECTED_PAYLOAD` |
-| Screenshot blank | Page not loaded | Add `await page.waitForTimeout(1000)` after `goto` |
+| Symptom                         | Cause                      | Fix                                                |
+| ------------------------------- | -------------------------- | -------------------------------------------------- |
+| `chrome-error://chromewebdata/` | Login POST blocked by CSRF | Use `login` fixture or `loginViaCookie()`          |
+| `page.routeWebSocket timed out` | WS not connected           | Ensure mock sends `CONNECTED_PAYLOAD`              |
+| Screenshot blank                | Page not loaded            | Add `await page.waitForTimeout(1000)` after `goto` |

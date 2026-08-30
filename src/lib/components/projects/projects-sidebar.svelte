@@ -2,7 +2,8 @@
   /**
    * Projects sidebar — recency-first session list grouped under thin project
    * headers. Projects sort by their most recent session (pinned first);
-   * sessions render flat (no nesting) in recency order.
+   * sub-sessions nest under their parent (substacks always expanded), each
+   * sibling level ordered by its subtree's most recent activity.
    *
    * The active project can be collapsed like any other; a search filter expands
    * everything and shows every match. Projects can be renamed, pinned, collapsed
@@ -27,6 +28,7 @@
   import ChevronRight from '@lucide/svelte/icons/chevron-right';
   import Plus from '@lucide/svelte/icons/plus';
   import Pin from '@lucide/svelte/icons/pin';
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars -- used in template {#if g.pinned}<PinOff>
   import PinOff from '@lucide/svelte/icons/pin-off';
   import Pencil from '@lucide/svelte/icons/pencil';
   import Trash from '@lucide/svelte/icons/trash-2';
@@ -34,6 +36,7 @@
   import Check from '@lucide/svelte/icons/check';
   import GitBranch from '@lucide/svelte/icons/git-branch';
   import TriangleAlert from '@lucide/svelte/icons/triangle-alert';
+  import CornerDownRight from '@lucide/svelte/icons/corner-down-right';
 
   let {
     open,
@@ -128,6 +131,16 @@
     );
   }
 
+  function confirmDeleteProject(g: ProjectGroup) {
+    const count = g.sessions.length;
+    const label = count === 1 ? '1 session' : `${count} sessions`;
+    onRequestConfirm(
+      `Delete project "${g.name}" and all ${label}? This will permanently delete ${label} and cannot be undone.`,
+      () => ps.deleteProject(g.cwd),
+      { title: `Delete ${g.name}?`, confirmLabel: `Delete project`, variant: 'error' }
+    );
+  }
+
   function openNewProject(path: string) {
     newProjectMode = false;
     ps.newSession(path);
@@ -138,9 +151,11 @@
   {@const isActive = g.cwd === ps.cwd}
   {@const isCollapsed = !ps.filter && ps.collapsed.has(g.cwd)}
   {@const isRenaming = renamingProject === g.cwd}
+  {@const rootCount = g.sessions.filter((r) => r.depth === 0).length}
   {@const anyRunning =
-    (ps.isStreaming && isActive) || g.sessions.some((s) => ps.runningSessions.has(s.id))}
-  {@const anyUnchecked = !anyRunning && g.sessions.some((s) => ps.uncheckedSessions.has(s.id))}
+    (ps.isStreaming && isActive) || g.sessions.some((r) => ps.runningSessions.has(r.session.id))}
+  {@const anyUnchecked =
+    !anyRunning && g.sessions.some((r) => ps.uncheckedSessions.has(r.session.id))}
   <div
     class="group/dir relative rounded-2xl transition-colors duration-150 {isActive
       ? 'bg-base-content/[0.03]'
@@ -231,16 +246,24 @@
             aria-label="Rename project {g.name}"
             tabindex={open ? 0 : -1}><Pencil class="w-3 h-3" /></button
           >
-          <button
-            onclick={() => ps.setPinned(g.cwd, !g.pinned)}
-            class="w-7 h-7 flex items-center justify-center rounded-xl transition-colors {g.pinned
-              ? 'text-primary/70 hover:text-primary hover:bg-primary/10'
-              : 'text-base-content/35 hover:text-base-content/70 hover:bg-base-content/8'}"
-            title={g.pinned ? 'Unpin project' : 'Pin project'}
-            aria-label="{g.pinned ? 'Unpin' : 'Pin'} project {g.name}"
-            tabindex={open ? 0 : -1}
-            >{#if g.pinned}<PinOff class="w-3 h-3" />{:else}<Pin class="w-3 h-3" />{/if}</button
-          >
+          {#if g.registered && g.sessions.length === 0 && !isActive}
+            <button
+              onclick={() => confirmForgetProject(g)}
+              class="w-7 h-7 flex items-center justify-center text-base-content/30 hover:text-error hover:bg-error/8 rounded-xl transition-colors"
+              title="Forget project"
+              aria-label="Forget project {g.name}"
+              tabindex={open ? 0 : -1}><X class="w-3.5 h-3.5" /></button
+            >
+          {/if}
+          {#if g.sessions.length > 0 && !isActive}
+            <button
+              onclick={() => confirmDeleteProject(g)}
+              class="w-7 h-7 flex items-center justify-center text-base-content/30 hover:text-error hover:bg-error/8 rounded-xl transition-colors"
+              title="Delete project and all sessions"
+              aria-label="Delete project {g.name}"
+              tabindex={open ? 0 : -1}><Trash class="w-3.5 h-3.5" /></button
+            >
+          {/if}
           {#if g.registered && g.sessions.length === 0 && !isActive}
             <button
               onclick={() => confirmForgetProject(g)}
@@ -265,18 +288,20 @@
       </div>
     {/if}
 
-    <!-- Sessions under this project — flat rows, no nested indent -->
+    <!-- Sessions under this project — nested substacks, always expanded -->
     {#if !isCollapsed}
       <div class="pt-0.5 pb-1.5 space-y-1">
         {#if g.sessions.length === 0}
           <p class="px-3 py-1.5 text-xs text-base-content/30">no sessions yet</p>
         {/if}
-        {#each ps.visibleSessions(g) as s (s.id)}
+        {#each ps.visibleSessions(g) as row (row.session.id)}
+          {@const s = row.session}
           {@const isActiveSession = ps.activeSessionId === s.id}
           {@const isRenamingSession = renamingSession === s.path}
           {@const hasUnchecked = ps.uncheckedSessions.has(s.id)}
           {@const isBgRunning = ps.runningSessions.has(s.id) && !isActiveSession}
           <div
+            style="margin-left: {Math.min(row.depth, 3) * 14}px"
             class="group rounded-2xl transition-colors duration-150 {isActiveSession
               ? 'bg-primary/[0.07] border border-primary/[0.08]'
               : 'border border-transparent hover:bg-base-content/[0.035]'}"
@@ -327,6 +352,11 @@
                         class="w-2 h-2 rounded-full bg-primary shrink-0 glow-primary"
                         aria-label="Unchecked result"
                       ></span>
+                    {:else if s.parentSession}
+                      <CornerDownRight
+                        class="w-3 h-3 text-base-content/30 shrink-0"
+                        aria-label="Sub-session"
+                      />
                     {:else}
                       <span class="w-2 h-2 rounded-full bg-base-content/20 shrink-0"></span>
                     {/if}
@@ -389,7 +419,7 @@
             {/if}
           </div>
         {/each}
-        {#if !ps.filter && g.sessions.length > SESSION_PREVIEW_LIMIT}
+        {#if !ps.filter && rootCount > SESSION_PREVIEW_LIMIT}
           {@const expanded = ps.expandedGroups.has(g.cwd)}
           <button
             onclick={() => ps.toggleExpandedGroup(g.cwd)}
@@ -398,7 +428,7 @@
           >
             {expanded
               ? 'Show fewer sessions'
-              : `Show ${g.sessions.length - SESSION_PREVIEW_LIMIT} more sessions`}
+              : `Show ${rootCount - SESSION_PREVIEW_LIMIT} more sessions`}
           </button>
         {/if}
       </div>

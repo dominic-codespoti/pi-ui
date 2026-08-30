@@ -1,5 +1,6 @@
 import { test, expect } from './fixtures';
 import {
+  CONNECTED_PAYLOAD,
   PROJECTS_LIST_PAYLOAD,
   ALL_SESSIONS_LIST_PAYLOAD,
   SESSION_LOADED_PAYLOAD,
@@ -106,6 +107,134 @@ test.describe('Projects sidebar', () => {
     expect(
       await page.evaluate(() => (window as unknown as Record<string, unknown>).__piNoReload)
     ).toBe(true);
+  });
+
+  test('rejected switch restores the previous session URL param', async ({ page }) => {
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.onMessage((data) => {
+        const msg = JSON.parse(String(data));
+        if (msg.type === 'get_projects') ws.send(JSON.stringify(PROJECTS_LIST_PAYLOAD));
+        if (msg.type === 'get_all_sessions') ws.send(JSON.stringify(ALL_SESSIONS_LIST_PAYLOAD));
+        if (msg.type === 'switch_session') {
+          if (msg.path === '/rejected.jsonl') {
+            ws.send(
+              JSON.stringify({
+                type: 'sessions_error',
+                requestId: msg.requestId,
+                message: 'Session not found.',
+              })
+            );
+          } else {
+            ws.send(
+              JSON.stringify({
+                type: 'session_loaded',
+                sessionId: String(msg.path),
+                isStreaming: false,
+                thinkingLevel: 'medium',
+                model: null,
+                availableModels: [],
+                messages: [],
+                cwd: String(msg.path),
+                requestId: msg.requestId,
+              })
+            );
+          }
+        }
+      });
+      ws.send(
+        JSON.stringify({
+          type: 'connected',
+          sessionId: 's1',
+          isStreaming: false,
+          thinkingLevel: 'medium',
+          model: null,
+          availableModels: [],
+          messages: [],
+        })
+      );
+    });
+
+    await openProjectsSidebar(page);
+    await page.getByRole('button', { name: /Bug fix/ }).click();
+    const s1Url = /session=%2Fhome%2Fuser%2Fproject-a%2Fs1\.jsonl/;
+    await expect(page).toHaveURL(s1Url);
+
+    // Deep-link tap for a path the server will reject — routed via the same
+    // pi_focus_session handler notification clicks use.
+    await page.evaluate(() => {
+      navigator.serviceWorker.dispatchEvent(
+        new MessageEvent('message', {
+          data: { type: 'pi_focus_session', sessionPath: '/rejected.jsonl' },
+        })
+      );
+    });
+
+    await expect(page.getByText('Session not found.').first()).toBeVisible();
+    // The optimistic ?session=/rejected.jsonl must be reverted, not left dead.
+    await expect(page).toHaveURL(s1Url);
+  });
+
+  test('keeps the selected conversation after a late session snapshot', async ({ page }) => {
+    const s1Path = '/home/user/project-a/s1.jsonl';
+    const s2Path = '/home/user/project-a/s2.jsonl';
+    const message = (role: 'user' | 'assistant', text: string) => ({
+      role,
+      content: role === 'assistant' ? [{ type: 'text', text }] : text,
+      timestamp: Date.now(),
+    });
+
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.onMessage((data) => {
+        const msg = JSON.parse(String(data));
+        if (msg.type === 'get_projects') ws.send(JSON.stringify(PROJECTS_LIST_PAYLOAD));
+        if (msg.type === 'get_all_sessions') ws.send(JSON.stringify(ALL_SESSIONS_LIST_PAYLOAD));
+        if (msg.type === 'switch_session') {
+          ws.send(
+            JSON.stringify({
+              ...SESSION_LOADED_PAYLOAD,
+              sessionId: 's2',
+              sessionPath: s2Path,
+              messages: [
+                message('user', 'Session B prompt'),
+                message('assistant', 'Session B only'),
+              ],
+              requestId: msg.requestId,
+            })
+          );
+          setTimeout(() => {
+            ws.send(
+              JSON.stringify({
+                ...SESSION_LOADED_PAYLOAD,
+                sessionId: 's1',
+                sessionPath: s1Path,
+                messages: [
+                  message('user', 'Session A prompt'),
+                  message('assistant', 'Session A only'),
+                ],
+                requestId: 'stale-session-operation',
+              })
+            );
+          }, 25);
+        }
+      });
+      ws.send(
+        JSON.stringify({
+          ...CONNECTED_PAYLOAD,
+          sessionId: 's1',
+          sessionPath: s1Path,
+          messages: [message('user', 'Session A prompt'), message('assistant', 'Session A only')],
+        })
+      );
+    });
+
+    await expect(page.getByText('Session A only')).toBeVisible({ timeout: 3000 });
+    await openProjectsSidebar(page);
+    await page.getByRole('button', { name: 'Add tests' }).click();
+
+    await expect(page.getByText('Session B only')).toBeVisible({ timeout: 3000 });
+    await page.waitForTimeout(75);
+    await expect(page.getByText('Session A only')).toHaveCount(0);
+    await expect(page.getByText('Session B only')).toBeVisible();
   });
 
   test('search filters projects', async ({ page }) => {

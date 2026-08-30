@@ -13,30 +13,34 @@ test.describe('File viewer', () => {
       ws.onMessage((data) => {
         const msg = JSON.parse(String(data));
         if (msg.type === 'read_file') {
-          ws.send(JSON.stringify({
-            type: 'file_content',
-            path: msg.path,
-            content: 'line1\nline2\nline3',
-          }));
+          ws.send(
+            JSON.stringify({
+              type: 'file_content',
+              path: msg.path,
+              content: 'line1\nline2\nline3',
+            })
+          );
         }
       });
-      ws.send(JSON.stringify({
-        type: 'connected',
-        sessionId: 's1',
-        isStreaming: false,
-        thinkingLevel: 'medium',
-        model: null,
-        availableModels: [],
-        messages: [
-          {
-            role: 'assistant',
-            content: [{ type: 'text', text: 'Check `src/lib/foo.ts` for details.' }],
-            usage: { input: 10, output: 20, totalTokens: 30 },
-            stopReason: 'endTurn',
-            timestamp: Date.now(),
-          },
-        ],
-      }));
+      ws.send(
+        JSON.stringify({
+          type: 'connected',
+          sessionId: 's1',
+          isStreaming: false,
+          thinkingLevel: 'medium',
+          model: null,
+          availableModels: [],
+          messages: [
+            {
+              role: 'assistant',
+              content: [{ type: 'text', text: 'Check `src/lib/foo.ts` for details.' }],
+              usage: { input: 10, output: 20, totalTokens: 30 },
+              stopReason: 'endTurn',
+              timestamp: Date.now(),
+            },
+          ],
+        })
+      );
     });
 
     await page.goto('/');
@@ -47,6 +51,8 @@ test.describe('File viewer', () => {
     await fileLink.click();
 
     // Wait for the file viewer modal to appear — the path renders as the dialog heading
-    await expect(page.getByRole('heading', { name: 'src/lib/foo.ts' })).toBeVisible({ timeout: 3000 });
+    await expect(page.getByRole('heading', { name: 'src/lib/foo.ts' })).toBeVisible({
+      timeout: 3000,
+    });
   });
 });

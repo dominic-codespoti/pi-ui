@@ -39,10 +39,10 @@ function snapshotPayload() {
 
 test.describe('Cold-start resume', () => {
   test.beforeEach(async ({ page, mockWs, login }) => {
-    await page.addInitScript(
-      ([key, snap]) => localStorage.setItem(key, snap),
-      [SNAPSHOT_KEY, JSON.stringify(snapshotPayload())] as const
-    );
+    await page.addInitScript(([key, snap]) => localStorage.setItem(key, snap), [
+      SNAPSHOT_KEY,
+      JSON.stringify(snapshotPayload()),
+    ] as const);
     await mockWs(page);
     await login(page, 'test-password');
   });
@@ -78,7 +78,11 @@ test.describe('Cold-start resume', () => {
           availableModels: [],
           sessionPath: SESSION_PATH,
           messages: [
-            { role: 'user', content: 'question from before the phone slept', timestamp: Date.now() - 60_000 },
+            {
+              role: 'user',
+              content: 'question from before the phone slept',
+              timestamp: Date.now() - 60_000,
+            },
             {
               role: 'assistant',
               content: [{ type: 'text', text: 'fresh answer from the live server' }],

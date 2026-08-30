@@ -44,6 +44,11 @@ export interface SessionSummary {
   messageCount: number;
   /** User-facing turn count — only user + assistant messages. */
   turns?: number;
+  /**
+   * Session file this one was forked or spawned from (SDK header
+   * `parentSession`) — set on subagent/branched sessions, absent otherwise.
+   */
+  parentSession?: string;
   firstMessage: string;
 }
 
@@ -322,6 +327,10 @@ export interface ConnectedMessage {
   diagnostics?: RuntimeDiagnostic[];
   /** SDK model fallback warning, if the saved model was unavailable. */
   modelFallbackMessage?: string;
+  /** All tools available in this session (proactive warm — avoids extra get_tools round-trip). */
+  tools?: Array<{ name: string; description: string; isBuiltin: boolean; origin?: string }>;
+  /** Names of active/enabled tools. */
+  activeToolNames?: string[];
 }
 
 /**
@@ -330,7 +339,7 @@ export interface ConnectedMessage {
  *   (b) custom server-emitted events:
  *
  * Custom server events (not from the SDK):
- *   { type: "model_changed",           model: ModelInfo | null }
+ *   { type: "model_changed",           model: ModelInfo | null; thinkingLevel?: string }
  *   { type: "session_loaded",          sessionId, isStreaming, thinkingLevel, model, availableModels, messages, contextUsage }
  *   { type: "sessions_list",           sessions: SessionSummary[] }
  *   { type: "all_sessions_list",       sessions: SessionSummary[] }
@@ -397,6 +406,14 @@ export interface ConnectedMessage {
  *   closes the dialog in every connected tab, not just the one that answered:
  *   { type: "extension_ui_dismiss",    id: string }
  *
+ *   message_end may carry extension-derived content:
+ *     – role:"custom" messages synthesized from pi.appendEntry CustomEntries
+ *       (fromEntry:true, renderedNoticeHtml from the entry renderer) — history
+ *       reloads interleave them by timestamp via customEntriesForWire().
+ *     – assistant/user finals with contentTransformed:true when registered
+ *       markdown transformers (registerMarkdownTransformer) rewrote text —
+ *       the client replaces its streamed buffer with this sealed content.
+ *
  *   Session runtime status (lightweight — no message content, just metadata):
  *   { type: "session_runtime",         sessionId: string, isRunning: boolean, unseen: boolean, lastActivity: number }
  *
@@ -432,7 +449,7 @@ export type PiEvent = { type: string } & Record<string, unknown>;
 /** Custom server-authored events (not from the SDK). Typed so payload drift —
  *  a missing or renamed field — fails at compile time on the broadcast site. */
 export type ServerCustomEvent =
-  | { type: 'model_changed'; model: ModelInfo | null }
+  | { type: 'model_changed'; model: ModelInfo | null; thinkingLevel?: string }
   | {
       type: 'session_loaded';
       sessionId: string;
@@ -453,11 +470,12 @@ export type ServerCustomEvent =
       queuedFollowUp?: string[];
       piVersion?: string;
       uiVersion?: string;
-      sessionMode?: 'in-memory' | 'persisted';
-      sessionPath?: string;
       projectTrust?: ProjectTrustInfo;
       diagnostics?: RuntimeDiagnostic[];
       modelFallbackMessage?: string;
+      contextUsage?: ContextUsage;
+      tools?: Array<{ name: string; description: string; isBuiltin: boolean; origin?: string }>;
+      activeToolNames?: string[];
     }
   | { type: 'sessions_list'; sessions: SessionSummary[] }
   | { type: 'all_sessions_list'; sessions: SessionSummary[] }
@@ -465,10 +483,8 @@ export type ServerCustomEvent =
   | { type: 'projects_list'; projects: ProjectInfo[] }
   | { type: 'dir_completions'; prefix: string; entries: string[] }
   | { type: 'file_completions'; query: string; entries: string[] }
-  | { type: 'providers_list'; providers: ProviderInfo[] }
-  | { type: 'providers_error'; message: string }
-  | { type: 'available_models_changed'; availableModels: ModelInfo[] }
-  | { type: 'sessions_error'; message: string }
+  | { type: 'available_models_changed'; availableModels: ModelInfo[]; sessionId?: string }
+  | { type: 'sessions_error'; message: string; requestId?: string }
   | { type: 'fork_points'; entries: Array<{ entryId: string; text: string }> }
   | {
       type: 'tools_list';
@@ -570,8 +586,8 @@ export type ClientMessage =
   | { type: 'abort_retry' }
   | { type: 'set_thinking_level'; level: string }
   | { type: 'set_model'; provider: string; modelId: string }
-  | { type: 'new_session'; targetCwd?: string }
-  | { type: 'switch_session'; path: string }
+  | { type: 'new_session'; targetCwd?: string; requestId?: string }
+  | { type: 'switch_session'; path: string; requestId?: string }
   /** Request all sessions across all project directories. Server replies with all_sessions_list. */
   | { type: 'get_all_sessions' }
   /** Request the merged project list (registry + session dirs). Server replies with projects_list. */
@@ -580,6 +596,8 @@ export type ClientMessage =
   | { type: 'add_project'; path: string }
   /** Forget a project from the registry. Sessions and files are untouched. */
   | { type: 'remove_project'; cwd: string }
+  /** Permanently delete a project and all its sessions (cannot delete the active project). */
+  | { type: 'delete_project'; cwd: string }
   /** Pin or unpin a project. Pinning an unregistered project registers it. */
   | { type: 'pin_project'; cwd: string; pinned: boolean }
   /** Set a custom display name for a project. Empty name resets to the basename. */

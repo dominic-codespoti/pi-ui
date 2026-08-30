@@ -118,13 +118,7 @@ describe('parseDiff', () => {
   });
 
   it('handles hunk headers without line counts', () => {
-    const diff = [
-      '--- a/x.ts',
-      '+++ b/x.ts',
-      '@@ -1 +1 @@',
-      '-old',
-      '+new',
-    ].join('\n');
+    const diff = ['--- a/x.ts', '+++ b/x.ts', '@@ -1 +1 @@', '-old', '+new'].join('\n');
     const files = parseDiff(diff);
     expect(files[0].hunks[0].oldLineCount).toBe(1);
     expect(files[0].hunks[0].newLineCount).toBe(1);

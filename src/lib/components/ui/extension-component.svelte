@@ -28,6 +28,7 @@
   }: Props = $props();
   let checkboxStates = $state<Record<string, boolean>>({});
   let settingsLocal = $state<Record<string, string>>({});
+  let failedImages = $state<Record<string, boolean>>({});
 
   function submitInput(comp: { path?: number[] }) {
     if (onaction) onaction(comp.path ?? [], 'submit', inputValue);
@@ -49,32 +50,40 @@
 {#snippet renderParsed(comp: ParsedComponent)}
   {#if comp.kind === 'select'}
     {#if comp.label}
-      <p class="text-sm text-base-content/65 mb-2">{comp.label}</p>
+      <p class="mb-2 break-words text-sm text-base-content/65">{comp.label}</p>
     {/if}
-    <div class="space-y-1 {interactive ? 'max-h-60 overflow-y-auto pr-1' : 'flex flex-wrap gap-1'}">
+    <div
+      class="min-w-0 space-y-1 {interactive
+        ? 'max-h-[min(24rem,45dvh)] overflow-y-auto pr-1'
+        : 'flex flex-wrap gap-1'}"
+    >
       {#each comp.options as opt (opt.value)}
         {#if interactive && (onaction || onselect)}
           <button
-            class="w-full rounded-lg border border-base-content/8 bg-base-content/[0.025] px-3 py-2.5 text-left text-sm text-base-content/75 transition-colors hover:bg-primary/10 hover:text-base-content focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/35"
+            type="button"
+            class="w-full min-w-0 rounded-lg border border-base-content/8 bg-base-content/[0.025] px-3 py-2.5 text-left text-sm text-base-content/75 transition-colors hover:bg-primary/10 hover:text-base-content focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/35"
             onclick={() =>
               onaction ? onaction(comp.path ?? [], 'select', opt.value) : onselect?.(opt.value)}
           >
-            <span class="font-medium">{opt.label}</span>
+            <span class="block whitespace-normal break-words font-medium">{opt.label}</span>
             {#if opt.description}
-              <span class="block text-xs text-base-content/45 mt-0.5">{opt.description}</span>
+              <span class="mt-0.5 block whitespace-normal break-words text-xs text-base-content/45"
+                >{opt.description}</span
+              >
             {/if}
           </button>
         {:else}
-          <span class="px-2 py-0.5 bg-base-content/10 rounded text-xs text-base-content/70"
+          <span
+            class="max-w-full break-words rounded bg-base-content/10 px-2 py-0.5 text-xs text-base-content/70"
             >{opt.label}</span
           >
         {/if}
       {/each}
     </div>
   {:else if comp.kind === 'input'}
-    <div class="flex flex-col gap-1.5">
+    <div class="min-w-0 flex flex-col gap-1.5">
       {#if comp.label}
-        <span class="text-sm text-base-content/65">{comp.label}</span>
+        <span class="break-words text-sm text-base-content/65">{comp.label}</span>
       {/if}
       {#if comp.multiline}
         <textarea
@@ -88,7 +97,7 @@
               submitInput(comp);
             }
           }}
-          class="w-full rounded-lg border border-base-content/12 bg-base-content/[0.025] p-3 text-sm leading-relaxed outline-none transition-colors placeholder:text-base-content/35 focus:border-primary/50 focus:bg-base-100/60"
+          class="max-h-[min(18rem,40dvh)] w-full resize-y rounded-lg border border-base-content/12 bg-base-content/[0.025] p-3 text-sm leading-relaxed outline-none transition-colors placeholder:text-base-content/35 focus:border-primary/50 focus:bg-base-100/60"
         ></textarea>
       {:else}
         <input
@@ -99,54 +108,64 @@
           onkeydown={(e) => {
             if (e.key === 'Enter') submitInput(comp);
           }}
-          class="w-full rounded-lg border border-base-content/12 bg-base-content/[0.025] px-3 py-2 text-sm outline-none transition-colors placeholder:text-base-content/35 focus:border-primary/50 focus:bg-base-100/60"
+          class="w-full min-w-0 rounded-lg border border-base-content/12 bg-base-content/[0.025] px-3 py-2 text-sm outline-none transition-colors placeholder:text-base-content/35 focus:border-primary/50 focus:bg-base-100/60"
         />
       {/if}
     </div>
   {:else if comp.kind === 'text'}
     {#if comp.monoPreserve}
       <pre
-        class="max-h-56 overflow-y-auto rounded-lg border border-base-content/8 bg-base-content/[0.035] p-3 text-xs font-mono text-base-content/65 whitespace-pre leading-relaxed">{comp.content}</pre>
+        class="max-h-[min(18rem,45dvh)] max-w-full overflow-auto rounded-lg border border-base-content/8 bg-base-content/[0.035] p-3 text-xs font-mono leading-relaxed text-base-content/65 whitespace-pre">{comp.content}</pre>
     {:else if comp.content}
-      <p class="text-sm text-base-content/75 whitespace-pre-wrap leading-relaxed">{comp.content}</p>
+      <p
+        class="min-w-0 whitespace-pre-wrap break-words text-sm leading-relaxed text-base-content/75"
+      >
+        {comp.content}
+      </p>
     {/if}
   {:else if comp.kind === 'markdown'}
-    <div class="prose prose-sm max-w-none text-base-content/80">
-      {@html renderMarkdown(comp.content)}
-    </div>
+    {#if comp.content}
+      <div class="prose prose-sm min-w-0 max-w-none overflow-x-auto text-base-content/80">
+        {@html renderMarkdown(comp.content)}
+      </div>
+    {/if}
   {:else if comp.kind === 'settings'}
-    <div class="space-y-1">
+    <div class="min-w-0 space-y-1">
       {#each comp.items as item (item.id)}
         {@const cyclable = interactive && !!item.values?.length}
         {#if cyclable}
           <button
             type="button"
-            class="flex w-full items-center justify-between gap-3 rounded-lg border border-base-content/8 bg-base-content/[0.025] px-3 py-2 text-left text-sm transition-colors hover:bg-primary/10"
+            class="flex w-full min-w-0 items-start justify-between gap-3 rounded-lg border border-base-content/8 bg-base-content/[0.025] px-3 py-2 text-left text-sm transition-colors hover:bg-primary/10"
             onclick={() => cycleSetting(item, comp.path ?? [])}
           >
             <div class="min-w-0">
-              <span class="text-base-content/75">{item.label}</span>
+              <span class="break-words text-base-content/75">{item.label}</span>
               {#if item.description}
-                <span class="block text-xs text-base-content/45 mt-0.5">{item.description}</span>
+                <span class="mt-0.5 block break-words text-xs text-base-content/45"
+                  >{item.description}</span
+                >
               {/if}
             </div>
             <span
-              class="shrink-0 rounded-full bg-base-content/10 px-2 py-0.5 text-xs text-base-content/60"
+              class="shrink-0 rounded-full bg-base-content/10 px-2 py-0.5 text-xs tabular-nums text-base-content/60"
               >{settingsLocal[item.id] ?? item.currentValue}</span
             >
           </button>
         {:else}
           <div
-            class="flex items-center justify-between gap-3 rounded-lg border border-base-content/8 bg-base-content/[0.025] px-3 py-2 text-sm"
+            class="flex w-full min-w-0 items-start justify-between gap-3 rounded-lg border border-base-content/8 bg-base-content/[0.025] px-3 py-2 text-sm"
           >
             <div class="min-w-0">
-              <span class="text-base-content/75">{item.label}</span>
+              <span class="break-words text-base-content/75">{item.label}</span>
               {#if item.description}
-                <span class="block text-xs text-base-content/45 mt-0.5">{item.description}</span>
+                <span class="mt-0.5 block break-words text-xs text-base-content/45"
+                  >{item.description}</span
+                >
               {/if}
             </div>
             <span
-              class="shrink-0 rounded-full bg-base-content/10 px-2 py-0.5 text-xs text-base-content/60"
+              class="shrink-0 rounded-full bg-base-content/10 px-2 py-0.5 text-xs tabular-nums text-base-content/60"
               >{item.currentValue}</span
             >
           </div>
@@ -162,14 +181,14 @@
             ? 'destructive'
             : 'outline'}
         size="sm"
-        class="w-full justify-start"
+        class="h-auto min-h-9 w-full max-w-full justify-start whitespace-normal break-words text-left"
         onclick={() =>
           onaction ? onaction(comp.path ?? [], 'click', comp.label) : onselect?.(comp.label)}
         >{comp.label}</Button
       >
     {:else}
       <span
-        class="font-semibold text-sm"
+        class="break-words text-sm font-semibold"
         class:text-primary={comp.variant === 'primary'}
         class:text-destructive={comp.variant === 'danger'}>{comp.label}</span
       >
@@ -178,21 +197,23 @@
     {#if interactive}
       {@const localChecked = checkboxStates[comp.label] ?? comp.checked}
       <button
-        class="flex w-full items-center gap-2 rounded-lg border border-base-content/8 bg-base-content/[0.025] px-3 py-2 text-left text-sm text-base-content/65 transition-colors hover:bg-primary/10 hover:text-base-content focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/35"
-        aria-pressed={localChecked}
+        type="button"
+        class="flex w-full min-w-0 items-start gap-2 rounded-lg border border-base-content/8 bg-base-content/[0.025] px-3 py-2 text-left text-sm text-base-content/65 transition-colors hover:bg-primary/10 hover:text-base-content focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/35"
+        role="checkbox"
+        aria-checked={localChecked}
         onclick={() => {
           checkboxStates[comp.label] = !localChecked;
           onaction?.(comp.path ?? [], 'toggle', String(!localChecked));
         }}
       >
         <span
-          class="w-4 h-4 rounded border flex items-center justify-center text-xs transition-colors {localChecked
-            ? 'bg-primary border-primary'
+          class="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded border text-xs transition-colors {localChecked
+            ? 'border-primary bg-primary'
             : 'border-base-content/20'}"
         >
           {#if localChecked}
             <svg
-              class="w-3 h-3 text-white"
+              class="h-3 w-3 text-white"
               viewBox="0 0 12 12"
               fill="none"
               stroke="currentColor"
@@ -201,23 +222,25 @@
               stroke-linejoin="round"><path d="M2 6l3 3 5-5" /></svg
             >
           {:else}
-            <Square class="w-3.5 h-3.5 text-base-content/35" />
+            <Square class="h-3.5 w-3.5 text-base-content/35" />
           {/if}
         </span>
-        <span>{comp.label}</span>
+        <span class="min-w-0 break-words">{comp.label}</span>
       </button>
     {:else}
       <div
-        class="flex items-center gap-2 rounded-lg border border-base-content/8 bg-base-content/[0.025] px-3 py-2 text-sm text-base-content/65"
+        class="flex w-full min-w-0 items-start gap-2 rounded-lg border border-base-content/8 bg-base-content/[0.025] px-3 py-2 text-sm text-base-content/65"
+        role="checkbox"
+        aria-checked={comp.checked}
       >
         <span
-          class="w-4 h-4 rounded border flex items-center justify-center text-xs transition-colors {comp.checked
-            ? 'bg-primary border-primary'
+          class="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded border text-xs transition-colors {comp.checked
+            ? 'border-primary bg-primary'
             : 'border-base-content/20'}"
         >
           {#if comp.checked}
             <svg
-              class="w-3 h-3 text-white"
+              class="h-3 w-3 text-white"
               viewBox="0 0 12 12"
               fill="none"
               stroke="currentColor"
@@ -226,58 +249,77 @@
               stroke-linejoin="round"><path d="M2 6l3 3 5-5" /></svg
             >
           {:else}
-            <Square class="w-3.5 h-3.5 text-base-content/35" />
+            <Square class="h-3.5 w-3.5 text-base-content/35" />
           {/if}
         </span>
-        <span>{comp.label}</span>
+        <span class="min-w-0 break-words">{comp.label}</span>
       </div>
     {/if}
   {:else if comp.kind === 'progress'}
-    <div class="flex flex-col gap-1.5">
+    <div class="min-w-0 flex flex-col gap-1.5" role="status" aria-live="polite">
       {#if comp.label}
-        <span class="text-xs text-base-content/55">{comp.label}</span>
+        <span class="break-words text-xs text-base-content/55">{comp.label}</span>
       {/if}
       <progress
         value={comp.progress}
         max="1"
         aria-label={comp.label || 'Progress'}
-        class="w-full h-2 rounded-full [&::-webkit-progress-bar]:bg-base-content/10 [&::-webkit-progress-value]:bg-primary/60 [&::-moz-progress-bar]:bg-primary/60"
+        class="h-2 w-full max-w-full rounded-full [&::-webkit-progress-bar]:bg-base-content/10 [&::-webkit-progress-value]:bg-primary/60 [&::-moz-progress-bar]:bg-primary/60"
       ></progress>
     </div>
   {:else if comp.kind === 'loader'}
     <div
-      class="flex items-center gap-2 rounded-lg border border-base-content/8 bg-base-content/[0.025] px-3 py-2 text-sm text-base-content/65"
+      class="flex min-w-0 items-start gap-2 rounded-lg border border-base-content/8 bg-base-content/[0.025] px-3 py-2 text-sm text-base-content/65"
+      role="status"
+      aria-live="polite"
     >
-      <LoaderIcon class="w-4 h-4 animate-spin text-primary/70" />
+      <LoaderIcon
+        class="mt-0.5 h-4 w-4 shrink-0 animate-spin text-primary/70 motion-reduce:animate-none"
+      />
       {#if comp.label}
-        <span>{comp.label}</span>
+        <span class="min-w-0 break-words">{comp.label}</span>
       {/if}
       {#if comp.cancellable}
-        <span class="ml-auto text-[10px] uppercase tracking-wide text-base-content/35"
+        <span class="ml-auto shrink-0 text-[10px] uppercase tracking-wide text-base-content/35"
           >Esc to cancel</span
         >
       {/if}
     </div>
   {:else if comp.kind === 'image'}
-    <div class="flex flex-col gap-1">
+    {@const imageKey = comp.path?.join('.') ?? `${comp.label}:${comp.mimeType}`}
+    <div class="min-w-0 flex flex-col gap-1">
       {#if comp.label}
-        <span class="text-xs text-muted-foreground mb-1">{comp.label}</span>
+        <span class="mb-1 break-words text-xs text-muted-foreground">{comp.label}</span>
       {/if}
-      <img
-        src="data:{comp.mimeType};base64,{comp.data}"
-        alt={comp.label}
-        class="max-h-64 max-w-full rounded-lg object-contain border border-base-content/10"
-      />
+      {#if failedImages[imageKey]}
+        <div
+          role="img"
+          aria-label={comp.label || 'Extension image unavailable'}
+          class="flex min-h-24 items-center justify-center rounded-lg border border-dashed border-base-content/12 bg-base-content/[0.025] px-4 py-6 text-center text-xs text-base-content/45"
+        >
+          Image unavailable
+        </div>
+      {:else}
+        <img
+          src="data:{comp.mimeType};base64,{comp.data}"
+          alt={comp.label}
+          onerror={() => (failedImages[imageKey] = true)}
+          class="max-h-[min(24rem,50dvh)] max-w-full rounded-lg border border-base-content/10 object-contain"
+        />
+      {/if}
     </div>
   {:else if comp.kind === 'container'}
-    <div
-      class="flex {comp.direction === 'horizontal' ? 'flex-row flex-wrap gap-3' : 'flex-col gap-2'}"
-    >
+    {@const horizontal = comp.direction === 'horizontal'}
+    <div class="min-w-0 flex {horizontal ? 'flex-row flex-wrap gap-2 sm:gap-3' : 'flex-col gap-2'}">
       {#each comp.children as child, i (i)}
-        {@render renderParsed(child)}
+        <div class={horizontal ? 'min-w-0 flex-1 basis-56' : 'min-w-0'}>
+          {@render renderParsed(child)}
+        </div>
       {/each}
     </div>
   {/if}
 {/snippet}
 
-{@render renderParsed(component)}
+<div class="min-w-0 max-w-full overflow-hidden">
+  {@render renderParsed(component)}
+</div>

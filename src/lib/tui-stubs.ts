@@ -7,7 +7,7 @@
  * content — serializable shapes the web client can render natively.
  */
 
-import type { AgentSession } from '@earendil-works/pi-coding-agent';
+import type { AgentSession, MarkdownTransformer } from '@earendil-works/pi-coding-agent';
 import type { Terminal } from '@earendil-works/pi-tui';
 // ── Stubs ────────────────────────────────────────────────────────────────────
 
@@ -628,6 +628,21 @@ function isInput(comp: Record<string, unknown>): boolean {
 }
 
 /**
+ * Duck-type check: does this object look like a pi-tui Editor?
+ * Editor has: getText/setText/handleInput (functions) — different accessors
+ * from Input's getValue/setValue, so it must be checked alongside isInput.
+ * `onSubmit`/`onChange` are optional fields assigned post-construction.
+ */
+function isEditor(comp: Record<string, unknown>): boolean {
+  return (
+    typeof comp.getText === 'function' &&
+    typeof comp.setText === 'function' &&
+    typeof comp.handleInput === 'function' &&
+    !isInput(comp)
+  );
+}
+
+/**
  * Duck-type check: does this object look like a Container/Box?
  * Container has: children (array), addChild (function)
  */
@@ -754,6 +769,18 @@ export function parseComponentTree(
     return register({ kind: 'select', label, options: items });
   }
 
+  // ── Leaf: Editor — checked before Input (getText/setText, not getValue/setValue)
+  if (isEditor(comp)) {
+    const value = typeof comp.getText === 'function' ? (comp.getText() as string) : '';
+    const editorLabel = extractLabel(comp);
+    return register({
+      kind: 'input',
+      label: editorLabel,
+      placeholder: 'Type your response…',
+      value,
+    });
+  }
+
   // ── Leaf: Input ───────────────────────────────────────────────────────
   if (isInput(comp)) {
     const value = typeof comp.getValue === 'function' ? (comp.getValue() as string) : '';
@@ -811,7 +838,10 @@ export function parseComponentTree(
   if (isContainer(comp)) {
     const children = comp.children as Record<string, unknown>[];
     const direction: 'vertical' | 'horizontal' =
-      typeof comp.direction === 'string' && comp.direction === 'row' ? 'horizontal' : 'vertical';
+      (typeof comp.direction === 'string' && comp.direction === 'row') ||
+      comp.layoutType === 'hstack'
+        ? 'horizontal'
+        : 'vertical';
 
     const parsedChildren: ParsedComponent[] = [];
     children.forEach((child, i) => {
@@ -1002,8 +1032,11 @@ export function renderToolResultHtml(
  */
 export function renderCustomMessage(sess: AgentSession, msg: unknown): unknown {
   if (!msg || typeof msg !== 'object') return msg;
-  const m = msg as { role?: string; customType?: string; display?: boolean };
+  const m = msg as { role?: string; customType?: string; display?: boolean; fromEntry?: boolean };
   if (m.role !== 'custom' || !m.customType) return msg;
+  // Synthetic notice projected from a CustomEntry — its output is already the
+  // ENTRY renderer's HTML; a same-type message renderer must not override it.
+  if (m.fromEntry === true) return msg;
   // display: false means the message is LLM-context only — never visible in the UI.
   if (m.display === false) return msg;
   try {
@@ -1029,6 +1062,186 @@ export function renderCustomMessagesForWire(sess: AgentSession, messages: unknow
   return changed ? out : messages;
 }
 
+// ── Custom entries (registerEntryRenderer) + markdown transformers ───────────
+
+/**
+ * Apply all registered markdown transformers (registration order) to one
+ * user/assistant message — copy-on-write, same convention as
+ * `trimMessagesForWire`. Mirrors what pi's interactive transcript does before
+ * rendering markdown; the LLM context is never touched.
+ */
+export function applyMarkdownTransformers<T>(sess: AgentSession, msg: T): T {
+  if (!msg || typeof msg !== 'object') return msg;
+  if (!('role' in msg) || (msg.role !== 'user' && msg.role !== 'assistant')) return msg;
+  const role = msg.role;
+  let transformers: MarkdownTransformer[];
+  try {
+    transformers = sess.extensionRunner.getMarkdownTransformers();
+  } catch {
+    return msg;
+  }
+  if (transformers.length === 0) return msg;
+
+  const run = (text: string, messageType: 'user' | 'assistant' | 'assistant-thinking') => {
+    let out = text;
+    for (const transformer of transformers) {
+      try {
+        out = transformer(out, { messageType, isStreaming: false, availableWidth: 80 });
+      } catch {
+        /* a broken transformer must not take down the wire path */
+      }
+    }
+    return out;
+  };
+
+  const content = 'content' in msg ? msg.content : undefined;
+  let changedContent = false;
+  let nextContent: unknown = content;
+  if (typeof content === 'string') {
+    const next = run(content, role);
+    if (next !== content) {
+      changedContent = true;
+      nextContent = next;
+    }
+  } else if (Array.isArray(content)) {
+    const mapped = content.map((block) => {
+      if (
+        block &&
+        typeof block === 'object' &&
+        'type' in block &&
+        block.type === 'text' &&
+        'text' in block &&
+        typeof block.text === 'string'
+      ) {
+        const next = run(block.text, role);
+        if (next !== block.text) {
+          changedContent = true;
+          return { ...block, text: next };
+        }
+      }
+      return block;
+    });
+    if (changedContent) nextContent = mapped;
+  }
+
+  const thinking = role === 'assistant' && 'thinking' in msg ? msg.thinking : undefined;
+  let changedThinking = false;
+  let nextThinking: unknown = thinking;
+  if (typeof thinking === 'string' && thinking.length > 0) {
+    const next = run(thinking, 'assistant-thinking');
+    if (next !== thinking) {
+      changedThinking = true;
+      nextThinking = next;
+    }
+  }
+
+  if (!changedContent && !changedThinking) return msg;
+  // Copy-on-write: spread preserves the caller's exact runtime shape.
+  return {
+    ...msg,
+    ...(changedContent ? { content: nextContent } : {}),
+    ...(changedThinking ? { thinking: nextThinking } : {}),
+  } as T;
+}
+
+/** Array wrapper for {@link applyMarkdownTransformers} — copy-on-write. */
+export function applyMarkdownTransformersToMessages(
+  sess: AgentSession,
+  messages: unknown[]
+): unknown[] {
+  let changed = false;
+  const out = messages.map((msg) => {
+    const next = applyMarkdownTransformers(sess, msg);
+    if (next !== msg) changed = true;
+    return next;
+  });
+  return changed ? out : messages;
+}
+
+/**
+ * Render one CustomEntry through its registered `registerEntryRenderer` and
+ * project it onto the wire as a synthetic custom notice — the same shape
+ * `role:'custom'` messages already use, so the browser renders it with zero
+ * client-side special-casing. Returns null when nothing would be visible (no
+ * renderer registered, or the renderer produced no output) — matching pi's
+ * interactive transcript, which hides renderer-less entries.
+ */
+export function renderCustomEntry(sess: AgentSession, entry: unknown): unknown | null {
+  if (!entry || typeof entry !== 'object') return null;
+  if (!('type' in entry) || entry.type !== 'custom') return null;
+  if (!('customType' in entry) || typeof entry.customType !== 'string') return null;
+  try {
+    const renderer = sess.extensionRunner.getEntryRenderer(entry.customType);
+    if (!renderer) return null;
+    // Named-surface cast: the renderer expects the SDK's own CustomEntry type,
+    // and we only ever feed it the session manager's untouched entry objects.
+    const render = renderer as (
+      e: unknown,
+      options: { expanded: boolean },
+      theme: unknown
+    ) => unknown;
+    const lines = componentToHtmlLines(render(entry, { expanded: true }, stubTheme));
+    if (!lines || lines.length === 0) return null;
+    const data = 'data' in entry ? entry.data : undefined;
+    const rawTimestamp = 'timestamp' in entry ? entry.timestamp : undefined;
+    const timestamp =
+      typeof rawTimestamp === 'string' || typeof rawTimestamp === 'number'
+        ? rawTimestamp
+        : undefined;
+    return {
+      role: 'custom',
+      customType: entry.customType,
+      content: '',
+      display: true,
+      fromEntry: true,
+      ...(data !== undefined ? { details: data } : {}),
+      renderedNoticeHtml: lines,
+      ...(timestamp !== undefined ? { timestamp } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Normalized ms timestamp of a wire message or session entry for interleaving
+ * both on one ordering axis; accepts epoch ms or ISO strings, missing → 0.
+ */
+function timestampOf(item: unknown): number {
+  if (!item || typeof item !== 'object' || !('timestamp' in item)) return 0;
+  const value = item.timestamp;
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string') {
+    const parsed = Date.parse(value);
+    if (!Number.isNaN(parsed)) return parsed;
+  }
+  return 0;
+}
+
+/**
+ * Merge display-only CustomEntries (rendered via their entry renderers) into
+ * a history payload in timestamp order. Copy-on-write: returns the input
+ * array unchanged when the session has no visible entries.
+ */
+export function customEntriesForWire(sess: AgentSession, messages: unknown[]): unknown[] {
+  let entries: unknown[];
+  try {
+    entries = sess.sessionManager.getEntries();
+  } catch {
+    return messages;
+  }
+  if (!Array.isArray(entries)) return messages;
+  const synthetics: unknown[] = [];
+  for (const entry of entries) {
+    const rendered = renderCustomEntry(sess, entry);
+    if (rendered) synthetics.push(rendered);
+  }
+  if (synthetics.length === 0) return messages;
+  // Array.prototype.sort is stable (ES2019+) — equal timestamps keep the
+  // original messages-first relative order.
+  return [...messages, ...synthetics].sort((a, b) => timestampOf(a) - timestampOf(b));
+}
+
 // ── Factory executor ──────────────────────────────────────────────────────────
 
 /**
@@ -1037,23 +1250,22 @@ export function renderCustomMessagesForWire(sess: AgentSession, messages: unknow
  * @param factory - The factory function from the extension's custom() call
  * @param title - Title hint from the extension
  * @param options - The options object from custom() (overlay, overlayOptions, etc.)
+ * @param thirdArg - Surface-specific third argument. Footer factories receive a
+ *   ReadonlyFooterDataProvider here instead of keybindings (SDK ExtensionUIContext
+ *   setFooter signature); custom()/editor factories keep the keybindings default.
  * @returns Parsed component tree for web rendering, or null on failure
  */
 export async function callFactoryAndParse(
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- extension factories are untyped host callbacks
   factory: (...args: any[]) => any | Promise<any>,
   title: string,
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  options?: Record<string, any>
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- see above
+  options?: Record<string, any>,
+  thirdArg?: unknown
 ): Promise<ParsedComponent | null> {
   try {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let component: any;
-    if (options) {
-      component = await factory(stubTui, stubTheme, stubKeybindings, () => {});
-    } else {
-      component = await factory(stubTui, stubTheme, stubKeybindings, () => {});
-    }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- see above
+    const component: any = await factory(stubTui, stubTheme, thirdArg ?? stubKeybindings, () => {});
 
     if (!component || typeof component !== 'object') return null;
 

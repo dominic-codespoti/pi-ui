@@ -34,7 +34,7 @@ function sendInit(ws: WsHandle) {
 function generateSessionToken(): string {
   const token = execSync(
     'PI_PASSWORD=test-password PI_UI_JWT_SECRET=test-e2e-jwt-secret-0123456789abcdef bun -e "import { createSessionToken } from \'./src/lib/auth/password.ts\'; console.log(await createSessionToken())"',
-    { cwd: process.cwd(), encoding: 'utf-8', timeout: 10_000 },
+    { cwd: process.cwd(), encoding: 'utf-8', timeout: 10_000 }
   ).trim();
   return token;
 }
@@ -42,14 +42,16 @@ function generateSessionToken(): string {
 /** Inject a valid session cookie into the browser context and navigate to /. */
 async function loginViaCookie(page: import('@playwright/test').Page) {
   const token = generateSessionToken();
-  await page.context().addCookies([{
-    name: 'pi-session',
-    value: token,
-    domain: '127.0.0.1',
-    path: '/',
-    httpOnly: true,
-    sameSite: 'Strict',
-  }]);
+  await page.context().addCookies([
+    {
+      name: 'pi-session',
+      value: token,
+      domain: '127.0.0.1',
+      path: '/',
+      httpOnly: true,
+      sameSite: 'Strict',
+    },
+  ]);
   await page.goto('/');
 }
 
@@ -74,11 +76,16 @@ test.describe('Extension component visual review', () => {
       ws.onMessage(() => {});
       sendInit(ws);
       setTimeout(() => {
-        ws.send(JSON.stringify({
-          type: 'extension_ui_request', id: 'pw-progress', method: 'setWidget',
-          widgetKey: 'pw-progress', widgetType: 'component',
-          widgetComponent: { kind: 'progress', label: 'Building extension…', progress: 0.65 },
-        }));
+        ws.send(
+          JSON.stringify({
+            type: 'extension_ui_request',
+            id: 'pw-progress',
+            method: 'setWidget',
+            widgetKey: 'pw-progress',
+            widgetType: 'component',
+            widgetComponent: { kind: 'progress', label: 'Building extension…', progress: 0.65 },
+          })
+        );
       }, 500);
     });
     await page.goto('/');
@@ -90,11 +97,16 @@ test.describe('Extension component visual review', () => {
       ws.onMessage(() => {});
       sendInit(ws);
       setTimeout(() => {
-        ws.send(JSON.stringify({
-          type: 'extension_ui_request', id: 'pw-loader', method: 'setWidget',
-          widgetKey: 'pw-loader', widgetType: 'component',
-          widgetComponent: { kind: 'loader', label: 'Fetching packages…' },
-        }));
+        ws.send(
+          JSON.stringify({
+            type: 'extension_ui_request',
+            id: 'pw-loader',
+            method: 'setWidget',
+            widgetKey: 'pw-loader',
+            widgetType: 'component',
+            widgetComponent: { kind: 'loader', label: 'Fetching packages…' },
+          })
+        );
       }, 500);
     });
     await page.goto('/');
@@ -106,18 +118,24 @@ test.describe('Extension component visual review', () => {
       ws.onMessage(() => {});
       sendInit(ws);
       setTimeout(() => {
-        ws.send(JSON.stringify({
-          type: 'extension_ui_request', id: 'pw-container', method: 'setWidget',
-          widgetKey: 'pw-container', widgetType: 'component',
-          widgetComponent: {
-            kind: 'container', direction: 'vertical',
-            children: [
-              { kind: 'text', label: '', content: 'OMP v3.2 — 12 extensions loaded' },
-              { kind: 'button', label: 'Reload', variant: 'primary' },
-              { kind: 'checkbox', label: 'Auto-update enabled', checked: true },
-            ],
-          },
-        }));
+        ws.send(
+          JSON.stringify({
+            type: 'extension_ui_request',
+            id: 'pw-container',
+            method: 'setWidget',
+            widgetKey: 'pw-container',
+            widgetType: 'component',
+            widgetComponent: {
+              kind: 'container',
+              direction: 'vertical',
+              children: [
+                { kind: 'text', label: '', content: 'OMP v3.2 — 12 extensions loaded' },
+                { kind: 'button', label: 'Reload', variant: 'primary' },
+                { kind: 'checkbox', label: 'Auto-update enabled', checked: true },
+              ],
+            },
+          })
+        );
       }, 500);
     });
     await page.goto('/');
@@ -129,21 +147,36 @@ test.describe('Extension component visual review', () => {
       ws.onMessage(() => {});
       sendInit(ws);
       setTimeout(() => {
-        ws.send(JSON.stringify({
-          type: 'extension_ui_request', id: 'pw-m1', method: 'setWidget',
-          widgetKey: 'pw-multi-progress', widgetType: 'component',
-          widgetComponent: { kind: 'progress', label: 'Deploying…', progress: 0.9 },
-        }));
-        ws.send(JSON.stringify({
-          type: 'extension_ui_request', id: 'pw-m2', method: 'setWidget',
-          widgetKey: 'pw-multi-status', widgetType: 'component',
-          widgetComponent: { kind: 'text', label: '', content: 'Build: passing | Tests: 42/42' },
-        }));
-        ws.send(JSON.stringify({
-          type: 'extension_ui_request', id: 'pw-m3', method: 'setWidget',
-          widgetKey: 'pw-multi-badge', widgetType: 'badge',
-          widgetData: { text: 'v3.2.1', variant: 'success' },
-        }));
+        ws.send(
+          JSON.stringify({
+            type: 'extension_ui_request',
+            id: 'pw-m1',
+            method: 'setWidget',
+            widgetKey: 'pw-multi-progress',
+            widgetType: 'component',
+            widgetComponent: { kind: 'progress', label: 'Deploying…', progress: 0.9 },
+          })
+        );
+        ws.send(
+          JSON.stringify({
+            type: 'extension_ui_request',
+            id: 'pw-m2',
+            method: 'setWidget',
+            widgetKey: 'pw-multi-status',
+            widgetType: 'component',
+            widgetComponent: { kind: 'text', label: '', content: 'Build: passing | Tests: 42/42' },
+          })
+        );
+        ws.send(
+          JSON.stringify({
+            type: 'extension_ui_request',
+            id: 'pw-m3',
+            method: 'setWidget',
+            widgetKey: 'pw-multi-badge',
+            widgetType: 'badge',
+            widgetData: { text: 'v3.2.1', variant: 'success' },
+          })
+        );
       }, 500);
     });
     await page.goto('/');
@@ -155,18 +188,27 @@ test.describe('Extension component visual review', () => {
       ws.onMessage((data) => {
         const msg = JSON.parse(String(data));
         if (msg.type === 'prompt') {
-          ws.send(JSON.stringify({
-            type: 'extension_ui_request', id: 'pw-modal-select', method: 'custom',
-            title: 'Choose Extension',
-            parsed: {
-              kind: 'select', label: 'Select an extension to configure:',
-              options: [
-                { value: 'omp', label: 'OMP — Open Memory Protocol', description: 'Manages extension memory' },
-                { value: 'git', label: 'Git Helper', description: 'Git operations assistant' },
-                { value: 'test', label: 'Test Runner', description: 'Run and debug tests' },
-              ],
-            },
-          }));
+          ws.send(
+            JSON.stringify({
+              type: 'extension_ui_request',
+              id: 'pw-modal-select',
+              method: 'custom',
+              title: 'Choose Extension',
+              parsed: {
+                kind: 'select',
+                label: 'Select an extension to configure:',
+                options: [
+                  {
+                    value: 'omp',
+                    label: 'OMP — Open Memory Protocol',
+                    description: 'Manages extension memory',
+                  },
+                  { value: 'git', label: 'Git Helper', description: 'Git operations assistant' },
+                  { value: 'test', label: 'Test Runner', description: 'Run and debug tests' },
+                ],
+              },
+            })
+          );
         }
       });
       sendInit(ws);
@@ -185,22 +227,31 @@ test.describe('Extension component visual review', () => {
       ws.onMessage((data) => {
         const msg = JSON.parse(String(data));
         if (msg.type === 'prompt') {
-          ws.send(JSON.stringify({
-            type: 'extension_ui_request', id: 'pw-modal-container', method: 'custom',
-            title: 'Extension Dashboard',
-            parsed: {
-              kind: 'container', direction: 'vertical',
-              children: [
-                { kind: 'text', label: '', content: 'Extension Dashboard v1.0' },
-                { kind: 'progress', label: 'Syncing data…', progress: 0.8 },
-                { kind: 'container', direction: 'horizontal', children: [
-                  { kind: 'button', label: 'Refresh', variant: 'primary' },
-                  { kind: 'button', label: 'Settings' },
-                ]},
-                { kind: 'checkbox', label: 'Enable notifications', checked: false },
-              ],
-            },
-          }));
+          ws.send(
+            JSON.stringify({
+              type: 'extension_ui_request',
+              id: 'pw-modal-container',
+              method: 'custom',
+              title: 'Extension Dashboard',
+              parsed: {
+                kind: 'container',
+                direction: 'vertical',
+                children: [
+                  { kind: 'text', label: '', content: 'Extension Dashboard v1.0' },
+                  { kind: 'progress', label: 'Syncing data…', progress: 0.8 },
+                  {
+                    kind: 'container',
+                    direction: 'horizontal',
+                    children: [
+                      { kind: 'button', label: 'Refresh', variant: 'primary' },
+                      { kind: 'button', label: 'Settings' },
+                    ],
+                  },
+                  { kind: 'checkbox', label: 'Enable notifications', checked: false },
+                ],
+              },
+            })
+          );
         }
       });
       sendInit(ws);
@@ -219,10 +270,15 @@ test.describe('Extension component visual review', () => {
       ws.onMessage((data) => {
         const msg = JSON.parse(String(data));
         if (msg.type === 'prompt') {
-          ws.send(JSON.stringify({
-            type: 'extension_event', source: 'omp', event: 'quota_low',
-            level: 'warning', message: 'Only 3 requests remaining',
-          }));
+          ws.send(
+            JSON.stringify({
+              type: 'extension_event',
+              source: 'omp',
+              event: 'quota_low',
+              level: 'warning',
+              message: 'Only 3 requests remaining',
+            })
+          );
         }
       });
       sendInit(ws);
@@ -239,10 +295,15 @@ test.describe('Extension component visual review', () => {
       ws.onMessage((data) => {
         const msg = JSON.parse(String(data));
         if (msg.type === 'prompt') {
-          ws.send(JSON.stringify({
-            type: 'extension_event', source: 'git-helper', event: 'push_failed',
-            level: 'error', message: 'Permission denied: push to main',
-          }));
+          ws.send(
+            JSON.stringify({
+              type: 'extension_event',
+              source: 'git-helper',
+              event: 'push_failed',
+              level: 'error',
+              message: 'Permission denied: push to main',
+            })
+          );
         }
       });
       sendInit(ws);

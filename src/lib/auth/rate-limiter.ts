@@ -10,8 +10,8 @@
  */
 
 const MAX_ATTEMPTS = 5;
-const WINDOW_MS = 5 * 60 * 1000;    // 5-minute sliding window
-const BLOCK_MS  = 15 * 60 * 1000;   // 15-minute lockout after exceeding the limit
+const WINDOW_MS = 5 * 60 * 1000; // 5-minute sliding window
+const BLOCK_MS = 15 * 60 * 1000; // 15-minute lockout after exceeding the limit
 
 type AttemptRecord = {
   count: number;

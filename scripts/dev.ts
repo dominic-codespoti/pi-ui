@@ -16,8 +16,8 @@
  */
 
 const env: Record<string, string> = {
-  ...process.env as Record<string, string>,
-  PI_PASSWORD: (process.env.PI_PASSWORD ?? 'dev'),
+  ...(process.env as Record<string, string>),
+  PI_PASSWORD: process.env.PI_PASSWORD ?? 'dev',
   // Login runs in the Vite process and /ws auth in the WS process — both must
   // verify the same session tokens, so share one random JWT secret between
   // them. Random per run: dev tokens cannot be forged from the known 'dev'
@@ -32,24 +32,18 @@ const env: Record<string, string> = {
 };
 
 // WS-only server — handles /ws, rejects all other HTTP (Vite serves those).
-const wsServer = Bun.spawn(
-  ['bun', '--watch', 'server.ts'],
-  {
-    env: { ...env, PORT: '5174', DEV_WS_ONLY: 'true' },
-    stdout: 'inherit',
-    stderr: 'inherit',
-  },
-);
+const wsServer = Bun.spawn(['bun', '--watch', 'server.ts'], {
+  env: { ...env, PORT: '5174', DEV_WS_ONLY: 'true' },
+  stdout: 'inherit',
+  stderr: 'inherit',
+});
 
 // Vite dev server — full HMR, SvelteKit SSR, proxies /ws to port 5174.
-const viteServer = Bun.spawn(
-  ['bun', 'run', 'dev'],
-  {
-    env,
-    stdout: 'inherit',
-    stderr: 'inherit',
-  },
-);
+const viteServer = Bun.spawn(['bun', 'run', 'dev'], {
+  env,
+  stdout: 'inherit',
+  stderr: 'inherit',
+});
 
 function shutdown() {
   wsServer.kill();

@@ -2358,6 +2358,7 @@ async function createSdkSession(
   reason: PiSDKNS.SessionStartEvent['reason'],
   previousSessionFile?: string
 ): Promise<CreatedSdkSession> {
+  const tCreate = Date.now();
   const sdk = await getSDK();
   const source = activeSessionOrNull();
   const settingsManager = sdk.SettingsManager.create(targetCwd, sdk.getAgentDir(), {
@@ -2389,6 +2390,7 @@ async function createSdkSession(
   if (result.modelFallbackMessage) {
     diagnostics.push({ type: 'warning', message: result.modelFallbackMessage });
   }
+  log.info(`[pifrontier] createSdkSession ${reason} done in ${Date.now() - tCreate}ms`);
   return {
     session: result.session,
     diagnostics,
@@ -2599,22 +2601,39 @@ async function ensureSession(): Promise<AgentSession> {
   if (activeSessionId && sessionPool.has(activeSessionId)) return activeSession();
   if (!_sessionInitPromise) {
     _sessionInitPromise = (async () => {
+      const start = Date.now();
       const sdk = await getSDK();
+      const t0 = Date.now();
       log.info(`[pifrontier] Starting pi session in ${cwd} …`);
       const sm = sdk.SessionManager.continueRecent(cwd);
       const created = await createSdkSession(cwd, sm, 'startup');
       const sess = created.session;
-      await bindRpcHost(sess);
-      projectCatalog.apply({ kind: 'touch', path: sess.sessionManager.getCwd() || cwd });
-      log.info(
-        `[pifrontier] Pi session ready: ${sess.sessionId} (${sm.isPersisted() ? 'persisted' : 'in-memory'})`
-      );
-
       const sid = sess.sessionId;
       const cwdV = sess.sessionManager.getCwd() || cwd;
+      // Register immediately without waiting for bind — bindExtensions can be
+      // slow with 34+ tools/extensions and previously blocked the cold-start
+      // session_loaded for seconds. See setActiveSession for the same pattern.
       registerSession(sid, sess, cwdV, false, created);
       activeSessionId = sid;
       syncWidgetFactories(sid);
+      const bindStart = Date.now();
+      void bindRpcHost(sess)
+        .then(() => {
+          const e = sessionPool.get(sid);
+          if (e) e.hostBound = true;
+          log.info(
+            `[pifrontier] bindRpcHost startup done in ${Date.now() - bindStart}ms (createSdkSession ${bindStart - t0}ms, total ${Date.now() - start}ms)`
+          );
+          broadcast({ type: 'tools_list', ...toolsPayloadFor(sess) });
+          broadcast({ type: 'commands_list', commands: extensionCommandsFor(sess) });
+          const diag = sessionPool.get(sid)?.diagnostics ?? [];
+          broadcast({ type: 'runtime_diagnostics', diagnostics: diag });
+        })
+        .catch((err) => log.error('[pifrontier] bindRpcHost startup failed:', err));
+      projectCatalog.apply({ kind: 'touch', path: sess.sessionManager.getCwd() || cwd });
+      log.info(
+        `[pifrontier] Pi session ready: ${sess.sessionId} (${sm.isPersisted() ? 'persisted' : 'in-memory'}) in ${Date.now() - start}ms (bind in background)`
+      );
 
       return sid;
     })();
@@ -2929,6 +2948,21 @@ function snapshotModels(sess: AgentSession): ModelInfo[] {
   return snap;
 }
 
+function toolsPayloadFor(sess: AgentSession): {
+  tools: Array<{ name: string; description: string; isBuiltin: boolean; origin?: string }>;
+  activeToolNames: string[];
+} {
+  return {
+    tools: sess.getAllTools().map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      isBuiltin: tool.sourceInfo.source === 'builtin',
+      origin: tool.sourceInfo.source,
+    })),
+    activeToolNames: sess.getActiveToolNames(),
+  };
+}
+
 /** Broadcast a full session_loaded payload for `sess` — used on session switch
  *  and to refresh the client after a successful compaction. */
 function broadcastSessionLoaded(sess: AgentSession): void {
@@ -2961,6 +2995,7 @@ function broadcastSessionLoaded(sess: AgentSession): void {
     modelFallbackMessage: sessionPool.get(sess.sessionId)?.modelFallbackMessage,
     extensionUiState: extensionUiStateForSession(sess.sessionId),
     widgets: widgetsForSession(sess.sessionId),
+    ...toolsPayloadFor(sess),
   });
 }
 let _sessionListRefreshTimer: Timer | null = null;
@@ -3045,14 +3080,28 @@ async function setActiveSession(
 
   const alreadyPooled = sessionPool.has(newId);
   if (!alreadyPooled) {
-    if (!created) await bindRpcHost(newSession);
+    // Register immediately without waiting for bind — bindExtensions can be
+    // slow with 34+ tools/extensions and previously blocked the new-chat
+    // response for seconds. The session is usable for messaging before the
+    // RPC host is ready; host-bound details (extension tools/commands) are
+    // pushed incrementally once bind completes.
     registerSession(
       newId,
       newSession,
       newCwd || newSession.sessionManager.getCwd() || cwd,
-      true,
+      false,
       created
     );
+    void bindRpcHost(newSession)
+      .then(() => {
+        const e = sessionPool.get(newId);
+        if (e) e.hostBound = true;
+        broadcast({ type: 'tools_list', ...toolsPayloadFor(newSession) });
+        broadcast({ type: 'commands_list', commands: extensionCommandsFor(newSession) });
+        const diag = sessionPool.get(newId)?.diagnostics ?? [];
+        broadcast({ type: 'runtime_diagnostics', diagnostics: diag });
+      })
+      .catch((err) => log.error('[pifrontier] bindRpcHost for new session failed:', err));
   }
 
   activeSessionId = newId;
@@ -3234,11 +3283,12 @@ try {
         }
 
         try {
-          // Load SDK + session on first connection; subsequent calls return instantly.
           const sess = await ensureSession();
           const init = initialMessages(sess.messages, sess);
-          const availableModels = (await sess.modelRuntime.getAvailable()).map(serializeModel);
-
+          // Non-blocking snapshot; background refresh pushes fresh list via
+          // available_models_changed. Avoids stalling connected on provider
+          // network round trips (each 15s timeout).
+          const availableModels = snapshotModels(sess);
           // The client may have disconnected while the SDK/model snapshot loaded —
           // don't send to (or install a timer on) a dead socket.
           if (ws.data.closed) return;
@@ -3275,6 +3325,7 @@ try {
                 webhookUrl: getWebhookUrl() || undefined,
                 extensionUiState: extensionUiStateForSession(sess.sessionId),
                 widgets: widgetsForSession(sess.sessionId),
+                ...toolsPayloadFor(sess),
               })
             );
           try {
@@ -4535,19 +4586,20 @@ try {
 
             case 'get_tools': {
               try {
-                const sess = await ensureSession();
-                const allTools = sess.getAllTools();
-                const activeNames = sess.getActiveToolNames();
+                const t0 = Date.now();
+                const sess = activeSessionOrNull();
+                if (!sess) {
+                  ws.send(JSON.stringify({ type: 'tools_list', tools: [], activeToolNames: [] }));
+                  break;
+                }
+                const payload = toolsPayloadFor(sess);
+                const dt = Date.now() - t0;
+                if (dt > 50)
+                  log.info(`[pifrontier] get_tools serialize ${dt}ms for ${payload.tools.length} tools`);
                 ws.send(
                   JSON.stringify({
                     type: 'tools_list',
-                    tools: allTools.map((t) => ({
-                      name: t.name,
-                      description: t.description,
-                      isBuiltin: t.sourceInfo.source === 'builtin',
-                      origin: t.sourceInfo.source,
-                    })),
-                    activeToolNames: activeNames,
+                    ...payload,
                   })
                 );
               } catch (err) {

@@ -133,7 +133,10 @@ describe('loadSnapshot gating', () => {
   it('returns null for corrupt or wrong-version payloads', () => {
     localStorage.setItem(SNAPSHOT_KEY, 'not json{');
     expect(loadSnapshot(PATH)).toBeNull();
-    localStorage.setItem(SNAPSHOT_KEY, JSON.stringify({ v: 999, sessionPath: PATH, savedAt: Date.now(), messages: [msg()] }));
+    localStorage.setItem(
+      SNAPSHOT_KEY,
+      JSON.stringify({ v: 999, sessionPath: PATH, savedAt: Date.now(), messages: [msg()] })
+    );
     expect(loadSnapshot(PATH)).toBeNull();
   });
 });

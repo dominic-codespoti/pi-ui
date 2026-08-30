@@ -70,7 +70,7 @@ export async function sendWebhookNotification(title: string, message: string): P
     await fetch(url, {
       method: 'POST',
       body: message,
-      headers: { 'Title': title },
+      headers: { Title: title },
       signal: AbortSignal.timeout(5_000),
     });
   } catch (err) {

@@ -46,6 +46,7 @@ export function serializeSession(s: SessionSummaryInput): SessionSummary {
     modified: s.modified instanceof Date ? s.modified.getTime() : s.modified,
     messageCount: rawCount,
     turns: s.turns ?? (rawCount > 0 ? undefined : 0),
+    parentSession: s.parentSessionPath,
     firstMessage: s.firstMessage,
   };
 }

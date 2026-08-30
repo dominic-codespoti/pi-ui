@@ -1,5 +1,9 @@
 import { test as base, type Page } from '@playwright/test';
-import { CONNECTED_PAYLOAD, PROJECTS_LIST_PAYLOAD, ALL_SESSIONS_LIST_PAYLOAD } from './mocks/payloads';
+import {
+  CONNECTED_PAYLOAD,
+  PROJECTS_LIST_PAYLOAD,
+  ALL_SESSIONS_LIST_PAYLOAD,
+} from './mocks/payloads';
 
 export type MockWsOptions = {
   /** If true, the mock WS auto-replies to common init messages (get_projects, get_all_sessions). */

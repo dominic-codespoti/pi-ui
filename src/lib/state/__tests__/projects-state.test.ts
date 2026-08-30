@@ -1,10 +1,25 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import type { SessionSummary } from '#lib/ws/protocol.js';
 import {
+  buildSessionRows,
   projectsState,
   pathBasename,
   SESSION_OP_TIMEOUT_MS,
   type ProjectGroup,
 } from '../projects-state.svelte';
+
+/** Minimal SessionSummary with per-field overrides for tree/filter fixtures. */
+const mkSession = (id: string, overrides: Partial<SessionSummary> = {}): SessionSummary => ({
+  id,
+  path: `/p/${id}.jsonl`,
+  cwd: '/p',
+  name: '',
+  created: 0,
+  modified: 0,
+  messageCount: 0,
+  firstMessage: '',
+  ...overrides,
+});
 
 describe('pathBasename', () => {
   it('extracts basename from path', () => {
@@ -21,6 +36,85 @@ describe('pathBasename', () => {
 
   it('handles empty string', () => {
     expect(pathBasename('')).toBe('');
+  });
+});
+
+describe('buildSessionRows', () => {
+  it('nests a child under its parent with depth 1', () => {
+    const rows = buildSessionRows([
+      mkSession('parent'),
+      mkSession('child', { parentSession: '/p/parent.jsonl' }),
+    ]);
+    expect(rows.map((r) => [r.session.id, r.depth])).toEqual([
+      ['parent', 0],
+      ['child', 1],
+    ]);
+  });
+
+  it('nests a subagent task session referencing its parent by bare id', () => {
+    // Subagent tasks write parentSession as the parent's session id, not path.
+    const rows = buildSessionRows([
+      mkSession('parent'),
+      mkSession('task', { parentSession: 'parent' }),
+    ]);
+    expect(rows.map((r) => [r.session.id, r.depth])).toEqual([
+      ['parent', 0],
+      ['task', 1],
+    ]);
+  });
+
+  it('orders sibling children by subtree recency, not input order', () => {
+    const rows = buildSessionRows([
+      mkSession('parent', { modified: 5 }),
+      mkSession('old-child', { parentSession: '/p/parent.jsonl', modified: 10 }),
+      mkSession('new-child', { parentSession: '/p/parent.jsonl', modified: 20 }),
+    ]);
+    expect(rows.map((r) => r.session.id)).toEqual(['parent', 'new-child', 'old-child']);
+  });
+
+  it('keeps a newer child attached below its root instead of floating above other roots', () => {
+    const rows = buildSessionRows([
+      mkSession('root-a'),
+      mkSession('root-b'),
+      mkSession('child-of-a', { parentSession: '/p/root-a.jsonl', modified: 999 }),
+    ]);
+    expect(rows.map((r) => [r.session.id, r.depth])).toEqual([
+      ['root-a', 0],
+      ['child-of-a', 1],
+      ['root-b', 0],
+    ]);
+  });
+
+  it('renders an orphan child (unknown parent path) as a root', () => {
+    const rows = buildSessionRows([mkSession('orphan', { parentSession: '/p/gone.jsonl' })]);
+    expect(rows.map((r) => [r.session.id, r.depth])).toEqual([['orphan', 0]]);
+  });
+
+  it('renders a self-parenting session as a root', () => {
+    const rows = buildSessionRows([mkSession('loop', { parentSession: '/p/loop.jsonl' })]);
+    expect(rows.map((r) => [r.session.id, r.depth])).toEqual([['loop', 0]]);
+  });
+
+  it('renders a two-session parentSession cycle as roots — nothing dropped', () => {
+    const rows = buildSessionRows([
+      mkSession('a', { parentSession: '/p/b.jsonl' }),
+      mkSession('b', { parentSession: '/p/a.jsonl' }),
+    ]);
+    expect(rows.map((r) => [r.session.id, r.depth])).toEqual([
+      ['a', 0],
+      ['b', 0],
+    ]);
+  });
+
+  it('renders duplicate-path sessions (pooled in-memory) as separate roots', () => {
+    const rows = buildSessionRows([
+      mkSession('m1', { path: '(in-memory)' }),
+      mkSession('m2', { path: '(in-memory)', parentSession: '(in-memory)' }),
+    ]);
+    expect(rows.map((r) => [r.session.id, r.depth])).toEqual([
+      ['m1', 0],
+      ['m2', 0],
+    ]);
   });
 });
 
@@ -148,7 +242,7 @@ describe('ProjectsState', () => {
         },
       ];
       expect(projectsState.groups[0].sessions).toHaveLength(1);
-      expect(projectsState.groups[0].sessions[0].id).toBe('s1');
+      expect(projectsState.groups[0].sessions[0].session.id).toBe('s1');
     });
   });
 
@@ -238,7 +332,51 @@ describe('ProjectsState', () => {
         },
       ];
       projectsState.filter = 'feature';
-      expect(projectsState.filteredGroups[0].sessions).toHaveLength(1);
+      expect(projectsState.filteredGroups[0].sessions.map((r) => r.session.id)).toEqual(['s1']);
+    });
+    it('keeps a matching child anchored under its non-matching parent chain', () => {
+      projectsState.projects = [
+        {
+          cwd: '/p',
+          name: 'P',
+          pinned: false,
+          exists: true,
+          registered: true,
+          sessionCount: 3,
+          lastActivity: 100,
+        },
+      ];
+      projectsState.allSessions = [
+        mkSession('parent', { name: 'Refactor task' }),
+        mkSession('kid-match', { parentSession: '/p/parent.jsonl', name: 'Feature X' }),
+        mkSession('kid-quiet', { parentSession: '/p/parent.jsonl', name: 'Chores' }),
+      ];
+      projectsState.filter = 'feature';
+      expect(projectsState.filteredGroups[0].sessions.map((r) => r.session.id)).toEqual([
+        'parent',
+        'kid-match',
+      ]);
+    });
+
+    it('keeps every nested row when the project name matches', () => {
+      projectsState.projects = [
+        {
+          cwd: '/p',
+          name: 'P',
+          pinned: false,
+          exists: true,
+          registered: true,
+          sessionCount: 3,
+          lastActivity: 100,
+        },
+      ];
+      projectsState.allSessions = [
+        mkSession('parent', { name: 'Refactor task' }),
+        mkSession('kid-match', { parentSession: '/p/parent.jsonl', name: 'Feature X' }),
+        mkSession('kid-quiet', { parentSession: '/p/parent.jsonl', name: 'Chores' }),
+      ];
+      projectsState.filter = 'p';
+      expect(projectsState.filteredGroups[0].sessions).toHaveLength(3);
     });
   });
 
@@ -346,6 +484,57 @@ describe('ProjectsState', () => {
       expect(projectsState.allSessions[0]).toMatchObject({ name: 'renamed', messageCount: 12 });
     });
 
+    it('re-sorts sessions within a project when a delta bumps recency', () => {
+      projectsState.projects = [
+        {
+          cwd: '/p',
+          name: 'P',
+          pinned: false,
+          exists: true,
+          registered: true,
+          sessionCount: 2,
+          lastActivity: 0,
+        },
+      ];
+      projectsState.allSessions = [
+        {
+          id: 'older',
+          path: '/p/older.jsonl',
+          cwd: '/p',
+          created: 1,
+          modified: 100,
+          messageCount: 1,
+          firstMessage: 'old',
+        },
+        {
+          id: 'newer',
+          path: '/p/newer.jsonl',
+          cwd: '/p',
+          created: 1,
+          modified: 200,
+          messageCount: 1,
+          firstMessage: 'new',
+        },
+      ];
+      expect(projectsState.groups[0].sessions.map((r) => r.session.id)).toEqual(['newer', 'older']);
+
+      // Live delta: 'older' runs again — its row must move to the top without
+      // a full all_sessions_list arriving.
+      projectsState.handleMessage({
+        type: 'session_updated',
+        session: {
+          id: 'older',
+          path: '/p/older.jsonl',
+          cwd: '/p',
+          created: 1,
+          modified: 300,
+          messageCount: 2,
+          firstMessage: 'old but active',
+        },
+      } as { type: string } & Record<string, unknown>);
+      expect(projectsState.groups[0].sessions.map((r) => r.session.id)).toEqual(['older', 'newer']);
+    });
+
     it('keeps the list fresh-guarded after a full list arrives', () => {
       const send = vi.fn().mockReturnValue(true);
       projectsState.send = send;
@@ -403,7 +592,13 @@ describe('ProjectsState', () => {
       ];
       projectsState.uncheckedSessions.add('s1');
       projectsState.switchSession('/s1');
-      expect(send).toHaveBeenCalledWith({ type: 'switch_session', path: '/s1' });
+      expect(send).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'switch_session',
+          path: '/s1',
+          requestId: expect.any(String),
+        })
+      );
       expect(projectsState.uncheckedSessions.has('s1')).toBe(false);
     });
 
@@ -411,7 +606,9 @@ describe('ProjectsState', () => {
       const send = vi.fn().mockReturnValue(true);
       projectsState.send = send;
       projectsState.newSession();
-      expect(send).toHaveBeenCalledWith({ type: 'new_session' });
+      expect(send).toHaveBeenCalledWith(
+        expect.objectContaining({ type: 'new_session', requestId: expect.any(String) })
+      );
       expect(projectsState.pendingNewSession).toBe(true);
       expect(projectsState.sessionLoading).toBe(true);
     });
@@ -492,6 +689,48 @@ describe('ProjectsState', () => {
       expect(projectsState.pendingNewSession).toBe(false);
       expect(projectsState.sessionLoading).toBe(false);
     });
+    it('rejects a late snapshot from a different session operation', () => {
+      const send = vi.fn().mockReturnValue(true);
+      projectsState.send = send;
+      projectsState.activeSessionId = 's1';
+      projectsState.switchSession('/s2');
+      const requestId = send.mock.calls[0][0].requestId as string;
+
+      expect(
+        projectsState.acceptsSessionLoaded({
+          sessionId: 's1',
+          sessionPath: '/s1',
+          requestId: 'stale-request',
+        })
+      ).toBe(false);
+      expect(projectsState.onSessionLoaded({ sessionId: 's1', requestId: 'stale-request' })).toBe(
+        false
+      );
+      expect(projectsState.sessionLoading).toBe(true);
+
+      expect(
+        projectsState.onSessionLoaded({
+          sessionId: 's2',
+          sessionPath: '/s2',
+          requestId,
+        })
+      ).toBe(false);
+      expect(projectsState.sessionLoading).toBe(false);
+    });
+
+    it('invalidates timed-out operation replies', () => {
+      vi.useFakeTimers();
+      const send = vi.fn().mockReturnValue(true);
+      projectsState.send = send;
+      projectsState.activeSessionId = 's1';
+      projectsState.newSession();
+      const requestId = send.mock.calls[0][0].requestId as string;
+
+      vi.advanceTimersByTime(SESSION_OP_TIMEOUT_MS + 1);
+
+      expect(projectsState.acceptsSessionLoaded({ sessionId: 's2', requestId })).toBe(false);
+      expect(projectsState.sessionLoading).toBe(false);
+    });
 
     it('newSession arms a watchdog that re-enables the UI when unanswered', () => {
       vi.useFakeTimers();
@@ -502,7 +741,7 @@ describe('ProjectsState', () => {
       vi.advanceTimersByTime(SESSION_OP_TIMEOUT_MS + 1);
       expect(projectsState.pendingNewSession).toBe(false);
       expect(projectsState.sessionLoading).toBe(false);
-      expect(projectsState.error).toContain('took too long');
+      expect(projectsState.error).toBe('New chat timed out — server did not respond in time');
     });
 
     it('watchdog is cancelled by session_loaded', () => {
@@ -523,9 +762,8 @@ describe('ProjectsState', () => {
       expect(projectsState.sessionLoading).toBe(true);
       vi.advanceTimersByTime(SESSION_OP_TIMEOUT_MS + 1);
       expect(projectsState.sessionLoading).toBe(false);
-      expect(projectsState.error).toContain('took too long');
+      expect(projectsState.error).toBe('Session switch timed out');
     });
-
     it('sessions_error cancels the watchdog', () => {
       vi.useFakeTimers();
       projectsState.send = vi.fn().mockReturnValue(true);
@@ -576,16 +814,7 @@ describe('ProjectsState', () => {
     it('visibleSessions limits to SESSION_PREVIEW_LIMIT', () => {
       const group = {
         cwd: '/p',
-        sessions: Array.from({ length: 10 }, (_, i) => ({
-          id: `s${i}`,
-          path: '',
-          cwd: '',
-          name: '',
-          created: 0,
-          modified: 0,
-          messageCount: 0,
-          firstMessage: '',
-        })),
+        sessions: buildSessionRows(Array.from({ length: 10 }, (_, i) => mkSession(`s${i}`))),
       } as ProjectGroup;
       expect(projectsState.visibleSessions(group)).toHaveLength(3);
     });
@@ -594,16 +823,7 @@ describe('ProjectsState', () => {
       projectsState.cwd = '/p';
       const group = {
         cwd: '/p',
-        sessions: Array.from({ length: 10 }, (_, i) => ({
-          id: `s${i}`,
-          path: '',
-          cwd: '',
-          name: '',
-          created: 0,
-          modified: 0,
-          messageCount: 0,
-          firstMessage: '',
-        })),
+        sessions: buildSessionRows(Array.from({ length: 10 }, (_, i) => mkSession(`s${i}`))),
       } as ProjectGroup;
       expect(projectsState.visibleSessions(group)).toHaveLength(3);
     });
@@ -612,18 +832,34 @@ describe('ProjectsState', () => {
       projectsState.filter = 'feature';
       const group = {
         cwd: '/p',
-        sessions: Array.from({ length: 10 }, (_, i) => ({
-          id: `s${i}`,
-          path: '',
-          cwd: '',
-          name: '',
-          created: 0,
-          modified: 0,
-          messageCount: 0,
-          firstMessage: '',
-        })),
+        sessions: buildSessionRows(Array.from({ length: 10 }, (_, i) => mkSession(`s${i}`))),
       } as ProjectGroup;
       expect(projectsState.visibleSessions(group)).toHaveLength(10);
+    });
+
+    it('visibleSessions keeps whole subtrees without spending slots on children', () => {
+      const group = {
+        cwd: '/p',
+        sessions: buildSessionRows([
+          mkSession('r1', { modified: 70 }),
+          mkSession('r2', { modified: 60 }),
+          mkSession('stack', { modified: 50 }),
+          mkSession('c1', { parentSession: '/p/stack.jsonl', modified: 40 }),
+          mkSession('c2', { parentSession: '/p/stack.jsonl', modified: 30 }),
+          mkSession('c3', { parentSession: '/p/stack.jsonl', modified: 20 }),
+          mkSession('r4', { modified: 10 }),
+        ]),
+      } as ProjectGroup;
+      // Three top-level slots — the third rides in with its complete substack,
+      // pushing only the fourth root (r4) out of the preview.
+      expect(projectsState.visibleSessions(group).map((r) => r.session.id)).toEqual([
+        'r1',
+        'r2',
+        'stack',
+        'c1',
+        'c2',
+        'c3',
+      ]);
     });
   });
 });

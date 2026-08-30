@@ -78,7 +78,11 @@ export function initSessionScanCache(filePath: string): void {
       const [path, mtimeMs, size, info] = raw as [unknown, unknown, unknown, unknown];
       if (typeof path !== 'string' || typeof mtimeMs !== 'number' || typeof size !== 'number')
         continue;
-      fileInfoCache.set(path, { mtimeMs, size, info: reviveInfo(info) });
+      const revived = reviveInfo(info);
+      // `modified` is derived from the file's stat mtime (single clock with
+      // the pooled-session overlay) — the persisted value is never authoritative.
+      if (revived) revived.modified = new Date(mtimeMs);
+      fileInfoCache.set(path, { mtimeMs, size, info: revived });
     }
   } catch (err) {
     log.warn('[pifrontier] session-scan cache: failed to load, starting empty:', err);
@@ -207,7 +211,10 @@ function strField(obj: object, key: string): string | undefined {
 }
 
 /** Parse one session .jsonl streaming; returns null for non-session files. */
-async function parseSessionFile(filePath: string): Promise<SessionFileInfo | null> {
+async function parseSessionFile(
+  filePath: string,
+  mtimeMs: number
+): Promise<SessionFileInfo | null> {
   let headerId: string | undefined;
   let headerCwd = '';
   let headerTimestamp: string | undefined;
@@ -216,7 +223,6 @@ async function parseSessionFile(filePath: string): Promise<SessionFileInfo | nul
   let name: string | undefined;
   let messageCount = 0;
   let firstMessage = '';
-  let lastActivityTime: number | undefined;
 
   const rl = createInterface({
     input: createReadStream(filePath, { encoding: 'utf8' }),
@@ -252,13 +258,6 @@ async function parseSessionFile(filePath: string): Promise<SessionFileInfo | nul
       const role = strField(message, 'role');
       if (role !== 'user' && role !== 'assistant') continue;
       messageCount++;
-      // Activity time — prefer the message's own timestamp, fall back to the entry's.
-      const msgTs = 'timestamp' in message ? message.timestamp : undefined;
-      const activity =
-        typeof msgTs === 'number' ? msgTs : new Date(strField(entry, 'timestamp') ?? '').getTime();
-      if (!Number.isNaN(activity)) {
-        lastActivityTime = Math.max(lastActivityTime ?? 0, activity);
-      }
       if (!firstMessage && role === 'user') {
         firstMessage = firstTextContent(message);
       }
@@ -277,9 +276,7 @@ async function parseSessionFile(filePath: string): Promise<SessionFileInfo | nul
     name,
     parentSessionPath,
     created: new Date(fallbackCreated),
-    modified: new Date(
-      lastActivityTime && lastActivityTime > 0 ? lastActivityTime : fallbackCreated
-    ),
+    modified: new Date(mtimeMs),
     messageCount,
     firstMessage: firstMessage || '(no messages)',
   };
@@ -301,7 +298,7 @@ async function fileInfo(filePath: string): Promise<SessionFileInfo | null> {
   if (cached && cached.mtimeMs === mtimeMs && cached.size === size) return cached.info;
   let info: SessionFileInfo | null;
   try {
-    info = await parseSessionFile(filePath);
+    info = await parseSessionFile(filePath, mtimeMs);
   } catch {
     info = null;
   }
@@ -339,8 +336,31 @@ async function collectInfos(files: string[]): Promise<SessionFileInfo[]> {
 
 async function jsonlFilesIn(dir: string): Promise<string[]> {
   try {
-    const entries = await readdir(dir);
-    return entries.filter((f) => f.endsWith('.jsonl')).map((f) => join(dir, f));
+    const entries = await readdir(dir, { withFileTypes: true });
+    const files = entries
+      .filter((e) => e.isFile() && e.name.endsWith('.jsonl'))
+      .map((e) => join(dir, e.name));
+    // Subagent task sessions live beside their parent file: a directory
+    // named after the parent's file stem holds one tasks/ subdir with one
+    // file per spawned task. Without this walk those sessions never reach
+    // the sidebar at all.
+    const taskLists = await Promise.all(
+      entries.filter((e) => e.isDirectory()).map(async (e) => {
+        try {
+          const taskDir = join(dir, e.name, 'tasks');
+          return (await readdir(taskDir))
+            .filter((f) => f.endsWith('.jsonl'))
+            .map((f) => join(taskDir, f));
+        } catch (nestedErr) {
+          if ((nestedErr as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+            log.error(`[pifrontier] cannot scan task sessions in ${join(dir, e.name)}:`, nestedErr);
+          }
+          return [];
+        }
+      })
+    );
+    for (const list of taskLists) files.push(...list);
+    return files;
   } catch (err) {
     // Deleted-between-scans is a normal race; anything else is an operator
     // error (permissions) — log it instead of silently dropping the project.

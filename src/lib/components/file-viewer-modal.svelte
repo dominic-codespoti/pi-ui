@@ -114,6 +114,19 @@
       copied = false;
     }, 1500);
   }
+  function handleDownload() {
+    const text = editing ? editContent : content;
+    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = path.split('/').pop() || 'file.txt';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
 
   function requestClose() {
     if (hasUnsaved) {
@@ -175,6 +188,11 @@
             disabled={saving}
             >{#if saving}saving…{:else}Save{/if}</button
           >
+          <button
+            class="px-2 py-1 text-xs rounded-md text-base-content/60 hover:text-base-content hover:bg-base-content/8 transition-colors"
+            onclick={handleDownload}
+            title="Download file">Download</button
+          >
         {:else}
           <button
             class="px-2 py-1 text-xs rounded-md text-base-content/60 hover:text-base-content hover:bg-base-content/8 transition-colors"
@@ -182,6 +200,11 @@
           >
             {#if copied}Copied{:else}Copy{/if}
           </button>
+          <button
+            class="px-2 py-1 text-xs rounded-md text-base-content/60 hover:text-base-content hover:bg-base-content/8 transition-colors"
+            onclick={handleDownload}
+            title="Download file">Download</button
+          >
           <button
             class="px-2 py-1 text-xs rounded-md text-primary/70 hover:text-primary hover:bg-primary/10 transition-colors"
             onclick={oninsert}>Insert @file</button

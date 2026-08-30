@@ -31,14 +31,23 @@ async function startServer(): Promise<number> {
   const t0 = process.hrtime.bigint();
 
   serverProc = Bun.spawn(['bun', '--smol', 'run', 'bin/pifrontier.ts'], {
-    env: { ...process.env as Record<string, string>, PI_PASSWORD: PASSWORD, PORT: String(PORT), PI_CWD: CWD },
+    env: {
+      ...(process.env as Record<string, string>),
+      PI_PASSWORD: PASSWORD,
+      PORT: String(PORT),
+      PI_CWD: CWD,
+    },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 
   const reader = serverProc.stdout!.getReader();
   const decoder = new TextDecoder();
   let output = '';
-  const timeout = setTimeout(() => { console.error('[bench] Timeout'); cleanup(); process.exit(1); }, 45_000);
+  const timeout = setTimeout(() => {
+    console.error('[bench] Timeout');
+    cleanup();
+    process.exit(1);
+  }, 45_000);
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
@@ -55,7 +64,10 @@ async function startServer(): Promise<number> {
 }
 
 function cleanup() {
-  if (serverProc) { serverProc.kill('SIGTERM'); serverProc = null; }
+  if (serverProc) {
+    serverProc.kill('SIGTERM');
+    serverProc = null;
+  }
 }
 async function getMemRssKb(pid: number): Promise<number> {
   const out = await $`ps -o rss= -p ${pid}`.text();
@@ -102,7 +114,9 @@ try {
             clearTimeout(timeout);
             resolve();
           }
-        } catch { /* skip */ }
+        } catch {
+          /* skip */
+        }
       });
     });
   });
@@ -127,7 +141,9 @@ try {
   // Post-connection metrics
   const postConnRss = await getMemRssKb(pid);
   const postConnCpu = await getCpuPercent(pid);
-  console.log(`\n  After SDK: RSS ${(postConnRss / 1024).toFixed(1)} MB (+${((postConnRss - idleRssKb) / 1024).toFixed(1)} MB)`);
+  console.log(
+    `\n  After SDK: RSS ${(postConnRss / 1024).toFixed(1)} MB (+${((postConnRss - idleRssKb) / 1024).toFixed(1)} MB)`
+  );
   console.log(`  CPU: ${postConnCpu.toFixed(2)}%`);
 
   // ── Create benchmark WS from page context ─────────────────────────────────
@@ -160,25 +176,34 @@ try {
 
   // ── Round-trip measurement via page.evaluate ──────────────────────────────
   async function measureRT(msg: object, expectType: string): Promise<number> {
-    return page.evaluate(({ msgStr, expectType }) => {
-      const msg = JSON.parse(msgStr);
-      return new Promise((resolve, reject) => {
-        const ws = (window as any).__benchWS;
-        if (!ws || ws.readyState !== WebSocket.OPEN) { reject('WS not open'); return; }
-        const t0 = performance.now();
-        const handler = (e: MessageEvent) => {
-          try {
-            if (JSON.parse(e.data as string).type === expectType) {
-              ws.removeEventListener('message', handler);
-              resolve(performance.now() - t0);
-            }
-          } catch {}
-        };
-        ws.addEventListener('message', handler);
-        ws.send(JSON.stringify(msg));
-        setTimeout(() => { ws.removeEventListener('message', handler); reject('timeout'); }, 15_000);
-      });
-    }, { msgStr: JSON.stringify(msg), expectType });
+    return page.evaluate(
+      ({ msgStr, expectType }) => {
+        const msg = JSON.parse(msgStr);
+        return new Promise((resolve, reject) => {
+          const ws = (window as any).__benchWS;
+          if (!ws || ws.readyState !== WebSocket.OPEN) {
+            reject('WS not open');
+            return;
+          }
+          const t0 = performance.now();
+          const handler = (e: MessageEvent) => {
+            try {
+              if (JSON.parse(e.data as string).type === expectType) {
+                ws.removeEventListener('message', handler);
+                resolve(performance.now() - t0);
+              }
+            } catch {}
+          };
+          ws.addEventListener('message', handler);
+          ws.send(JSON.stringify(msg));
+          setTimeout(() => {
+            ws.removeEventListener('message', handler);
+            reject('timeout');
+          }, 15_000);
+        });
+      },
+      { msgStr: JSON.stringify(msg), expectType }
+    );
   }
 
   // ── Run measurements ────────────────────────────────────────────────────
@@ -189,8 +214,8 @@ try {
     record(`get_providers #${i + 1}`, ms);
   }
   for (let i = 0; i < 3; i++) {
-    const ms = await measureRT({ type: 'list_sessions' }, 'sessions_list');
-    record(`list_sessions #${i + 1}`, ms);
+    const ms = await measureRT({ type: 'get_projects' }, 'projects_list');
+    record(`get_projects #${i + 1}`, ms);
   }
   {
     const ms = await measureRT({ type: 'get_resources' }, 'resources_list');
@@ -200,48 +225,66 @@ try {
   const dirs = ['.', './src', './src/lib'];
   for (let i = 0; i < dirs.length; i++) {
     const prefix = dirs[i];
-    const ms = await page.evaluate(({ prefix }) => {
-      return new Promise<number>((resolve, reject) => {
-        const ws = (window as any).__benchWS;
-        if (!ws || ws.readyState !== WebSocket.OPEN) { reject('WS not open'); return; }
-        const t0 = performance.now();
-        const handler = (e: MessageEvent) => {
-          try {
-            if (JSON.parse(e.data as string).type === 'dir_completions') {
-              ws.removeEventListener('message', handler);
-              resolve(performance.now() - t0);
-            }
-          } catch {}
-        };
-        ws.addEventListener('message', handler);
-        ws.send(JSON.stringify({ type: 'dir_complete', prefix }));
-        setTimeout(() => { ws.removeEventListener('message', handler); reject('timeout'); }, 15_000);
-      });
-    }, { prefix });
+    const ms = await page.evaluate(
+      ({ prefix }) => {
+        return new Promise<number>((resolve, reject) => {
+          const ws = (window as any).__benchWS;
+          if (!ws || ws.readyState !== WebSocket.OPEN) {
+            reject('WS not open');
+            return;
+          }
+          const t0 = performance.now();
+          const handler = (e: MessageEvent) => {
+            try {
+              if (JSON.parse(e.data as string).type === 'dir_completions') {
+                ws.removeEventListener('message', handler);
+                resolve(performance.now() - t0);
+              }
+            } catch {}
+          };
+          ws.addEventListener('message', handler);
+          ws.send(JSON.stringify({ type: 'dir_complete', prefix }));
+          setTimeout(() => {
+            ws.removeEventListener('message', handler);
+            reject('timeout');
+          }, 15_000);
+        });
+      },
+      { prefix }
+    );
     record(`dir_complete('${prefix}')`, ms);
   }
 
   const queries = ['server', 'protocol', ''];
   for (let i = 0; i < queries.length; i++) {
     const query = queries[i];
-    const ms = await page.evaluate(({ query }) => {
-      return new Promise<number>((resolve, reject) => {
-        const ws = (window as any).__benchWS;
-        if (!ws || ws.readyState !== WebSocket.OPEN) { reject('WS not open'); return; }
-        const t0 = performance.now();
-        const handler = (e: MessageEvent) => {
-          try {
-            if (JSON.parse(e.data as string).type === 'file_completions') {
-              ws.removeEventListener('message', handler);
-              resolve(performance.now() - t0);
-            }
-          } catch {}
-        };
-        ws.addEventListener('message', handler);
-        ws.send(JSON.stringify({ type: 'file_complete', query }));
-        setTimeout(() => { ws.removeEventListener('message', handler); reject('timeout'); }, 15_000);
-      });
-    }, { query });
+    const ms = await page.evaluate(
+      ({ query }) => {
+        return new Promise<number>((resolve, reject) => {
+          const ws = (window as any).__benchWS;
+          if (!ws || ws.readyState !== WebSocket.OPEN) {
+            reject('WS not open');
+            return;
+          }
+          const t0 = performance.now();
+          const handler = (e: MessageEvent) => {
+            try {
+              if (JSON.parse(e.data as string).type === 'file_completions') {
+                ws.removeEventListener('message', handler);
+                resolve(performance.now() - t0);
+              }
+            } catch {}
+          };
+          ws.addEventListener('message', handler);
+          ws.send(JSON.stringify({ type: 'file_complete', query }));
+          setTimeout(() => {
+            ws.removeEventListener('message', handler);
+            reject('timeout');
+          }, 15_000);
+        });
+      },
+      { query }
+    );
     record(`file_complete('${query}')`, ms);
   }
 
@@ -262,19 +305,24 @@ try {
   console.log(`${'='.repeat(62)}`);
   console.log(`  Memory:`);
   console.log(`    Idle:                       ${(idleRssKb / 1024).toFixed(1)} MB`);
-  console.log(`    After SDK (1st WS):         ${(postConnRss / 1024).toFixed(1)} MB  (+${((postConnRss - idleRssKb) / 1024).toFixed(1)} MB)`);
-  console.log(`    After benchmark:            ${(finalRss / 1024).toFixed(1)} MB  (+${((finalRss - idleRssKb) / 1024).toFixed(1)} MB)`);
-  console.log(`    SDK overhead estimate:      ~${((postConnRss - idleRssKb) / 1024).toFixed(0)} MB`);
+  console.log(
+    `    After SDK (1st WS):         ${(postConnRss / 1024).toFixed(1)} MB  (+${((postConnRss - idleRssKb) / 1024).toFixed(1)} MB)`
+  );
+  console.log(
+    `    After benchmark:            ${(finalRss / 1024).toFixed(1)} MB  (+${((finalRss - idleRssKb) / 1024).toFixed(1)} MB)`
+  );
+  console.log(
+    `    SDK overhead estimate:      ~${((postConnRss - idleRssKb) / 1024).toFixed(0)} MB`
+  );
   console.log(`  CPU:`);
   console.log(`    Idle:                       ${idleCpu.toFixed(1)}%`);
   console.log(`    Post-connection:            ${postConnCpu.toFixed(1)}%`);
   console.log(`    Final:                      ${finalCpu.toFixed(1)}%`);
   console.log(`\n  Latency:`);
-  const maxLabel = Math.max(...samples.map(s => s.label.length));
+  const maxLabel = Math.max(...samples.map((s) => s.label.length));
   for (const s of samples) {
     console.log(`    ${s.label.padEnd(maxLabel)}  ${s.ms.toFixed(1).padStart(8)} ms`);
   }
-
 } catch (err) {
   console.error('[bench] Error:', err.stack || err);
 } finally {

@@ -253,11 +253,33 @@
   /** Track which tool output was recently copied (by msg id). */
   let toolCopiedId: string | null = $state(null);
   function copyToolOutput(content: string, id: string) {
-    navigator.clipboard.writeText(content);
+    navigator.clipboard.writeText(content).catch(() => {
+      // Fallback for large content or denied permission — offer download
+      if (content.length > 50000) downloadToolOutput(content, 'tool-output');
+    });
     toolCopiedId = id;
     setTimeout(() => {
       if (toolCopiedId === id) toolCopiedId = null;
     }, 1500);
+  }
+  function downloadToolOutput(content: string, toolName: string) {
+    const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${toolName || 'output'}-${Date.now()}.txt`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+  function downloadImage(src: string, index: number) {
+    const a = document.createElement('a');
+    a.href = src;
+    a.download = `image-${Date.now()}-${index}.png`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
   }
 
   /**
@@ -969,24 +991,44 @@
                     <pre
                       class="trace-output text-base-content/58 text-xs whitespace-pre-wrap break-words max-h-56 overflow-y-auto leading-relaxed select-text py-1.5 bg-base-content/[0.025] rounded-r pr-8">{msg.content}</pre>
                   {/if}
-                  <button
-                    onclick={() => copyToolOutput(msg.content, msg.id)}
-                    class="touch-reveal absolute top-1.5 right-1.5 opacity-0 group-hover/copy:opacity-100 group-focus-within/copy:opacity-100 transition-opacity duration-150 {isMobile
-                      ? 'px-2 py-1.5'
-                      : 'px-1.5 py-0.5'} rounded text-[10px] text-base-content/40 hover:text-base-content/70 hover:bg-base-content/[0.06] backdrop-blur-sm"
-                    aria-label="Copy output"
+                  <div
+                    class="touch-reveal absolute top-1.5 right-1.5 flex gap-1 opacity-0 group-hover/copy:opacity-100 group-focus-within/copy:opacity-100 transition-opacity duration-150"
                   >
-                    {toolCopiedId === msg.id ? 'copied' : 'copy'}
-                  </button>
+                    <button
+                      onclick={() => copyToolOutput(msg.content, msg.id)}
+                      class="{isMobile
+                        ? 'px-2 py-1.5'
+                        : 'px-1.5 py-0.5'} rounded text-[10px] text-base-content/40 hover:text-base-content/70 hover:bg-base-content/[0.06] backdrop-blur-sm"
+                      aria-label="Copy output"
+                    >
+                      {toolCopiedId === msg.id ? 'copied' : 'copy'}
+                    </button>
+                    <button
+                      onclick={() => downloadToolOutput(msg.content, msg.toolName ?? 'output')}
+                      class="{isMobile ? 'px-2 py-1.5' : 'px-1.5 py-0.5'} rounded text-[10px] text-base-content/40 hover:text-base-content/70 hover:bg-base-content/[0.06] backdrop-blur-sm"
+                      aria-label="Download output"
+                      title="Download output as .txt">download</button
+                    >
+                  </div>
                 </div>
               {/if}
               {#if msg.images?.length}
                 <div class="trace-output flex gap-2 flex-wrap mt-2">
-                  {#each msg.images as src (src)}<img
-                      {src}
-                      alt=""
-                      class="max-h-64 max-w-full rounded-lg object-contain border border-base-content/10"
-                    />{/each}
+                  {#each msg.images as src, idx (src)}
+                    <div class="relative group/img">
+                      <img
+                        {src}
+                        alt=""
+                        class="max-h-64 max-w-full rounded-lg object-contain border border-base-content/10"
+                      />
+                      <button
+                        onclick={() => downloadImage(src, idx)}
+                        class="absolute top-1 right-1 opacity-0 group-hover/img:opacity-100 transition-opacity px-1.5 py-0.5 rounded text-[10px] bg-base-100/80 text-base-content/60 hover:text-base-content border border-base-content/10 backdrop-blur-sm"
+                        aria-label="Download image"
+                        title="Download image">download</button
+                      >
+                    </div>
+                  {/each}
                 </div>
               {/if}
             {/if}

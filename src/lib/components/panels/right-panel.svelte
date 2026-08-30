@@ -97,6 +97,24 @@
     onUseSkill: (name: string) => void;
     onDismissProviderError: () => void;
   } = $props();
+
+  // Derived grouping + O(1) active-check: avoids inline filter()/Map IIFE and
+  // per-row includes() that re-ran on every parent render (streaming ticks).
+  // With 30+ tools this was the hot path that made the tab feel stuck.
+  const activeToolSet = $derived(new Set(activeToolNames));
+  const builtinTools = $derived(filteredTools.filter((t) => t.isBuiltin));
+  const customTools = $derived(filteredTools.filter((t) => !t.isBuiltin));
+  const customToolsByOrigin = $derived.by(() => {
+    // eslint-disable-next-line svelte/prefer-svelte-reactivity -- local grouping Map, not reactive state
+    const groups = new Map<string, typeof customTools>();
+    for (const t of customTools) {
+      const key = t.origin || 'custom';
+      const g = groups.get(key);
+      if (g) g.push(t);
+      else groups.set(key, [t]);
+    }
+    return [...groups.entries()] as [string, typeof customTools][];
+  });
 </script>
 
 {#snippet sectionHeader(letter: string, bg: string, label: string, color?: string)}
@@ -549,12 +567,10 @@
             <p class="text-xs text-base-content/20">no match</p>
           </div>
         {:else}
-          {@const builtinTools = filteredTools.filter((t) => t.isBuiltin)}
-          {@const customTools = filteredTools.filter((t) => !t.isBuiltin)}
           {#if builtinTools.length > 0}
             {@render sectionHeader('B', 'bg-base-content/30', 'built-in')}
             {#each builtinTools as tool (tool.name)}
-              {@const isActive = activeToolNames.includes(tool.name)}
+              {@const isActive = activeToolSet.has(tool.name)}
               <button
                 onclick={() => onToggleTool(tool.name)}
                 class="group cursor-pointer w-full text-left px-5 py-2.5 text-sm transition-all duration-150 flex items-center gap-3 relative {isActive
@@ -596,20 +612,10 @@
               </button>
             {/each}
           {/if}
-          {@const customToolsByOrigin = (() => {
-            const groups = new Map<string, typeof customTools>();
-            for (const t of customTools) {
-              const key = t.origin || 'custom';
-              const g = groups.get(key);
-              if (g) g.push(t);
-              else groups.set(key, [t]);
-            }
-            return [...groups.entries()];
-          })()}
           {#each customToolsByOrigin as [origin, tools] (origin)}
             {@render sectionHeader('C', 'bg-primary/70', origin)}
             {#each tools as tool (tool.name)}
-              {@const isActive = activeToolNames.includes(tool.name)}
+              {@const isActive = activeToolSet.has(tool.name)}
               <button
                 onclick={() => onToggleTool(tool.name)}
                 class="group cursor-pointer w-full text-left px-5 py-2.5 text-sm transition-all duration-150 flex items-center gap-3 relative {isActive

@@ -27,7 +27,9 @@
       (g) =>
         g.name.toLowerCase().includes(q) ||
         g.cwd.toLowerCase().includes(q) ||
-        g.sessions.some((s) => (s.name ?? s.firstMessage ?? '').toLowerCase().includes(q))
+        g.sessions.some((r) =>
+          (r.session.name ?? r.session.firstMessage ?? '').toLowerCase().includes(q)
+        )
     );
   });
 

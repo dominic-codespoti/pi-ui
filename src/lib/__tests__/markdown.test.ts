@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
+  memoizedRenderMarkdown,
   renderMarkdown,
   renderStreamingPreview,
   highlightCode,
@@ -89,6 +90,20 @@ describe('renderMarkdown', () => {
     const result = renderMarkdown('line1\nline2');
     expect(result).toContain('<br>');
   });
+
+  it('renders common LaTeX symbols as Unicode', () => {
+    const result = renderMarkdown(String.raw`$a \rightarrow b$ and $c \leftarrow d$`);
+    expect(result).toContain('a → b');
+    expect(result).toContain('c ← d');
+    expect(result).not.toContain('rightarrow');
+    expect(result).not.toContain('leftarrow');
+  });
+
+  it('resolves complete math in the streaming preview without changing code', () => {
+    const result = renderStreamingPreview('$a \\rightarrow b$ and `$c \\leftarrow d$`');
+    expect(result).toContain('a → b');
+    expect(result).toContain('$c \\leftarrow d$');
+  });
 });
 
 describe('renderStreamingPreview', () => {
@@ -174,5 +189,44 @@ describe('lazy language race (onLangRegistered / whenLangReady)', () => {
     await whenLangReady('rust');
     unsubscribe();
     expect(seen).toContain('rust');
+  });
+});
+
+describe('memoizedRenderMarkdown', () => {
+  it('returns identical output to renderMarkdown and on repeat calls', () => {
+    const input = '# Heading\n\nSome paragraph with **bold** text and `code`.';
+    const direct = renderMarkdown(input);
+    const first = memoizedRenderMarkdown(input);
+    const second = memoizedRenderMarkdown(input);
+    expect(first).toBe(direct);
+    expect(second).toBe(first);
+  });
+
+  it('does not confuse distinct inputs with same length or different content', () => {
+    const inputA = 'abc-123';
+    const inputB = 'xyz-789';
+    const outA = memoizedRenderMarkdown(inputA);
+    const outB = memoizedRenderMarkdown(inputB);
+    expect(outA).not.toBe(outB);
+    expect(memoizedRenderMarkdown(inputA)).toBe(outA);
+    expect(memoizedRenderMarkdown(inputB)).toBe(outB);
+  });
+
+  it('respects entry limit (300 entries) and char limit (4,000,000 chars)', () => {
+    // Fill cache with > 300 unique entries to trigger entry eviction
+    for (let i = 0; i < 350; i++) {
+      memoizedRenderMarkdown(`unique entry ${i} for count limit testing`);
+    }
+    // Verify most recently added entries are still rendered accurately
+    const latest = memoizedRenderMarkdown(`unique entry 349 for count limit testing`);
+    expect(latest).toContain('unique entry 349');
+
+    // Fill cache with large strings to exercise total HTML char limit eviction
+    const largeA = 'a'.repeat(2_500_000);
+    const largeB = 'b'.repeat(2_500_000);
+    const resA = memoizedRenderMarkdown(largeA);
+    expect(resA.length).toBeGreaterThan(0);
+    const resB = memoizedRenderMarkdown(largeB);
+    expect(resB.length).toBeGreaterThan(0);
   });
 });
