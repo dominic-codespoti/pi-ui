@@ -121,9 +121,9 @@ export const SESSION_PREVIEW_LIMIT = 3;
 /**
  * How long a new_session / switch_session may stay unanswered before the UI
  * gives up and re-enables. The server normally replies with session_loaded in
- * tens of ms, but a dropped socket or a busy SDK must not leave the sidebar
- * and composer disabled forever — before this watchdog only a full reload
- * healed a lost reply.
+ * tens of ms, but a dropped socket or a busy SDK must not leave sidebar
+ * controls blocked forever — before this watchdog only a full reload healed
+ * a lost reply.
  */
 export const SESSION_OP_TIMEOUT_MS = 20_000;
 

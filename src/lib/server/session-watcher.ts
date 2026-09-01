@@ -19,17 +19,19 @@ const DEBOUNCE_MS = 500;
  * session file changes. Fire-and-forget best effort: if the watch cannot be
  * established, log and give up — scans still work, just not live.
  */
-export function startSessionWatch(getRoot: () => string, onDirty: () => void): void {
+export function startSessionWatch(
+  getRoot: () => string,
+  onDirty: () => void
+): (() => void) | undefined {
   let root: string;
   try {
     root = getRoot();
   } catch {
-    return; // SDK not loaded yet — nothing to watch.
+    return undefined; // SDK not loaded yet — nothing to watch.
   }
   let timer: Timer | null = null;
   let watcher: FSWatcher;
   try {
-    // Fresh installs have no sessions dir until the first session is created.
     mkdirSync(root, { recursive: true });
     watcher = watch(root, { recursive: true }, (_event, filename) => {
       if (filename && !filename.endsWith('.jsonl')) return;
@@ -41,9 +43,13 @@ export function startSessionWatch(getRoot: () => string, onDirty: () => void): v
     });
   } catch (err) {
     log.warn('[pifrontier] session watcher: not watching', root, '-', err);
-    return;
+    return undefined;
   }
   watcher.on('error', (err) => {
     log.warn('[pifrontier] session watcher error:', err);
   });
+  return () => {
+    if (timer) clearTimeout(timer);
+    watcher.close();
+  };
 }

@@ -5,6 +5,18 @@ export type MsgUsage = {
   cost: { total: number };
 };
 
+export type CompactionNoticeDetails = {
+  reason?: string;
+  status: 'running' | 'completed' | 'failed' | 'aborted' | 'retrying';
+  startedAt: number;
+  endedAt?: number;
+  durationMs?: number;
+  tokensBefore?: number;
+  tokensAfter?: number;
+  errorMessage?: string;
+  willRetry?: boolean;
+};
+
 export type UIMessage = {
   id: string;
   role: 'user' | 'assistant' | 'tool' | 'notice' | 'diagnostic';
@@ -28,6 +40,7 @@ export type UIMessage = {
   thinkingStartMs?: number;
   detailExpanded?: boolean;
   noticeKind?: 'compaction' | 'retry' | 'custom' | 'abort' | 'toast';
+  compaction?: CompactionNoticeDetails;
   customType?: string;
   renderedContent?: string;
   renderedThinking?: string;

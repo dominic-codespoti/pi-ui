@@ -453,7 +453,7 @@ export type ServerCustomEvent =
   | {
       type: 'session_loaded';
       sessionId: string;
-      isStreaming: boolean;
+      requestId?: string;
       thinkingLevel: string;
       model: ModelInfo | null;
       availableModels: ModelInfo[];

@@ -73,7 +73,7 @@ test.describe('PWA notifications', () => {
         if (msg.type === 'get_projects') ws.send(JSON.stringify(PROJECTS_LIST_PAYLOAD));
         if (msg.type === 'switch_session') {
           // Real server replies session_loaded after a switch — without it the
-          // app stays in the sessionLoading state (composer disabled).
+          // app cannot finish applying the requested session state.
           ws.send(
             JSON.stringify({
               type: 'session_loaded',

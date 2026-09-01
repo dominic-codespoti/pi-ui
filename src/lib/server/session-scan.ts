@@ -17,7 +17,7 @@
  */
 
 import { createReadStream, existsSync, mkdirSync, readFileSync } from 'node:fs';
-import { readdir, rename, stat, writeFile } from 'node:fs/promises';
+import { open, readdir, rename, stat, writeFile } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
 import { dirname, join, resolve } from 'node:path';
 import { log } from './logger';
@@ -45,6 +45,13 @@ interface CachedFileInfo {
   mtimeMs: number;
   size: number;
   info: SessionFileInfo | null;
+  /** Device/inode/fold captured the last time this process fully parsed the
+   *  file. Undefined right after loading the persisted cache (a restart) —
+   *  the first change to the file after a restart always does one full
+   *  re-parse, which populates these and enables incremental appends again. */
+  dev?: number;
+  ino?: number;
+  fold?: SessionScanFold;
 }
 
 const fileInfoCache = new Map<string, CachedFileInfo>();
@@ -111,6 +118,8 @@ function reviveInfo(raw: unknown): SessionFileInfo | null {
 }
 
 let persistTimer: Timer | null = null;
+let cacheWritePromise: Promise<void> | null = null;
+let cacheGeneration = 0;
 
 /**
  * Mark the cache dirty and schedule an atomic write. Debounced so a burst of
@@ -120,7 +129,8 @@ let persistTimer: Timer | null = null;
  */
 function schedulePersist(): void {
   cacheDirty = true;
-  if (persistTimer) return;
+  cacheGeneration++;
+  if (persistTimer || cacheWritePromise) return;
   persistTimer = setTimeout(() => {
     persistTimer = null;
     void persistCache();
@@ -129,24 +139,47 @@ function schedulePersist(): void {
 
 /** Atomic tmp+rename write. The file is small (~1 KB per session). */
 async function persistCache(): Promise<void> {
+  if (cacheWritePromise) return cacheWritePromise;
   if (!cacheFilePath || !cacheDirty) return;
-  try {
-    mkdirSync(dirname(cacheFilePath), { recursive: true });
-    const entries = [...fileInfoCache].map(([path, c]) => [
-      path,
-      c.mtimeMs,
-      c.size,
-      c.info
-        ? { ...c.info, created: c.info.created.getTime(), modified: c.info.modified.getTime() }
-        : null,
-    ]);
-    const tmp = `${cacheFilePath}.tmp`;
-    await writeFile(tmp, JSON.stringify({ version: 1, entries }));
-    await rename(tmp, cacheFilePath);
-    cacheDirty = false;
-  } catch (err) {
-    log.error('[pifrontier] session-scan cache: failed to save:', err);
-  }
+
+  const run = (async () => {
+    let failed = false;
+    try {
+      do {
+        const generation = cacheGeneration;
+        const filePath = cacheFilePath;
+        if (!filePath) break;
+        const entries = [...fileInfoCache].map(([path, c]) => [
+          path,
+          c.mtimeMs,
+          c.size,
+          c.info
+            ? { ...c.info, created: c.info.created.getTime(), modified: c.info.modified.getTime() }
+            : null,
+        ]);
+        mkdirSync(dirname(filePath), { recursive: true });
+        const tmp = `${filePath}.tmp`;
+        await writeFile(tmp, JSON.stringify({ version: 1, entries }));
+        await rename(tmp, filePath);
+        // A scan can mutate the cache while the write is awaited. Keep the
+        // dirty bit set for that newer generation so the loop persists it too.
+        if (cacheGeneration === generation) cacheDirty = false;
+      } while (cacheDirty);
+    } catch (err) {
+      failed = true;
+      log.error('[pifrontier] session-scan cache: failed to save:', err);
+    } finally {
+      cacheWritePromise = null;
+      if (!failed && cacheDirty && !persistTimer) {
+        persistTimer = setTimeout(() => {
+          persistTimer = null;
+          void persistCache();
+        }, 500);
+      }
+    }
+  })();
+  cacheWritePromise = run;
+  await run;
 }
 
 /** Flush any pending cache write — call on shutdown and in tests. */
@@ -202,6 +235,34 @@ export function firstTextContent(message: object): string {
   return candidates[0]?.slice(0, FIRST_MESSAGE_MAX_CHARS) ?? '';
 }
 
+/** Folding state accumulated while streaming a session file's lines — the
+ *  same locals parseSessionFile used before extraction, now reusable so an
+ *  appended tail can resume folding instead of re-reading from byte 0. */
+interface SessionScanFold {
+  headerId: string | undefined;
+  headerCwd: string;
+  headerTimestamp: string | undefined;
+  parentSessionPath: string | undefined;
+  sawHeader: boolean;
+  rejected: boolean;
+  name: string | undefined;
+  messageCount: number;
+  firstMessage: string;
+}
+
+function createEmptyFold(): SessionScanFold {
+  return {
+    headerId: undefined,
+    headerCwd: '',
+    headerTimestamp: undefined,
+    parentSessionPath: undefined,
+    sawHeader: false,
+    rejected: false,
+    name: undefined,
+    messageCount: 0,
+    firstMessage: '',
+  };
+}
 function strField(obj: object, key: string): string | undefined {
   // Parsed-JSON object with arbitrary keys — a string-keyed record view is the
   // honest type here; every read is still runtime-checked below.
@@ -209,102 +270,207 @@ function strField(obj: object, key: string): string | undefined {
   const value = record[key];
   return typeof value === 'string' ? value : undefined;
 }
+/** Fold one line into `fold`, mutating it in place. Mirrors the exact
+ *  per-line rules parseSessionFile used inline: the first line must be a
+ *  `session` header (else the file is permanently rejected, and every
+ *  later call is a no-op), later `session_info` lines update the display
+ *  name, and only `message` entries with a user/assistant role count. */
+function foldSessionLine(fold: SessionScanFold, line: string): void {
+  if (fold.rejected || !line.trim()) return;
+  let entry: unknown;
+  try {
+    entry = JSON.parse(line);
+  } catch {
+    return;
+  }
+  if (!entry || typeof entry === 'boolean' || typeof entry !== 'object') return;
+  const type = strField(entry, 'type');
+  if (!fold.sawHeader) {
+    if (type !== 'session') {
+      fold.rejected = true;
+      return;
+    }
+    fold.sawHeader = true;
+    fold.headerId = strField(entry, 'id');
+    fold.headerCwd = strField(entry, 'cwd') ?? '';
+    fold.headerTimestamp = strField(entry, 'timestamp');
+    fold.parentSessionPath = strField(entry, 'parentSession');
+    return;
+  }
+  if (type === 'session_info') {
+    fold.name = strField(entry, 'name')?.trim() || undefined;
+    return;
+  }
+  if (type !== 'message') return;
+  const message = 'message' in entry ? entry.message : undefined;
+  if (!message || typeof message !== 'object') return;
+  const role = strField(message, 'role');
+  if (role !== 'user' && role !== 'assistant') return;
+  fold.messageCount++;
+  if (!fold.firstMessage && role === 'user') {
+    fold.firstMessage = firstTextContent(message);
+  }
+}
 
-/** Parse one session .jsonl streaming; returns null for non-session files. */
-async function parseSessionFile(
+/** Stream `filePath` from `startByte` (default 0) through `fold`, mutating
+ *  it in place. Stops as soon as the file is rejected — matching the
+ *  original single-return-null behavior — instead of reading the rest of
+ *  a non-session file. */
+async function foldSessionFileFrom(
   filePath: string,
-  mtimeMs: number
-): Promise<SessionFileInfo | null> {
-  let headerId: string | undefined;
-  let headerCwd = '';
-  let headerTimestamp: string | undefined;
-  let parentSessionPath: string | undefined;
-  let sawHeader = false;
-  let name: string | undefined;
-  let messageCount = 0;
-  let firstMessage = '';
-
+  fold: SessionScanFold,
+  startByte = 0
+): Promise<void> {
   const rl = createInterface({
-    input: createReadStream(filePath, { encoding: 'utf8' }),
+    input: createReadStream(filePath, { encoding: 'utf8', start: startByte }),
     crlfDelay: Infinity,
   });
   try {
     for await (const line of rl) {
-      if (!line.trim()) continue;
-      let entry: unknown;
-      try {
-        entry = JSON.parse(line);
-      } catch {
-        continue;
-      }
-      if (!entry || typeof entry === 'boolean' || typeof entry !== 'object') continue;
-      const type = strField(entry, 'type');
-      if (!sawHeader) {
-        if (type !== 'session') return null;
-        sawHeader = true;
-        headerId = strField(entry, 'id');
-        headerCwd = strField(entry, 'cwd') ?? '';
-        headerTimestamp = strField(entry, 'timestamp');
-        parentSessionPath = strField(entry, 'parentSession');
-        continue;
-      }
-      if (type === 'session_info') {
-        name = strField(entry, 'name')?.trim() || undefined;
-        continue;
-      }
-      if (type !== 'message') continue;
-      const message = 'message' in entry ? entry.message : undefined;
-      if (!message || typeof message !== 'object') continue;
-      const role = strField(message, 'role');
-      if (role !== 'user' && role !== 'assistant') continue;
-      messageCount++;
-      if (!firstMessage && role === 'user') {
-        firstMessage = firstTextContent(message);
-      }
+      foldSessionLine(fold, line);
+      if (fold.rejected) break;
     }
   } finally {
     rl.close();
   }
+}
 
-  if (!sawHeader || !headerId) return null;
-  const headerTime = headerTimestamp ? new Date(headerTimestamp).getTime() : NaN;
+/** Build the public summary from a completed fold, or null when the file
+ *  was never a valid session (no header, or the first line rejected it). */
+function summaryFromFold(
+  fold: SessionScanFold,
+  filePath: string,
+  mtimeMs: number
+): SessionFileInfo | null {
+  if (fold.rejected || !fold.sawHeader || !fold.headerId) return null;
+  const headerTime = fold.headerTimestamp ? new Date(fold.headerTimestamp).getTime() : NaN;
   const fallbackCreated = Number.isNaN(headerTime) ? Date.now() : headerTime;
   return {
     path: filePath,
-    id: headerId,
-    cwd: headerCwd,
-    name,
-    parentSessionPath,
+    id: fold.headerId,
+    cwd: fold.headerCwd,
+    name: fold.name,
+    parentSessionPath: fold.parentSessionPath,
     created: new Date(fallbackCreated),
     modified: new Date(mtimeMs),
-    messageCount,
-    firstMessage: firstMessage || '(no messages)',
+    messageCount: fold.messageCount,
+    firstMessage: fold.firstMessage || '(no messages)',
   };
 }
 
-/** Stat-validated, cached info for one file; re-parses only when the file changed. */
+/** Parse one session .jsonl streaming from byte 0; returns null info for
+ *  non-session files. Always returns the fold so the caller can cache it
+ *  for a future incremental extension. */
+async function parseSessionFile(
+  filePath: string,
+  mtimeMs: number
+): Promise<{ info: SessionFileInfo | null; fold: SessionScanFold }> {
+  const fold = createEmptyFold();
+  await foldSessionFileFrom(filePath, fold);
+  return { info: summaryFromFold(fold, filePath, mtimeMs), fold };
+}
+
+/** Stat-validated, cached info for one file. An append-only change (same
+ *  device/inode, larger size) extends the cached fold from its previous
+ *  end-of-file instead of re-parsing from byte 0; any other change (new
+ *  file, shrink, identity change, or a failed extension attempt) does a
+ *  full re-parse. */
 async function fileInfo(filePath: string): Promise<SessionFileInfo | null> {
-  let mtimeMs: number;
-  let size: number;
+  let stats: { dev: number; ino: number; mtimeMs: number; size: number };
   try {
-    const stats = await stat(filePath);
-    mtimeMs = stats.mtimeMs;
-    size = stats.size;
+    const s = await stat(filePath);
+    stats = { dev: s.dev, ino: s.ino, mtimeMs: s.mtimeMs, size: s.size };
   } catch {
     if (fileInfoCache.delete(filePath)) schedulePersist();
     return null;
   }
   const cached = fileInfoCache.get(filePath);
-  if (cached && cached.mtimeMs === mtimeMs && cached.size === size) return cached.info;
+  if (cached && cached.mtimeMs === stats.mtimeMs && cached.size === stats.size) return cached.info;
+
+  if (
+    cached?.fold &&
+    cached.dev === stats.dev &&
+    cached.ino === stats.ino &&
+    stats.size > cached.size
+  ) {
+    const cachedWithFold = cached as CachedFileInfo & {
+      fold: SessionScanFold;
+      dev: number;
+      ino: number;
+    };
+    const extended = await tryExtendFold(filePath, cachedWithFold, stats);
+    if (extended) {
+      fileInfoCache.set(filePath, extended);
+      schedulePersist();
+      return extended.info;
+    }
+  }
+
   let info: SessionFileInfo | null;
+  let fold: SessionScanFold | undefined;
   try {
-    info = await parseSessionFile(filePath, mtimeMs);
+    const result = await parseSessionFile(filePath, stats.mtimeMs);
+    info = result.info;
+    fold = result.fold;
   } catch {
     info = null;
+    fold = undefined;
   }
-  fileInfoCache.set(filePath, { mtimeMs, size, info });
+  fileInfoCache.set(filePath, {
+    mtimeMs: stats.mtimeMs,
+    size: stats.size,
+    info,
+    dev: stats.dev,
+    ino: stats.ino,
+    fold,
+  });
   schedulePersist();
   return info;
+}
+/**
+ * Attempt to extend a cached fold with only the bytes appended since
+ * `cached.size`. Verifies the byte immediately before that offset is a
+ * newline, proving the cached prefix still ends on a line boundary in the
+ * file's current content — the one case identity+size cannot rule out on
+ * their own. Returns undefined (caller falls back to a full re-parse)
+ * when the fold is already permanently rejected, the boundary check
+ * fails, the handle can't be opened, or the read comes back short.
+ */
+async function tryExtendFold(
+  filePath: string,
+  cached: CachedFileInfo & { fold: SessionScanFold; dev: number; ino: number },
+  stats: { dev: number; ino: number; mtimeMs: number; size: number }
+): Promise<CachedFileInfo | undefined> {
+  if (cached.fold.rejected) return undefined;
+  if (cached.size > 0) {
+    let handle;
+    try {
+      handle = await open(filePath, 'r');
+    } catch {
+      return undefined;
+    }
+    try {
+      const boundary = Buffer.alloc(1);
+      const { bytesRead } = await handle.read(boundary, 0, 1, cached.size - 1);
+      if (bytesRead !== 1 || boundary[0] !== 0x0a) return undefined;
+    } finally {
+      await handle.close();
+    }
+  }
+  const fold: SessionScanFold = { ...cached.fold };
+  try {
+    await foldSessionFileFrom(filePath, fold, cached.size);
+  } catch {
+    return undefined;
+  }
+  return {
+    mtimeMs: stats.mtimeMs,
+    size: stats.size,
+    info: summaryFromFold(fold, filePath, stats.mtimeMs),
+    dev: stats.dev,
+    ino: stats.ino,
+    fold,
+  };
 }
 
 /**
@@ -345,19 +511,24 @@ async function jsonlFilesIn(dir: string): Promise<string[]> {
     // file per spawned task. Without this walk those sessions never reach
     // the sidebar at all.
     const taskLists = await Promise.all(
-      entries.filter((e) => e.isDirectory()).map(async (e) => {
-        try {
-          const taskDir = join(dir, e.name, 'tasks');
-          return (await readdir(taskDir))
-            .filter((f) => f.endsWith('.jsonl'))
-            .map((f) => join(taskDir, f));
-        } catch (nestedErr) {
-          if ((nestedErr as NodeJS.ErrnoException)?.code !== 'ENOENT') {
-            log.error(`[pifrontier] cannot scan task sessions in ${join(dir, e.name)}:`, nestedErr);
+      entries
+        .filter((e) => e.isDirectory())
+        .map(async (e) => {
+          try {
+            const taskDir = join(dir, e.name, 'tasks');
+            return (await readdir(taskDir))
+              .filter((f) => f.endsWith('.jsonl'))
+              .map((f) => join(taskDir, f));
+          } catch (nestedErr) {
+            if ((nestedErr as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+              log.error(
+                `[pifrontier] cannot scan task sessions in ${join(dir, e.name)}:`,
+                nestedErr
+              );
+            }
+            return [];
           }
-          return [];
-        }
-      })
+        })
     );
     for (const list of taskLists) files.push(...list);
     return files;

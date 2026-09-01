@@ -71,6 +71,7 @@ import {
   type SessionFileInfo,
 } from './src/lib/server/session-scan.ts';
 import { SessionCatalog } from './src/lib/server/session-catalog.ts';
+import { startSessionWatch } from './src/lib/server/session-watcher.ts';
 import {
   EXTENSION_UI_SCHEMA_VERSION,
   type ClientMessage,
@@ -169,6 +170,11 @@ const MAX_INITIAL_MESSAGES = 100;
 const FILE_COMPLETE_TTL_MS = 5_000;
 const FILE_COMPLETE_CACHE_MAX = 50;
 const fileCompleteCache = new Map<string, { at: number; entries: string[] }>();
+/** Per-directory completion cache — completion requests repeat while a path is
+ *  being typed. Short TTL keeps newly-created directories discoverable. */
+const DIR_COMPLETE_TTL_MS = 2_000;
+const DIR_COMPLETE_CACHE_MAX = 50;
+const dirCompleteCache = new Map<string, { at: number; entries: string[] }>();
 
 /** Truncate messages for initial payload — keeps the WS + client render fast.
  *  Oversized text/thinking blocks are additionally size-capped for transfer. */
@@ -738,7 +744,7 @@ function poolSummary(sess: AgentSession, entry: ManagedSession): SessionFileInfo
     id: sess.sessionId,
     path: entry.path ?? '(in-memory)',
     cwd: entry.cwd,
-    name: sess.sessionManager.getSessionName() || undefined,
+    name: entry.sessionName || undefined,
     created: new Date(entry.createdAt),
     modified: new Date(entry.lastActivity),
     messageCount: sess.messages.length,
@@ -2034,6 +2040,7 @@ function tickWidgetFactory(key: string, owner: string | null): void {
 
 let _sdk: typeof PiSDKNS | null = null;
 let _projectTrustStore: PiSDKNS.ProjectTrustStore | null = null;
+let _stopSessionWatch: (() => void) | undefined;
 
 // ── Autocomplete provider wrappers (extension-registered) ─────────────────
 // Providers belong to the session that registered them. This prevents a
@@ -2097,6 +2104,16 @@ async function getSDK(): Promise<typeof PiSDKNS> {
     } catch {
       // Not critical — version display stays 'unknown'
     }
+    // Start watching the session root exactly once, now that the SDK's agent
+    // dir (and therefore sessionsRoot()) is resolvable. External appends
+    // (subagents, a concurrent pi CLI process) invalidate the cached scan and
+    // trigger a coalesced sidebar/projects refresh instead of staying hidden
+    // until an unrelated structural change forces a rescan.
+    _stopSessionWatch = startSessionWatch(sessionsRoot, () => {
+      sessionCatalog.invalidateScan();
+      scheduleSessionListRefresh();
+      scheduleProjectsRefresh();
+    });
   }
   return _sdk!;
 }
@@ -2127,6 +2144,10 @@ interface ManagedSession {
   /** Pending graceful extension shutdown request. */
   shutdownRequested: boolean;
   modelFallbackMessage?: string;
+  /** Cached session display name — refreshed only on session_info_changed,
+   *  not recomputed from sessionManager.getSessionName() on every message
+   *  (that call scans every entry the session has ever had). */
+  sessionName: string | undefined;
 }
 
 /** Grace before a navigated-away idle session is dropped from memory. Long
@@ -2134,6 +2155,53 @@ interface ManagedSession {
  *  re-creates an SDK session (the dominant switch-lag cost); short enough
  *  that a whale session doesn't sit in RAM for the 30-min LRU window. */
 const NAV_OUT_DISPOSE_GRACE_MS = 5 * 60 * 1000;
+/** Hard cap on resident pooled sessions (the active session is always exempt).
+ *  Configurable via PI_UI_MAX_POOLED_SESSIONS for deployments with more
+ *  available memory. Sessions with unseen results, queued work, or that
+ *  are in-memory-only are never evicted to honor this cap — see
+ *  isSessionSafeToDispose — so it is a best-effort bound, not a hard limit. */
+const MAX_POOLED_SESSIONS = Number(Bun.env.PI_UI_MAX_POOLED_SESSIONS) || 12;
+
+/**
+ * True when a pooled entry may be safely disposed right now: not active,
+ * not running, no unseen results, no queued steering/follow-up messages,
+ * and persisted to disk (in-memory sessions would lose data). Shared by
+ * the navigated-away timer and the idle sweep so both apply identical
+ * guarantees.
+ */
+function isSessionSafeToDispose(sid: string, entry: ManagedSession): boolean {
+  if (sid === activeSessionId) return false;
+  if (entry.isRunning || entry.unseen) return false;
+  if (!entry.path) return false; // in-memory session — disposal would lose data
+  try {
+    if (entry.session.getSteeringMessages().length || entry.session.getFollowUpMessages().length) {
+      return false;
+    }
+  } catch {
+    return false; // session state unreadable — leave it to a later sweep
+  }
+  return true;
+}
+
+/** Mechanical teardown of one pooled entry: unsubscribe, dispose the SDK
+ *  session, drop UI state, and remove it (and its path index entry) from
+ *  the pool. Callers that need eligibility checks run isSessionSafeToDispose
+ *  first; delete_session disposes unconditionally on explicit user request
+ *  and does not use this helper. */
+function releaseManagedSession(sid: string, entry: ManagedSession, reason: string): void {
+  try {
+    entry.forwardingUnsub?.();
+    entry.runtimeUnsub?.();
+    entry.session.dispose();
+  } catch (err) {
+    log.error(`[pifrontier] Error disposing session ${sid}:`, err);
+  }
+  disposeUi(sid);
+  sessionPool.delete(sid);
+  if (entry.path) pathToSessionId.delete(entry.path);
+  sessionCatalog.apply({ kind: 'release', id: sid });
+  log.info(`[pifrontier] Released session ${sid} from memory (${reason}).`);
+}
 
 /**
  * Schedule disposal of a session the user navigated away from. Sessions are
@@ -2148,25 +2216,8 @@ function scheduleNavOutDisposal(sid: string): void {
   if (!entry.path) return; // in-memory session — disposal would lose data
   entry.disposeTimer = setTimeout(() => {
     entry.disposeTimer = null;
-    if (activeSessionId === sid || sessionPool.get(sid) !== entry) return;
-    if (entry.isRunning || entry.unseen) return;
-    try {
-      if (entry.session.getSteeringMessages().length || entry.session.getFollowUpMessages().length)
-        return;
-    } catch {
-      return; // session state unreadable — leave it to the LRU sweep
-    }
-    try {
-      entry.forwardingUnsub?.();
-      entry.runtimeUnsub?.();
-      entry.session.dispose();
-    } catch (err) {
-      log.error(`[pifrontier] Error disposing navigated-away session ${sid}:`, err);
-    }
-    disposeUi(sid);
-    sessionPool.delete(sid);
-    sessionCatalog.apply({ kind: 'release', id: sid });
-    log.info(`[pifrontier] Released navigated-away session ${sid} from memory.`);
+    if (sessionPool.get(sid) !== entry || !isSessionSafeToDispose(sid, entry)) return;
+    releaseManagedSession(sid, entry, 'navigated-away');
   }, NAV_OUT_DISPOSE_GRACE_MS);
 }
 
@@ -2178,10 +2229,27 @@ function cancelNavOutDisposal(entry: ManagedSession): void {
   }
 }
 
+/** Path→session-id index kept in sync with `sessionPool` so switching to an
+ *  already-pooled session by file path is O(1) instead of scanning the pool. */
+const pathToSessionId = new Map<string, string>();
 const sessionPool = new Map<string, ManagedSession>();
 let activeSessionId: string | null = null;
 // Promise lock — prevents concurrent first-connection races from creating duplicate sessions.
 let _sessionInitPromise: Promise<string> | null = null;
+/** Serializes session-creating/switching operations (new_session,
+ *  switch_session, fork_session, and the matching extension command
+ *  actions) so concurrent requests cannot race to create duplicate SDK
+ *  sessions or interleave activeSessionId updates. A rejected operation
+ *  does not jam the queue for the next one. */
+let _sessionMutationQueue: Promise<unknown> = Promise.resolve();
+function withSessionMutationLock<T>(operation: () => Promise<T>): Promise<T> {
+  const run = _sessionMutationQueue.then(operation, operation);
+  _sessionMutationQueue = run.then(
+    () => undefined,
+    () => undefined
+  );
+  return run;
+}
 
 // ── Session catalog ───────────────────────────────────────────────────────────
 // Single source of truth for the merged session list (sidebar, project
@@ -2233,22 +2301,22 @@ function startIdleCleanup(): void {
   if (_idleCleanupTimer) return;
   _idleCleanupTimer = setInterval(() => {
     const now = Date.now();
+    const eligible: [string, ManagedSession][] = [];
     for (const [sid, entry] of sessionPool) {
-      if (sid === activeSessionId) continue;
-      if (entry.isRunning) continue;
-      if (now - entry.lastActivity < IDLE_SESSION_TIMEOUT_MS) continue;
-      // Dispose — unsubscribe and remove from pool.
+      if (isSessionSafeToDispose(sid, entry)) eligible.push([sid, entry]);
+    }
+    // Oldest-activity-first: the size cap below trims the least-recently-used
+    // eligible entries; a session past the flat idle timeout is disposed
+    // regardless of the cap.
+    eligible.sort((a, b) => a[1].lastActivity - b[1].lastActivity);
+    let poolSize = sessionPool.size;
+    for (const [sid, entry] of eligible) {
+      const overCap = poolSize > MAX_POOLED_SESSIONS;
+      const idleTooLong = now - entry.lastActivity >= IDLE_SESSION_TIMEOUT_MS;
+      if (!overCap && !idleTooLong) continue;
       cancelNavOutDisposal(entry);
-      try {
-        entry.forwardingUnsub?.();
-        entry.runtimeUnsub?.();
-        entry.session.dispose();
-      } catch (err) {
-        log.error(`[pifrontier] Error disposing idle session ${sid}:`, err);
-      }
-      disposeUi(sid);
-      sessionPool.delete(sid);
-      sessionCatalog.apply({ kind: 'release', id: sid });
+      releaseManagedSession(sid, entry, overCap ? 'pool-cap' : 'idle-timeout');
+      poolSize--;
     }
   }, 60_000); // check every 60s
 }
@@ -2267,10 +2335,8 @@ function activeSessionOrNull(): AgentSession | null {
 
 /** Look up a managed session by its session-file path. */
 function findManagedSessionByPath(path: string): ManagedSession | undefined {
-  for (const m of sessionPool.values()) {
-    if (m.path === path) return m;
-  }
-  return undefined;
+  const sid = pathToSessionId.get(path);
+  return sid ? sessionPool.get(sid) : undefined;
 }
 function extensionFlagValuesFor(): Map<string, boolean | string> {
   const stored = readSettings().extensionFlags;
@@ -2437,64 +2503,67 @@ function commandContextActionsFor(
 ): ExtensionCommandContextActions {
   return {
     waitForIdle: () => session.waitForIdle(),
-    newSession: async (options) => {
-      const sdk = await getSDK();
-      const previousSessionFile = session.sessionFile;
-      const targetCwd = session.sessionManager.getCwd() || cwd;
-      const manager = sdk.SessionManager.create(targetCwd);
-      await options?.setup?.(manager);
-      const created = await createSdkSession(targetCwd, manager, 'new', previousSessionFile);
-      await bindRpcHost(created.session);
-      await setActiveSession(created.session, targetCwd, created);
-      await options?.withSession?.(replacementContextFor(created.session));
-      return { cancelled: false };
-    },
-    fork: async (entryId, options) => {
-      const sessionFile = session.sessionFile;
-      if (!sessionFile) throw new Error('Cannot fork an in-memory session');
-      const manager = sdkOrThrow().SessionManager.open(sessionFile);
-      const forkPath = manager.createBranchedSession(entryId);
-      if (!forkPath) throw new Error('Failed to create branched session');
-      const forkManager = sdkOrThrow().SessionManager.open(forkPath);
-      const created = await createSdkSession(
-        forkManager.getCwd() || session.sessionManager.getCwd() || cwd,
-        forkManager,
-        'fork',
-        session.sessionFile
-      );
-      await bindRpcHost(created.session);
-      await setActiveSession(created.session, forkManager.getCwd(), created);
-      await options?.withSession?.(replacementContextFor(created.session));
-      return { cancelled: false };
-    },
-    navigateTree: (targetId, options) => session.navigateTree(targetId, options),
-    switchSession: async (sessionPath, options) => {
-      const target = findManagedSessionByPath(resolve(sessionPath));
-      if (target) {
-        await setActiveSession(target.session, target.cwd);
-        await options?.withSession?.(replacementContextFor(target.session));
+    newSession: (options) =>
+      withSessionMutationLock(async () => {
+        const sdk = await getSDK();
+        const previousSessionFile = session.sessionFile;
+        const targetCwd = session.sessionManager.getCwd() || cwd;
+        const manager = sdk.SessionManager.create(targetCwd);
+        await options?.setup?.(manager);
+        const created = await createSdkSession(targetCwd, manager, 'new', previousSessionFile);
+        await bindRpcHost(created.session);
+        await setActiveSession(created.session, targetCwd, created);
+        await options?.withSession?.(replacementContextFor(created.session));
         return { cancelled: false };
-      }
-      const known = await sessionCatalog.list();
-      const resolvedPath = resolve(sessionPath);
-      if (
-        !known.some((item) => item.path === resolvedPath) &&
-        !(await sessionCatalog.hasFile(resolvedPath))
-      ) {
-        throw new Error('Session not found');
-      }
-      const manager = sdkOrThrow().SessionManager.open(resolvedPath);
-      const created = await createSdkSession(
-        manager.getCwd() || cwd,
-        manager,
-        'resume',
-        session.sessionFile
-      );
-      await bindRpcHost(created.session);
-      await setActiveSession(created.session, manager.getCwd(), created);
-      await options?.withSession?.(replacementContextFor(created.session));
-      return { cancelled: false };
-    },
+      }),
+    fork: (entryId, options) =>
+      withSessionMutationLock(async () => {
+        const sessionFile = session.sessionFile;
+        if (!sessionFile) throw new Error('Cannot fork an in-memory session');
+        const manager = sdkOrThrow().SessionManager.open(sessionFile);
+        const forkPath = manager.createBranchedSession(entryId);
+        if (!forkPath) throw new Error('Failed to create branched session');
+        const forkManager = sdkOrThrow().SessionManager.open(forkPath);
+        const created = await createSdkSession(
+          forkManager.getCwd() || session.sessionManager.getCwd() || cwd,
+          forkManager,
+          'fork',
+          session.sessionFile
+        );
+        await bindRpcHost(created.session);
+        await setActiveSession(created.session, forkManager.getCwd(), created);
+        await options?.withSession?.(replacementContextFor(created.session));
+        return { cancelled: false };
+      }),
+    navigateTree: (targetId, options) => session.navigateTree(targetId, options),
+    switchSession: (sessionPath, options) =>
+      withSessionMutationLock(async () => {
+        const target = findManagedSessionByPath(resolve(sessionPath));
+        if (target) {
+          await setActiveSession(target.session, target.cwd);
+          await options?.withSession?.(replacementContextFor(target.session));
+          return { cancelled: false };
+        }
+        const known = await sessionCatalog.list();
+        const resolvedPath = resolve(sessionPath);
+        if (
+          !known.some((item) => item.path === resolvedPath) &&
+          !(await sessionCatalog.hasFile(resolvedPath))
+        ) {
+          throw new Error('Session not found');
+        }
+        const manager = sdkOrThrow().SessionManager.open(resolvedPath);
+        const created = await createSdkSession(
+          manager.getCwd() || cwd,
+          manager,
+          'resume',
+          session.sessionFile
+        );
+        await bindRpcHost(created.session);
+        await setActiveSession(created.session, manager.getCwd(), created);
+        await options?.withSession?.(replacementContextFor(created.session));
+        return { cancelled: false };
+      }),
     reload: async () => {
       await reloadSessionHost(sid, session);
     },
@@ -2660,7 +2729,13 @@ function makeEventForwarder(
 ): (event: PiSDKNS.AgentSessionEvent) => void {
   const pendingToolArgs = new Map<string, unknown>();
   return (event) => {
-    if (activeSessionId !== sid) return; // not active — skip forwarding
+    // Normal completion/turn-end events must release argument payloads even
+    // when forwarding is disabled or the session is no longer active.
+    if (event.type === 'agent_end') pendingToolArgs.clear();
+    if (activeSessionId !== sid || connectedClients === 0) {
+      if (event.type === 'tool_execution_end') pendingToolArgs.delete(event.toolCallId);
+      return;
+    }
     if (event.type === 'message_update') {
       broadcast({ ...event, sessionId: sid, message: { role: event.message.role } });
     } else if (event.type === 'message_end') {
@@ -2736,6 +2811,7 @@ function registerSession(
     disposeTimer: null,
     runtimeBroadcastTimer: null,
     diagnostics: created?.diagnostics ?? [],
+    sessionName: sess.sessionManager.getSessionName(),
     hostBound: _bindExt || created !== undefined,
     shutdownRequested: false,
     ...(created?.modelFallbackMessage
@@ -2743,6 +2819,7 @@ function registerSession(
       : {}),
   };
   sessionPool.set(sid, entry);
+  if (path) pathToSessionId.set(path, sid);
   // Pooled sessions are overlay-authoritative while resident — register the
   // live summary immediately so the sidebar sees the session without any
   // file scan (and without waiting for the first message_end).
@@ -2797,6 +2874,7 @@ function registerSession(
         // live summary so the sidebar name is never stale. The WS rename
         // handler's explicit apply stays for non-pooled targets (no
         // AgentSession → no event); for pooled ones this is the chokepoint.
+        entry.sessionName = sess.sessionManager.getSessionName();
         sessionCatalog.apply({ kind: 'upsert', session: poolSummary(sess, entry) });
         break;
       case 'compaction_start': {
@@ -2823,7 +2901,7 @@ function registerSession(
         // pre-compaction history) — re-broadcast session_loaded so the UI
         // shows the compacted conversation. Deferred a tick so the SDK's
         // finally block has cleared isCompacting before we read it.
-        if (!ce.aborted && !ce.willRetry && activeSessionId === sid) {
+        if (!ce.aborted && !ce.willRetry && !ce.errorMessage && activeSessionId === sid) {
           setTimeout(() => {
             if (activeSessionId !== sid) return; // user switched away mid-compaction
             const sess = sessionPool.get(sid)?.session;
@@ -2864,15 +2942,27 @@ function registerSession(
   // Subscribe event-forwarding (only active session gets this)
   entry.forwardingUnsub = sess.subscribe(makeEventForwarder(sid, sess));
 }
-/** Broadcast a runtime-status update for a single pooled session. */
-function broadcastSessionRuntime(sid: string, entry: ManagedSession) {
-  broadcast({
-    type: 'session_runtime',
+function sessionRuntimePayload(sid: string, entry: ManagedSession) {
+  return {
+    type: 'session_runtime' as const,
     sessionId: sid,
     isRunning: entry.isRunning,
     unseen: entry.unseen,
     lastActivity: entry.lastActivity,
-  });
+  };
+}
+
+function sendSessionRuntime(
+  sink: { send(data: string): unknown },
+  sid: string,
+  entry: ManagedSession
+): void {
+  sink.send(JSON.stringify(sessionRuntimePayload(sid, entry)));
+}
+
+/** Broadcast a runtime-status update for a single pooled session. */
+function broadcastSessionRuntime(sid: string, entry: ManagedSession): void {
+  broadcast(sessionRuntimePayload(sid, entry));
 }
 
 /**
@@ -2965,11 +3055,12 @@ function toolsPayloadFor(sess: AgentSession): {
 
 /** Broadcast a full session_loaded payload for `sess` — used on session switch
  *  and to refresh the client after a successful compaction. */
-function broadcastSessionLoaded(sess: AgentSession): void {
+function broadcastSessionLoaded(sess: AgentSession, requestId?: string): void {
   const init = initialMessages(sess.messages, sess);
   broadcast({
     type: 'session_loaded',
     sessionId: sess.sessionId,
+    ...(requestId !== undefined ? { requestId } : {}),
     isStreaming: sess.isStreaming,
     thinkingLevel: sess.thinkingLevel,
     model: serializeModel(sess.model),
@@ -3065,17 +3156,19 @@ function scheduleSessionListRefresh(): void {
 async function setActiveSession(
   newSession: AgentSession,
   newCwd?: string,
-  created?: CreatedSdkSession
+  created?: CreatedSdkSession,
+  requestId?: string
 ) {
   const newId = newSession.sessionId;
+  const previousSessionId = activeSessionId;
 
-  if (activeSessionId && activeSessionId !== newId) {
-    const prev = sessionPool.get(activeSessionId);
+  if (previousSessionId && previousSessionId !== newId) {
+    const prev = sessionPool.get(previousSessionId);
     if (prev?.forwardingUnsub) {
       prev.forwardingUnsub();
       prev.forwardingUnsub = null;
     }
-    if (prev) scheduleNavOutDisposal(activeSessionId);
+    if (prev) scheduleNavOutDisposal(previousSessionId);
   }
 
   const alreadyPooled = sessionPool.has(newId);
@@ -3092,14 +3185,18 @@ async function setActiveSession(
       false,
       created
     );
+    const entryAtBind = sessionPool.get(newId)!;
     void bindRpcHost(newSession)
       .then(() => {
-        const e = sessionPool.get(newId);
-        if (e) e.hostBound = true;
+        // A nav-out or pool-cap release may have removed this entry while
+        // extension binding was in flight. Never publish stale tool state or
+        // retain the old session graph after that replacement.
+        if (sessionPool.get(newId) !== entryAtBind) return;
+        entryAtBind.hostBound = true;
+        if (connectedClients === 0) return;
         broadcast({ type: 'tools_list', ...toolsPayloadFor(newSession) });
         broadcast({ type: 'commands_list', commands: extensionCommandsFor(newSession) });
-        const diag = sessionPool.get(newId)?.diagnostics ?? [];
-        broadcast({ type: 'runtime_diagnostics', diagnostics: diag });
+        broadcast({ type: 'runtime_diagnostics', diagnostics: entryAtBind.diagnostics });
       })
       .catch((err) => log.error('[pifrontier] bindRpcHost for new session failed:', err));
   }
@@ -3115,10 +3212,12 @@ async function setActiveSession(
   entry.unseen = false;
   entry.lastActivity = Date.now();
 
-  broadcastSessionLoaded(newSession);
-  for (const [sid, pooledEntry] of sessionPool) {
-    broadcastSessionRuntime(sid, pooledEntry);
+  broadcastSessionLoaded(newSession, requestId);
+  if (previousSessionId && previousSessionId !== newId) {
+    const previous = sessionPool.get(previousSessionId);
+    if (previous) broadcastSessionRuntime(previousSessionId, previous);
   }
+  broadcastSessionRuntime(newId, entry);
   broadcast({ type: 'commands_list', commands: extensionCommandsFor(newSession) });
   projectCatalog.apply({ kind: 'touch', path: newSession.sessionManager.getCwd() || cwd });
   scheduleSessionListRefresh();
@@ -3368,10 +3467,11 @@ try {
             }
           }
 
-          // Send runtime snapshots for all pooled sessions so reconnecting clients
-          // get correct sidebar state (background running, unseen, etc.)
+          // Send runtime snapshots only to the reconnecting socket. Publishing
+          // each pooled session to every existing client makes one reconnect
+          // cost O(pool × clients) and duplicates unchanged sidebar state.
           for (const [sid, entry] of sessionPool) {
-            broadcastSessionRuntime(sid, entry);
+            sendSessionRuntime(ws, sid, entry);
           }
 
           // Periodic token check (every 60s) — closes expired or revoked
@@ -3564,64 +3664,78 @@ try {
             }
 
             case 'new_session': {
-              try {
-                const rawTargetCwd =
-                  (msg as { type: 'new_session'; targetCwd?: string }).targetCwd ?? cwd;
-                const targetCwd = resolve(expandTilde(rawTargetCwd));
-                // Create the directory if it doesn't exist (brand new folder).
-                await mkdir(targetCwd, { recursive: true });
-                const sm = _sdk!.SessionManager.create(targetCwd);
-                const created = await createSdkSession(
-                  targetCwd,
-                  sm,
-                  'new',
-                  activeSessionOrNull()?.sessionFile
-                );
-                await setActiveSession(created.session, targetCwd, created);
-              } catch (err) {
-                log.error('[pifrontier] new_session error:', err);
-                ws.send(JSON.stringify({ type: 'sessions_error', message: String(err) }));
-              }
+              const requestId = msg.requestId;
+              await withSessionMutationLock(async () => {
+                try {
+                  const rawTargetCwd =
+                    (msg as { type: 'new_session'; targetCwd?: string }).targetCwd ?? cwd;
+                  const targetCwd = resolve(expandTilde(rawTargetCwd));
+                  // Create the directory if it doesn't exist (brand new folder).
+                  await mkdir(targetCwd, { recursive: true });
+                  const sm = _sdk!.SessionManager.create(targetCwd);
+                  const created = await createSdkSession(
+                    targetCwd,
+                    sm,
+                    'new',
+                    activeSessionOrNull()?.sessionFile
+                  );
+                  await setActiveSession(created.session, targetCwd, created, requestId);
+                } catch (err) {
+                  log.error('[pifrontier] new_session error:', err);
+                  ws.send(
+                    JSON.stringify({ type: 'sessions_error', requestId, message: String(err) })
+                  );
+                }
+              });
               break;
             }
 
             case 'switch_session': {
-              try {
-                // If the user selects the current session path, we proceed anyway to refresh client state.
-                const resolvedPath = resolve(cwd, expandTilde(msg.path));
-                // Check pool first — reuse live session if already loaded
-                const existing = findManagedSessionByPath(resolvedPath);
-                if (existing) {
-                  await setActiveSession(existing.session, existing.cwd);
-                  break;
-                }
-                // Security: only open known session files — never raw client paths.
-                // Cache-miss falls back to a targeted stat of the exact file — a
-                // session created moments ago (e.g. by the pi TUI) must not be
-                // rejected on a stale cache, but validating it must not re-scan
-                // the whole store either (seconds of lag on large stores).
-                const knownSessions = await sessionCatalog.list();
-                if (
-                  !knownSessions.some((s) => s.path === resolvedPath) &&
-                  !(await sessionCatalog.hasFile(resolvedPath))
-                ) {
-                  ws.send(
-                    JSON.stringify({ type: 'sessions_error', message: 'Session not found.' })
+              const requestId = msg.requestId;
+              await withSessionMutationLock(async () => {
+                try {
+                  // If the user selects the current session path, we proceed anyway to refresh client state.
+                  const resolvedPath = resolve(cwd, expandTilde(msg.path));
+                  // Check pool first — reuse live session if already loaded
+                  const existing = findManagedSessionByPath(resolvedPath);
+                  if (existing) {
+                    await setActiveSession(existing.session, existing.cwd, undefined, requestId);
+                    return;
+                  }
+                  // Security: only open known session files — never raw client paths.
+                  // Cache-miss falls back to a targeted stat of the exact file — a
+                  // session created moments ago (e.g. by the pi TUI) must not be
+                  // rejected on a stale cache, but validating it must not re-scan
+                  // the whole store either (seconds of lag on large stores).
+                  const knownSessions = await sessionCatalog.list();
+                  if (
+                    !knownSessions.some((s) => s.path === resolvedPath) &&
+                    !(await sessionCatalog.hasFile(resolvedPath))
+                  ) {
+                    ws.send(
+                      JSON.stringify({
+                        type: 'sessions_error',
+                        requestId,
+                        message: 'Session not found.',
+                      })
+                    );
+                    return;
+                  }
+                  const sm = _sdk!.SessionManager.open(resolvedPath);
+                  const created = await createSdkSession(
+                    sm.getCwd() || cwd,
+                    sm,
+                    'resume',
+                    activeSessionOrNull()?.sessionFile
                   );
-                  break;
+                  await setActiveSession(created.session, sm.getCwd() || cwd, created, requestId);
+                } catch (err) {
+                  log.error('[pifrontier] switch_session error:', err);
+                  ws.send(
+                    JSON.stringify({ type: 'sessions_error', requestId, message: String(err) })
+                  );
                 }
-                const sm = _sdk!.SessionManager.open(resolvedPath);
-                const created = await createSdkSession(
-                  sm.getCwd() || cwd,
-                  sm,
-                  'resume',
-                  activeSessionOrNull()?.sessionFile
-                );
-                await setActiveSession(created.session, sm.getCwd() || cwd, created);
-              } catch (err) {
-                log.error('[pifrontier] switch_session error:', err);
-                ws.send(JSON.stringify({ type: 'sessions_error', message: String(err) }));
-              }
+              });
               break;
             }
             case 'extension_ui_response': {
@@ -3879,6 +3993,7 @@ try {
                     /* session may have already been disposed */
                   }
                   sessionPool.delete(target.id);
+                  if (pooled.path) pathToSessionId.delete(pooled.path);
                 }
                 // Drop the overlay entry and force the next scan; onChange
                 // broadcasts the new list (sidebar + projects).
@@ -3984,6 +4099,14 @@ try {
                 const dir = isDir ? prefix : dirname(prefix);
                 const resolvedDir = resolve(dir);
                 const fragment = isDir ? '' : basename(prefix).toLowerCase();
+                const cacheKey = `${resolvedDir}\u0000${dir}\u0000${fragment}`;
+                const cachedHit = dirCompleteCache.get(cacheKey);
+                if (cachedHit && Date.now() - cachedHit.at < DIR_COMPLETE_TTL_MS) {
+                  ws.send(
+                    JSON.stringify({ type: 'dir_completions', prefix, entries: cachedHit.entries })
+                  );
+                  break;
+                }
                 let entries: string[] = [];
                 try {
                   const dirents = await readdir(resolvedDir, { withFileTypes: true });
@@ -3997,6 +4120,18 @@ try {
                     .slice(0, 20);
                 } catch {
                   entries = [];
+                }
+                dirCompleteCache.set(cacheKey, { at: Date.now(), entries });
+                if (dirCompleteCache.size > DIR_COMPLETE_CACHE_MAX) {
+                  let oldestKey: string | null = null;
+                  let oldestAt = Infinity;
+                  for (const [key, value] of dirCompleteCache) {
+                    if (value.at < oldestAt) {
+                      oldestAt = value.at;
+                      oldestKey = key;
+                    }
+                  }
+                  if (oldestKey) dirCompleteCache.delete(oldestKey);
                 }
                 ws.send(JSON.stringify({ type: 'dir_completions', prefix, entries }));
               } catch (err) {
@@ -4595,7 +4730,9 @@ try {
                 const payload = toolsPayloadFor(sess);
                 const dt = Date.now() - t0;
                 if (dt > 50)
-                  log.info(`[pifrontier] get_tools serialize ${dt}ms for ${payload.tools.length} tools`);
+                  log.info(
+                    `[pifrontier] get_tools serialize ${dt}ms for ${payload.tools.length} tools`
+                  );
                 ws.send(
                   JSON.stringify({
                     type: 'tools_list',
@@ -5054,25 +5191,27 @@ try {
             }
 
             case 'fork_session': {
-              try {
-                const entryId = (msg as { type: 'fork_session'; entryId: string }).entryId;
-                const sessionFile = activeSession().sessionFile;
-                if (!sessionFile) throw new Error('Active session is not persisted');
-                const sm = _sdk!.SessionManager.open(sessionFile);
-                const forkPath = sm.createBranchedSession(entryId);
-                if (!forkPath) throw new Error('Failed to create branched session');
-                const sm2 = _sdk!.SessionManager.open(forkPath);
-                const created = await createSdkSession(
-                  activeCwd(),
-                  sm2,
-                  'fork',
-                  activeSession().sessionFile
-                );
-                await setActiveSession(created.session, activeCwd(), created);
-              } catch (err) {
-                log.error('[pifrontier] fork_session error:', err);
-                ws.send(JSON.stringify({ type: 'sessions_error', message: String(err) }));
-              }
+              await withSessionMutationLock(async () => {
+                try {
+                  const entryId = (msg as { type: 'fork_session'; entryId: string }).entryId;
+                  const sessionFile = activeSession().sessionFile;
+                  if (!sessionFile) throw new Error('Active session is not persisted');
+                  const sm = _sdk!.SessionManager.open(sessionFile);
+                  const forkPath = sm.createBranchedSession(entryId);
+                  if (!forkPath) throw new Error('Failed to create branched session');
+                  const sm2 = _sdk!.SessionManager.open(forkPath);
+                  const created = await createSdkSession(
+                    activeCwd(),
+                    sm2,
+                    'fork',
+                    activeSession().sessionFile
+                  );
+                  await setActiveSession(created.session, activeCwd(), created);
+                } catch (err) {
+                  log.error('[pifrontier] fork_session error:', err);
+                  ws.send(JSON.stringify({ type: 'sessions_error', message: String(err) }));
+                }
+              });
               break;
             }
 
@@ -5433,6 +5572,7 @@ const _shutdown = async () => {
   } catch {
     /* ignore */
   }
+  _stopSessionWatch?.();
   // Dispose all pooled sessions so background agent work stops cleanly
   for (const [, entry] of sessionPool) {
     try {

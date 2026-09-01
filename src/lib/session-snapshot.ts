@@ -65,6 +65,7 @@ function slim(m: UIMessage): UIMessage {
     startMs: m.startMs,
     endMs: m.endMs,
     noticeKind: m.noticeKind,
+    compaction: m.compaction,
     customType: m.customType,
     level: m.level,
     source: m.source,

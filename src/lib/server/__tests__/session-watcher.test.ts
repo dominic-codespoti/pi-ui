@@ -5,8 +5,11 @@ import { startSessionWatch } from '../session-watcher';
 
 const ROOT = '/tmp/pi-ui-test-session-watch-' + Date.now();
 
+const stopHandles: (() => void)[] = [];
+
 afterEach(() => {
-  // Watchers are best-effort and process-lifetime; no handles to close.
+  for (const stop of stopHandles) stop();
+  stopHandles.length = 0;
   rmSync(ROOT, { recursive: true, force: true });
 });
 
@@ -15,10 +18,11 @@ describe('session-watcher', () => {
     const dir = join(ROOT, '--tmp-proj--');
     mkdirSync(dir, { recursive: true });
     let fired = 0;
-    startSessionWatch(
+    const stop = startSessionWatch(
       () => ROOT,
       () => fired++
     );
+    if (stop) stopHandles.push(stop);
 
     writeFileSync(
       join(dir, '2026-01-01T00-00-00-000Z_s1.jsonl'),
@@ -31,10 +35,11 @@ describe('session-watcher', () => {
   it('ignores non-jsonl writes', async () => {
     mkdirSync(ROOT, { recursive: true });
     let fired = 0;
-    startSessionWatch(
+    const stop = startSessionWatch(
       () => ROOT,
       () => fired++
     );
+    if (stop) stopHandles.push(stop);
 
     writeFileSync(join(ROOT, 'scan-cache.json'), '{}');
     await new Promise((r) => setTimeout(r, 1200));
@@ -42,11 +47,12 @@ describe('session-watcher', () => {
   });
 
   it('survives a missing root without throwing', () => {
-    expect(() =>
-      startSessionWatch(
+    expect(() => {
+      const stop = startSessionWatch(
         () => join(ROOT, 'does-not-exist'),
         () => {}
-      )
-    ).not.toThrow();
+      );
+      if (stop) stopHandles.push(stop);
+    }).not.toThrow();
   });
 });

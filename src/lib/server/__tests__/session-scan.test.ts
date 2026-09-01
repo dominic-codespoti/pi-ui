@@ -155,6 +155,42 @@ describe('session-scan', () => {
     expect(fourth[0]).toBe(third[0]);
   });
 
+  it('resumes the cached fold across consecutive appends', async () => {
+    const path = writeSession('append-fold.jsonl', {
+      id: 'append-fold',
+      ts: '2026-01-01T00:00:00.000Z',
+      messages: [{ role: 'user', text: 'original first message' }],
+    });
+    const appendMessage = (id: string, role: string, text: string) => {
+      appendFileSync(
+        path,
+        JSON.stringify({
+          type: 'message',
+          id,
+          timestamp: '2026-01-02T00:00:00.000Z',
+          message: { role, content: [{ type: 'text', text }] },
+        }) + '\n'
+      );
+    };
+
+    expect((await scanAllSessions(ROOT))[0]).toMatchObject({
+      messageCount: 1,
+      firstMessage: 'original first message',
+    });
+
+    appendMessage('m2', 'assistant', 'second message');
+    expect((await scanAllSessions(ROOT))[0]).toMatchObject({
+      messageCount: 2,
+      firstMessage: 'original first message',
+    });
+
+    appendMessage('m3', 'user', 'third message');
+    expect((await scanAllSessions(ROOT))[0]).toMatchObject({
+      messageCount: 3,
+      firstMessage: 'original first message',
+    });
+  });
+
   it('drops results and cache entries for deleted files', async () => {
     const path = writeSession('a.jsonl', { id: 's1', ts: '2026-01-01T00:00:00.000Z' });
     expect(await scanAllSessions(ROOT)).toHaveLength(1);

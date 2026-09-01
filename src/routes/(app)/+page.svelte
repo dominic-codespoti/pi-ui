@@ -43,6 +43,7 @@
     extractTextContent,
     reconnectDelay,
     type UIMessage,
+    type CompactionNoticeDetails,
   } from '#lib/client-messages.js';
   import { saveSnapshot, loadSnapshot } from '#lib/session-snapshot.js';
   import { encodeTerminalKey, wrapBracketedPaste } from '#lib/terminal-key-encoder.js';
@@ -55,6 +56,7 @@
   import * as Card from '#lib/components/ui/card/index.js';
   import SidebarPanel from '#lib/components/sidebar-panel.svelte';
   import ProjectsSidebar from '#lib/components/projects/lazy-projects-sidebar.svelte';
+  import LiveElapsed from '#lib/components/chat/live-elapsed.svelte';
   import MessageList from '#lib/components/chat/message-list.svelte';
   import RightPanel from '#lib/components/panels/lazy-right-panel.svelte';
   import ExtensionComponent from '#lib/components/ui/extension-component.svelte';
@@ -519,6 +521,10 @@
   let truncatedUserMsgs = $state<Record<string, boolean>>({});
   /** Direct pointer to the currently-streaming assistant message — avoids O(n) lastStreaming() scans. */
   let activeStreamMsg = $state<UIMessage | null>(null);
+  // Non-reactive index for high-frequency tool updates. Rebuilt when history
+  // is replaced and updated incrementally for live tool events.
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity -- non-reactive lookup index
+  const toolMessagesById = new Map<string, UIMessage>();
 
   let input = $state('');
   /** Images staged for the next prompt (base64 data + display src). */
@@ -566,18 +572,6 @@
   let commandArgCommand = $state('');
   let commandArgPrefix = $state('');
   let commandCompletionsPending = $state(false);
-  /** Live elapsed-seconds tick for streaming tool timers. */
-  let now = $state(Date.now());
-  $effect(() => {
-    // Only tick while something is streaming — the 1s `now` prop feeds tool
-    // timers; ticking forever re-renders the whole message list every second.
-    const anyStreaming = isStreaming || messages.some((m) => m.streaming);
-    if (!anyStreaming) return;
-    const id = setInterval(() => {
-      now = Date.now();
-    }, 1000);
-    return () => clearInterval(id);
-  });
   /** Whether the composer shortcut menu is open. */
   let showSlashMenu = $state(false);
   /** Currently highlighted index in the composer shortcut menu (-1 = none). */
@@ -832,27 +826,37 @@
   // dispatched — waiting for the server's session_loaded (which can take
   // seconds with 34 tools/extensions) makes "new chat" feel hung.
   let _optimisticPrevMessages: typeof messages | null = null;
+  /** Draft captured before an optimistic new-session reset; restored on failure. */
+  let _optimisticPrevInput: string | null = null;
   $effect(() => {
     if (projectsState.pendingNewSession && !_optimisticPrevMessages) {
+      discardPendingTerminalInputs();
       _optimisticPrevMessages = messages.slice();
+      _optimisticPrevInput = input;
       messages = [];
+      toolMessagesById.clear();
+      input = '';
       totalRawMessagesLoaded = 0;
       totalMessageCount = 0;
       messagesTruncated = false;
       activeStreamMsg = null;
       isStreaming = false;
       projectsState.isStreaming = false;
+      compactionStartedAt = null;
       sessionName = undefined;
       // Keep cwd until server confirms targetCwd; don't wipe model etc.
     }
   });
   // If the optimistic new-chat times out or errors without a server reply,
-  // restore the previous messages. session_loaded and sessions_error handle
-  // the normal paths; this covers the watchdog timeout.
+  // restore the previous messages and draft. session_loaded and sessions_error
+  // handle the normal paths; this covers the watchdog timeout.
   $effect(() => {
     if (!projectsState.pendingNewSession && _optimisticPrevMessages && projectsState.error) {
       messages = _optimisticPrevMessages;
+      rebuildToolMessageIndex();
+      if (_optimisticPrevInput !== null) input = _optimisticPrevInput;
       _optimisticPrevMessages = null;
+      _optimisticPrevInput = null;
     }
   });
   let sessionStartTime = $state(0);
@@ -862,6 +866,8 @@
   let queuedFollowUp = $state<string[]>([]);
   /** Whether context compaction is currently running */
   let isCompacting = $state(false);
+  /** Unix ms when the current compaction began, for live elapsed display. */
+  let compactionStartedAt = $state<number | null>(null);
   /** Whether auto-compaction is enabled — persisted in localStorage */
   let autoCompactionEnabled = $state(true);
   /** Whether auto-retry on transient errors is enabled — persisted in localStorage */
@@ -1328,6 +1334,24 @@
         ? Math.round((effectiveContextTokens / model.contextWindow) * 100)
         : 0
   );
+
+  /** Most recent completed compaction, surfaced in the context tooltip. */
+  const latestCompaction = $derived.by(() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const message = messages[i];
+      if (message.noticeKind === 'compaction' && message.compaction?.status === 'completed') {
+        return message.compaction;
+      }
+    }
+    return undefined;
+  });
+  const lastCompactionSavings = $derived.by(() => {
+    const before = latestCompaction?.tokensBefore;
+    const after = latestCompaction?.tokensAfter;
+    if (before === undefined || after === undefined || before <= 0 || after > before)
+      return undefined;
+    return Math.round(((before - after) / before) * 100);
+  });
 
   /** Display name of the active project (custom name → directory basename). */
   const activeProjectName = $derived(projectsState.activeProjectName);
@@ -1872,7 +1896,13 @@
     if (!_editorMirrorTimer) return;
     clearTimeout(_editorMirrorTimer);
     _editorMirrorTimer = null;
-    if (wsState === 'open' && _wsHandshakeComplete && sessionId) {
+    if (
+      wsState === 'open' &&
+      _wsHandshakeComplete &&
+      sessionId &&
+      !sessionLoading &&
+      !projectsState.pendingNewSession
+    ) {
       send({ type: 'extension_editor_text_change', text: input, sessionId });
     }
   }
@@ -1882,8 +1912,17 @@
     const sid = sessionId;
     // Same handshake gate as the bridge: before `connected` the stale
     // sessionId would write the previous session's editor mirror.
-    if (wsState === 'open' && _wsHandshakeComplete && sid) {
-      if (_editorMirrorTimer) clearTimeout(_editorMirrorTimer);
+    if (_editorMirrorTimer) {
+      clearTimeout(_editorMirrorTimer);
+      _editorMirrorTimer = null;
+    }
+    if (
+      wsState === 'open' &&
+      _wsHandshakeComplete &&
+      sid &&
+      !sessionLoading &&
+      !projectsState.pendingNewSession
+    ) {
       _editorMirrorTimer = setTimeout(() => {
         _editorMirrorTimer = null;
         send({ type: 'extension_editor_text_change', text, sessionId: sid });
@@ -1911,11 +1950,21 @@
       const nextSessionId = payload.sessionId as string;
       if (nextSessionId !== prevSessionId) {
         if (prevSessionId) {
-          viewCache.save(prevSessionId, input, expandedUserMsgs, truncatedUserMsgs);
+          const draftToSave =
+            projectsState.pendingNewSession && _optimisticPrevInput !== null
+              ? _optimisticPrevInput
+              : input;
+          viewCache.save(prevSessionId, draftToSave, expandedUserMsgs, truncatedUserMsgs);
         }
         sessionId = nextSessionId;
         const restored = viewCache.restore(nextSessionId);
-        if (restored) {
+        if (projectsState.pendingNewSession) {
+          // The composer stays live while the server creates the session.
+          // Keep that new draft instead of replacing it with the previous
+          // session's cached draft.
+          expandedUserMsgs = {};
+          truncatedUserMsgs = {};
+        } else if (restored) {
           input = restored.draft;
           expandedUserMsgs = restored.expandedUserMsgs;
           truncatedUserMsgs = restored.truncatedUserMsgs;
@@ -1954,6 +2003,7 @@
       const raw = (payload.messages as unknown[]) ?? [];
       const streamingMessage = payload.streamingMessage;
       messages = rawMessagesToUI(streamingMessage === undefined ? raw : [...raw, streamingMessage]);
+      rebuildToolMessageIndex();
       pruneUnresolvedLangs();
       activeStreamMsg = null;
       if (streamingMessage !== undefined && isStreaming) {
@@ -2013,7 +2063,15 @@
     }
     if (newWindow != null) contextUsageWindow = newWindow;
     // Session-level settings (optional — present on connected/session_loaded)
-    if ('isCompacting' in payload) isCompacting = Boolean(payload.isCompacting);
+    if ('isCompacting' in payload) {
+      const compacting = Boolean(payload.isCompacting);
+      isCompacting = compacting;
+      if (compacting) {
+        if (compactionStartedAt === null) compactionStartedAt = Date.now();
+      } else {
+        compactionStartedAt = null;
+      }
+    }
     if ('autoCompactionEnabled' in payload) {
       autoCompactionEnabled = Boolean(payload.autoCompactionEnabled ?? true);
       try {
@@ -2111,6 +2169,12 @@
 
       case 'session_loaded': {
         const sl = msg as Record<string, unknown>;
+        const identity = {
+          sessionId: typeof sl.sessionId === 'string' ? sl.sessionId : undefined,
+          sessionPath: typeof sl.sessionPath === 'string' ? sl.sessionPath : undefined,
+          requestId: typeof sl.requestId === 'string' ? sl.requestId : undefined,
+        };
+        if (!projectsState.acceptsSessionLoaded(identity)) break;
         applySessionState(sl);
         projectTrust = (sl.projectTrust as ProjectTrustInfo | undefined) ?? null;
         runtimeDiagnostics = (sl.diagnostics as RuntimeDiagnostic[] | undefined) ?? [];
@@ -2121,7 +2185,7 @@
         if (sl.sessionMode) sessionMode = sl.sessionMode as string;
         sessionLoading = false;
         projectsState.sessionLoading = false;
-        if (projectsState.onSessionLoaded()) {
+        if (projectsState.onSessionLoaded(identity)) {
           showSessionPanel = false;
         }
         projectPickerOpen = false;
@@ -2133,10 +2197,12 @@
           // Fork/clone/reload — persist the new session path so URL always matches
           setSessionParam(sessionPath);
         }
-        if (Array.isArray(sl.tools) && (sl.tools as unknown[]).length > 0) lastToolsFetch = Date.now();
+        if (Array.isArray(sl.tools) && (sl.tools as unknown[]).length > 0)
+          lastToolsFetch = Date.now();
         saveSnapshot(sessionPath, sessionName, messages);
-        // Optimistic new-chat succeeded — drop the stash
+        // Optimistic new-chat succeeded — drop the stash.
         _optimisticPrevMessages = null;
+        _optimisticPrevInput = null;
         break;
       }
 
@@ -2164,11 +2230,16 @@
       case 'sessions_error': {
         const errMsg = (msg as Record<string, unknown>).message ?? 'Unknown session error';
         showChatNotice(errMsg as string, 'warning');
-        // Restore optimistic new-chat if it failed — don't leave empty chat
+        // Restore optimistic new-chat if it failed — don't leave empty chat or draft.
         if (_optimisticPrevMessages) {
           messages = _optimisticPrevMessages;
           _optimisticPrevMessages = null;
         }
+        if (_optimisticPrevInput !== null) {
+          input = _optimisticPrevInput;
+          _optimisticPrevInput = null;
+        }
+        rebuildToolMessageIndex();
         sessionLoading = false;
         projectsState.sessionLoading = false;
         projectsState.handleMessage(msg as PiEvent);
@@ -2286,6 +2357,7 @@
               };
               content?: { type: string; data?: string; mimeType?: string }[];
               stopReason?: string;
+              errorMessage?: string;
             }
           | undefined;
         if (endMsg?.role === 'assistant') {
@@ -2324,6 +2396,9 @@
               });
           }
         }
+        if (endMsg?.role === 'assistant' && endMsg.stopReason === 'error' && endMsg.errorMessage) {
+          showChatNotice(`Agent error: ${endMsg.errorMessage}`, 'error');
+        }
         activeStreamMsg = null;
         // Use real context usage from the SDK (server enriches message_end with this)
         const cu = (msg as Record<string, unknown>).contextUsage as
@@ -2339,7 +2414,7 @@
         const toolCallId = msg.toolCallId as string | undefined;
         const details = (msg.args ?? msg.input ?? msg.details) as
           Record<string, unknown> | undefined;
-        messages.push({
+        const toolMessage: UIMessage = {
           id: uid(),
           role: 'tool',
           content: '',
@@ -2352,7 +2427,9 @@
           expanded: toolsExpandedGlobal,
           startMs: Date.now(),
           createdAt: Date.now(),
-        });
+        };
+        messages.push(toolMessage);
+        indexToolMessage(messages[messages.length - 1]);
         break;
       }
 
@@ -2438,26 +2515,30 @@
         } else if (method === 'setTitle') {
           extensionUiState.setTitle(msg.title as string | undefined);
         } else if (method === 'set_editor_text') {
-          input = (msg.text as string | undefined) ?? '';
-          tick().then(() => {
-            autoResizeTextarea();
-            inputEl?.focus();
-          });
-        } else if (method === 'paste_to_editor') {
-          const textToInsert = (msg.text as string | undefined) ?? '';
-          if (inputEl) {
-            const start = inputEl.selectionStart ?? input.length;
-            const end = inputEl.selectionEnd ?? input.length;
-            input = input.slice(0, start) + textToInsert + input.slice(end);
+          if (!projectsState.pendingNewSession) {
+            input = (msg.text as string | undefined) ?? '';
             tick().then(() => {
-              if (inputEl) {
-                inputEl.selectionStart = inputEl.selectionEnd = start + textToInsert.length;
-                autoResizeTextarea();
-                inputEl.focus();
-              }
+              autoResizeTextarea();
+              inputEl?.focus();
             });
-          } else {
-            input += textToInsert;
+          }
+        } else if (method === 'paste_to_editor') {
+          if (!projectsState.pendingNewSession) {
+            const textToInsert = (msg.text as string | undefined) ?? '';
+            if (inputEl) {
+              const start = inputEl.selectionStart ?? input.length;
+              const end = inputEl.selectionEnd ?? input.length;
+              input = input.slice(0, start) + textToInsert + input.slice(end);
+              tick().then(() => {
+                if (inputEl) {
+                  inputEl.selectionStart = inputEl.selectionEnd = start + textToInsert.length;
+                  autoResizeTextarea();
+                  inputEl.focus();
+                }
+              });
+            } else {
+              input += textToInsert;
+            }
           }
         } else if (method === 'setWorkingMessage') {
           extensionUiState.setWorkingMessage(msg.message as string | undefined);
@@ -2574,44 +2655,86 @@
       }
 
       case 'compaction_start': {
-        isCompacting = true;
+        const startedAt = Date.now();
         const reason = (msg.reason as string | undefined) ?? '';
+        const beforeTokens = effectiveContextTokens > 0 ? effectiveContextTokens : undefined;
+        isCompacting = true;
+        compactionStartedAt = startedAt;
         messages.push({
           id: uid(),
           role: 'notice',
           content:
-            reason === 'manual' ? 'compacting context…' : `auto-compacting context (${reason})…`,
+            reason === 'manual'
+              ? 'compacting context…'
+              : `auto-compacting context (${reason || 'automatic'})…`,
           noticeKind: 'compaction',
+          compaction: {
+            reason: reason || 'automatic',
+            status: 'running',
+            startedAt,
+            ...(beforeTokens !== undefined ? { tokensBefore: beforeTokens } : {}),
+          },
           streaming: true,
-          createdAt: Date.now(),
+          createdAt: startedAt,
         });
         break;
       }
 
       case 'compaction_end': {
-        isCompacting = false;
-        // Seal the in-progress compaction notice
+        const endedAt = Date.now();
+        const aborted = (msg.aborted as boolean | undefined) ?? false;
+        const willRetry = (msg.willRetry as boolean | undefined) ?? false;
+        const errMsg = msg.errorMessage as string | undefined;
+        const compResult = (msg as Record<string, unknown>).result as
+          { estimatedTokensAfter?: number; tokensBefore?: number } | undefined;
+        const cu = (msg as Record<string, unknown>).contextUsage as
+          { tokens?: number | null; contextWindow?: number } | undefined;
+        // Seal the in-progress compaction notice with its measured outcome.
         const notice = [...messages]
           .reverse()
           .find((m) => m.role === 'notice' && m.noticeKind === 'compaction' && m.streaming);
+        const previous = notice?.compaction;
+        const startedAt =
+          compactionStartedAt ?? previous?.startedAt ?? notice?.createdAt ?? endedAt;
+        const durationMs = Math.max(0, endedAt - startedAt);
+        const tokensBefore = compResult?.tokensBefore ?? previous?.tokensBefore;
+        const tokensAfter = compResult?.estimatedTokensAfter ?? cu?.tokens ?? previous?.tokensAfter;
+        const status: CompactionNoticeDetails['status'] = willRetry
+          ? 'retrying'
+          : errMsg
+            ? 'failed'
+            : aborted
+              ? 'aborted'
+              : 'completed';
+        const reason =
+          ((msg.reason as string | undefined) ?? previous?.reason ?? 'automatic').trim() ||
+          'automatic';
+        isCompacting = false;
+        compactionStartedAt = null;
         if (notice) {
           notice.streaming = false;
-          const aborted = (msg.aborted as boolean | undefined) ?? false;
-          const errMsg = msg.errorMessage as string | undefined;
-          const result = msg.result as
-            { tokensBefore?: number; estimatedTokensAfter?: number } | undefined;
-          notice.content = aborted
-            ? `compaction ${errMsg ? `failed: ${errMsg}` : 'aborted'}`
-            : result?.tokensBefore != null && result.estimatedTokensAfter != null
-              ? `context compacted · ${result.tokensBefore.toLocaleString()} → ${result.estimatedTokensAfter.toLocaleString()} tokens`
-              : 'context compacted';
+          notice.compaction = {
+            ...(previous ?? { status: 'running', startedAt }),
+            reason,
+            status,
+            startedAt,
+            endedAt,
+            durationMs,
+            ...(tokensBefore !== undefined ? { tokensBefore } : {}),
+            ...(tokensAfter !== undefined ? { tokensAfter } : {}),
+            ...(errMsg ? { errorMessage: errMsg } : {}),
+            willRetry,
+          };
+          notice.content = willRetry
+            ? `compaction failed${errMsg ? `: ${errMsg}` : ''} · retrying…`
+            : errMsg
+              ? `compaction failed: ${errMsg}`
+              : aborted
+                ? 'compaction aborted'
+                : compResult?.tokensBefore != null && compResult.estimatedTokensAfter != null
+                  ? `context compacted · ${compResult.tokensBefore.toLocaleString()} → ${compResult.estimatedTokensAfter.toLocaleString()} tokens`
+                  : 'context compacted';
         }
-        const compResult = (msg as Record<string, unknown>).result as
-          | { estimatedTokensAfter?: number; tokensBefore?: number }
-          | undefined;
-        const cu = (msg as Record<string, unknown>).contextUsage as
-          | { tokens?: number | null; contextWindow?: number }
-          | undefined;
         if (cu?.tokens != null) {
           applySessionState({ contextUsage: cu });
         } else if (compResult?.estimatedTokensAfter != null) {
@@ -2915,7 +3038,8 @@
           messagesTruncated: boolean;
         };
         const olderUi = rawMessagesToUI(older.messages);
-        messages = [...olderUi, ...messages];
+        messages.unshift(...olderUi);
+        for (let i = 0; i < olderUi.length; i++) indexToolMessage(messages[i]);
         totalRawMessagesLoaded += older.messages.length;
         totalMessageCount = older.totalMessageCount;
         messagesTruncated = older.messagesTruncated;
@@ -3158,6 +3282,7 @@
     // Update content first, then truncate after this message
     messages[idx].content = newText;
     messages = messages.slice(0, idx + 1);
+    rebuildToolMessageIndex();
     // Send to server — server rewinds session and resends
     send({ type: 'edit_message', originalMessage: originalText, newMessage: newText });
     scrollBottom();
@@ -3267,9 +3392,26 @@
     }
   }
 
+  function indexToolMessage(message: UIMessage): void {
+    if (message.role === 'tool' && message.toolCallId) {
+      toolMessagesById.set(message.toolCallId, message);
+    }
+  }
+
+  function rebuildToolMessageIndex(): void {
+    toolMessagesById.clear();
+    for (const message of messages) indexToolMessage(message);
+  }
+
   function findToolMessage(toolCallId: string): UIMessage | undefined {
+    const indexed = toolMessagesById.get(toolCallId);
+    if (indexed) return indexed;
     for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i].role === 'tool' && messages[i].toolCallId === toolCallId) return messages[i];
+      const message = messages[i];
+      if (message.role === 'tool' && message.toolCallId === toolCallId) {
+        toolMessagesById.set(toolCallId, message);
+        return message;
+      }
     }
     return undefined;
   }
@@ -3975,6 +4117,9 @@
         return true;
       }
     }
+    // Keep Enter available as a newline while the session is opening. The
+    // eventual session_loaded path enables submission without losing the draft.
+    if ((sessionLoading || projectsState.pendingNewSession) && e.key === 'Enter') return false;
     if (e.key === 'Enter' && (isMobile ? e.shiftKey : !e.shiftKey)) {
       e.preventDefault();
       submitMessage();
@@ -4037,10 +4182,16 @@
   }
 
   function handleComposerKeydown(e: KeyboardEvent) {
-    // During the reconnect handshake (socket open, connected not yet arrived)
-    // sessionId/terminalInputActive still describe the previous session —
-    // routing a key now would dispatch it to the wrong session's handlers.
-    if (!_wsHandshakeComplete || !extensionUiState.terminalInputActive || e.isComposing) {
+    // During session creation or the reconnect handshake, sessionId and
+    // terminalInputActive still describe the previous session. Keep typing
+    // local and never route keys to that session's extension handlers.
+    if (
+      sessionLoading ||
+      projectsState.pendingNewSession ||
+      !_wsHandshakeComplete ||
+      !extensionUiState.terminalInputActive ||
+      e.isComposing
+    ) {
       handleComposerKey(e);
       return;
     }
@@ -4458,6 +4609,7 @@
     const snap = loadSnapshot(getSessionParam());
     if (snap) {
       messages = snap.messages;
+      rebuildToolMessageIndex();
       if (snap.sessionName) sessionName = snap.sessionName;
     }
     connect();
@@ -4856,6 +5008,20 @@
                       >
                     {/if}
                   </div>
+                  {#if latestCompaction?.tokensBefore !== undefined && latestCompaction.tokensAfter !== undefined}
+                    <div
+                      class="flex items-center justify-between gap-3 border-t border-background/10 pt-1.5 mt-0.5"
+                    >
+                      <span class="text-background/45">Last compaction</span>
+                      <span class="text-success/75">
+                        {latestCompaction.tokensBefore.toLocaleString()} →
+                        {latestCompaction.tokensAfter.toLocaleString()}
+                        {#if lastCompactionSavings !== undefined}
+                          <span class="ml-1">({lastCompactionSavings}% freed)</span>
+                        {/if}
+                      </span>
+                    </div>
+                  {/if}
                   {#if sessionTokens > 0}
                     <div
                       class="flex items-center justify-between border-t border-background/10 pt-1.5 mt-0.5"
@@ -5208,7 +5374,6 @@
           {totalMessageCount}
           {projectPickerOpen}
           {activeProjectName}
-          {now}
           onLoadOlder={loadOlderMessages}
           onCopyMessage={copyMessage}
           onCopyTurn={copyTurnMessages}
@@ -5573,7 +5738,8 @@
                           ? 'Message pi…'
                           : 'Message pi — @ files · / commands · ! shell'}
                 aria-label="Message to pi"
-                disabled={wsState !== 'open' || sessionLoading}
+                disabled={wsState !== 'open' ||
+                  (sessionLoading && !projectsState.pendingNewSession)}
                 class="w-full min-h-10 sm:min-h-12 mt-0 sm:mt-1 bg-transparent resize-none outline-none placeholder-base-content/45 disabled:opacity-40 leading-relaxed max-h-40 sm:max-h-48 overflow-y-auto transition-opacity text-base"
                 autocapitalize="off"
                 spellcheck={false}
@@ -5654,16 +5820,26 @@
                   </Tooltip.Root>
                   {#if isCompacting}
                     <span
-                      class="hidden md:flex w-8 h-8 items-center justify-center text-base-content/20 animate-pulse"
+                      class="hidden md:flex items-center gap-1.5 min-w-0 max-w-40 text-warning/70"
+                      role="status"
+                      aria-live="polite"
+                      aria-label="Compaction in progress"
                     >
                       <svg
-                        class="w-4 h-4 animate-spin"
+                        class="w-3.5 h-3.5 shrink-0 animate-spin"
                         viewBox="0 0 24 24"
                         fill="none"
                         stroke="currentColor"
                         stroke-width="2.5"
                         stroke-linecap="round"><path d="M21 12a9 9 0 1 1-6.219-8.56"></path></svg
                       >
+                      <span class="truncate text-[10px]">compacting ·</span>
+                      <LiveElapsed
+                        startMs={compactionStartedAt ?? undefined}
+                        active={isCompacting}
+                        format="duration"
+                        className="shrink-0 text-[10px] tabular-nums"
+                      />
                     </span>
                   {:else}
                     <Tooltip.Root>

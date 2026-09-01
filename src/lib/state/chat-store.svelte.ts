@@ -14,6 +14,7 @@ import {
   extractTextContent,
   formatToolInput,
   type UIMessage,
+  type CompactionNoticeDetails,
 } from '#lib/client-messages.js';
 import { memoizedRenderMarkdown, renderMarkdown, renderStreamingPreview } from '#lib/markdown.js';
 
@@ -454,34 +455,75 @@ export class ChatStore {
   }
 
   compactionStart(reason: string): void {
+    const startedAt = Date.now();
+    const normalizedReason = reason.trim() || 'automatic';
     this.isCompacting = true;
     this.messages.push({
       id: uid(),
       role: 'notice',
-      content: reason === 'manual' ? 'compacting context…' : `auto-compacting context (${reason})…`,
+      content:
+        normalizedReason === 'manual'
+          ? 'compacting context…'
+          : `auto-compacting context (${normalizedReason})…`,
       noticeKind: 'compaction',
+      compaction: {
+        reason: normalizedReason,
+        status: 'running',
+        startedAt,
+      },
       streaming: true,
-      createdAt: Date.now(),
+      createdAt: startedAt,
     });
   }
 
   compactionEnd(msg: Record<string, unknown>): void {
-    this.isCompacting = false;
-    // Seal the in-progress compaction notice
+    const endedAt = Date.now();
+    const aborted = (msg.aborted as boolean | undefined) ?? false;
+    const willRetry = (msg.willRetry as boolean | undefined) ?? false;
+    const errMsg = msg.errorMessage as string | undefined;
+    const compResult = msg.result as
+      { tokensBefore?: number; estimatedTokensAfter?: number } | undefined;
+    const cu = msg.contextUsage as { tokens?: number | null } | undefined;
     const notice = [...this.messages]
       .reverse()
       .find((m) => m.role === 'notice' && m.noticeKind === 'compaction' && m.streaming);
+    const previous = notice?.compaction;
+    const startedAt = previous?.startedAt ?? notice?.createdAt ?? endedAt;
+    const durationMs = Math.max(0, endedAt - startedAt);
+    const tokensBefore = compResult?.tokensBefore ?? previous?.tokensBefore;
+    const tokensAfter = compResult?.estimatedTokensAfter ?? cu?.tokens ?? previous?.tokensAfter;
+    const status: CompactionNoticeDetails['status'] = willRetry
+      ? 'retrying'
+      : errMsg
+        ? 'failed'
+        : aborted
+          ? 'aborted'
+          : 'completed';
+    const reason = previous?.reason ?? 'automatic';
+    this.isCompacting = false;
     if (notice) {
       notice.streaming = false;
-      const aborted = (msg.aborted as boolean | undefined) ?? false;
-      const errMsg = msg.errorMessage as string | undefined;
-      const result = msg.result as
-        { tokensBefore?: number; estimatedTokensAfter?: number } | undefined;
-      notice.content = aborted
-        ? `compaction ${errMsg ? `failed: ${errMsg}` : 'aborted'}`
-        : result?.tokensBefore != null && result.estimatedTokensAfter != null
-          ? `context compacted · ${result.tokensBefore.toLocaleString()} → ${result.estimatedTokensAfter.toLocaleString()} tokens`
-          : 'context compacted';
+      notice.compaction = {
+        ...(previous ?? { status: 'running', startedAt }),
+        reason,
+        status,
+        startedAt,
+        endedAt,
+        durationMs,
+        ...(tokensBefore !== undefined ? { tokensBefore } : {}),
+        ...(tokensAfter !== undefined ? { tokensAfter } : {}),
+        ...(errMsg ? { errorMessage: errMsg } : {}),
+        willRetry,
+      };
+      notice.content = willRetry
+        ? `compaction failed${errMsg ? `: ${errMsg}` : ''} · retrying…`
+        : errMsg
+          ? `compaction failed: ${errMsg}`
+          : aborted
+            ? 'compaction aborted'
+            : compResult?.tokensBefore != null && compResult.estimatedTokensAfter != null
+              ? `context compacted · ${compResult.tokensBefore.toLocaleString()} → ${compResult.estimatedTokensAfter.toLocaleString()} tokens`
+              : 'context compacted';
     }
   }
 

@@ -206,6 +206,28 @@ describe('ChatStore notices, queues, history', () => {
     chat.compactionEnd({ result: { tokensBefore: 1000, estimatedTokensAfter: 250 } });
     expect(chat.isCompacting).toBe(false);
     expect(chat.messages.at(-1)?.content).toContain('1,000 → 250');
+    expect(chat.messages.at(-1)?.compaction).toMatchObject({
+      status: 'completed',
+      tokensBefore: 1000,
+      tokensAfter: 250,
+      willRetry: false,
+    });
+  });
+
+  it('marks non-aborted compaction errors as failed', () => {
+    const chat = new ChatStore();
+    chat.compactionStart('manual');
+    chat.compactionEnd({
+      aborted: false,
+      errorMessage: 'Nothing to compact (session too small)',
+    });
+    expect(chat.messages.at(-1)?.compaction).toMatchObject({
+      status: 'failed',
+      errorMessage: 'Nothing to compact (session too small)',
+    });
+    expect(chat.messages.at(-1)?.content).toBe(
+      'compaction failed: Nothing to compact (session too small)'
+    );
   });
 
   it('seals retry notices on failure', () => {

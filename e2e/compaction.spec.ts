@@ -35,6 +35,12 @@ test.describe('Compaction UI', () => {
     await login(page, 'test-password');
 
     await expect(page.getByText('compacting context…')).toBeVisible({ timeout: 3000 });
+
+    await expect(page.getByText('Context compaction')).toBeVisible({ timeout: 3000 });
+    await expect(page.getByText('Running', { exact: true })).toBeVisible({ timeout: 3000 });
+
+    await expect(page.getByText('Completed', { exact: true })).toBeVisible({ timeout: 3000 });
+    await expect(page.getByText('93% freed', { exact: true })).toBeVisible({ timeout: 3000 });
     await expect(page.getByText('context compacted · 240,000 → 18,000 tokens')).toBeVisible({
       timeout: 3000,
     });
@@ -69,8 +75,42 @@ test.describe('Compaction UI', () => {
     await login(page, 'test-password');
 
     await expect(page.getByText('auto-compacting context (auto)…')).toBeVisible({ timeout: 3000 });
+    await expect(page.getByText('Context compaction')).toBeVisible({ timeout: 3000 });
+    await expect(page.getByText('Running', { exact: true })).toBeVisible({ timeout: 3000 });
+
+    await expect(page.getByText('Failed', { exact: true })).toBeVisible({ timeout: 3000 });
     await expect(
       page.getByText('compaction failed: Compaction timed out after 5 min and was aborted.')
+    ).toBeVisible({ timeout: 3000 });
+  });
+
+  test('marks a non-aborted SDK compaction error as failed', async ({ page, login }) => {
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.onMessage(() => {
+        /* ignore client messages */
+      });
+      ws.send(JSON.stringify(CONNECTED_PAYLOAD));
+      setTimeout(() => ws.send(JSON.stringify(compactionStartPayload('manual'))), 150);
+      setTimeout(
+        () =>
+          ws.send(
+            JSON.stringify(
+              compactionEndPayload({
+                aborted: false,
+                willRetry: false,
+                result: undefined,
+                errorMessage: 'Nothing to compact (session too small)',
+              })
+            )
+          ),
+        450
+      );
+    });
+    await login(page, 'test-password');
+
+    await expect(page.getByText('Failed', { exact: true })).toBeVisible({ timeout: 3000 });
+    await expect(
+      page.getByText('compaction failed: Nothing to compact (session too small)')
     ).toBeVisible({ timeout: 3000 });
   });
 });

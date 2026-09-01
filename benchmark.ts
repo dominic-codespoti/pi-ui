@@ -8,12 +8,37 @@
 // @ts-nocheck
 
 import { chromium } from 'playwright';
-import { $ } from 'bun';
-import { resolve } from 'node:path';
+import type { Browser } from 'playwright';
+import { $, type Subprocess } from 'bun';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { createServer } from 'node:net';
+import { join, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
 
-const PORT = 9876;
+async function reservePort(): Promise<number> {
+  const probe = createServer();
+  await new Promise<void>((resolvePort, reject) => {
+    probe.once('error', reject);
+    probe.listen(0, '127.0.0.1', () => resolvePort());
+  });
+  const address = probe.address();
+  const port = typeof address === 'object' && address ? address.port : 0;
+  await new Promise<void>((resolveClose, reject) => {
+    probe.close((err) => (err ? reject(err) : resolveClose()));
+  });
+  if (!port) throw new Error('Could not reserve a benchmark port');
+  return port;
+}
+
+const BENCH_ROOT = mkdtempSync(join(tmpdir(), 'pi-ui-benchmark-'));
+const AGENT_DIR = join(BENCH_ROOT, 'agent');
+const HOME_DIR = join(BENCH_ROOT, 'home');
+mkdirSync(AGENT_DIR);
+mkdirSync(HOME_DIR);
+
+const PORT = await reservePort();
 const PASSWORD = 'benchmark-test';
-const URL = `http://localhost:${PORT}`;
+const URL = `http://127.0.0.1:${PORT}`;
 const CWD = resolve(import.meta.dir ?? '.');
 
 const samples: { label: string; ms: number }[] = [];
@@ -24,16 +49,23 @@ function record(label: string, ms: number) {
 
 // ── Server lifecycle ──────────────────────────────────────────────────────────
 
-let serverProc: import('bun').Subprocess | null = null;
+let serverProc: Subprocess | null = null;
+let browser: Browser | null = null;
 
 async function startServer(): Promise<number> {
   console.log('\n=== Starting server ===');
+  console.log(`  Isolated agent dir: ${AGENT_DIR}`);
+  console.log(`  Isolated home dir: ${HOME_DIR}`);
   const t0 = process.hrtime.bigint();
 
   serverProc = Bun.spawn(['bun', '--smol', 'run', 'bin/pifrontier.ts'], {
     env: {
       ...(process.env as Record<string, string>),
       PI_PASSWORD: PASSWORD,
+      PI_CODING_AGENT_DIR: AGENT_DIR,
+      HOME: HOME_DIR,
+      XDG_CONFIG_HOME: join(HOME_DIR, '.config'),
+      XDG_CACHE_HOME: join(HOME_DIR, '.cache'),
       PORT: String(PORT),
       PI_CWD: CWD,
     },
@@ -43,10 +75,10 @@ async function startServer(): Promise<number> {
   const reader = serverProc.stdout!.getReader();
   const decoder = new TextDecoder();
   let output = '';
+  let startupTimedOut = false;
   const timeout = setTimeout(() => {
-    console.error('[bench] Timeout');
-    cleanup();
-    process.exit(1);
+    startupTimedOut = true;
+    serverProc?.kill('SIGTERM');
   }, 45_000);
   while (true) {
     const { done, value } = await reader.read();
@@ -56,6 +88,9 @@ async function startServer(): Promise<number> {
   }
   clearTimeout(timeout);
   reader.releaseLock();
+  if (startupTimedOut || !output.includes('Listening on')) {
+    throw new Error(`Benchmark server exited before listening:\n${output}`);
+  }
 
   const ms = Number(process.hrtime.bigint() - t0) / 1e6;
   console.log(`  Started in ${ms.toFixed(1)} ms`);
@@ -63,11 +98,16 @@ async function startServer(): Promise<number> {
   return serverProc.pid;
 }
 
-function cleanup() {
+async function cleanup(): Promise<void> {
+  await browser?.close();
+  browser = null;
   if (serverProc) {
-    serverProc.kill('SIGTERM');
+    const proc = serverProc;
     serverProc = null;
+    proc.kill('SIGTERM');
+    await proc.exited.catch(() => {});
   }
+  rmSync(BENCH_ROOT, { recursive: true, force: true });
 }
 async function getMemRssKb(pid: number): Promise<number> {
   const out = await $`ps -o rss= -p ${pid}`.text();
@@ -89,7 +129,7 @@ try {
   console.log(`\n=== Idle ===`);
   console.log(`  RSS: ${(idleRssKb / 1024).toFixed(1)} MB | CPU: ${idleCpu.toFixed(1)}%`);
 
-  const browser = await chromium.launch({ headless: true });
+  browser = await chromium.launch({ headless: true });
   const context = await browser.newContext();
   const page = await context.newPage();
 
@@ -153,7 +193,7 @@ try {
   const benchWsMs: number = await page.evaluate((port) => {
     return new Promise((resolve, reject) => {
       const t0 = performance.now();
-      const ws = new WebSocket(`ws://localhost:${port}/ws`);
+      const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
       ws.addEventListener('open', () => {
         ws.addEventListener('message', function handler(e) {
           try {
@@ -324,7 +364,8 @@ try {
     console.log(`    ${s.label.padEnd(maxLabel)}  ${s.ms.toFixed(1).padStart(8)} ms`);
   }
 } catch (err) {
-  console.error('[bench] Error:', err.stack || err);
+  console.error('[bench] Error:', err instanceof Error ? err.stack : err);
+  process.exitCode = 1;
 } finally {
-  cleanup();
+  await cleanup();
 }

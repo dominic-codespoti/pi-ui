@@ -353,6 +353,107 @@ test.describe('Projects sidebar', () => {
     await expect(page.getByPlaceholder('Opening session…')).toBeVisible();
     expect(newSessionCount).toBe(1);
   });
+
+  test('keeps the composer responsive while opening a new session', async ({ page }) => {
+    let newSessionCount = 0;
+    let promptCount = 0;
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.onMessage((data) => {
+        const msg = JSON.parse(String(data));
+        if (msg.type === 'get_projects') ws.send(JSON.stringify(PROJECTS_LIST_PAYLOAD));
+        if (msg.type === 'get_all_sessions') ws.send(JSON.stringify(ALL_SESSIONS_LIST_PAYLOAD));
+        if (msg.type === 'prompt') promptCount += 1;
+        if (msg.type === 'new_session') {
+          newSessionCount += 1;
+          setTimeout(() => {
+            ws.send(
+              JSON.stringify({
+                ...SESSION_LOADED_PAYLOAD,
+                sessionId: 'new-session',
+                messages: [],
+                sessionName: undefined,
+              })
+            );
+          }, 1000);
+        }
+      });
+      ws.send(
+        JSON.stringify({
+          type: 'connected',
+          sessionId: 's1',
+          isStreaming: false,
+          thinkingLevel: 'medium',
+          model: null,
+          availableModels: [],
+          messages: [],
+        })
+      );
+    });
+
+    await openProjectsSidebar(page);
+    await page.getByRole('button', { name: 'project-a 2' }).hover();
+    const newSessionButton = page.getByRole('button', { name: 'New session in project-a' });
+    await newSessionButton.click();
+
+    await expect(newSessionButton).toBeDisabled();
+    const composer = page.getByLabel('Message to pi');
+    await expect(composer).toHaveAttribute('placeholder', 'Opening session…');
+    await expect(composer).toBeEnabled();
+    await composer.pressSequentially('draft while opening');
+    await expect(composer).toHaveValue('draft while opening');
+    expect(newSessionCount).toBe(1);
+    expect(promptCount).toBe(0);
+
+    await expect(composer).toHaveAttribute('placeholder', /Message pi/, { timeout: 3000 });
+    await expect(composer).toHaveValue('draft while opening');
+    expect(promptCount).toBe(0);
+  });
+  test('disables the composer while switching an existing session', async ({ page }) => {
+    let switchSessionCount = 0;
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.onMessage((data) => {
+        const msg = JSON.parse(String(data));
+        if (msg.type === 'get_projects') ws.send(JSON.stringify(PROJECTS_LIST_PAYLOAD));
+        if (msg.type === 'get_all_sessions') ws.send(JSON.stringify(ALL_SESSIONS_LIST_PAYLOAD));
+        if (msg.type === 'switch_session') {
+          switchSessionCount += 1;
+          setTimeout(() => {
+            ws.send(
+              JSON.stringify({
+                ...SESSION_LOADED_PAYLOAD,
+                sessionId: 'switched-session',
+                sessionPath: msg.path,
+                messages: [],
+                requestId: msg.requestId,
+              })
+            );
+          }, 1000);
+        }
+      });
+      ws.send(
+        JSON.stringify({
+          ...CONNECTED_PAYLOAD,
+          sessionId: 's1',
+          sessionPath: '/home/user/project-a/s1.jsonl',
+          messages: [],
+        })
+      );
+    });
+
+    const composer = page.getByLabel('Message to pi');
+    await expect(composer).toBeEnabled();
+    await composer.fill('draft before switch');
+
+    await openProjectsSidebar(page);
+    await page.getByRole('button', { name: 'Add tests' }).click();
+
+    await expect(composer).toBeDisabled();
+    await expect(composer).toHaveValue('draft before switch');
+    expect(switchSessionCount).toBe(1);
+
+    await expect(composer).toBeEnabled({ timeout: 3000 });
+    await expect(composer).toHaveValue('');
+  });
   test('collapses the active project and previews three sessions', async ({ page }) => {
     const sessions = [
       ...ALL_SESSIONS_LIST_PAYLOAD.sessions,
