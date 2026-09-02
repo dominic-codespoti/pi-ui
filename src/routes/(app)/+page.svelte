@@ -828,8 +828,11 @@
   let _optimisticPrevMessages: typeof messages | null = null;
   /** Draft captured before an optimistic new-session reset; restored on failure. */
   let _optimisticPrevInput: string | null = null;
+  /** Draft typed while an existing session is still opening. */
+  let sessionSwitchDraft: string | null = null;
   $effect(() => {
     if (projectsState.pendingNewSession && !_optimisticPrevMessages) {
+      sessionSwitchDraft = null;
       discardPendingTerminalInputs();
       _optimisticPrevMessages = messages.slice();
       _optimisticPrevInput = input;
@@ -1949,6 +1952,7 @@
     if ('sessionId' in payload) {
       const nextSessionId = payload.sessionId as string;
       if (nextSessionId !== prevSessionId) {
+        const draftWhileSwitching = !projectsState.pendingNewSession ? sessionSwitchDraft : null;
         if (prevSessionId) {
           const draftToSave =
             projectsState.pendingNewSession && _optimisticPrevInput !== null
@@ -1964,6 +1968,13 @@
           // session's cached draft.
           expandedUserMsgs = {};
           truncatedUserMsgs = {};
+        } else if (draftWhileSwitching !== null) {
+          // Keep text entered while an existing session was opening. The
+          // target session's cached draft is only a fallback when the user
+          // did not edit during the switch.
+          input = draftWhileSwitching;
+          expandedUserMsgs = {};
+          truncatedUserMsgs = {};
         } else if (restored) {
           input = restored.draft;
           expandedUserMsgs = restored.expandedUserMsgs;
@@ -1977,6 +1988,7 @@
         // or routed toward the new one (its late verdict would insert text or
         // even submit into the wrong composer).
         discardPendingTerminalInputs();
+        sessionSwitchDraft = null;
       }
     }
     if ('isStreaming' in payload) isStreaming = payload.isStreaming as boolean;
@@ -2229,6 +2241,10 @@
 
       case 'sessions_error': {
         const errMsg = (msg as Record<string, unknown>).message ?? 'Unknown session error';
+        if (sessionSwitchDraft !== null) {
+          input = sessionSwitchDraft;
+          sessionSwitchDraft = null;
+        }
         showChatNotice(errMsg as string, 'warning');
         // Restore optimistic new-chat if it failed — don't leave empty chat or draft.
         if (_optimisticPrevMessages) {
@@ -4178,6 +4194,9 @@
     } else {
       composerForeignEditSeq++;
     }
+    if (sessionLoading && !projectsState.pendingNewSession) {
+      sessionSwitchDraft = input;
+    }
     autoResizeTextarea();
   }
 
@@ -5738,8 +5757,7 @@
                           ? 'Message pi…'
                           : 'Message pi — @ files · / commands · ! shell'}
                 aria-label="Message to pi"
-                disabled={wsState !== 'open' ||
-                  (sessionLoading && !projectsState.pendingNewSession)}
+                disabled={wsState !== 'open'}
                 class="w-full min-h-10 sm:min-h-12 mt-0 sm:mt-1 bg-transparent resize-none outline-none placeholder-base-content/45 disabled:opacity-40 leading-relaxed max-h-40 sm:max-h-48 overflow-y-auto transition-opacity text-base"
                 autocapitalize="off"
                 spellcheck={false}

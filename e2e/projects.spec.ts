@@ -408,7 +408,7 @@ test.describe('Projects sidebar', () => {
     await expect(composer).toHaveValue('draft while opening');
     expect(promptCount).toBe(0);
   });
-  test('disables the composer while switching an existing session', async ({ page }) => {
+  test('keeps the composer responsive while switching an existing session', async ({ page }) => {
     let switchSessionCount = 0;
     await page.routeWebSocket('/ws', (ws) => {
       ws.onMessage((data) => {
@@ -447,12 +447,14 @@ test.describe('Projects sidebar', () => {
     await openProjectsSidebar(page);
     await page.getByRole('button', { name: 'Add tests' }).click();
 
-    await expect(composer).toBeDisabled();
+    await expect(composer).toBeEnabled();
     await expect(composer).toHaveValue('draft before switch');
+    await composer.fill('draft during switch');
+    await expect(composer).toHaveValue('draft during switch');
     expect(switchSessionCount).toBe(1);
 
     await expect(composer).toBeEnabled({ timeout: 3000 });
-    await expect(composer).toHaveValue('');
+    await expect(composer).toHaveValue('draft during switch');
   });
   test('collapses the active project and previews three sessions', async ({ page }) => {
     const sessions = [
