@@ -1884,6 +1884,11 @@
   // Same for the extension UI store (modal answers need to send responses).
   const viewCache = new SessionViewCache();
   projectsState.onBeforeSwitch = () => {
+    // Stop any awaited key verdicts before the active session identity can
+    // change. The store flips sessionLoading synchronously, but the local
+    // mirror is an effect and can lag one turn behind a click.
+    discardPendingTerminalInputs();
+    sessionSwitchDraft = null;
     if (sessionId) {
       viewCache.save(sessionId, input, expandedUserMsgs, truncatedUserMsgs);
     }
@@ -4194,7 +4199,7 @@
     } else {
       composerForeignEditSeq++;
     }
-    if (sessionLoading && !projectsState.pendingNewSession) {
+    if ((sessionLoading || projectsState.sessionLoading) && !projectsState.pendingNewSession) {
       sessionSwitchDraft = input;
     }
     autoResizeTextarea();
@@ -4206,6 +4211,7 @@
     // local and never route keys to that session's extension handlers.
     if (
       sessionLoading ||
+      projectsState.sessionLoading ||
       projectsState.pendingNewSession ||
       !_wsHandshakeComplete ||
       !extensionUiState.terminalInputActive ||

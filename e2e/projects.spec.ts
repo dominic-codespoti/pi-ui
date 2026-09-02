@@ -410,11 +410,13 @@ test.describe('Projects sidebar', () => {
   });
   test('keeps the composer responsive while switching an existing session', async ({ page }) => {
     let switchSessionCount = 0;
+    let terminalInputCount = 0;
     await page.routeWebSocket('/ws', (ws) => {
       ws.onMessage((data) => {
         const msg = JSON.parse(String(data));
         if (msg.type === 'get_projects') ws.send(JSON.stringify(PROJECTS_LIST_PAYLOAD));
         if (msg.type === 'get_all_sessions') ws.send(JSON.stringify(ALL_SESSIONS_LIST_PAYLOAD));
+        if (msg.type === 'extension_terminal_input') terminalInputCount += 1;
         if (msg.type === 'switch_session') {
           switchSessionCount += 1;
           setTimeout(() => {
@@ -436,6 +438,7 @@ test.describe('Projects sidebar', () => {
           sessionId: 's1',
           sessionPath: '/home/user/project-a/s1.jsonl',
           messages: [],
+          extensionUiState: { terminalInputActive: true },
         })
       );
     });
@@ -445,16 +448,24 @@ test.describe('Projects sidebar', () => {
     await composer.fill('draft before switch');
 
     await openProjectsSidebar(page);
-    await page.getByRole('button', { name: 'Add tests' }).click();
+    const switchButton = page.getByRole('button', { name: 'Add tests' });
+    await switchButton.evaluate((button) => {
+      button.click();
+      const textarea = document.querySelector('textarea');
+      textarea?.dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'a', bubbles: true, cancelable: true })
+      );
+    });
+    await expect.poll(() => terminalInputCount).toBe(0);
 
     await expect(composer).toBeEnabled();
     await expect(composer).toHaveValue('draft before switch');
-    await composer.fill('draft during switch');
-    await expect(composer).toHaveValue('draft during switch');
+    await composer.pressSequentially('abc');
+    await expect(composer).toHaveValue('draft before switchabc');
     expect(switchSessionCount).toBe(1);
 
     await expect(composer).toBeEnabled({ timeout: 3000 });
-    await expect(composer).toHaveValue('draft during switch');
+    await expect(composer).toHaveValue('draft before switchabc');
   });
   test('collapses the active project and previews three sessions', async ({ page }) => {
     const sessions = [
