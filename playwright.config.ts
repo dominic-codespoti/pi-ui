@@ -47,7 +47,7 @@ export default defineConfig({
       // sessions) and an empty working dir (no trust gate, no project
       // extensions). Live-agent specs never touch real ~/.pi state.
       command:
-        'bun scripts/maybe-build.ts && PI_PASSWORD=test-password PI_UI_JWT_SECRET=test-e2e-jwt-secret-0123456789abcdef PI_CODING_AGENT_DIR=/tmp/pi-ui-e2e-agent PI_CWD=/tmp/pi-ui-e2e-workspace PORT=3000 bun run start',
+        'mkdir -p /tmp/pi-ui-e2e-workspace /tmp/pi-ui-e2e-agent && bun scripts/maybe-build.ts && PI_PASSWORD=test-password PI_UI_JWT_SECRET=test-e2e-jwt-secret-0123456789abcdef PI_CODING_AGENT_DIR=/tmp/pi-ui-e2e-agent PI_CWD=/tmp/pi-ui-e2e-workspace PORT=3000 bun run start',
       url: 'http://127.0.0.1:3000',
       reuseExistingServer: !process.env.CI,
       timeout: 120_000,
