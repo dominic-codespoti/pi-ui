@@ -318,7 +318,6 @@ test.describe('Chat / prompt streaming', () => {
     await expect(page.getByLabel('Running tool example_tool')).toBeVisible({ timeout: 3000 });
   });
 
-
   test('shows thinking deltas', async ({ page }) => {
     await page.routeWebSocket('/ws', (ws) => {
       let streaming = false;
@@ -361,7 +360,9 @@ test.describe('Chat / prompt streaming', () => {
     await expect(page.getByText('Here is my answer.')).toBeVisible({ timeout: 5000 });
   });
 
-  test('shows extension subcommands after slash command space', async ({ page }) => {
+  test('shows extension subcommands with spaces and typed prefixes', async ({ page }) => {
+    const longDescription =
+      'Agent commands with a deliberately long description that should wrap instead of being clipped';
     await page.routeWebSocket('/ws', (ws) => {
       ws.onMessage((data) => {
         const msg = JSON.parse(String(data));
@@ -393,7 +394,7 @@ test.describe('Chat / prompt streaming', () => {
       ws.send(
         JSON.stringify({
           type: 'commands_list',
-          commands: [{ name: 'ag', description: 'Agent commands', source: 'test' }],
+          commands: [{ name: 'ag', description: longDescription, source: 'test' }],
         })
       );
       ws.send(JSON.stringify({ type: 'projects_list', projects: [] }));
@@ -401,12 +402,19 @@ test.describe('Chat / prompt streaming', () => {
     });
 
     await page.goto('/');
-    await page.fill('textarea', '/ag ');
+    await page.fill('textarea', '/ag');
+    const description = page.getByText(longDescription, { exact: true });
+    await expect(description).toBeVisible();
+    await expect(description).toHaveCSS('white-space', 'normal');
 
+    await page.fill('textarea', '/ag   ');
     await expect(page.getByText('/ag subcommands')).toBeVisible({ timeout: 3000 });
-    await expect(page.getByText('Start an agent')).toBeVisible();
-    await page.getByRole('option', { name: /start Start an agent/ }).click();
-    await expect(page.locator('textarea')).toHaveValue('/ag start ');
+    await expect(page.getByText('Show agent status')).toBeVisible();
+
+    await page.fill('textarea', '/ag sta');
+    await expect(page.getByText('Show agent status')).toBeVisible({ timeout: 3000 });
+    await page.getByRole('option', { name: /status Show agent status/ }).click();
+    await expect(page.locator('textarea')).toHaveValue('/ag status ');
   });
   test('stages an image pasted from clipboard', async ({ page }) => {
     const wsMessages: string[] = [];

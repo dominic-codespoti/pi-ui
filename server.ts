@@ -64,6 +64,7 @@ import { log } from './src/lib/server/logger.ts';
 import { terminalInputRegistry } from './src/lib/server/terminal-input.ts';
 import { trimMessagesForWire } from './src/lib/server/wire-messages.ts';
 import { createCompactionWatchdog } from './src/lib/server/compaction-watchdog.ts';
+import { getCommandArgumentCompletions } from './src/lib/server/extension-completions.ts';
 import {
   flushSessionScanCache,
   initSessionScanCache,
@@ -5029,38 +5030,32 @@ try {
             }
 
             case 'get_command_completions': {
+              const { command, prefix } = msg as {
+                type: 'get_command_completions';
+                command: string;
+                prefix: string;
+              };
               try {
-                const { command, prefix } = msg as {
-                  type: string;
-                  command: string;
-                  prefix: string;
-                };
-                const { extensions } = activeSession().resourceLoader.getExtensions();
-                for (const extension of extensions) {
-                  const registered = extension.commands.get(command);
-                  if (registered?.getArgumentCompletions) {
-                    const items = await registered.getArgumentCompletions(prefix);
-                    ws.send(
-                      JSON.stringify({
-                        type: 'command_completions',
-                        command,
-                        prefix,
-                        items: items ?? [],
-                      })
-                    );
-                    return;
-                  }
-                }
+                const items = await getCommandArgumentCompletions(
+                  activeSession().extensionRunner,
+                  command,
+                  prefix
+                );
                 ws.send(
-                  JSON.stringify({ type: 'command_completions', command, prefix, items: [] })
+                  JSON.stringify({
+                    type: 'command_completions',
+                    command,
+                    prefix,
+                    items,
+                  })
                 );
               } catch (err) {
                 log.error('[pifrontier] get_command_completions error:', err);
                 ws.send(
                   JSON.stringify({
                     type: 'command_completions',
-                    command: '',
-                    prefix: '',
+                    command,
+                    prefix,
                     items: [],
                   })
                 );

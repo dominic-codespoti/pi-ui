@@ -628,12 +628,12 @@
   const commandArgMode = $derived.by<{ command: string; prefix: string } | null>(() => {
     if (shortcutTrigger !== '/') return null;
     const trimmed = input.slice(1).trimStart();
-    const parts = trimmed.split(/\s+/);
-    if (parts.length < 2) return null;
-    const cmdName = parts[0].toLowerCase();
+    const commandEnd = trimmed.search(/\s/);
+    if (commandEnd < 0) return null;
+    const cmdName = trimmed.slice(0, commandEnd).toLowerCase();
     const extCmd = extensionCommands.find((c) => c.name.toLowerCase() === cmdName);
     if (!extCmd) return null;
-    return { command: cmdName, prefix: parts.slice(1).join(' ') };
+    return { command: cmdName, prefix: trimmed.slice(commandEnd).trim() };
   });
   const filteredSlashCommands = $derived.by<ComposerShortcut[]>(() => {
     if (!shortcutTrigger) return [];
@@ -644,10 +644,9 @@
       // Show subcommand completions when typing past an extension command, e.g. "/ag ".
       if (commandArgMode) {
         const cmdName = commandArgMode.command;
+        const prefix = commandArgMode.prefix.toLowerCase();
         const filtered = commandArgCompletions
-          .filter(
-            (c) => !commandArgMode.prefix || c.value.toLowerCase().startsWith(commandArgMode.prefix)
-          )
+          .filter((c) => !prefix || c.value.toLowerCase().startsWith(prefix))
           .map((c) => ({
             trigger: '/' as const,
             label: c.label || c.value,
@@ -3077,9 +3076,12 @@
       case 'extension_completions': {
         const extMsg = msg as unknown as {
           trigger: string;
+          query: string;
           items: { value: string; label: string; description?: string }[];
         };
-        if (extMsg.trigger === shortcutTrigger) extensionCompletions = extMsg.items ?? [];
+        if (extMsg.trigger === shortcutTrigger && extMsg.query === shortcutQuery) {
+          extensionCompletions = extMsg.items ?? [];
+        }
         break;
       }
 
@@ -5768,12 +5770,13 @@
                         >
                         <span class="min-w-0 flex-1">
                           <span
-                            class="block truncate text-sm font-mono {cmd.muted
+                            class="block whitespace-normal break-words [overflow-wrap:anywhere] text-sm font-mono {cmd.muted
                               ? 'text-base-content/55'
                               : ''}">{cmd.label}</span
                           >
                           {#if cmd.description}
-                            <span class="block truncate text-xs text-base-content/38"
+                            <span
+                              class="block whitespace-normal break-words [overflow-wrap:anywhere] text-xs text-base-content/38"
                               >{cmd.description}</span
                             >
                           {/if}
