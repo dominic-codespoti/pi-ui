@@ -5,6 +5,7 @@ import {
   SessionLoadedSchema,
   SessionsErrorSchema,
   AvailableModelsChangedSchema,
+  ModelsRefreshResultSchema,
 } from '../server-message-schema.js';
 
 const v = await import('valibot');
@@ -181,11 +182,15 @@ describe('server-message-schema', () => {
     const sessionRuntime = parseServerMessage({
       type: 'session_runtime',
       sessionId: 's-1',
-      isRunning: true,
+      isRunning: false,
+      activeToolName: 'read',
       unseen: false,
       lastActivity: 1234567890,
     });
     expect(sessionRuntime.ok).toBe(true);
+    if (sessionRuntime.ok && sessionRuntime.kind === 'custom') {
+      expect(sessionRuntime.value.activeToolName).toBe('read');
+    }
 
     const olderMsgs = parseServerMessage({
       type: 'older_messages',
@@ -257,6 +262,14 @@ describe('server-message-schema', () => {
       const res = v.safeParse(AvailableModelsChangedSchema, {
         type: 'available_models_changed',
         availableModels: [],
+      });
+      expect(res.success).toBe(true);
+    });
+    it('parses a model refresh result', () => {
+      const res = v.safeParse(ModelsRefreshResultSchema, {
+        type: 'models_refresh_result',
+        success: true,
+        message: 'Models refreshed.',
       });
       expect(res.success).toBe(true);
     });

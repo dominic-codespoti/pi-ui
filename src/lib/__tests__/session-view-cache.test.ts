@@ -76,4 +76,12 @@ describe('SessionViewCache', () => {
     cache.evict('a');
     expect(cache.size).toBe(1);
   });
+
+  it('overwriting a cached session with a blank draft and no flags evicts it', () => {
+    cache.save('s1', 'draft', { m1: true }, { m2: true });
+    expect(cache.size).toBe(1);
+    cache.save('s1', '   ', {}, {});
+    expect(cache.restore('s1')).toBeNull();
+    expect(cache.size).toBe(0);
+  });
 });

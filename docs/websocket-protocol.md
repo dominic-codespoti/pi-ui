@@ -17,6 +17,7 @@ Sent on WS open. Contains full session state.
   type: 'connected';
   sessionId: string;
   isStreaming: boolean;
+  activeToolName?: string;
   thinkingLevel: string;
   model: ModelInfo | null;
   availableModels: ModelInfo[];
@@ -59,6 +60,7 @@ Broadcast when session changes (switch, fork, edit rewind, or after successful c
   type: 'session_loaded';
   sessionId: string;
   isStreaming: boolean;
+  activeToolName?: string;
   thinkingLevel: string;
   model: ModelInfo | null;
   availableModels: ModelInfo[];
@@ -99,16 +101,17 @@ interface SessionSummary {
   path: string;
   cwd: string;
   name?: string;
-  created: number;       // Unix ms
-  modified: number;      // Unix ms
-  messageCount: number;  // Raw message count
-  turns?: number;        // User + assistant turns
-  parentSession?: string;// Forked file path or subagent task parent session ID
+  created: number; // Unix ms
+  modified: number; // Unix ms
+  messageCount: number; // Raw message count
+  turns?: number; // User + assistant turns
+  parentSession?: string; // Forked file path or subagent task parent session ID
   firstMessage: string;
 }
 ```
 
 When `parentSession` is present, clients organize sessions into hierarchical trees/threads under the parent session.
+
 #### SDK Events (forwarded as-is)
 
 - `agent_start` — Generation started
@@ -124,8 +127,9 @@ When `parentSession` is present, clients organize sessions into hierarchical tre
 - `model_changed` — `{ model: ModelInfo | null, thinkingLevel?: string }`; model selection or thinking level updated
 - `thinking_level_changed` — `{ level: string }`; reasoning depth updated
 - `available_models_changed` — `{ availableModels: ModelInfo[], sessionId?: string }`; session-stamped refreshes from a prior session are ignored by clients
+- `models_refresh_result` — `{ success: boolean, message: string }`; completion status for a forced network model-catalog refresh
 - `sessions_error` — `{ message: string, requestId?: string }`; operation error echoed with optional `requestId` correlation
-- `session_runtime` — `{ sessionId: string, isRunning: boolean, unseen: boolean, lastActivity: number }`; global runtime metadata broadcast across sessions
+- `session_runtime` — `{ sessionId: string, isRunning: boolean, unseen: boolean, lastActivity: number, activeToolName?: string }`; global runtime metadata broadcast across sessions
 - `session_updated` — `{ session: SessionSummary }`; coalesced live delta for one session (emitted on `message_end` turns)
 - `all_sessions_list` / `sessions_list` — `{ sessions: SessionSummary[] }`; full session inventory
 - `projects_list` — `{ projects: ProjectInfo[] }`; merged list of registered and discovered session projects
@@ -140,7 +144,9 @@ When `parentSession` is present, clients organize sessions into hierarchical tre
 - `extension_ui_dismiss` — `{ id: string, sessionId?: string }`; dismisses an open extension dialog across all tabs
 - `update_status` — Update check results
 - `server_restarting` — Server shutdown initiated
+- `slash_result` — `{ command: string, message: string, level?: 'info' | 'warning' | 'error', sessionId?: string }`; output from built-in commands like direct shell execution (`!`)
 - `agent_error` — Error from SDK or server
+
 ### Client → Server
 
 #### Messaging
@@ -155,67 +161,72 @@ When `parentSession` is present, clients organize sessions into hierarchical tre
 
 #### Session Management
 
-| Type                                        | Payload                       | Purpose                                                                              |
-| ------------------------------------------- | ----------------------------- | ------------------------------------------------------------------------------------ |
+| Type                                        | Payload                       | Purpose                                                                                |
+| ------------------------------------------- | ----------------------------- | -------------------------------------------------------------------------------------- |
 | `new_session`                               | `{ targetCwd?, requestId? }`  | Start a new session; echoes `requestId` in `session_loaded`/`sessions_error`           |
 | `switch_session`                            | `{ path, requestId? }`        | Switch to an existing session; echoes `requestId` in `session_loaded`/`sessions_error` |
-| `fork_session`                              | `{ entryId }`                 | Fork session at a specific entry                                                     |
+| `fork_session`                              | `{ entryId }`                 | Fork session at a specific entry                                                       |
 | `get_all_sessions`                          | —                             | Request all sessions across all project directories (replies with `all_sessions_list`) |
-| `get_session_tree`                          | —                             | Request session branch tree                                                          |
-| `get_fork_points`                           | —                             | Request user messages for forking                                                    |
-| `compact`                                   | —                             | Manually compact session context (carries updated `contextUsage`)                    |
-| `set_auto_compaction`                       | `{ enabled }`                 | Toggle auto-compaction                                                               |
-| `set_auto_retry`                            | `{ enabled }`                 | Toggle auto-retry                                                                    |
-| `rename_session` / `rename_current_session` | `{ path, name }` / `{ name }` | Set session display name                                                             |
-| `delete_session`                            | `{ path }`                    | Delete a session file (active session protected)                                     |
+| `get_session_tree`                          | —                             | Request session branch tree                                                            |
+| `get_fork_points`                           | —                             | Request user messages for forking                                                      |
+| `compact`                                   | —                             | Manually compact session context (carries updated `contextUsage`)                      |
+| `set_auto_compaction`                       | `{ enabled }`                 | Toggle auto-compaction                                                                 |
+| `set_auto_retry`                            | `{ enabled }`                 | Toggle auto-retry                                                                      |
+| `rename_session` / `rename_current_session` | `{ path, name }` / `{ name }` | Set session display name                                                               |
+| `delete_session`                            | `{ path }`                    | Delete a session file (active session protected)                                       |
+
 #### Model & Provider
 
-| Type                  | Payload                 | Purpose                      |
-| --------------------- | ----------------------- | ---------------------------- |
-| `set_model`           | `{ provider, modelId }` | Switch active model          |
-| `set_thinking_level`  | `{ level }`             | Set reasoning depth          |
-| `get_providers`       | —                       | Request provider list        |
-| `set_provider_key`    | `{ provider, key }`     | Persist API key for provider |
-| `remove_provider_key` | `{ provider }`          | Remove stored API key        |
+| Type                  | Payload                 | Purpose                                           |
+| --------------------- | ----------------------- | ------------------------------------------------- |
+| `set_model`           | `{ provider, modelId }` | Switch active model                               |
+| `set_thinking_level`  | `{ level }`             | Set reasoning depth                               |
+| `get_providers`       | —                       | Request provider list                             |
+| `refresh_models`      | —                       | Force a network refresh of dynamic model catalogs |
+| `set_provider_key`    | `{ provider, key }`     | Persist API key for provider                      |
+| `remove_provider_key` | `{ provider }`          | Remove stored API key                             |
 
 #### Project & Filesystem
 
-| Type             | Payload             | Purpose                                                                                        |
-| ---------------- | ------------------- | ---------------------------------------------------------------------------------------------- |
-| `get_projects`   | —                   | Request project list (replies with `projects_list`)                                            |
-| `add_project`    | `{ path }`          | Register a project directory                                                                   |
-| `remove_project` | `{ cwd }`           | Unregister a project from registry (sessions untouched)                                        |
-| `delete_project` | `{ cwd }`           | Permanently delete a project and all its sessions (cannot delete active project)               |
-| `pin_project`    | `{ cwd, pinned }`   | Pin or unpin a project (pinned projects sort to top)                                           |
-| `rename_project` | `{ cwd, name }`     | Set project custom display name                                                                |
-| `dir_complete`   | `{ prefix }`        | Directory path autocomplete (replies with `dir_completions`)                                   |
-| `file_complete`  | `{ query }`         | Workspace file autocomplete for `@` mentions (replies with `file_completions`)                 |
-| `read_file`      | `{ path }`          | Read file contents with workspace guard + null-byte rejection (replies with `file_content`)    |
-| `write_file`     | `{ path, content }` | Write file contents with workspace guard + null-byte rejection (replies with `file_saved`)      |
+| Type             | Payload             | Purpose                                                                                     |
+| ---------------- | ------------------- | ------------------------------------------------------------------------------------------- |
+| `get_projects`   | —                   | Request project list (replies with `projects_list`)                                         |
+| `add_project`    | `{ path }`          | Register a project directory                                                                |
+| `remove_project` | `{ cwd }`           | Unregister a project from registry (sessions untouched)                                     |
+| `delete_project` | `{ cwd }`           | Permanently delete a project and all its sessions (cannot delete active project)            |
+| `pin_project`    | `{ cwd, pinned }`   | Pin or unpin a project (pinned projects sort to top)                                        |
+| `rename_project` | `{ cwd, name }`     | Set project custom display name                                                             |
+| `dir_complete`   | `{ prefix }`        | Directory path autocomplete (replies with `dir_completions`)                                |
+| `file_complete`  | `{ query }`         | Workspace file autocomplete for `@` mentions (replies with `file_completions`)              |
+| `read_file`      | `{ path }`          | Read file contents with workspace guard + null-byte rejection (replies with `file_content`) |
+| `write_file`     | `{ path, content }` | Write file contents with workspace guard + null-byte rejection (replies with `file_saved`)  |
+
 #### Extension UI
 
-| Type                           | Payload                                  | Purpose                                                                                                                                                             |
-| ------------------------------ | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `extension_ui_response`        | `{ id, value?, confirmed?, cancelled? }` | Respond to extension dialog                                                                                                                                         |
-| `dismiss_widget`               | `{ key }`                                | Tear down a widget server-side and broadcast its removal                                                                                                            |
-| `extension_custom_input`       | `{ id, data }`                           | Forward raw terminal bytes to an interactive custom() overlay component (`data` is the pi-tui key sequence)                                                         |
-| `extension_custom_resize`      | `{ id, columns, rows }`                  | Report live viewport size for interactive custom overlays                                                                                                           |
-| `extension_terminal_input`     | `{ id, data, sessionId }`                | Forward a composer keystroke (encoded as pi-tui key bytes) to the session's `onTerminalInput` handlers; the server replies with `extension_terminal_input_result`   |
-| `extension_editor_text_change` | `{ text, sessionId }`                    | Sync the composer content to the server's per-session editor mirror (feeds synchronous `ctx.ui.getEditorText()`)                                                    |
+| Type                           | Payload                                  | Purpose                                                                                                                                                           |
+| ------------------------------ | ---------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `extension_ui_response`        | `{ id, value?, confirmed?, cancelled? }` | Respond to extension dialog                                                                                                                                       |
+| `dismiss_widget`               | `{ key }`                                | Tear down a widget server-side and broadcast its removal                                                                                                          |
+| `extension_custom_input`       | `{ id, data }`                           | Forward raw terminal bytes to an interactive custom() overlay component (`data` is the pi-tui key sequence)                                                       |
+| `extension_custom_resize`      | `{ id, columns, rows }`                  | Report live viewport size for interactive custom overlays                                                                                                         |
+| `extension_terminal_input`     | `{ id, data, sessionId }`                | Forward a composer keystroke (encoded as pi-tui key bytes) to the session's `onTerminalInput` handlers; the server replies with `extension_terminal_input_result` |
+| `extension_editor_text_change` | `{ text, sessionId }`                    | Sync the composer content to the server's per-session editor mirror (feeds synchronous `ctx.ui.getEditorText()`)                                                  |
+
 #### Admin
 
-| Type                | Payload          | Purpose                                                               |
-| ------------------- | ---------------- | --------------------------------------------------------------------- |
-| `get_tools`         | —                | Request full tool list and active tools (replies with `tools_list`)   |
-| `set_active_tools`  | `{ toolNames }`  | Set active tool subset for the active session                         |
-| `get_resources`     | —                | Request skills/prompts (replies with `resources_list`)                 |
-| `get_extensions`    | —                | Request extension list (replies with `extensions_list`)               |
-| `get_commands`      | —                | Request slash commands (replies with `commands_list`)                 |
-| `install_skill`     | `{ url, scope }` | Install a skill from URL (replies with `skill_install_result`)         |
-| `get_update_status` | —                | Check for updates (replies with `update_status`)                      |
-| `run_update`        | `{ target }`     | Execute update (`ui` or `sdk`)                                        |
-| `request_restart`   | —                | Request single-use nonce for server restart                           |
-| `restart_server`    | `{ nonce? }`     | Restart server process                                                |
+| Type                | Payload          | Purpose                                                             |
+| ------------------- | ---------------- | ------------------------------------------------------------------- |
+| `get_tools`         | —                | Request full tool list and active tools (replies with `tools_list`) |
+| `set_active_tools`  | `{ toolNames }`  | Set active tool subset for the active session                       |
+| `get_resources`     | —                | Request skills/prompts (replies with `resources_list`)              |
+| `get_extensions`    | —                | Request extension list (replies with `extensions_list`)             |
+| `get_commands`      | —                | Request slash commands (replies with `commands_list`)               |
+| `install_skill`     | `{ url, scope }` | Install a skill from URL (replies with `skill_install_result`)      |
+| `get_update_status` | —                | Check for updates (replies with `update_status`)                    |
+| `run_update`        | `{ target }`     | Execute update (`ui` or `sdk`)                                      |
+| `request_restart`   | —                | Request single-use nonce for server restart                         |
+| `restart_server`    | `{ nonce? }`     | Restart server process                                              |
+
 ## Edit Message Flow
 
 1. Client sends `{ type: 'edit_message', originalMessage, newMessage }`
@@ -242,6 +253,7 @@ When `parentSession` is present, clients organize sessions into hierarchical tre
 2. The client intercepts composer keystrokes, encodes them into `pi-tui` legacy terminal byte sequences (`terminal-key-encoder.ts`), and sends `{ type: 'extension_terminal_input', id, data, sessionId }`.
 3. The server dispatches the key bytes through the session's handler chain and responds with `{ type: 'extension_terminal_input_result', id, consumed, data?, sessionId }`.
 4. If `consumed: true`, the client swallows the default keyboard action. If `data` is returned, the client applies the rewritten key replacement.
+
 ## Error Handling
 
 - `agent_error` events contain a human-readable error string from the SDK or server.
@@ -255,4 +267,3 @@ When `parentSession` is present, clients organize sessions into hierarchical tre
 - The server closes an established socket with close code **4001** (`Session expired`) when the JWT expires or is revoked (checked on message and on a 60s timer).
 - On **4001** the client redirects to `/login?redirect=<current-url>` instead of reconnecting.
 - A rejected upgrade (401) is indistinguishable from a dead server to the WS API, so after any other abnormal close the client probes `HEAD /`; `hooks.server` answers with a 302 to `/login` when the JWT is invalid, and the client redirects there.
-

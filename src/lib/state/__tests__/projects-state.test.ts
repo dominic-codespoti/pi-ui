@@ -1,4 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+// Vitest resolves SvelteKit's navigation module through its server condition.
+vi.mock('$app/navigation', () => ({ goto: vi.fn(() => Promise.resolve()) }));
 import type { SessionSummary } from '#lib/ws/protocol.js';
 import {
   buildSessionRows,
@@ -126,6 +128,10 @@ describe('ProjectsState', () => {
     projectsState.cwd = '';
     projectsState.activeSessionId = null;
     projectsState.isStreaming = false;
+    projectsState.activeToolName = undefined;
+    projectsState.uncheckedSessions.clear();
+    projectsState.runningSessions.clear();
+    projectsState.runningToolSessions.clear();
     projectsState.filter = '';
     projectsState.error = null;
     projectsState.pendingNewSession = false;
@@ -133,6 +139,7 @@ describe('ProjectsState', () => {
     projectsState.dirCompletions = [];
     projectsState.collapsed.clear();
     projectsState.expandedGroups.clear();
+    projectsState.expandedSubsessions.clear();
     projectsState.cancelPendingOps();
   });
 
@@ -416,6 +423,19 @@ describe('ProjectsState', () => {
         type: string;
       } & Record<string, unknown>);
       expect(projectsState.allSessions).toHaveLength(1);
+    });
+    it('prunes runtime markers for sessions removed from the full list', () => {
+      projectsState.runningSessions.add('gone-agent');
+      projectsState.runningToolSessions.add('gone-tool');
+      projectsState.uncheckedSessions.add('gone-result');
+
+      projectsState.handleMessage({ type: 'all_sessions_list', sessions: [{ id: 's1' }] } as {
+        type: string;
+      } & Record<string, unknown>);
+
+      expect(projectsState.runningSessions.has('gone-agent')).toBe(false);
+      expect(projectsState.runningToolSessions.has('gone-tool')).toBe(false);
+      expect(projectsState.uncheckedSessions.has('gone-result')).toBe(false);
     });
 
     it('handles sessions_error', () => {
@@ -793,6 +813,20 @@ describe('ProjectsState', () => {
       projectsState.markUnchecked('s1');
       expect(projectsState.uncheckedSessions.has('s1')).toBe(true);
     });
+    it('derives unread activity from a non-active session', () => {
+      projectsState.activeSessionId = 'active';
+      projectsState.runningSessions.add('active');
+      projectsState.uncheckedSessions.add('active');
+      projectsState.uncheckedSessions.add('done');
+      expect(projectsState.backgroundActivity).toBe('unread');
+    });
+
+    it('prioritizes running tool activity over unread activity', () => {
+      projectsState.activeSessionId = 'active';
+      projectsState.uncheckedSessions.add('done');
+      projectsState.runningToolSessions.add('tool-session');
+      expect(projectsState.backgroundActivity).toBe('running');
+    });
 
     it('toggleCollapsed toggles and persists', () => {
       projectsState.toggleCollapsed('/p');
@@ -837,7 +871,7 @@ describe('ProjectsState', () => {
       expect(projectsState.visibleSessions(group)).toHaveLength(10);
     });
 
-    it('visibleSessions keeps whole subtrees without spending slots on children', () => {
+    it('visibleSessions collapses nested subtrees without spending preview slots', () => {
       const group = {
         cwd: '/p',
         sessions: buildSessionRows([
@@ -850,8 +884,14 @@ describe('ProjectsState', () => {
           mkSession('r4', { modified: 10 }),
         ]),
       } as ProjectGroup;
-      // Three top-level slots — the third rides in with its complete substack,
-      // pushing only the fourth root (r4) out of the preview.
+
+      expect(projectsState.visibleSessions(group).map((r) => r.session.id)).toEqual([
+        'r1',
+        'r2',
+        'stack',
+      ]);
+
+      projectsState.toggleSubsessions('stack');
       expect(projectsState.visibleSessions(group).map((r) => r.session.id)).toEqual([
         'r1',
         'r2',
@@ -859,6 +899,28 @@ describe('ProjectsState', () => {
         'c1',
         'c2',
         'c3',
+      ]);
+
+      // Three top-level slots still push only the fourth root out of preview.
+      expect(projectsState.visibleSessions(group).some((r) => r.session.id === 'r4')).toBe(false);
+    });
+
+    it('visibleSessions keeps the active nested session path visible', () => {
+      const group = {
+        cwd: '/p',
+        sessions: buildSessionRows([
+          mkSession('parent'),
+          mkSession('child', { parentSession: '/p/parent.jsonl' }),
+          mkSession('grandchild', { parentSession: '/p/child.jsonl' }),
+          mkSession('sibling', { parentSession: '/p/parent.jsonl' }),
+        ]),
+      } as ProjectGroup;
+      projectsState.activeSessionId = 'grandchild';
+
+      expect(projectsState.visibleSessions(group).map((r) => r.session.id)).toEqual([
+        'parent',
+        'child',
+        'grandchild',
       ]);
     });
   });

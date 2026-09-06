@@ -5,6 +5,7 @@
   import SidebarPanel from '#lib/components/sidebar-panel.svelte';
   import CornerDownLeft from '@lucide/svelte/icons/corner-down-left';
   import Sparkles from '@lucide/svelte/icons/sparkles';
+  import RefreshCw from '@lucide/svelte/icons/refresh-cw';
   import type { ModelInfo, ProviderInfo, SkillSummary, PromptSummary } from '#lib/ws/protocol.js';
   import { providerColor, sourceLabel, canRemove } from '#lib/utils.js';
 
@@ -17,6 +18,8 @@
     modelTab = $bindable(),
     model,
     availableModels,
+    modelRefreshLoading,
+    modelRefreshFeedback,
     toolsList,
     activeToolNames,
     resourcesLoaded,
@@ -52,6 +55,7 @@
     onInstallSkill,
     onUseSkill,
     onDismissProviderError,
+    onRefreshModels,
   }: {
     open: boolean;
     isMobile: boolean;
@@ -61,6 +65,8 @@
     modelTab: 'models' | 'providers';
     model: ModelInfo | null;
     availableModels: ModelInfo[];
+    modelRefreshLoading: boolean;
+    modelRefreshFeedback: { success: boolean; message: string } | null;
     toolsList: { name: string; description: string; isBuiltin: boolean; origin?: string }[];
     activeToolNames: string[];
     resourcesLoaded: boolean;
@@ -96,6 +102,7 @@
     onInstallSkill: (url: string, scope: 'project' | 'user') => void;
     onUseSkill: (name: string) => void;
     onDismissProviderError: () => void;
+    onRefreshModels: () => void;
   } = $props();
 
   // Derived grouping + O(1) active-check: avoids inline filter()/Map IIFE and
@@ -260,7 +267,7 @@
     ></div>
 
     <div class="shrink-0 px-5 py-2 border-b border-base-content/8 flex items-center gap-3">
-      <Tabs.Root bind:value={modelTab} class="flex-1">
+      <Tabs.Root bind:value={modelTab} class="min-w-0">
         <Tabs.List variant="line">
           <Tabs.Trigger value="models" tabindex={open ? 0 : -1}>models</Tabs.Trigger>
           <Tabs.Trigger value="providers" tabindex={open ? 0 : -1}
@@ -271,7 +278,34 @@
           >
         </Tabs.List>
       </Tabs.Root>
+      <Button
+        variant="ghost"
+        size="icon"
+        onclick={onRefreshModels}
+        disabled={modelRefreshLoading || !open}
+        aria-label={modelRefreshLoading ? 'Refreshing model catalog' : 'Refresh model catalog'}
+        title="Refresh model catalog"
+        aria-busy={modelRefreshLoading}
+        tabindex={open ? 0 : -1}
+        class="shrink-0 text-base-content/35 hover:text-base-content/70"
+      >
+        <RefreshCw
+          class="h-3.5 w-3.5 {modelRefreshLoading ? 'animate-spin' : ''}"
+          aria-hidden="true"
+        />
+      </Button>
     </div>
+    {#if modelRefreshFeedback}
+      <div
+        class="shrink-0 px-5 py-1.5 text-[11px] border-b {modelRefreshFeedback.success
+          ? 'text-success/75 bg-success/[0.04] border-success/10'
+          : 'text-error/80 bg-error/[0.07] border-error/20'}"
+        role="status"
+        aria-live="polite"
+      >
+        {modelRefreshFeedback.message}
+      </div>
+    {/if}
 
     {#if modelTab === 'models'}
       {#if model?.reasoning}

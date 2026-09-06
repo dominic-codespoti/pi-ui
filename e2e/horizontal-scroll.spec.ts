@@ -75,6 +75,40 @@ test('code blocks keep their horizontal scroll', async ({ page }) => {
   expect(pannable.panned).toBe(true);
 });
 
+test('long custom notices wrap without widening the chat page', async ({ page }) => {
+  const longNotice =
+    '**[~/vaults/Notes] vault_inbox_triage ✓ success** attempt 0/3 Command: ' +
+    'pi --print "For each markdown file in ~/vaults/Notes/z, infer tags from content and write them back" '.repeat(
+      6
+    );
+  await page.routeWebSocket('/ws', (ws) => {
+    ws.send(
+      JSON.stringify({
+        type: 'connected',
+        sessionId: 's1',
+        isStreaming: false,
+        thinkingLevel: 'medium',
+        model: null,
+        availableModels: [],
+        messages: [
+          { role: 'custom', customType: 'fleet', content: longNotice, timestamp: Date.now() },
+        ],
+      })
+    );
+  });
+  await loginAndOpen(page);
+
+  await expect(page.getByText(longNotice, { exact: true })).toBeVisible({ timeout: 5000 });
+  const dimensions = await page.locator('.scroll-container-mobile').evaluate((el: HTMLElement) => ({
+    viewport: document.documentElement.clientWidth,
+    documentWidth: document.documentElement.scrollWidth,
+    chatWidth: el.clientWidth,
+    chatScrollWidth: el.scrollWidth,
+  }));
+  expect(dimensions.documentWidth).toBeLessThanOrEqual(dimensions.viewport);
+  expect(dimensions.chatScrollWidth).toBeLessThanOrEqual(dimensions.chatWidth);
+});
+
 test('the chat scroller clips page-level sideways pan', async ({ page }) => {
   await page.routeWebSocket('/ws', (ws) => {
     ws.send(connectedWithAssistant(`Data:\n\n${WIDE_TABLE_MD}`));

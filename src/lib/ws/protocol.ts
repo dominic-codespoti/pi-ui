@@ -283,6 +283,8 @@ export interface ConnectedMessage {
   type: 'connected';
   sessionId: string;
   isStreaming: boolean;
+  /** Name of the tool currently executing in this session (if any). */
+  activeToolName?: string;
   thinkingLevel: string;
   model: ModelInfo | null;
   availableModels: ModelInfo[];
@@ -315,7 +317,7 @@ export interface ConnectedMessage {
   /** Session file path on disk — used to persist the active session across page reloads. */
   sessionPath?: string;
   /** Real-time context window usage from the SDK. */
-  contextUsage?: ContextUsage;
+  contextUsage?: ContextUsage | null;
   /** Current notification webhook URL (empty/null = disabled). */
   webhookUrl?: string;
   /** Full session-owned extension UI snapshot; replaces stale panels on connect/switch. */
@@ -340,7 +342,7 @@ export interface ConnectedMessage {
  *
  * Custom server events (not from the SDK):
  *   { type: "model_changed",           model: ModelInfo | null; thinkingLevel?: string }
- *   { type: "session_loaded",          sessionId, isStreaming, thinkingLevel, model, availableModels, messages, contextUsage }
+ *   { type: "session_loaded",          sessionId, isStreaming, activeToolName?, thinkingLevel, model, availableModels, messages, contextUsage }
  *   { type: "sessions_list",           sessions: SessionSummary[] }
  *   { type: "all_sessions_list",       sessions: SessionSummary[] }
  *   { type: "session_updated",         session: SessionSummary }
@@ -415,7 +417,7 @@ export interface ConnectedMessage {
  *       the client replaces its streamed buffer with this sealed content.
  *
  *   Session runtime status (lightweight — no message content, just metadata):
- *   { type: "session_runtime",         sessionId: string, isRunning: boolean, unseen: boolean, lastActivity: number }
+ *   { type: "session_runtime",         sessionId: string, isRunning: boolean, unseen: boolean, lastActivity: number, activeToolName?: string }
  *
  *   Supported extension_ui_request methods:
  *     confirm    – dialog with confirm/cancel (title, message)
@@ -454,6 +456,9 @@ export type ServerCustomEvent =
       type: 'session_loaded';
       sessionId: string;
       requestId?: string;
+      isStreaming?: boolean;
+      /** Name of the tool currently executing in this session (if any). */
+      activeToolName?: string;
       thinkingLevel: string;
       model: ModelInfo | null;
       availableModels: ModelInfo[];
@@ -473,7 +478,7 @@ export type ServerCustomEvent =
       projectTrust?: ProjectTrustInfo;
       diagnostics?: RuntimeDiagnostic[];
       modelFallbackMessage?: string;
-      contextUsage?: ContextUsage;
+      contextUsage?: ContextUsage | null;
       tools?: Array<{ name: string; description: string; isBuiltin: boolean; origin?: string }>;
       activeToolNames?: string[];
     }
@@ -484,6 +489,7 @@ export type ServerCustomEvent =
   | { type: 'dir_completions'; prefix: string; entries: string[] }
   | { type: 'file_completions'; query: string; entries: string[] }
   | { type: 'available_models_changed'; availableModels: ModelInfo[]; sessionId?: string }
+  | { type: 'models_refresh_result'; success: boolean; message: string }
   | { type: 'sessions_error'; message: string; requestId?: string }
   | { type: 'fork_points'; entries: Array<{ entryId: string; text: string }> }
   | {
@@ -515,7 +521,12 @@ export type ServerCustomEvent =
   | { type: 'restart_nonce'; nonce: string }
   | { type: 'server_restarting' }
   | { type: 'notification_webhook_url'; url: string | null }
-  | { type: 'slash_result'; command: string; message: string; level?: 'info' | 'warning' | 'error' }
+  | {
+      type: 'slash_result';
+      command: string;
+      message: string;
+      level?: 'info' | 'warning' | 'error';
+    }
   | { type: 'file_content'; path: string; content: string; error?: string }
   | { type: 'file_saved'; path: string; error?: string }
   | {
@@ -542,6 +553,7 @@ export type ServerCustomEvent =
       isRunning: boolean;
       unseen: boolean;
       lastActivity: number;
+      activeToolName?: string;
     }
   | { type: 'extension_ui_state'; sessionId: string; ui: ExtensionUiStatePayload }
   | { type: 'extension_terminal_input_active'; active: boolean; sessionId?: string }
@@ -611,7 +623,8 @@ export type ClientMessage =
   /** Forward raw terminal input to an interactive custom component (ConversationViewer
    * etc). `data` is the exact byte sequence a real terminal would send for the
    * keystroke/paste — see `#lib/terminal-key-encoder.js` — and is passed straight to
-   * the component's `handleInput()`. */
+   * the component.
+   */
   | { type: 'extension_custom_input'; id: string; data: string }
   /** Report the interactive custom overlay's live viewport so the server's headless terminal renders at the real size. */
   | { type: 'extension_custom_resize'; id: string; columns: number; rows: number }
@@ -637,6 +650,8 @@ export type ClientMessage =
     }
   /** Dismiss an extension widget — server tears down its factory and broadcasts removal to all tabs. */
   | { type: 'dismiss_widget'; key: string }
+  /** Force a network refresh of dynamic provider model catalogs. */
+  | { type: 'refresh_models' }
   /** Request list of all providers with auth status. */
   | { type: 'get_providers' }
   /** Persist an API key for a provider. */

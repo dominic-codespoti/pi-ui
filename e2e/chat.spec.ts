@@ -295,6 +295,30 @@ test.describe('Chat / prompt streaming', () => {
     await expect(page.getByText('Partial response')).toBeVisible({ timeout: 3000 });
   });
 
+  test('shows active tool execution indicator', async ({ page }) => {
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.onMessage(() => {});
+      ws.send(
+        JSON.stringify({
+          type: 'connected',
+          sessionId: 's1',
+          isStreaming: false,
+          activeToolName: 'example_tool',
+          thinkingLevel: 'medium',
+          model: null,
+          availableModels: [],
+          messages: [],
+        })
+      );
+      ws.send(JSON.stringify({ type: 'projects_list', projects: [] }));
+      ws.send(JSON.stringify({ type: 'all_sessions_list', sessions: [] }));
+    });
+
+    await page.goto('/');
+    await expect(page.getByLabel('Running tool example_tool')).toBeVisible({ timeout: 3000 });
+  });
+
+
   test('shows thinking deltas', async ({ page }) => {
     await page.routeWebSocket('/ws', (ws) => {
       let streaming = false;
@@ -383,6 +407,61 @@ test.describe('Chat / prompt streaming', () => {
     await expect(page.getByText('Start an agent')).toBeVisible();
     await page.getByRole('option', { name: /start Start an agent/ }).click();
     await expect(page.locator('textarea')).toHaveValue('/ag start ');
+  });
+  test('stages an image pasted from clipboard', async ({ page }) => {
+    const wsMessages: string[] = [];
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.onMessage((data) => wsMessages.push(String(data)));
+      ws.send(
+        JSON.stringify({
+          type: 'connected',
+          sessionId: 's1',
+          isStreaming: false,
+          thinkingLevel: 'medium',
+          model: null,
+          availableModels: [],
+          messages: [],
+        })
+      );
+    });
+
+    await page.goto('/');
+    const pngBase64 =
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
+    await page.locator('textarea').evaluate((textarea, base64) => {
+      const bytes = Uint8Array.from(atob(base64), (char) => char.charCodeAt(0));
+      const transfer = new DataTransfer();
+      transfer.items.add(new File([bytes], 'clipboard.png', { type: 'image/png' }));
+      textarea.dispatchEvent(
+        new ClipboardEvent('paste', {
+          bubbles: true,
+          cancelable: true,
+          clipboardData: transfer,
+        })
+      );
+    }, pngBase64);
+
+    await expect(page.locator('img[alt="clipboard.png"]')).toBeVisible({ timeout: 3000 });
+    await page.getByLabel('Send message').click();
+    await expect
+      .poll(
+        () =>
+          wsMessages.some((raw) => {
+            try {
+              const message = JSON.parse(raw);
+              return (
+                message.type === 'prompt' &&
+                Array.isArray(message.images) &&
+                message.images.length === 1 &&
+                message.images[0]?.mimeType === 'image/png'
+              );
+            } catch {
+              return false;
+            }
+          }),
+        { timeout: 3000 }
+      )
+      .toBe(true);
   });
 });
 

@@ -175,6 +175,7 @@ export const ConnectedMessageSchema = v.looseObject({
   type: v.literal('connected'),
   sessionId: v.string(),
   isStreaming: v.boolean(),
+  activeToolName: v.optional(v.string()),
   thinkingLevel: v.string(),
   model: v.nullable(ModelInfoSchema),
   availableModels: v.array(ModelInfoSchema),
@@ -192,7 +193,7 @@ export const ConnectedMessageSchema = v.looseObject({
   uiVersion: v.optional(v.string()),
   sessionMode: v.optional(v.union([v.literal('in-memory'), v.literal('persisted')])),
   sessionPath: v.optional(v.string()),
-  contextUsage: v.optional(ContextUsageSchema),
+  contextUsage: v.optional(v.nullable(ContextUsageSchema)),
   webhookUrl: v.optional(v.string()),
   extensionUiState: v.optional(v.unknown()),
   projectTrust: v.optional(ProjectTrustInfoSchema),
@@ -216,6 +217,7 @@ export const SessionLoadedSchema = v.looseObject({
   type: v.literal('session_loaded'),
   sessionId: v.string(),
   isStreaming: v.boolean(),
+  activeToolName: v.optional(v.string()),
   thinkingLevel: v.string(),
   model: v.nullable(ModelInfoSchema),
   availableModels: v.array(ModelInfoSchema),
@@ -238,7 +240,7 @@ export const SessionLoadedSchema = v.looseObject({
   projectTrust: v.optional(ProjectTrustInfoSchema),
   diagnostics: v.optional(v.array(RuntimeDiagnosticSchema)),
   modelFallbackMessage: v.optional(v.string()),
-  contextUsage: v.optional(ContextUsageSchema),
+  contextUsage: v.optional(v.nullable(ContextUsageSchema)),
   tools: v.optional(
     v.array(
       v.looseObject({
@@ -274,6 +276,11 @@ export const AvailableModelsChangedSchema = v.looseObject({
   availableModels: v.array(ModelInfoSchema),
   sessionId: v.optional(v.string()),
 });
+export const ModelsRefreshResultSchema = v.looseObject({
+  type: v.literal('models_refresh_result'),
+  success: v.boolean(),
+  message: v.string(),
+});
 
 export const OlderMessagesSchema = v.looseObject({
   type: v.literal('older_messages'),
@@ -288,6 +295,7 @@ export const SessionRuntimeSchema = v.looseObject({
   isRunning: v.boolean(),
   unseen: v.boolean(),
   lastActivity: v.number(),
+  activeToolName: v.optional(v.string()),
 });
 
 export const ExtensionTerminalInputResultSchema = v.looseObject({
@@ -452,6 +460,7 @@ export const customEventSchemas = {
   model_changed: ModelChangedSchema,
   thinking_level_changed: ThinkingLevelChangedSchema,
   available_models_changed: AvailableModelsChangedSchema,
+  models_refresh_result: ModelsRefreshResultSchema,
   older_messages: OlderMessagesSchema,
   session_runtime: SessionRuntimeSchema,
   extension_terminal_input_result: ExtensionTerminalInputResultSchema,

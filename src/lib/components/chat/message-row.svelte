@@ -637,7 +637,7 @@
       />
       <!-- Label / detail (extension-rendered if available) -->
       {#if msg.renderedCallHtml}
-        <span class="trace-row-label font-normal"
+        <span class="trace-row-label trace-row-call font-normal"
           >{#each msg.renderedCallHtml as line, i (i)}{#if i > 0}<br
               />{/if}{@html line}{/each}</span
         >
@@ -787,9 +787,9 @@
   <!-- ── Notice ────────────────────────────────────────────────────── -->
 {:else if msg.role === 'notice'}
   {#if msg.noticeKind === 'toast'}
-    <div class="my-1.5 flex items-start gap-2.5" class:msg-in={isNewest}>
+    <div class="my-1.5 min-w-0 flex items-start gap-2.5" class:msg-in={isNewest}>
       <div
-        class="flex-1 rounded-xl border-l-4 px-3.5 py-2.5 text-sm leading-relaxed select-text {!msg.level ||
+        class="min-w-0 flex-1 rounded-xl border-l-4 px-3.5 py-2.5 text-sm leading-relaxed select-text {!msg.level ||
         msg.level === 'info'
           ? 'border-info bg-info/[0.03]'
           : ''} {msg.level === 'warning' ? 'border-warning bg-warning/[0.04]' : ''} {msg.level ===
@@ -797,8 +797,10 @@
           ? 'border-error bg-error/[0.04]'
           : ''}"
       >
-        <div class="flex items-center gap-2">
-          <span class="flex-1 text-base-content/85">{msg.content}</span>
+        <div class="flex min-w-0 items-start gap-2">
+          <span class="min-w-0 flex-1 break-words whitespace-pre-wrap text-base-content/85"
+            >{msg.content}</span
+          >
           <span class="text-[10px] text-base-content/40 shrink-0">{formatDate(msg.createdAt)}</span>
           <Button
             variant="ghost"
@@ -902,14 +904,14 @@
     </div>
   {:else}
     <div
-      class="flex items-center gap-2.5 text-[10px] text-base-content/45 select-none py-1"
+      class="flex min-w-0 max-w-full items-start gap-2.5 text-[10px] text-base-content/45 select-none py-1"
       class:msg-in={isNewest}
     >
-      <span class="flex-1 h-px bg-gradient-to-r from-transparent to-base-content/15"></span>
-      <span class="flex items-center gap-1 shrink-0">
+      <span class="min-w-0 flex-1 h-px bg-gradient-to-r from-transparent to-base-content/15"></span>
+      <span class="flex min-w-0 max-w-full items-start gap-1">
         {#if msg.streaming}
           <svg
-            class="w-2 h-2 animate-spin"
+            class="w-2 h-2 shrink-0 animate-spin"
             viewBox="0 0 24 24"
             fill="none"
             stroke="currentColor"
@@ -918,7 +920,7 @@
           >
         {:else if msg.noticeKind === 'retry'}
           <svg
-            class="w-2 h-2"
+            class="w-2 h-2 shrink-0"
             viewBox="0 0 24 24"
             fill="none"
             stroke="currentColor"
@@ -930,11 +932,11 @@
             /></svg
           >
         {:else if msg.noticeKind === 'custom'}
-          <span class="w-2 h-2 rounded-full bg-secondary inline-block"></span>
+          <span class="mt-0.5 h-2 w-2 shrink-0 rounded-full bg-secondary inline-block"></span>
         {/if}
-        <span>{msg.content}</span>
+        <span class="min-w-0 break-words whitespace-pre-wrap">{msg.content}</span>
       </span>
-      <span class="flex-1 h-px bg-gradient-to-l from-transparent to-base-content/15"></span>
+      <span class="min-w-0 flex-1 h-px bg-gradient-to-l from-transparent to-base-content/15"></span>
     </div>
   {/if}
 {/if}

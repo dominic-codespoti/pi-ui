@@ -82,7 +82,7 @@ Two-tier standard:
 - **shadcn-style UI primitives**: Compound sub-components + `index.ts` re-exports
 - **bits-ui wrapping**: Dialog, Select, Tabs, Tooltip, ScrollArea, Switch, Separator
 - **Data attributes**: `data-slot="button"`, `data-size="sm"` drive internal styling
-- **No component unit tests** — UI tested exclusively via Playwright E2E
+- **Component unit tests**: a small set of behavior-heavy components (chat banners, extension overlay dialogs) have Vitest coverage under `__tests__/`; most UI is still tested via Playwright E2E
 
 ## Formatting
 

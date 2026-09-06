@@ -118,11 +118,16 @@
 
 {#if sessionLoading}
   <div
-    class="aurora min-h-full flex flex-col items-center justify-start gap-3 px-4 pt-8"
+    class="aurora h-full overflow-hidden flex flex-col items-center justify-start gap-3 px-4 pt-8"
     role="status"
     aria-live="polite"
   >
-    {#each Array.from({ length: 14 }, (_, i) => i) as i (i)}
+    <!-- Over-render and clip: a fixed small count leaves an obvious empty
+     gap below the last bubble on tall viewports (4K monitors, zoomed-out
+     desktop). 40 rows safely exceeds any realistic viewport height; the
+     container's own overflow-hidden (not the scrollable <main> parent's)
+     clips the excess so this never becomes scrollable. -->
+    {#each Array.from({ length: 40 }, (_, i) => i) as i (i)}
       <div
         class="flex {i % 2 === 0
           ? 'justify-end'
@@ -215,7 +220,7 @@
   </div>
 {:else}
   <div
-    class="w-full max-w-3xl lg:max-w-5xl xl:max-w-6xl 2xl:max-w-7xl mx-auto px-4 md:px-6 flex flex-col gap-1"
+    class="w-full min-w-0 max-w-3xl lg:max-w-5xl xl:max-w-6xl 2xl:max-w-7xl mx-auto px-4 md:px-6 flex flex-col gap-1"
   >
     {#if messagesTruncated}
       <div class="flex items-center gap-3 py-2 select-none" aria-live="polite">

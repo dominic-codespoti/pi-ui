@@ -201,4 +201,41 @@ test.describe('Provider credentials', () => {
     await expect(claudeRow).toBeVisible();
     await expect(gptRow).toBeVisible();
   });
+  test('forces a model catalog refresh from the sidebar', async ({ page, login }) => {
+    const sent: Record<string, unknown>[] = [];
+    let sendWs: { send: (message: string) => void } | undefined;
+
+    await page.routeWebSocket('/ws', (ws) => {
+      sendWs = ws;
+      ws.onMessage((data) => {
+        sent.push(JSON.parse(String(data)) as Record<string, unknown>);
+      });
+      ws.send(JSON.stringify(CONNECTED_PAYLOAD));
+      ws.send(JSON.stringify(PROJECTS_LIST_PAYLOAD));
+      ws.send(JSON.stringify(ALL_SESSIONS_LIST_PAYLOAD));
+    });
+
+    await login(page);
+    await page.getByRole('button', { name: 'Open model and provider panel' }).click();
+
+    const refresh = page.locator('button[title="Refresh model catalog"]');
+    await expect(refresh).toBeVisible();
+    await refresh.click();
+    await expect(refresh).toHaveAttribute('aria-busy', 'true');
+    expect(sent.find((message) => message.type === 'refresh_models')).toBeDefined();
+
+    if (!sendWs) throw new Error('WebSocket did not open');
+    sendWs.send(
+      JSON.stringify({
+        type: 'models_refresh_result',
+        success: true,
+        message: 'Models refreshed.',
+      })
+    );
+
+    await expect(
+      page.getByRole('status').getByText('Models refreshed.', { exact: true })
+    ).toBeVisible();
+    await expect(refresh).toHaveAttribute('aria-busy', 'false');
+  });
 });

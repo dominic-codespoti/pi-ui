@@ -2129,6 +2129,10 @@ interface ManagedSession {
   createdAt: number;
   /** True while the agent is generating (agent_start … agent_end). */
   isRunning: boolean;
+  /** Name of the tool currently executing in this session, when known. */
+  activeToolName: string | undefined;
+  /** Active tool calls keyed by SDK tool-call id. */
+  activeToolCalls: Map<string, string>;
   /** True if the session has new result(s) since the user last looked at it. */
   unseen: boolean;
   /** Unix ms of the most recent agent_end / message_end. */
@@ -2164,14 +2168,14 @@ const MAX_POOLED_SESSIONS = Number(Bun.env.PI_UI_MAX_POOLED_SESSIONS) || 12;
 
 /**
  * True when a pooled entry may be safely disposed right now: not active,
- * not running, no unseen results, no queued steering/follow-up messages,
- * and persisted to disk (in-memory sessions would lose data). Shared by
- * the navigated-away timer and the idle sweep so both apply identical
- * guarantees.
+ * not running, not executing a shell command, no unseen results, no queued
+ * steering/follow-up messages, and persisted to disk (in-memory sessions
+ * would lose data). Shared by the navigated-away timer and the idle sweep so
+ * both apply identical guarantees.
  */
 function isSessionSafeToDispose(sid: string, entry: ManagedSession): boolean {
   if (sid === activeSessionId) return false;
-  if (entry.isRunning || entry.unseen) return false;
+  if (entry.isRunning || entry.activeToolCalls.size > 0 || entry.unseen) return false;
   if (!entry.path) return false; // in-memory session — disposal would lose data
   try {
     if (entry.session.getSteeringMessages().length || entry.session.getFollowUpMessages().length) {
@@ -2216,7 +2220,13 @@ function scheduleNavOutDisposal(sid: string): void {
   if (!entry.path) return; // in-memory session — disposal would lose data
   entry.disposeTimer = setTimeout(() => {
     entry.disposeTimer = null;
-    if (sessionPool.get(sid) !== entry || !isSessionSafeToDispose(sid, entry)) return;
+    if (sessionPool.get(sid) !== entry) return;
+    if (!isSessionSafeToDispose(sid, entry)) {
+      // A run can outlive the grace period. Keep checking while it is active;
+      // once it settles, unseen results intentionally keep it resident.
+      if (entry.isRunning || entry.activeToolCalls.size > 0) scheduleNavOutDisposal(sid);
+      return;
+    }
     releaseManagedSession(sid, entry, 'navigated-away');
   }, NAV_OUT_DISPOSE_GRACE_MS);
 }
@@ -2802,6 +2812,8 @@ function registerSession(
     session: sess,
     forwardingUnsub: null,
     runtimeUnsub: null,
+    activeToolName: undefined,
+    activeToolCalls: new Map(),
     cwd: cwdV,
     path,
     createdAt: Date.now(),
@@ -2829,12 +2841,16 @@ function registerSession(
   entry.runtimeUnsub = sess.subscribe((event) => {
     switch (event.type) {
       case 'agent_start':
+        entry.activeToolCalls.clear();
+        entry.activeToolName = undefined;
         entry.isRunning = true;
         entry.unseen = activeSessionId !== sid;
         // A run started (e.g. queued follow-up) — keep the session in memory.
         cancelNavOutDisposal(entry);
         break;
       case 'agent_end': {
+        entry.activeToolCalls.clear();
+        entry.activeToolName = undefined;
         entry.isRunning = false;
         const backgroundEnd = activeSessionId !== sid;
         if (backgroundEnd) entry.unseen = true;
@@ -2861,6 +2877,18 @@ function registerSession(
                 ...(entry.path ? { sessionPath: entry.path } : {}),
               }
         );
+        break;
+      }
+      case 'tool_execution_start':
+        entry.activeToolCalls.set(event.toolCallId, event.toolName);
+        entry.activeToolName = event.toolName;
+        cancelNavOutDisposal(entry);
+        break;
+      case 'tool_execution_end': {
+        entry.activeToolCalls.delete(event.toolCallId);
+        let latestToolName: string | undefined;
+        for (const toolName of entry.activeToolCalls.values()) latestToolName = toolName;
+        entry.activeToolName = latestToolName;
         break;
       }
       case 'message_end':
@@ -2947,6 +2975,7 @@ function sessionRuntimePayload(sid: string, entry: ManagedSession) {
     type: 'session_runtime' as const,
     sessionId: sid,
     isRunning: entry.isRunning,
+    ...(entry.activeToolName ? { activeToolName: entry.activeToolName } : {}),
     unseen: entry.unseen,
     lastActivity: entry.lastActivity,
   };
@@ -3062,6 +3091,9 @@ function broadcastSessionLoaded(sess: AgentSession, requestId?: string): void {
     sessionId: sess.sessionId,
     ...(requestId !== undefined ? { requestId } : {}),
     isStreaming: sess.isStreaming,
+    ...(sessionPool.get(sess.sessionId)?.activeToolName
+      ? { activeToolName: sessionPool.get(sess.sessionId)?.activeToolName }
+      : {}),
     thinkingLevel: sess.thinkingLevel,
     model: serializeModel(sess.model),
     availableModels: snapshotModels(sess),
@@ -3401,6 +3433,9 @@ try {
                 type: 'connected',
                 sessionId: sess.sessionId,
                 isStreaming: sess.isStreaming,
+                ...(sessionPool.get(sess.sessionId)?.activeToolName
+                  ? { activeToolName: sessionPool.get(sess.sessionId)?.activeToolName }
+                  : {}),
                 thinkingLevel: sess.thinkingLevel,
                 model: serializeModel(sess.model),
                 availableModels,
@@ -3659,6 +3694,7 @@ try {
                 broadcast({ type: 'model_changed', model: serializeModel(model) });
               } catch (err) {
                 log.error('[pifrontier] set_model error:', err);
+                sendSlashResult(ws, 'set_model', `Failed to switch model: ${err}`, 'error');
               }
               break;
             }
@@ -3771,9 +3807,13 @@ try {
                 if (typeof component.handleInput === 'function') {
                   component.handleInput(data);
                 }
-                flushInteractiveRender(customId);
               } catch (err) {
                 log.error('[pifrontier] extension_custom_input error:', err);
+              } finally {
+                // Always flush, even on a throw — otherwise a bad keystroke
+                // leaves the client's terminal render stale with no signal
+                // that anything happened.
+                flushInteractiveRender(customId);
               }
               break;
             }
@@ -3888,6 +3928,13 @@ try {
                 }
               } catch (err) {
                 log.error('[pifrontier] extension_component_event error:', err);
+                // A throwing callback (onSelect/onClick/onSubmit/etc.) must
+                // still resolve the dialog — otherwise the extension's
+                // `await ui.confirm()`/`select()` call hangs forever with no
+                // way for the user to retry or dismiss it.
+                const ui = existingUiStateFor(pendingRequestOwners.get(dialogId) ?? null);
+                const pending = ui?.pendingDialogs.get(dialogId);
+                if (pending) pending.resolve({ value });
               }
               break;
             }
@@ -3903,6 +3950,47 @@ try {
                   providers: await getProviders(sess.modelRuntime),
                 })
               );
+              break;
+            }
+            case 'refresh_models': {
+              try {
+                const sess = await ensureSession();
+                const result = await sess.modelRuntime.refresh({
+                  allowNetwork: true,
+                  force: true,
+                });
+                const errors = [...result.errors.entries()];
+                await broadcastProviderState(sess.modelRuntime);
+                const message = result.aborted
+                  ? 'Model refresh aborted.'
+                  : errors.length > 0
+                    ? `Model refresh completed with ${errors.length} provider ${
+                        errors.length === 1 ? 'error' : 'errors'
+                      }: ${errors
+                        .map(([provider, error]) => `${provider}: ${error.message}`)
+                        .join('; ')}`
+                    : 'Models refreshed.';
+                if (!ws.data.closed) {
+                  ws.send(
+                    JSON.stringify({
+                      type: 'models_refresh_result',
+                      success: !result.aborted && errors.length === 0,
+                      message,
+                    })
+                  );
+                }
+              } catch (err) {
+                log.error('[pifrontier] refresh_models error:', err);
+                if (!ws.data.closed) {
+                  ws.send(
+                    JSON.stringify({
+                      type: 'models_refresh_result',
+                      success: false,
+                      message: `Model refresh failed: ${String(err)}`,
+                    })
+                  );
+                }
+              }
               break;
             }
 
@@ -3984,7 +4072,22 @@ try {
                 // Clean up pooled session (if still in memory) to prevent leaks
                 const pooled = sessionPool.get(target.id);
                 if (pooled) {
+                  // Clear client-side runtime markers before tearing down the
+                  // entry; the command may finish after the pool identity is gone.
+                  broadcast({
+                    type: 'session_runtime',
+                    sessionId: target.id,
+                    isRunning: false,
+                    unseen: false,
+                    lastActivity: Date.now(),
+                  });
                   cancelNavOutDisposal(pooled);
+                  // Extension UI state (pending dialogs, terminal-input
+                  // registry, autocomplete providers bound to this session)
+                  // is not covered by the unsubs below — releaseManagedSession
+                  // handles it for the idle/nav-out path; deletion must too,
+                  // or a session with in-flight extension UI leaks it forever.
+                  disposeUi(target.id);
                   pooled.forwardingUnsub?.();
                   pooled.runtimeUnsub?.();
                   try {
@@ -4062,6 +4165,72 @@ try {
               break;
             }
 
+            case 'delete_project': {
+              try {
+                const target = (msg as { type: 'delete_project'; cwd: string }).cwd ?? '';
+                if (!target.trim()) {
+                  ws.send(
+                    JSON.stringify({ type: 'sessions_error', message: 'No project specified.' })
+                  );
+                  break;
+                }
+                if (target === (activeSessionOrNull()?.sessionManager.getCwd() || cwd)) {
+                  ws.send(
+                    JSON.stringify({
+                      type: 'sessions_error',
+                      message: 'Cannot delete the active project.',
+                    })
+                  );
+                  break;
+                }
+                // listForCwd already includes nested/subagent sessions — they
+                // share the parent project's cwd, so no separate walk needed.
+                const sessions = await sessionCatalog.listForCwd(target);
+                for (const session of sessions) {
+                  try {
+                    await rm(session.path);
+                  } catch (err) {
+                    log.error(
+                      `[pifrontier] delete_project: failed to remove ${session.path}:`,
+                      err
+                    );
+                    continue;
+                  }
+                  // Same pooled-session teardown as delete_session — a
+                  // project delete must not leak extension UI state, timers,
+                  // or forwarding subscriptions for any session it removes.
+                  const pooled = sessionPool.get(session.id);
+                  if (pooled) {
+                    broadcast({
+                      type: 'session_runtime',
+                      sessionId: session.id,
+                      isRunning: false,
+                      unseen: false,
+                      lastActivity: Date.now(),
+                    });
+                    cancelNavOutDisposal(pooled);
+                    disposeUi(session.id);
+                    pooled.forwardingUnsub?.();
+                    pooled.runtimeUnsub?.();
+                    try {
+                      pooled.session.dispose();
+                    } catch {
+                      /* session may have already been disposed */
+                    }
+                    sessionPool.delete(session.id);
+                    if (pooled.path) pathToSessionId.delete(pooled.path);
+                  }
+                  sessionCatalog.apply({ kind: 'remove', path: session.path });
+                }
+                projectCatalog.apply({ kind: 'remove', path: target });
+                ws.send(JSON.stringify({ type: 'sessions_list', sessions: [] }));
+              } catch (err) {
+                log.error('[pifrontier] delete_project error:', err);
+                ws.send(JSON.stringify({ type: 'sessions_error', message: String(err) }));
+              }
+              break;
+            }
+
             case 'pin_project': {
               const { cwd: target, pinned } = msg as {
                 type: 'pin_project';
@@ -4136,6 +4305,7 @@ try {
                 ws.send(JSON.stringify({ type: 'dir_completions', prefix, entries }));
               } catch (err) {
                 log.error('[pifrontier] dir_complete error:', err);
+                ws.send(JSON.stringify({ type: 'dir_completions', prefix: '', entries: [] }));
               }
               break;
             }
@@ -4605,8 +4775,8 @@ try {
                       sendSlashResult(ws, command, 'Usage: ! <command>', 'warning');
                       break;
                     }
+                    const sess = activeSession();
                     try {
-                      const sess = activeSession();
                       const result = await sess.executeBash(
                         args,
                         (chunk) =>
@@ -4741,6 +4911,7 @@ try {
                 );
               } catch (err) {
                 log.error('[pifrontier] get_tools error:', err);
+                ws.send(JSON.stringify({ type: 'tools_list', tools: [], activeToolNames: [] }));
               }
               break;
             }
@@ -4750,6 +4921,11 @@ try {
                 activeSession().setActiveToolsByName(msg.toolNames as string[]);
               } catch (err) {
                 log.error('[pifrontier] set_active_tools error:', err);
+                // The client's toggle is optimistic — a failed update must
+                // correct it back to the session's real active-tool state,
+                // not leave the UI showing a change that never took effect.
+                const sess = activeSessionOrNull();
+                if (sess) ws.send(JSON.stringify({ type: 'tools_list', ...toolsPayloadFor(sess) }));
               }
               break;
             }
@@ -5263,7 +5439,7 @@ try {
                   break;
                 }
                 // Security: resolve relative to the active project root and ensure it doesn't escape
-                const resolved = resolve(activeCwd(), filePath);
+                const resolved = resolve(activeCwd(), expandTilde(filePath));
                 if (!isInsideWorkspace(resolved)) {
                   ws.send(
                     JSON.stringify({
@@ -5329,7 +5505,7 @@ try {
                   );
                   break;
                 }
-                const resolved = resolve(activeCwd(), filePath);
+                const resolved = resolve(activeCwd(), expandTilde(filePath));
                 if (!isInsideWorkspace(resolved)) {
                   ws.send(
                     JSON.stringify({
@@ -5406,6 +5582,21 @@ try {
                 );
               } catch (err) {
                 log.error('[pifrontier] load_messages error:', err);
+                // messages:[] + messagesTruncated:false tells the client
+                // there's nothing more to load right now — but the real
+                // totalMessageCount must still be sent, or a transient
+                // failure would wrongly convince the client the session is
+                // shorter than it is and break pagination for the rest of
+                // the session.
+                const sess = activeSessionOrNull();
+                ws.send(
+                  JSON.stringify({
+                    type: 'older_messages',
+                    messages: [],
+                    totalMessageCount: sess?.messages.length ?? 0,
+                    messagesTruncated: false,
+                  })
+                );
               }
               break;
             }

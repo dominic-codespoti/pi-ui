@@ -174,4 +174,37 @@ test.describe('Session status orbs', () => {
     await page.getByRole('button', { name: /Bug fix/ }).click();
     await expect(page.getByLabel('Streaming')).toHaveCount(0);
   });
+
+  test('renders a background tool-call indicator', async ({ page, login }) => {
+    await page.routeWebSocket('/ws', (ws) => {
+      let bgRunning = true;
+      const bgTimer = setInterval(() => {
+        if (bgRunning) {
+          ws.send(JSON.stringify(sessionRuntimePayload('s3', true, false, 'example_tool')));
+        }
+      }, 300);
+      ws.onMessage((data) => {
+        const msg = JSON.parse(String(data));
+        if (msg.type === 'get_projects') {
+          ws.send(JSON.stringify(PROJECTS_LIST_PAYLOAD));
+        }
+        if (msg.type === 'get_all_sessions') {
+          ws.send(JSON.stringify(ALL_SESSIONS_LIST_PAYLOAD));
+        }
+        if (msg.type === 'switch_session') {
+          bgRunning = false;
+          clearInterval(bgTimer);
+          ws.send(JSON.stringify(sessionLoadedFor(msg.path)));
+        }
+      });
+      ws.send(JSON.stringify(CONNECTED_S1));
+    });
+    await login(page, 'test-password');
+
+    await openProjectsSidebar(page);
+    await expect(page.getByText('hello world')).toBeVisible({ timeout: 3000 });
+
+    await expect(page.getByLabel('Running tool in background')).toBeVisible({ timeout: 3000 });
+    await expect(page.getByLabel('Background session running')).toBeVisible({ timeout: 3000 });
+  });
 });

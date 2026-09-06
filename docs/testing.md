@@ -7,12 +7,12 @@
 | Framework           | Vitest v4.1.11 (`@vitest/coverage-v8` v4.1.11)                                               |
 | Environment         | jsdom                                                                                        |
 | Setup               | `@testing-library/jest-dom/vitest` (auto-imported)                                           |
-| Test locations      | `src/**/*.test.ts` (37 test files across `lib/`, `server/`, `state/`, `components/`, `routes/`) |
+| Test locations      | `src/**/*.test.ts` (36 test files across `lib/`, `server/`, `state/`, `components/`, `routes/`) |
 | Coverage            | v8 provider, 60% stmts/funcs/lines, 50% branches                                             |
 | Coverage exclusions | `src/lib/components/ui/**`, test files, service-worker                                       |
 | Mocking             | `vi.mock()` module mocking, `vi.mocked()` typed mocks, `vi.resetModules()` for fresh imports |
 
-### Test Files by Area (37 Files)
+### Test Files by Area (36 Files)
 
 #### Client Core & Protocol Helpers (`src/lib/__tests__/`, `src/lib/`)
 - `src/lib/__tests__/client-messages.test.ts` — uid, extractTextContent, formatToolInput, agentMsgToUI, thinking levels, reconnectDelay, rawMessagesToUI
@@ -21,12 +21,12 @@
 - `src/lib/__tests__/extension-modals.test.ts` — extension modal / confirm / input state transformations
 - `src/lib/__tests__/markdown.test.ts` — renderMarkdown, LaTeX math block rendering, memoization cache, highlightCode
 - `src/lib/__tests__/notification-prefs.test.ts` — web push notification preferences & storage serialization
+- `src/lib/__tests__/session-identity.test.ts` — device-scoped last-session identity persistence and resume priority
 - `src/lib/__tests__/session-snapshot.test.ts` — session snapshot hydration and message projection
 - `src/lib/__tests__/session-view-cache.test.ts` — session view cache invalidation & hydration
 - `src/lib/__tests__/thinking-levels.test.ts` — reasoning / thinking level definitions and cycle transitions
 - `src/lib/__tests__/tui-stubs.test.ts` — stripAnsi, StubTui, parseComponentTree, callFactoryAndParse, editor / isEditor stubs
 - `src/lib/__tests__/utils.test.ts` — cn, formatRelativeDate, type helpers
-- `src/lib/session-view-cache.test.ts` — root-level session view cache unit coverage
 
 #### Authentication & Security (`src/lib/auth/`)
 - `src/lib/auth/password.test.ts` — JWT round-trip, expiry, tamper detection, cookie parsing, WebCrypto signature verification
@@ -59,7 +59,6 @@
 #### UI Component Units (`src/lib/components/**/__tests__/`)
 - `src/lib/components/chat/__tests__/header-and-banners.test.ts` — banner rendering, offline notices, session headers
 - `src/lib/components/dialogs/__tests__/extension-overlays.test.ts` — extension modal overlays & custom dialog actions
-- `src/lib/components/panels/__tests__/settings-panel.test.ts` — settings form state, theme / provider toggle controls
 
 #### SvelteKit Route Handlers (`src/routes/__tests__/`)
 - `src/routes/__tests__/hooks.server.test.ts` — SvelteKit Handle guard logic, auth redirects, cookie validation
@@ -81,7 +80,7 @@
 | Aspect              | Value                                                                                           |
 | ------------------- | ----------------------------------------------------------------------------------------------- |
 | Framework           | Playwright v1.62+                                                                               |
-| Test dir            | `e2e/*.spec.ts` (22 spec files)                                                                 |
+| Test dir            | `e2e/*.spec.ts` (23 spec files)                                                                 |
 | Browsers            | Chromium (`Desktop Chrome`) + Mobile (`Pixel 5`)                                               |
 | Parallelism         | `fullyParallel: false`, `workers: process.env.CI ? 2 : 4` (mock suite)                          |
 | CI retries          | 2                                                                                               |
@@ -110,7 +109,7 @@
 - **`loginViaCookie(page)`**: Directly generates a session token signed with `PI_UI_JWT_SECRET` and attaches the auth cookie to the browser context, bypassing the login form submission.
 - **`CONNECTED_PAYLOAD` Factory (`e2e/mocks/payloads.ts`)**: Generates pre-populated connected states, mock session headers, and helper factories (`extensionSetWidgetPayload`, `extensionConfirmPayload`, `extensionInputPayload`, `extensionNotifyPayload`, `textDeltaPayload`, `thinkingDeltaPayload`).
 
-### Test Files (22 Specs)
+### Test Files (23 Specs)
 
 - `auth.spec.ts` — login form redirection, wrong password error banner, valid login, persisted auth cookie
 - `auth-expiry.spec.ts` — WS close code 4001 session expiry banner and reconnect flows
@@ -128,6 +127,7 @@
 - `providers.spec.ts` — provider list, API key input, OAuth modal triggers, custom model configs (4+ tests)
 - `resume.spec.ts` — resuming existing session from persisted JSONL snapshot vs live connection takeover
 - `server-smoke.spec.ts` — real HTTP tests against server: `/login` 200, 404 handler, `/ws` 401 without cookie, login HTML structure
+- `session-identity.spec.ts` — device identity resume priority (URL param vs. persisted vs. server default) and self-heal on a stale/deleted identity
 - `session-orbs.spec.ts` — background session streaming activity indicators and active session selection
 - `share-target.spec.ts` — PWA Web Share Target API handling for files and incoming text
 - `sidebar-nesting.spec.ts` — hierarchical sub-session nesting under parent roots in sidebar

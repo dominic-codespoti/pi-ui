@@ -20,8 +20,8 @@
 │                                    │              ▼                   │ │
 │                                    │  ┌─────────────────────────────┐ │ │
 │                                    │  │ Cold: shell connected (0 ms)│ │ │
-│                                    │  │   → session_loaded (40 msgs)│ │ │
-│                                    │  │ Warm: connected (40 msgs)   │ │ │
+│                                    │  │   → session_loaded (100msgs)│ │ │
+│                                    │  │ Warm: connected (100 msgs)  │ │ │
 │                                    │  │                             │ │ │
 │                                    │  │ pi SDK session              │ │ │
 │                                    │  │   (lazy-loaded)             │ │ │
@@ -57,11 +57,11 @@
 4. **First WebSocket connect** at `/ws`:
    - JWT cookie validated
    - pi SDK lazily imported
-   - **Cold start** (no pooled session): sends a shell `connected` immediately (0 messages) so the client paints instantly from its snapshot cache; full initial history follows as `session_loaded` with max 40 messages once the SDK finishes parsing the JSONL session file. Extension host binding (`bindRpcHost`) runs in the background to avoid blocking initial UI paint.
-   - **Warm reconnect**: reuses the pooled `AgentSession` and sends `connected` with max 40 messages directly (bounded for wire transfer).
+   - **Cold start** (no pooled session): sends a shell `connected` immediately (0 messages) so the client paints instantly from its snapshot cache; full initial history follows as `session_loaded` with max 100 messages once the SDK finishes parsing the JSONL session file. Extension host binding (`bindRpcHost`) runs in the background to avoid blocking initial UI paint.
+   - **Warm reconnect**: reuses the pooled `AgentSession` and sends `connected` with max 100 messages directly (bounded for wire transfer).
    - SDK events forwarded to all WS clients via `server.publish()`
 5. **On client disconnect**: 15s grace period before cancelling pending extension dialogs
-6. **Session switch**: saves current UI state in `SessionViewCache` (input drafts, collapsed/expanded user message views), correlates requests via `requestId`, preserves old session in pool, registers new one, and broadcasts `session_loaded` with max 40 messages
+6. **Session switch**: saves current UI state in `SessionViewCache` (input drafts, collapsed/expanded user message views), correlates requests via `requestId`, preserves old session in pool, registers new one, and broadcasts `session_loaded` with max 100 messages
 
 ## Session Pool
 

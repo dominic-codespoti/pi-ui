@@ -4,8 +4,8 @@ import type { WebSocketRoute } from 'playwright-core';
 /**
  * Sidebar sub-session nesting — sessions carrying parentSession render nested
  * under their parent at the parent's stack position (ordered by subtree
- * recency), and a live session_updated delta reorders within the substack
- * without moving the parent row.
+ * recency), start collapsed, and expand from their disclosure control. A live
+ * session_updated delta reorders within the substack without moving the parent.
  */
 
 const NOW = Date.now();
@@ -123,6 +123,40 @@ async function openProjectsSidebar(page: Page): Promise<void> {
   await expect(search).toBeVisible({ timeout: 3000 });
 }
 
+test('sub-sessions start collapsed and expand from their disclosure control', async ({
+  page,
+  login,
+}) => {
+  await page.routeWebSocket('/ws', (ws) => {
+    ws.onMessage(() => {});
+    sendIntro(ws);
+  });
+  await login(page);
+  await openProjectsSidebar(page);
+
+  await expect(page.getByText('Parent task')).toBeVisible();
+  await expect(page.getByText('Sub task one')).toBeHidden();
+  await expect(page.getByText('Sub task two')).toBeHidden();
+
+  const disclosure = page.getByRole('button', {
+    name: /sub-sessions for Parent task/,
+  });
+  await expect(disclosure).toHaveAttribute('aria-expanded', 'false');
+  await disclosure.click();
+  await expect(disclosure).toHaveAttribute('aria-expanded', 'true');
+  await expect(page.getByText('Sub task one')).toBeVisible();
+  await expect(page.getByText('Sub task two')).toBeVisible();
+
+  const parent = await box(page, 'Parent task');
+  const subOne = await box(page, 'Sub task one');
+  expect(subOne.x).toBeGreaterThan(parent.x);
+
+  await disclosure.click();
+  await expect(disclosure).toHaveAttribute('aria-expanded', 'false');
+  await expect(page.getByText('Sub task one')).toBeHidden();
+  await expect(page.getByText('Sub task two')).toBeHidden();
+});
+
 test('sub-sessions nest under their parent between unrelated roots', async ({ page, login }) => {
   await page.routeWebSocket('/ws', (ws) => {
     ws.onMessage(() => {});
@@ -130,6 +164,12 @@ test('sub-sessions nest under their parent between unrelated roots', async ({ pa
   });
   await login(page);
   await openProjectsSidebar(page);
+
+  await expect(page.getByText('Parent task')).toBeVisible();
+  const disclosure = page.getByRole('button', {
+    name: /sub-sessions for Parent task/,
+  });
+  await disclosure.click();
 
   for (const title of ['Fresh root', 'Parent task', 'Sub task one', 'Sub task two', 'Stale root']) {
     await expect(page.getByText(title)).toBeVisible();
@@ -166,6 +206,10 @@ test('session_updated delta reorders within the substack without moving the pare
   await login(page);
   await openProjectsSidebar(page);
 
+  const disclosure = page.getByRole('button', {
+    name: /sub-sessions for Parent task/,
+  });
+  await disclosure.click();
   await expect(page.getByText('Sub task two')).toBeVisible();
   const parentBefore = (await box(page, 'Parent task')).y;
 

@@ -145,11 +145,17 @@ export function agentStartPayload() {
  * Drives the sidebar orbs: green pulse while running, violet when done with
  * unseen results, grey once checked.
  */
-export function sessionRuntimePayload(sessionId: string, isRunning: boolean, unseen: boolean) {
+export function sessionRuntimePayload(
+  sessionId: string,
+  isRunning: boolean,
+  unseen: boolean,
+  activeToolName?: string
+) {
   return {
     type: 'session_runtime',
     sessionId,
     isRunning,
+    ...(activeToolName ? { activeToolName } : {}),
     unseen,
     lastActivity: Date.now(),
   };
@@ -188,14 +194,6 @@ export function agentEndPayload(willRetry = false) {
   return { type: 'agent_end', willRetry };
 }
 
-export function toolExecutionStartPayload(
-  toolName: string,
-  toolCallId: string,
-  args?: Record<string, unknown>
-) {
-  return { type: 'tool_execution_start', toolName, toolCallId, args: args ?? {} };
-}
-
 export function toolExecutionUpdatePayload(toolCallId: string, text: string) {
   return {
     type: 'tool_execution_update',
@@ -229,14 +227,6 @@ export function extensionNotifyPayload(message: string, notifyType: string) {
   return { type: 'extension_ui_request', id: 'n1', method: 'notify', message, notifyType };
 }
 
-export const PROVIDERS_LIST_PAYLOAD = {
-  type: 'providers_list',
-  providers: [
-    { id: 'openai', name: 'OpenAI', configured: true, source: 'environment', modelCount: 3 },
-    { id: 'anthropic', name: 'Anthropic', configured: false, modelCount: 2 },
-  ],
-};
-
 export const TOOLS_LIST_PAYLOAD = {
   type: 'tools_list',
   tools: [
@@ -245,28 +235,6 @@ export const TOOLS_LIST_PAYLOAD = {
     { name: 'bash', description: 'Run a shell command', isBuiltin: true },
   ],
   activeToolNames: ['read', 'edit', 'bash'],
-};
-
-export const RESOURCES_LIST_PAYLOAD = {
-  type: 'resources_list',
-  skills: [
-    {
-      name: 'debug',
-      description: 'Debugging assistant',
-      scope: 'user',
-      isBuiltin: false,
-      source: 'skills/debug.md',
-    },
-  ],
-  prompts: [
-    {
-      name: 'review',
-      description: 'Code review prompt',
-      scope: 'project',
-      isBuiltin: false,
-      source: '.pi/prompts/review.md',
-    },
-  ],
 };
 
 // ── New payloads for extension component rendering ──────────────────────────

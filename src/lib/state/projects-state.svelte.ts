@@ -20,10 +20,11 @@ export interface ProjectGroup extends ProjectInfo {
   sessions: SessionRow[];
 }
 
-/** One flattened display row: a session plus its nesting depth in the substack tree. */
+/** One flattened display row: a session plus its nesting depth and children. */
 export interface SessionRow {
   session: SessionSummary;
   depth: number;
+  hasChildren: boolean;
 }
 
 /**
@@ -105,7 +106,7 @@ export function buildSessionRows(sessions: SessionSummary[]): SessionRow[] {
   const flatten = (level: Node[], depth: number): void => {
     level.sort((a, b) => b.latest - a.latest);
     for (const node of level) {
-      rows.push({ session: node.session, depth });
+      rows.push({ session: node.session, depth, hasChildren: node.children.length > 0 });
       flatten(node.children, depth + 1);
     }
   };
@@ -166,6 +167,8 @@ class ProjectsState {
   activeSessionId = $state<string | null>(null);
   /** Whether the active session is currently streaming (synced from the page). */
   isStreaming = $state(false);
+  /** Name of the active session's running tool (if any). */
+  activeToolName = $state<string | undefined>(undefined);
 
   /** Sidebar search text. */
   filter = $state('');
@@ -180,6 +183,22 @@ class ProjectsState {
   uncheckedSessions = new SvelteSet<string>();
   /** Session ids that are currently generating (agent_start … agent_end). */
   runningSessions = new SvelteSet<string>();
+  /** Session ids with a currently executing tool call. */
+  runningToolSessions = new SvelteSet<string>();
+  /** Highest-priority activity in any non-active session for the global header indicator. */
+  backgroundActivity = $derived.by<'running' | 'unread' | null>(() => {
+    const active = this.activeSessionId;
+    for (const id of this.runningSessions) {
+      if (id !== active) return 'running';
+    }
+    for (const id of this.runningToolSessions) {
+      if (id !== active) return 'running';
+    }
+    for (const id of this.uncheckedSessions) {
+      if (id !== active) return 'unread';
+    }
+    return null;
+  });
   /** Session path from the most recent switch_session — consumed by the page for URL sync. */
   pendingSwitchPath: string | null = null;
   /** Optimistic ?session= URL updates are revertible until confirmed: set by
@@ -199,6 +218,8 @@ class ProjectsState {
   collapsed = new SvelteSet<string>(loadCollapsed());
   /** Projects whose full session list is expanded past the preview limit. */
   expandedGroups = new SvelteSet<string>();
+  /** Nested session branches expanded in the sidebar; intentionally ephemeral. */
+  expandedSubsessions = new SvelteSet<string>();
   /**
    * When the server last pushed a full list (all_sessions_list/projects_list).
    * Guards `refresh()`: the server now pushes coalesced session_updated
@@ -299,6 +320,16 @@ class ProjectsState {
 
   // ── Server message intake ────────────────────────────────────────────────
 
+  /** Drop runtime markers for sessions no longer present in the authoritative list. */
+  private pruneRuntimeState(): void {
+    const knownIds = new Set(this.allSessions.map((s) => s.id));
+    for (const set of [this.uncheckedSessions, this.runningSessions, this.runningToolSessions]) {
+      for (const id of set) {
+        if (!knownIds.has(id)) set.delete(id);
+      }
+    }
+  }
+
   /**
    * Apply a partial state update atomically.
    * `groups` is derived from both `projects` and `allSessions` — updating them
@@ -307,7 +338,10 @@ class ProjectsState {
    */
   applyState(payload: { projects?: ProjectInfo[]; sessions?: SessionSummary[] }): void {
     if (payload.projects !== undefined) this.projects = payload.projects;
-    if (payload.sessions !== undefined) this.allSessions = payload.sessions;
+    if (payload.sessions !== undefined) {
+      this.allSessions = payload.sessions;
+      this.pruneRuntimeState();
+    }
   }
 
   /** Refresh both lists — called on connect (force) and when the sidebar opens. */
@@ -364,6 +398,9 @@ class ProjectsState {
         this.pendingNewSession = false;
         this.sessionLoading = false;
         this.pendingSwitchPath = null;
+        // A rejected switch must not leave the optimistically-set ?session=
+        // param pointing at a session that was never actually opened.
+        this.revertOptimisticSessionUrl();
         return true;
       }
       case 'dir_completions':
@@ -580,7 +617,6 @@ class ProjectsState {
     this.send({ type: 'delete_project', cwd });
   }
 
-
   setPinned(cwd: string, pinned: boolean): void {
     // Optimistic — server broadcast confirms.
     this.applyState({
@@ -626,19 +662,57 @@ class ProjectsState {
     else this.expandedGroups.add(cwd);
   }
 
+  toggleSubsessions(sessionId: string): void {
+    if (this.expandedSubsessions.has(sessionId)) this.expandedSubsessions.delete(sessionId);
+    else this.expandedSubsessions.add(sessionId);
+  }
+
   /**
-   * Rows visible for a project in the sidebar. A search filter shows every
-   * match; otherwise the preview limit counts top-level rows only — each
-   * shown root keeps its complete (always-expanded) substack, whose children
-   * never consume slots.
+   * Rows visible for a project in the sidebar. Search still shows every
+   * matching row; otherwise the preview limit counts top-level rows only and
+   * nested branches stay collapsed until their parent is expanded.
+   *
+   * The active session's ancestor path remains visible when its branch is
+   * collapsed, so switching to a nested session never makes it disappear.
    */
   visibleSessions(g: ProjectGroup): SessionRow[] {
-    if (this.filter || this.expandedGroups.has(g.cwd)) return g.sessions;
+    let rows = g.sessions;
+    if (!this.filter && !this.expandedGroups.has(g.cwd)) {
+      rows = [];
+      let roots = 0;
+      for (const row of g.sessions) {
+        if (row.depth === 0 && ++roots > SESSION_PREVIEW_LIMIT) break;
+        rows.push(row);
+      }
+    }
+    if (this.filter) return rows;
+
+    const activeIndex = this.activeSessionId
+      ? rows.findIndex((row) => row.session.id === this.activeSessionId)
+      : -1;
+    const activePath = new SvelteSet<number>();
+    if (activeIndex >= 0) {
+      let targetDepth = rows[activeIndex].depth;
+      for (let i = activeIndex - 1; i >= 0; i--) {
+        if (rows[i].depth < targetDepth) {
+          activePath.add(i);
+          targetDepth = rows[i].depth;
+        }
+      }
+    }
+
     const out: SessionRow[] = [];
-    let roots = 0;
-    for (const row of g.sessions) {
-      if (row.depth === 0 && ++roots > SESSION_PREVIEW_LIMIT) break; // next root + its subtree
-      out.push(row);
+    const stack: SessionRow[] = [];
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      while (stack.length > 0 && stack[stack.length - 1].depth >= row.depth) {
+        stack.pop();
+      }
+      const blocked = stack.some(
+        (ancestor) => ancestor.hasChildren && !this.expandedSubsessions.has(ancestor.session.id)
+      );
+      if (!blocked || i === activeIndex || activePath.has(i)) out.push(row);
+      stack.push(row);
     }
     return out;
   }

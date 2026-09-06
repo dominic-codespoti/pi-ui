@@ -17,6 +17,8 @@
     modelTab = $bindable(),
     model,
     availableModels,
+    modelRefreshLoading,
+    modelRefreshFeedback,
     toolsList,
     activeToolNames,
     resourcesLoaded,
@@ -52,6 +54,7 @@
     onInstallSkill,
     onUseSkill,
     onDismissProviderError,
+    onRefreshModels,
   }: {
     open: boolean;
     isMobile: boolean;
@@ -61,6 +64,8 @@
     modelTab: 'models' | 'providers';
     model: ModelInfo | null;
     availableModels: ModelInfo[];
+    modelRefreshLoading: boolean;
+    modelRefreshFeedback: { success: boolean; message: string } | null;
     toolsList: { name: string; description: string; isBuiltin: boolean; origin?: string }[];
     activeToolNames: string[];
     resourcesLoaded: boolean;
@@ -96,6 +101,7 @@
     onInstallSkill: (url: string, scope: 'project' | 'user') => void;
     onUseSkill: (name: string) => void;
     onDismissProviderError: () => void;
+    onRefreshModels: () => void;
   } = $props();
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any -- dynamic component type
@@ -117,6 +123,8 @@
     bind:modelTab
     {model}
     {availableModels}
+    {modelRefreshLoading}
+    {modelRefreshFeedback}
     {toolsList}
     {activeToolNames}
     {resourcesLoaded}
@@ -152,5 +160,6 @@
     {onInstallSkill}
     {onUseSkill}
     {onDismissProviderError}
+    {onRefreshModels}
   />
 {/if}

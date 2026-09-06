@@ -109,6 +109,27 @@ body {
   .touch-reveal.hidden {
     display: flex !important;
   }
+
+  /* `.touch-reveal-lg` — for rows of icon-only action buttons (project/
+   * session rename, forget, delete, new-session) that are permanently
+   * visible on touch (no hover to "aim" first like on desktop). Bumps the
+   * 28px desktop-hover icon buttons to the same 40px target size used
+   * elsewhere in the app (composer, header toolbar) — 28px is below both
+   * the Apple HIG and WCAG 2.5.8 touch-target guidance — and widens the
+   * gap so a destructive action (forget/delete) next to rename/new-session
+   * isn't a stray-tap away. Plain `.touch-reveal` also covers small
+   * absolutely-positioned corner badges (widget dismiss, attachment
+   * remove) that must stay small to fit their corner without overlapping
+   * the content they sit on, so the size/gap bump does not apply there.
+   */
+  .touch-reveal-lg {
+    gap: 0.375rem !important;
+  }
+
+  .touch-reveal-lg button {
+    width: 2.5rem !important;
+    height: 2.5rem !important;
+  }
 }
 
 /* ── Text selection — primary tinted ──────────────────────────────────────── */
@@ -366,6 +387,12 @@ select,
     0 0 0 3px color-mix(in oklch, var(--color-primary) 14%, transparent);
 }
 
+/* The extension dialog has a zero-padding shell; do not let the shared
+ * Dialog.Footer's content-padding compensation create horizontal overflow. */
+.extension-dialog-footer {
+  margin: 0 !important;
+}
+
 /* ── Shimmer text — for live "thinking…" previews ────────────────────────── */
 @keyframes shimmer {
   from {
@@ -435,7 +462,6 @@ select,
   overflow-wrap: break-word;
   word-break: break-words;
 }
-
 .prose p {
   margin-bottom: 0.4em;
 }
@@ -798,12 +824,14 @@ select,
 
 /* Step — a single assistant or tool message container */
 .trace-step {
+  min-width: 0;
   padding: 0.35rem 0 0 0;
 }
 
 /* Row — flat horizontal flex for thinking/tool summaries */
 .trace-row {
   display: flex;
+  min-width: 0;
   align-items: baseline;
   gap: 0.5rem;
   padding: 0.3rem 0.5rem 0 0.5rem;
@@ -838,6 +866,12 @@ select,
   white-space: nowrap;
   color: color-mix(in oklch, var(--color-base-content) 55%, transparent);
   flex-shrink: 0;
+}
+.trace-row-call {
+  min-width: 0;
+  flex: 1 1 0%;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 /* Row detail — truncated preview text */

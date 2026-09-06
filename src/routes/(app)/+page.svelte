@@ -45,7 +45,22 @@
     type UIMessage,
     type CompactionNoticeDetails,
   } from '#lib/client-messages.js';
+  import { extensionOptionParts } from '#lib/extension-modals.js';
   import { saveSnapshot, loadSnapshot } from '#lib/session-snapshot.js';
+  import { saveIdentity, loadIdentity } from '#lib/session-identity.js';
+  import {
+    TEXT_FILE_EXTENSIONS,
+    fileToText,
+    prepareImage,
+    MAX_IMAGE_PAYLOAD,
+  } from '#lib/attachments.js';
+  import {
+    type NotificationPrefs,
+    NOTIF_NUDGE_SEEN_KEY,
+    loadNotificationPrefs,
+    saveNotificationPrefs,
+    urlBase64ToUint8Array,
+  } from '#lib/notification-prefs.js';
   import { encodeTerminalKey, wrapBracketedPaste } from '#lib/terminal-key-encoder.js';
   import * as Tooltip from '#lib/components/ui/tooltip/index.js';
   import { Switch } from '#lib/components/ui/switch/index.js';
@@ -192,6 +207,25 @@
 
   let modal = $derived(extensionUiState.modalQueue[0] ?? null);
   let modalInput = $state('');
+  let selectFilter = $state('');
+  let selectOptionIndex = $state(0);
+  const selectOptions = $derived.by(() => {
+    if (!modal || modal.method !== 'select') return [];
+    return modal.options.map((value, index) => ({
+      value,
+      index,
+      option: extensionOptionParts(value, index),
+    }));
+  });
+  const filteredSelectOptions = $derived.by(() => {
+    const query = selectFilter.trim().toLowerCase();
+    if (!query) return selectOptions;
+    return selectOptions.filter((item) =>
+      `${item.value} ${item.option.label} ${item.option.description ?? ''}`
+        .toLowerCase()
+        .includes(query)
+    );
+  });
   let modalFocusEl = $state<HTMLElement | undefined>(undefined);
   let overlayPreEl = $state<HTMLElement | undefined>(undefined);
   let overlayViewportEl = $state<HTMLElement | undefined>(undefined);
@@ -200,7 +234,6 @@
     { id: string; connection: number; columns: number; rows: number } | undefined;
   let preparedModalId = $state<string | null>(null);
   let focusedModalId = $state<string | null>(null);
-
   // Sync modalInput when the active modal changes — avoids overwriting input
   // for queued modals that are not yet active.
   $effect(() => {
@@ -211,6 +244,10 @@
     }
     if (preparedModalId === m.id) return;
     preparedModalId = m.id;
+    if (m.method === 'select') {
+      selectFilter = '';
+      selectOptionIndex = 0;
+    }
     if (m.method === 'custom' && m.interactive) {
       modalInput = '';
     } else if (m.method === 'editor') {
@@ -519,6 +556,9 @@
   let messages = $state<UIMessage[]>([]);
   let expandedUserMsgs = $state<Record<string, boolean>>({});
   let truncatedUserMsgs = $state<Record<string, boolean>>({});
+  /** Long runtime diagnostics (e.g. absolute-path dumps) collapse to a
+   * preview by default in the settings panel — keyed by message text. */
+  let expandedDiagnostics = $state<Record<string, boolean>>({});
   /** Direct pointer to the currently-streaming assistant message — avoids O(n) lastStreaming() scans. */
   let activeStreamMsg = $state<UIMessage | null>(null);
   // Non-reactive index for high-frequency tool updates. Rebuilt when history
@@ -757,6 +797,7 @@
       .map((s) => ({ trigger: '#' as const, ...s }));
   });
   let isStreaming = $state(false);
+  let activeToolName = $state<string | undefined>(undefined);
   let wsState = $state<'connecting' | 'open' | 'closed'>('connecting');
   /** True from server_restarting until the WS successfully reconnects. */
   let isRestarting = $state(false);
@@ -830,6 +871,14 @@
   let _optimisticPrevInput: string | null = null;
   /** Draft typed while an existing session is still opening. */
   let sessionSwitchDraft: string | null = null;
+  /**
+   * Path of the device-identity resume switch currently in flight (set right
+   * before calling `switchSession` from the `connected` handler), or null
+   * when no such switch is pending. Lets the `sessions_error` handler tell a
+   * stale/deleted identity apart from an ordinary user-initiated switch
+   * failure, so it can clear the bad pointer instead of retrying it forever.
+   */
+  let _identityRestoreTarget: string | null = null;
   $effect(() => {
     if (projectsState.pendingNewSession && !_optimisticPrevMessages) {
       sessionSwitchDraft = null;
@@ -844,6 +893,7 @@
       messagesTruncated = false;
       activeStreamMsg = null;
       isStreaming = false;
+      activeToolName = undefined;
       projectsState.isStreaming = false;
       compactionStartedAt = null;
       sessionName = undefined;
@@ -861,6 +911,16 @@
       _optimisticPrevMessages = null;
       _optimisticPrevInput = null;
     }
+  });
+  /**
+   * Keep the device's persisted session identity in sync with whatever the
+   * app is actually showing — the single choke point for every path that
+   * changes the active session (switch, new session, connected,
+   * fork/edit/rewind, reconnect). See session-identity.ts for why this
+   * lives in localStorage rather than only the `?session=` URL param.
+   */
+  $effect(() => {
+    if (sessionId && sessionPath) saveIdentity(sessionPath, sessionId, sessionName);
   });
   let sessionStartTime = $state(0);
   /** Pending steered messages (queue_update) */
@@ -992,6 +1052,15 @@
     { keys: '@', action: 'Attach file context' },
   ];
 
+  /** Touch gestures — see handleTouchStart/handleTouchEnd. Shown alongside
+   * SHORTCUTS in the settings panel so they're discoverable without a
+   * keyboard to hunt for a keybind list in the first place. */
+  const GESTURES = [
+    { gesture: 'Swipe right from left edge', action: 'Open sessions panel' },
+    { gesture: 'Swipe left from right edge', action: 'Open model & tools panel' },
+    { gesture: 'Swipe an open panel toward its edge', action: 'Close it' },
+  ];
+
   /** All tools reported by the server */
   let toolsList = $state<
     { name: string; description: string; isBuiltin: boolean; origin?: string }[]
@@ -1041,40 +1110,15 @@
       onConfirm,
     };
   }
-  interface NotificationPrefs {
-    enabled: boolean;
-    onComplete: boolean;
-    onSessionFinish: boolean;
-  }
-  const DEFAULT_NOTIFICATION_PREFS: NotificationPrefs = {
-    enabled: true,
-    onComplete: true,
-    onSessionFinish: true,
-  };
-  function loadNotificationPrefs(): NotificationPrefs {
-    try {
-      const raw = localStorage.getItem('pifrontier:notifications');
-      if (raw) return { ...DEFAULT_NOTIFICATION_PREFS, ...JSON.parse(raw) };
-    } catch {
-      /* ignore */
-    }
-    return { ...DEFAULT_NOTIFICATION_PREFS };
-  }
   let notificationPrefs = $state<NotificationPrefs>(loadNotificationPrefs());
   $effect(() => {
-    const p = notificationPrefs;
-    try {
-      localStorage.setItem('pifrontier:notifications', JSON.stringify(p));
-    } catch {
-      /* ignore */
-    }
+    saveNotificationPrefs(notificationPrefs);
   });
 
   // ── Post-run permission nudge ─────────────────────────────────────────────
   // Asking right after a completed turn (when the value is obvious) converts
   // far better than the Settings toggle. Shown once; permission requests MUST
   // come from a user gesture, so the banner's Enable button does the asking.
-  const NOTIF_NUDGE_SEEN_KEY = 'pifrontier:notif-nudge-seen';
   let showNotifNudge = $state(false);
   let notifNudgeSeen = $state(false);
   try {
@@ -1116,15 +1160,6 @@
   // notifications are enabled + permission granted; unsubscribe otherwise.
   let connectedPushVapidKey = $state<string | null>(null);
   let _pushSyncInFlight = false;
-
-  /** VAPID public keys arrive base64url-encoded; pushManager wants bytes. */
-  function urlBase64ToUint8Array(base64url: string): Uint8Array<ArrayBuffer> {
-    const pad = base64url.replace(/-/g, '+').replace(/_/g, '/');
-    const binary = atob(pad + '='.repeat((4 - (pad.length % 4)) % 4));
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    return bytes;
-  }
 
   async function syncPushSubscription() {
     if (_pushSyncInFlight) return;
@@ -1286,6 +1321,9 @@
   let skillFilter = $state('');
   /** Last error from set/remove provider key operations */
   let providerError = $state<string | null>(null);
+  let modelRefreshLoading = $state(false);
+  let modelRefreshFeedback = $state<{ success: boolean; message: string } | null>(null);
+  let modelRefreshFeedbackTimer: ReturnType<typeof setTimeout> | null = null;
 
   // ── Fork dialog state ─────────────────────────────────────────────────────────
 
@@ -1462,6 +1500,24 @@
       modelFilter = '';
     }
   });
+  function showModelRefreshFeedback(feedback: { success: boolean; message: string }) {
+    if (modelRefreshFeedbackTimer) clearTimeout(modelRefreshFeedbackTimer);
+    modelRefreshFeedback = feedback;
+    modelRefreshFeedbackTimer = setTimeout(() => {
+      modelRefreshFeedback = null;
+      modelRefreshFeedbackTimer = null;
+    }, 5_000);
+  }
+
+  function requestModelRefresh() {
+    if (modelRefreshLoading || wsState !== 'open') return;
+    modelRefreshLoading = true;
+    modelRefreshFeedback = null;
+    if (!send({ type: 'refresh_models' })) {
+      modelRefreshLoading = false;
+      showModelRefreshFeedback({ success: false, message: 'Not connected.' });
+    }
+  }
 
   // ── Load tools when tools tab is active ─────────────────────────────────────
   // Tools are now seeded from connected/session_loaded plus the async
@@ -1729,6 +1785,7 @@
       // down by the resume force-close) must not clobber the current
       // connection's state or schedule spurious reconnects.
       if (ws !== socket) return;
+      modelRefreshLoading = false;
       flushPendingTerminalInputs();
       stopHeartbeat();
       if (_intentionalClose) return;
@@ -1996,8 +2053,18 @@
         sessionSwitchDraft = null;
       }
     }
+    const isFullSessionPayload = payload.type === 'connected' || payload.type === 'session_loaded';
     if ('isStreaming' in payload) isStreaming = payload.isStreaming as boolean;
-    if ('thinkingLevel' in payload) thinkingLevel = payload.thinkingLevel as string;
+    if ('activeToolName' in payload) {
+      const incomingTool = payload.activeToolName;
+      activeToolName =
+        typeof incomingTool === 'string' && incomingTool.length > 0 ? incomingTool : undefined;
+    } else if (
+      isFullSessionPayload ||
+      ('sessionId' in payload && payload.sessionId !== prevSessionId)
+    ) {
+      activeToolName = undefined;
+    }
     const newModel = payload.model as ModelInfo | null | undefined;
     if (newModel !== undefined) model = newModel;
     if (payload.availableModels !== undefined) {
@@ -2053,6 +2120,7 @@
     projectsState.cwd = cwd;
     if ('sessionId' in payload) projectsState.activeSessionId = payload.sessionId as string;
     projectsState.isStreaming = isStreaming;
+    projectsState.activeToolName = activeToolName;
     // Restore queue state from payload (present on connected/session_loaded)
     if ('queuedSteering' in payload || 'queuedFollowUp' in payload) {
       queuedSteering = (payload.queuedSteering as string[]) ?? [];
@@ -2167,17 +2235,23 @@
           lastToolsFetch = Date.now();
         updateAppBadge();
         send({ type: 'get_settings' });
-        // Restore persisted session from URL param — but skip the redundant
-        // switch round trip when the server's active session already matches
-        // (the common resume path; keeps hydrated content on screen).
+        // Resume target, in priority order:
+        //  1. an explicit `?session=` URL param — deep link / in-tab nav, always wins
+        //  2. this device's last-known session (localStorage — survives a PWA cold
+        //     relaunch, unlike the URL, which the manifest `start_url` always resets)
+        //  3. neither present (first-ever open on this device) — accept whatever the
+        //     server defaulted to (continueRecent) and adopt it as the new identity
+        // Skip the redundant switch round trip when the target already matches the
+        // server's active session (the common resume path; keeps hydrated content on
+        // screen).
         const savedPath = getSessionParam();
-        if (savedPath && savedPath !== sessionPath) {
+        const targetPath = savedPath ?? loadIdentity()?.path ?? null;
+        if (targetPath && targetPath !== sessionPath) {
           // switchSession arms the op watchdog and syncs the URL — same
           // semantics as the manual send it replaces.
-          projectsState.switchSession(savedPath);
+          _identityRestoreTarget = targetPath;
+          projectsState.switchSession(targetPath);
         } else if (sessionPath) {
-          // No saved URL param (or it already matches) — persist the current
-          // session so future reloads work
           setSessionParam(sessionPath);
           saveSnapshot(sessionPath, sessionName, messages);
         }
@@ -2192,6 +2266,7 @@
           requestId: typeof sl.requestId === 'string' ? sl.requestId : undefined,
         };
         if (!projectsState.acceptsSessionLoaded(identity)) break;
+        _identityRestoreTarget = null;
         applySessionState(sl);
         projectTrust = (sl.projectTrust as ProjectTrustInfo | undefined) ?? null;
         runtimeDiagnostics = (sl.diagnostics as RuntimeDiagnostic[] | undefined) ?? [];
@@ -2250,7 +2325,22 @@
           input = sessionSwitchDraft;
           sessionSwitchDraft = null;
         }
-        showChatNotice(errMsg as string, 'warning');
+        // A failed device-identity resume (stale/deleted session) is not a
+        // user action gone wrong — silently correct the bad pointer instead
+        // of greeting a cold boot with an error toast. The server's
+        // already-active session stays displayed, so re-stamp that as the
+        // identity rather than leaving no pointer behind (a bare clear
+        // would just repeat the server's continueRecent guess if the
+        // process ever restarts before the next real switch).
+        const wasIdentityRestore =
+          _identityRestoreTarget !== null &&
+          _identityRestoreTarget === projectsState.pendingSwitchPath;
+        _identityRestoreTarget = null;
+        if (wasIdentityRestore) {
+          saveIdentity(sessionPath, sessionId ?? undefined, sessionName);
+        } else {
+          showChatNotice(errMsg as string, 'warning');
+        }
         // Restore optimistic new-chat if it failed — don't leave empty chat or draft.
         if (_optimisticPrevMessages) {
           messages = _optimisticPrevMessages;
@@ -2282,6 +2372,17 @@
         applySessionState({
           availableModels:
             (msg as { type: string; availableModels: ModelInfo[] }).availableModels ?? [],
+        });
+        break;
+      }
+      case 'models_refresh_result': {
+        modelRefreshLoading = false;
+        const success = Boolean(msg.success);
+        showModelRefreshFeedback({
+          success,
+          message:
+            (msg as { type: string; success?: boolean; message?: string }).message ??
+            (success ? 'Models refreshed.' : 'Model refresh failed.'),
         });
         break;
       }
@@ -3111,22 +3212,33 @@
           isRunning: boolean;
           unseen: boolean;
           lastActivity: number;
+          activeToolName?: string;
         };
+        const isRunning = Boolean(rt.isRunning);
+        const toolName =
+          typeof rt.activeToolName === 'string' && rt.activeToolName.length > 0
+            ? rt.activeToolName
+            : undefined;
         // Ignore stale updates from a previously-active session after switching
         if (rt.sessionId === sessionId) {
-          isStreaming = rt.isRunning;
-          projectsState.isStreaming = rt.isRunning;
-          if (rt.isRunning) requestWakeLock();
+          isStreaming = isRunning;
+          activeToolName = toolName;
+          projectsState.isStreaming = isRunning;
+          projectsState.activeToolName = toolName;
+          if (isRunning || toolName) requestWakeLock();
           else releaseWakeLock();
         }
-        if ((rt.isRunning || rt.unseen) && rt.sessionId !== sessionId) {
+        if ((isRunning || toolName || rt.unseen) && rt.sessionId !== sessionId) {
           projectsState.markUnchecked(rt.sessionId);
         }
-        if (rt.isRunning) projectsState.runningSessions.add(rt.sessionId);
+        if (isRunning) projectsState.runningSessions.add(rt.sessionId);
         else projectsState.runningSessions.delete(rt.sessionId);
+        if (toolName) projectsState.runningToolSessions.add(rt.sessionId);
+        else projectsState.runningToolSessions.delete(rt.sessionId);
         if (
           notificationPrefs.onSessionFinish &&
-          !rt.isRunning &&
+          !isRunning &&
+          !toolName &&
           rt.unseen &&
           rt.sessionId !== sessionId &&
           document.hidden
@@ -3213,7 +3325,44 @@
   /** Handles keydown inside the modal (Enter submits, Esc cancels). The
    *  interactive custom overlay is a separate DOM tree (see `overlayKeydown`) —
    *  this dialog is never open at the same time as that overlay. */
+  function focusSelectOption(direction: 1 | -1) {
+    const options = Array.from(
+      document.querySelectorAll<HTMLButtonElement>('[data-extension-option="true"]')
+    );
+    if (options.length === 0) return;
+
+    const current = options.findIndex((option) => option === document.activeElement);
+    const next =
+      current < 0
+        ? direction > 0
+          ? 0
+          : options.length - 1
+        : (current + direction + options.length) % options.length;
+    selectOptionIndex = next;
+    options[next]?.focus();
+  }
+
   function modalContentKeydown(e: KeyboardEvent) {
+    if (modal?.method === 'select') {
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        focusSelectOption(e.key === 'ArrowDown' ? 1 : -1);
+        return;
+      }
+      if (e.key === 'Enter' && !e.shiftKey) {
+        const target = e.target;
+        if (target instanceof HTMLButtonElement && target.dataset.extensionOption === 'true') {
+          const index = Number(target.dataset.extensionOptionIndex);
+          const selected = filteredSelectOptions[index];
+          if (selected) {
+            e.preventDefault();
+            extensionUiState.answerSelect(selected.value);
+          }
+        }
+        return;
+      }
+    }
+
     if (e.key === 'Enter' && !e.shiftKey && modal?.method !== 'editor') {
       e.preventDefault();
       if (modal?.method === 'confirm') extensionUiState.answerConfirm(true);
@@ -3651,131 +3800,22 @@
 
   // ── User input ───────────────────────────────────────────────────────────────
 
-  const TEXT_FILE_EXTENSIONS = new Set([
-    'txt',
-    'md',
-    'json',
-    'yaml',
-    'yml',
-    'xml',
-    'html',
-    'css',
-    'js',
-    'ts',
-    'jsx',
-    'tsx',
-    'py',
-    'rb',
-    'go',
-    'rs',
-    'java',
-    'kt',
-    'swift',
-    'c',
-    'cpp',
-    'h',
-    'hpp',
-    'cs',
-    'sh',
-    'bash',
-    'zsh',
-    'fish',
-    'toml',
-    'ini',
-    'cfg',
-    'conf',
-    'env',
-    'gitignore',
-    'svelte',
-    'vue',
-    'sass',
-    'scss',
-    'less',
-    'sql',
-    'graphql',
-    'r',
-    'mjs',
-    'cjs',
-    'npmrc',
-    'editorconfig',
-    'prettierrc',
-    'eslintrc',
-  ]);
-
-  function fileToBase64(file: File): Promise<string> {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => {
-        resolve((reader.result as string).split(',')[1]);
-      };
-      reader.onerror = reject;
-      reader.readAsDataURL(file);
-    });
-  }
-
-  function fileToText(file: File): Promise<string> {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => {
-        resolve(reader.result as string);
-      };
-      reader.onerror = reject;
-      reader.readAsText(file);
-    });
-  }
-
-  /** Max image dimension after in-browser attachment downscale. */
-  const MAX_IMAGE_DIM = 1600;
-  /** Max base64 image payload per attachment (keeps prompt messages under the
-   *  4 MB WS frame cap even with a couple of images attached). */
-  const MAX_IMAGE_PAYLOAD = 3 * 1024 * 1024;
-
-  /**
-   * Read an image attachment, downscaling oversized sources in-browser —
-   * full-res phone photos (12 MP+) inflate the WS payload ~4x as base64 and
-   * cost real tokens at the model. Falls back to the raw file when the
-   * browser can't decode it (createImageBitmap unsupported/unknown codec).
-   */
-  async function prepareImage(file: File): Promise<{ data: string; mimeType: string } | null> {
-    try {
-      const bitmap = await createImageBitmap(file);
-      try {
-        const scale = Math.min(1, MAX_IMAGE_DIM / Math.max(bitmap.width, bitmap.height));
-        if (scale >= 1) return { data: await fileToBase64(file), mimeType: file.type };
-        const canvas = document.createElement('canvas');
-        canvas.width = Math.max(1, Math.round(bitmap.width * scale));
-        canvas.height = Math.max(1, Math.round(bitmap.height * scale));
-        const ctx = canvas.getContext('2d');
-        if (!ctx) return { data: await fileToBase64(file), mimeType: file.type };
-        ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-        // Keep PNG/WebP (alpha channel); anything else re-encodes as JPEG.
-        const mimeType =
-          file.type === 'image/png' || file.type === 'image/webp' ? file.type : 'image/jpeg';
-        const dataUrl = canvas.toDataURL(mimeType, 0.85);
-        return { data: dataUrl.split(',')[1], mimeType };
-      } finally {
-        bitmap.close();
-      }
-    } catch {
-      return { data: await fileToBase64(file), mimeType: file.type };
-    }
-  }
-
-  async function handleFileInput(e: Event) {
-    const files = (e.target as HTMLInputElement).files;
-    if (!files) return;
-    for (const file of Array.from(files)) {
+  async function processAttachmentFiles(files: File[]) {
+    for (const file of files) {
       if (file.type.startsWith('image/')) {
         const prepared = await prepareImage(file);
         if (!prepared) continue;
         if (prepared.data.length > MAX_IMAGE_PAYLOAD) {
-          showChatNotice(`Image too large: ${file.name} (max 3MB encoded)`, 'warning');
+          showChatNotice(
+            `Image too large: ${file.name || 'clipboard image'} (max 3MB encoded)`,
+            'warning'
+          );
           continue;
         }
         attachedImages.push({
           data: prepared.data,
           mimeType: prepared.mimeType,
-          name: file.name,
+          name: file.name || 'clipboard image',
           src: `data:${prepared.mimeType};base64,${prepared.data}`,
         });
       } else {
@@ -3795,7 +3835,31 @@
         attachedFiles.push({ name: file.name, content, size: file.size });
       }
     }
-    (e.target as HTMLInputElement).value = '';
+  }
+
+  async function handleFileInput(e: Event) {
+    const input = e.target as HTMLInputElement;
+    if (input.files) await processAttachmentFiles(Array.from(input.files));
+    input.value = '';
+  }
+
+  /** Stages image files from the clipboard while leaving ordinary text paste
+   *  to the textarea's native editing behavior. */
+  async function handleComposerPaste(e: ClipboardEvent) {
+    const data = e.clipboardData;
+    if (!data) return;
+
+    const imageFiles = Array.from(data.items)
+      .filter((item) => item.kind === 'file' && item.type.startsWith('image/'))
+      .map((item) => item.getAsFile())
+      .filter((file): file is File => file !== null);
+    if (imageFiles.length === 0) {
+      imageFiles.push(...Array.from(data.files).filter((file) => file.type.startsWith('image/')));
+    }
+    if (imageFiles.length === 0) return;
+
+    e.preventDefault();
+    await processAttachmentFiles(imageFiles);
   }
 
   function removeAttachment(idx: number) {
@@ -4630,8 +4694,12 @@
     // Paint the last conversation immediately on cold start (mobile OSes
     // discard backgrounded PWAs; without this the user stares at a splash
     // until the WS delivers `connected`). Live server state replaces the
-    // snapshot wholesale — stable message ids keep that swap cheap.
-    const snap = loadSnapshot(getSessionParam());
+    // snapshot wholesale — stable message ids keep that swap cheap. Prefer
+    // the URL param (explicit nav) but fall back to the persisted device
+    // identity — a PWA relaunch from the home screen has no URL param at
+    // all, and without this the cached tail would be validated against
+    // `null` (any session) instead of the one we actually intend to resume.
+    const snap = loadSnapshot(getSessionParam() ?? loadIdentity()?.path ?? null);
     if (snap) {
       messages = snap.messages;
       rebuildToolMessageIndex();
@@ -4749,6 +4817,10 @@
     if (_editorMirrorTimer) {
       clearTimeout(_editorMirrorTimer);
       _editorMirrorTimer = null;
+    }
+    if (modelRefreshFeedbackTimer) {
+      clearTimeout(modelRefreshFeedbackTimer);
+      modelRefreshFeedbackTimer = null;
     }
     disconnect();
     document.removeEventListener('visibilitychange', _onVisibilityChange);
@@ -4911,12 +4983,13 @@
                   }}
                   class="{isMobile
                     ? 'h-10 w-10'
-                    : 'h-9 w-9'} flex items-center justify-center rounded-lg transition-colors {showSessionPanel
+                    : 'h-9 w-9'} relative flex items-center justify-center rounded-lg transition-colors {showSessionPanel
                     ? 'text-primary bg-primary/12'
                     : 'text-base-content/60 hover:text-base-content/90 hover:bg-base-content/8'}"
                   aria-label="Toggle session panel"
                   aria-expanded={showSessionPanel}
-                  ><svg
+                >
+                  <svg
                     class="w-[18px] h-[18px]"
                     viewBox="0 0 24 24"
                     fill="none"
@@ -4928,6 +5001,21 @@
                     <rect x="3" y="4" width="18" height="16" rx="2"></rect>
                     <path d="M9 4v16"></path>
                   </svg>
+                  {#if projectsState.backgroundActivity}
+                    <span
+                      class="absolute -right-0.5 -top-0.5 h-2 w-2 rounded-full border border-base-200 {projectsState.backgroundActivity ===
+                      'running'
+                        ? 'bg-success glow-success animate-pulse'
+                        : 'bg-primary glow-primary'}"
+                      role="status"
+                      aria-label={projectsState.backgroundActivity === 'running'
+                        ? 'Background session running'
+                        : 'Background session results'}
+                      title={projectsState.backgroundActivity === 'running'
+                        ? 'Background session running'
+                        : 'Background session results'}
+                    ></span>
+                  {/if}
                 </button>
               {/snippet}
             </Tooltip.Trigger>
@@ -4958,6 +5046,17 @@
         </button>
 
         <div class="relative z-10 flex items-center gap-1.5 shrink-0 ml-auto">
+          {#if activeToolName}
+            <div
+              class="h-9 flex items-center gap-1.5 rounded-xl px-2.5 sm:px-3 bg-primary/10 border border-primary/25 text-primary text-xs font-medium shrink-0 animate-pulse"
+              role="status"
+              aria-label={`Running tool ${activeToolName}`}
+            >
+              <Wrench class="w-3.5 h-3.5 shrink-0" />
+              <span class="hidden sm:inline max-w-40 truncate">Running {activeToolName}…</span>
+              <span class="sm:hidden">Running…</span>
+            </div>
+          {/if}
           {#if effectiveContextTokens > 0}
             <Tooltip.Root>
               <Tooltip.Trigger
@@ -5346,13 +5445,12 @@
           >
         </div>
       {/if}
-
       <!-- Extension header -->
       {#if extensionUiState.header}
         <div
-          class="shrink-0 px-3 py-1.5 text-xs text-base-content/60 bg-base-200/50 border-b border-base-content/10 font-mono whitespace-pre-wrap flex items-start gap-2"
+          class="shrink-0 min-w-0 px-3 py-1.5 text-xs text-base-content/60 bg-base-200/50 border-b border-base-content/10 font-mono whitespace-pre-wrap flex items-start gap-2"
         >
-          <span class="flex-1">{extensionUiState.header}</span>
+          <span class="min-w-0 flex-1 break-words">{extensionUiState.header}</span>
           <Button
             variant="ghost"
             size="icon-xs"
@@ -5429,9 +5527,9 @@
       <!-- Extension footer -->
       {#if visibleExtensionFooter}
         <div
-          class="shrink-0 px-3 py-1.5 text-xs text-base-content/60 bg-base-200/50 border-t border-base-content/10 font-mono whitespace-pre-wrap flex items-start gap-2"
+          class="shrink-0 min-w-0 px-3 py-1.5 text-xs text-base-content/60 bg-base-200/50 border-t border-base-content/10 font-mono whitespace-pre-wrap flex items-start gap-2"
         >
-          <span class="flex-1">{visibleExtensionFooter}</span>
+          <span class="min-w-0 flex-1 break-words">{visibleExtensionFooter}</span>
           <Button
             variant="ghost"
             size="icon-xs"
@@ -5725,10 +5823,8 @@
                           <path
                             d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"
                           ></path>
-
                           <polyline points="14 2 14 8 20 8"></polyline>
                         </svg>
-
                         <span
                           class="text-[10px] text-base-content/40 leading-tight truncate max-w-full"
                           >{f.name}</span
@@ -5750,6 +5846,7 @@
                 bind:value={input}
                 onkeydown={handleComposerKeydown}
                 oninput={handleComposerInput}
+                onpaste={handleComposerPaste}
                 rows={1}
                 placeholder={sessionLoading
                   ? 'Opening session…'
@@ -6197,6 +6294,8 @@
       {modelTab}
       {model}
       {availableModels}
+      {modelRefreshLoading}
+      {modelRefreshFeedback}
       {toolsList}
       {activeToolNames}
       {resourcesLoaded}
@@ -6268,6 +6367,7 @@
         tick().then(() => inputEl?.focus());
       }}
       onDismissProviderError={() => (providerError = null)}
+      onRefreshModels={requestModelRefresh}
     />
 
     <!-- ── MODAL: Settings ───────────────────────────────────────────────────── -->
@@ -6363,7 +6463,7 @@
               <Dialog.Description class="text-xs text-base-content/45 sm:text-base-content/38">
                 {#if settingsSection === 'session'}Defaults and behavior for session runs{:else if settingsSection === 'notifications'}Configure
                   PWA push and page notifications{:else if settingsSection === 'shortcuts'}Keyboard
-                  shortcuts available in the chat UI{:else if settingsSection === 'extensions'}Loaded
+                  shortcuts and touch gestures available in the chat UI{:else if settingsSection === 'extensions'}Loaded
                   extensions and their tools/commands{:else if settingsSection === 'packages'}Manage
                   SDK extension packages{:else if settingsSection === 'updates'}Check and apply
                   pi-ui or SDK updates{:else}Runtime information and server controls{/if}
@@ -6470,15 +6570,28 @@
                         <p class="text-sm text-base-content/75">Runtime diagnostics</p>
                         <div class="mt-2 space-y-1.5">
                           {#each runtimeDiagnostics as diagnostic (diagnostic.message)}
-                            <p
+                            {@const isLong = diagnostic.message.length > 120}
+                            {@const isExpanded = expandedDiagnostics[diagnostic.message]}
+                            <div
                               class="text-xs {diagnostic.type === 'error'
                                 ? 'text-error/75'
                                 : diagnostic.type === 'warning'
                                   ? 'text-warning/75'
                                   : 'text-base-content/50'}"
                             >
-                              {diagnostic.message}
-                            </p>
+                              <p class="break-words {isLong && !isExpanded ? 'line-clamp-2' : ''}">
+                                {diagnostic.message}
+                              </p>
+                              {#if isLong}
+                                <button
+                                  onclick={() =>
+                                    (expandedDiagnostics[diagnostic.message] = !isExpanded)}
+                                  class="mt-0.5 text-[10px] text-base-content/40 hover:text-base-content/70 transition-colors"
+                                >
+                                  {isExpanded ? '▾ less' : '▸ more'}
+                                </button>
+                              {/if}
+                            </div>
                           {/each}
                         </div>
                       </div>
@@ -6601,6 +6714,27 @@
                             >{shortcut.keys}</kbd
                           >
                           <span class="text-sm text-base-content/70">{shortcut.action}</span>
+                        </div>
+                      {/each}
+                    </div>
+                  </Card.Root>
+                  <p
+                    class="text-xs font-semibold text-base-content/50 uppercase tracking-wider mt-5 mb-2"
+                  >
+                    Touch gestures
+                  </p>
+                  <Card.Root
+                    size="sm"
+                    class="py-0 overflow-hidden bg-base-100/60 border-base-content/10"
+                  >
+                    <div class="divide-y divide-base-content/8">
+                      {#each GESTURES as gesture (gesture.gesture)}
+                        <div class="flex items-center gap-4 px-4 py-3">
+                          <span
+                            class="min-w-32 rounded-lg border border-base-content/12 bg-base-content/[0.055] px-2 py-1 text-xs text-base-content/60"
+                            >{gesture.gesture}</span
+                          >
+                          <span class="text-sm text-base-content/70">{gesture.action}</span>
                         </div>
                       {/each}
                     </div>
@@ -7330,92 +7464,176 @@
   }}
 >
   <Dialog.Content
-    class="max-w-[min(30rem,calc(100vw-1.5rem))] gap-0 overflow-hidden p-0 shadow-2xl ring-primary/12"
+    class="flex w-full max-w-[min(42rem,calc(100vw_-_1.5rem))] min-h-0 max-h-[min(44rem,calc(100dvh_-_2rem))] flex-col gap-0 overflow-hidden rounded-2xl border border-base-content/10 bg-base-100/96 p-0 shadow-2xl shadow-black/45 ring-1 ring-primary/12 backdrop-blur-xl sm:max-w-2xl"
     showCloseButton={false}
     onkeydown={modalContentKeydown}
   >
-    <Dialog.Header class="px-5 pt-5 pb-4">
-      <div class="flex items-center gap-3">
+    <Dialog.Header
+      class="min-w-0 shrink-0 border-b border-base-content/8 bg-gradient-to-br from-primary/[0.08] via-base-100/65 to-transparent px-4 py-4 sm:px-5 sm:py-5"
+    >
+      <div class="flex min-w-0 items-start gap-3">
         <div
-          class="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary/12 text-primary"
+          class="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-primary/12 text-primary ring-1 ring-primary/15"
         >
-          <Blocks class="h-4 w-4" />
+          <Blocks class="h-[1.125rem] w-[1.125rem]" />
         </div>
-        <div class="min-w-0">
-          <p class="text-[10px] uppercase tracking-[0.18em] text-muted-foreground/60">
-            Extension UI
+        <div class="min-w-0 flex-1 pt-0.5">
+          <p class="text-[10px] font-medium uppercase tracking-[0.18em] text-primary/65">
+            Extension question
           </p>
-          <Dialog.Title class="truncate">{modal?.title}</Dialog.Title>
+          <Dialog.Title
+            class="min-w-0 whitespace-normal break-words text-[0.95rem] font-semibold leading-snug text-base-content [overflow-wrap:anywhere]"
+            >{modal?.title}</Dialog.Title
+          >
         </div>
       </div>
       {#if modal?.method === 'confirm' && modal.message}
-        <Dialog.Description class="whitespace-pre-wrap leading-relaxed"
+        <Dialog.Description
+          class="mt-3 max-h-[min(12rem,30dvh)] min-w-0 overflow-y-auto whitespace-pre-wrap break-words text-sm leading-relaxed text-base-content/65 [overflow-wrap:anywhere]"
           >{modal.message}</Dialog.Description
         >
       {/if}
     </Dialog.Header>
 
     {#if modal?.method === 'input'}
-      <input
-        bind:this={modalFocusEl}
-        type={modal.secret ? 'password' : 'text'}
-        bind:value={modalInput}
-        placeholder={modal.placeholder ?? ''}
-        class="dialog-input mx-5 mb-5 w-[calc(100%-2.5rem)] rounded-xl px-3.5 py-2.5 text-sm outline-none placeholder-muted-foreground transition-colors"
-      />
-    {:else if modal?.method === 'select'}
-      {#if modal.options.length > 0}
-        <div class="mx-5 mb-5 space-y-1.5 max-h-60 overflow-y-auto">
-          {#each modal.options as opt (opt)}
-            <button
-              class="w-full text-left px-3.5 py-2.5 rounded-xl border border-transparent text-sm text-base-content/75 transition-all duration-150 hover:border-primary/25 hover:bg-primary/8 hover:text-base-content focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
-              onclick={() => extensionUiState.answerSelect(opt)}>{opt}</button
-            >
-          {/each}
-        </div>
-      {:else}
-        <p class="px-5 pb-5 text-sm text-muted-foreground">No options were provided.</p>
-      {/if}
-    {:else if modal?.method === 'editor'}
-      <textarea
-        bind:this={modalFocusEl}
-        bind:value={modalInput}
-        rows={8}
-        autocapitalize="off"
-        spellcheck={false}
-        use:autoCorrectOff
-        class="dialog-input mx-5 mb-5 w-[calc(100%-2.5rem)] rounded-xl p-3.5 text-sm leading-relaxed resize-none transition-colors"
-      ></textarea>
-    {:else if modal?.method === 'custom'}
-      {#if modal.parsed}
-        <ExtensionComponent
-          component={modal.parsed}
-          interactive
-          onaction={modalComponentAction}
-          bind:inputValue={modalInput}
+      <div class="min-h-0 min-w-0 flex-1 px-4 py-4 sm:px-5">
+        <input
+          bind:this={modalFocusEl}
+          type={modal.secret ? 'password' : 'text'}
+          bind:value={modalInput}
+          placeholder={modal.placeholder ?? ''}
+          class="dialog-input w-full rounded-xl px-3.5 py-2.5 text-sm outline-none placeholder-muted-foreground transition-colors"
         />
-        {#if customModalNeedsTextInput(modal.parsed)}
+      </div>
+    {:else if modal?.method === 'select'}
+      <div
+        class="min-h-0 min-w-0 flex-1 overflow-y-auto overscroll-contain px-4 py-3 sm:px-5 sm:py-4"
+      >
+        {#if modal.options.length > 0}
+          {#if modal.options.length > 10}
+            <div class="relative mb-3">
+              <input
+                bind:this={modalFocusEl}
+                type="search"
+                bind:value={selectFilter}
+                oninput={() => (selectOptionIndex = 0)}
+                placeholder="Filter options…"
+                aria-label="Filter options"
+                autocomplete="off"
+                class="w-full rounded-xl border border-base-content/10 bg-base-content/[0.035] px-3.5 py-2.5 pr-14 text-sm outline-none transition-colors placeholder:text-base-content/35 focus:border-primary/45 focus:bg-base-content/[0.06]"
+              />
+              <span
+                class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-[10px] tabular-nums uppercase tracking-wide text-base-content/30"
+                >{filteredSelectOptions.length}/{modal.options.length}</span
+              >
+            </div>
+          {/if}
+          {#if filteredSelectOptions.length > 0}
+            <div role="listbox" aria-label={modal.title} class="min-w-0 space-y-2">
+              {#each filteredSelectOptions as item, i (item.index + ':' + item.value)}
+                {@const option = item.option}
+                <!-- svelte-ignore a11y_autofocus -->
+                <button
+                  type="button"
+                  data-extension-option="true"
+                  data-extension-option-index={i}
+                  role="option"
+                  aria-selected={selectOptionIndex === i}
+                  aria-posinset={i + 1}
+                  aria-setsize={filteredSelectOptions.length}
+                  autofocus={i === 0 && !selectFilter}
+                  class="group flex w-full min-w-0 max-w-full items-start gap-3 overflow-hidden rounded-2xl border border-base-content/10 bg-base-content/[0.025] px-3.5 py-3 text-left transition-[border-color,background-color,transform] duration-150 hover:border-primary/35 hover:bg-primary/[0.06] focus-visible:border-primary/55 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/35 active:scale-[0.995]"
+                  onclick={() => extensionUiState.answerSelect(item.value)}
+                  onfocus={() => (selectOptionIndex = i)}
+                >
+                  <span
+                    class="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-primary/12 text-xs font-semibold tabular-nums text-primary/85 ring-1 ring-primary/10"
+                    >{option.index}</span
+                  >
+                  <span class="min-w-0 flex-1 [overflow-wrap:anywhere]">
+                    <span
+                      class="block min-w-0 whitespace-normal break-words text-sm font-medium leading-snug text-base-content/85 group-hover:text-base-content [overflow-wrap:anywhere]"
+                      >{option.label}</span
+                    >
+                    {#if option.description}
+                      <span
+                        class="mt-1 block min-w-0 whitespace-normal break-words text-xs leading-relaxed text-base-content/50 group-hover:text-base-content/65 [overflow-wrap:anywhere]"
+                        >{option.description}</span
+                      >
+                    {/if}
+                  </span>
+                  <ChevronRight
+                    class="mt-1 h-4 w-4 shrink-0 text-base-content/25 transition-transform group-hover:translate-x-0.5 group-hover:text-primary/70"
+                  />
+                </button>
+              {/each}
+            </div>
+          {:else}
+            <p
+              class="rounded-xl border border-dashed border-base-content/10 px-4 py-8 text-center text-sm text-muted-foreground"
+            >
+              No matching options.
+            </p>
+          {/if}
+        {:else}
+          <p
+            class="rounded-xl border border-dashed border-base-content/10 px-4 py-8 text-center text-sm text-muted-foreground"
+          >
+            No options were provided.
+          </p>
+        {/if}
+      </div>
+    {:else if modal?.method === 'editor'}
+      <div class="min-h-0 min-w-0 flex-1 px-4 py-4 sm:px-5">
+        <textarea
+          bind:this={modalFocusEl}
+          bind:value={modalInput}
+          rows={8}
+          autocapitalize="off"
+          spellcheck={false}
+          use:autoCorrectOff
+          class="dialog-input min-h-48 w-full resize-none rounded-xl p-3.5 text-sm leading-relaxed transition-colors"
+        ></textarea>
+      </div>
+    {:else if modal?.method === 'custom'}
+      <div class="min-h-0 min-w-0 flex-1 overflow-y-auto px-4 py-4 sm:px-5">
+        {#if modal.parsed}
+          <ExtensionComponent
+            component={modal.parsed}
+            interactive
+            onaction={modalComponentAction}
+            bind:inputValue={modalInput}
+          />
+          {#if customModalNeedsTextInput(modal.parsed)}
+            <input
+              bind:this={modalFocusEl}
+              type="text"
+              bind:value={modalInput}
+              placeholder="Type your response…"
+              class="dialog-input mt-4 w-full rounded-xl px-3.5 py-2.5 text-sm placeholder-muted-foreground transition-colors"
+            />
+          {/if}
+        {:else}
+          <p class="mb-2 text-sm text-muted-foreground">Extension request:</p>
           <input
             bind:this={modalFocusEl}
             type="text"
             bind:value={modalInput}
             placeholder="Type your response…"
-            class="dialog-input mx-5 mb-5 w-[calc(100%-2.5rem)] rounded-xl px-3.5 py-2.5 text-sm placeholder-muted-foreground transition-colors"
+            class="dialog-input w-full rounded-xl px-3.5 py-2.5 text-sm placeholder-muted-foreground transition-colors"
           />
         {/if}
-      {:else}
-        <p class="px-5 text-sm text-muted-foreground mb-2">Extension request:</p>
-        <input
-          bind:this={modalFocusEl}
-          type="text"
-          bind:value={modalInput}
-          placeholder="Type your response…"
-          class="dialog-input mx-5 mb-5 w-[calc(100%-2.5rem)] rounded-xl px-3.5 py-2.5 text-sm placeholder-muted-foreground transition-colors"
-        />
-      {/if}
+      </div>
     {/if}
 
-    <Dialog.Footer class="mt-0">
+    <Dialog.Footer
+      class="extension-dialog-footer shrink-0 flex-row justify-end gap-2 border-t border-base-content/8 bg-base-200/35 px-4 py-3 sm:px-5"
+    >
+      {#if modal?.method === 'select'}
+        <span class="mr-auto hidden text-[11px] text-base-content/35 sm:inline"
+          >↑↓ move · Enter select · Esc cancel</span
+        >
+      {/if}
       <Button
         variant="ghost"
         size="sm"

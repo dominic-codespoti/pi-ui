@@ -2,7 +2,6 @@ import { test, expect, submitPrompt } from './fixtures';
 import {
   CONNECTED_PAYLOAD,
   TOOLS_LIST_PAYLOAD,
-  toolExecutionStartPayload,
   toolExecutionUpdatePayload,
   toolExecutionEndPayload,
 } from './mocks/payloads';

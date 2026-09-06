@@ -2,13 +2,14 @@
   /**
    * Projects sidebar — recency-first session list grouped under thin project
    * headers. Projects sort by their most recent session (pinned first);
-   * sub-sessions nest under their parent (substacks always expanded), each
-   * sibling level ordered by its subtree's most recent activity.
+   * sub-sessions nest under their parent (substacks are collapsed by default),
+   * each sibling level ordered by its subtree's most recent activity.
    *
    * The active project can be collapsed like any other; a search filter expands
    * everything and shows every match. Projects can be renamed, pinned, collapsed
    * (persisted), and forgotten (registry-only projects with no sessions).
-   * Sessions support switch / rename / fork / delete.
+   * Sessions support switch / rename / fork / delete, with nested branches
+   * independently expandable.
    */
   import { tick } from 'svelte';
   import { ScrollArea } from '#lib/components/ui/scroll-area/index.js';
@@ -153,7 +154,10 @@
   {@const isRenaming = renamingProject === g.cwd}
   {@const rootCount = g.sessions.filter((r) => r.depth === 0).length}
   {@const anyRunning =
-    (ps.isStreaming && isActive) || g.sessions.some((r) => ps.runningSessions.has(r.session.id))}
+    ((ps.isStreaming || Boolean(ps.activeToolName)) && isActive) ||
+    g.sessions.some(
+      (r) => ps.runningSessions.has(r.session.id) || ps.runningToolSessions.has(r.session.id)
+    )}
   {@const anyUnchecked =
     !anyRunning && g.sessions.some((r) => ps.uncheckedSessions.has(r.session.id))}
   <div
@@ -237,7 +241,7 @@
         </button>
         <!-- Hover actions -->
         <div
-          class="touch-reveal hidden group-hover/dir:flex group-focus-within/dir:flex items-center gap-0.5 pr-1.5 shrink-0"
+          class="touch-reveal touch-reveal-lg hidden group-hover/dir:flex group-focus-within/dir:flex items-center gap-0.5 pr-1.5 shrink-0"
         >
           <button
             onclick={() => startProjectRename(g)}
@@ -264,15 +268,6 @@
               tabindex={open ? 0 : -1}><Trash class="w-3.5 h-3.5" /></button
             >
           {/if}
-          {#if g.registered && g.sessions.length === 0 && !isActive}
-            <button
-              onclick={() => confirmForgetProject(g)}
-              class="w-7 h-7 flex items-center justify-center text-base-content/30 hover:text-error hover:bg-error/8 rounded-xl transition-colors"
-              title="Forget project"
-              aria-label="Forget project {g.name}"
-              tabindex={open ? 0 : -1}><X class="w-3.5 h-3.5" /></button
-            >
-          {/if}
           <button
             onclick={() => {
               if (ps.collapsed.has(g.cwd)) ps.toggleCollapsed(g.cwd);
@@ -288,7 +283,7 @@
       </div>
     {/if}
 
-    <!-- Sessions under this project — nested substacks, always expanded -->
+    <!-- Sessions under this project — nested branches collapse independently -->
     {#if !isCollapsed}
       <div class="pt-0.5 pb-1.5 space-y-1">
         {#if g.sessions.length === 0}
@@ -296,10 +291,16 @@
         {/if}
         {#each ps.visibleSessions(g) as row (row.session.id)}
           {@const s = row.session}
+          {@const sessionLabel = s.name ? s.name : s.firstMessage || '(empty)'}
           {@const isActiveSession = ps.activeSessionId === s.id}
+          {@const isSubsessionsExpanded = ps.expandedSubsessions.has(s.id)}
           {@const isRenamingSession = renamingSession === s.path}
           {@const hasUnchecked = ps.uncheckedSessions.has(s.id)}
-          {@const isBgRunning = ps.runningSessions.has(s.id) && !isActiveSession}
+          {@const isBgRunning =
+            (ps.runningSessions.has(s.id) || ps.runningToolSessions.has(s.id)) && !isActiveSession}
+          {@const isSessionToolRunning =
+            (isActiveSession && Boolean(ps.activeToolName)) ||
+            (!isActiveSession && ps.runningToolSessions.has(s.id))}
           <div
             style="margin-left: {Math.min(row.depth, 3) * 14}px"
             class="group rounded-2xl transition-colors duration-150 {isActiveSession
@@ -330,6 +331,30 @@
               </div>
             {:else}
               <div class="flex items-stretch">
+                {#if row.hasChildren}
+                  <button
+                    type="button"
+                    onclick={(event) => {
+                      event.stopPropagation();
+                      ps.toggleSubsessions(s.id);
+                    }}
+                    class="flex h-10 w-9 shrink-0 items-center justify-center rounded-lg text-base-content/30 transition-colors hover:bg-base-content/8 hover:text-base-content/65 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 sm:h-7 sm:w-7"
+                    aria-label="{isSubsessionsExpanded
+                      ? 'Collapse'
+                      : 'Expand'} sub-sessions for {sessionLabel}"
+                    aria-expanded={isSubsessionsExpanded}
+                    title="{isSubsessionsExpanded ? 'Collapse' : 'Expand'} sub-sessions"
+                    tabindex={open ? 0 : -1}
+                  >
+                    <ChevronRight
+                      class="h-3 w-3 transition-transform duration-150 {isSubsessionsExpanded
+                        ? 'rotate-90'
+                        : ''}"
+                    />
+                  </button>
+                {:else}
+                  <span class="h-10 w-9 shrink-0 sm:h-7 sm:w-7" aria-hidden="true"></span>
+                {/if}
                 <button
                   onclick={() => ps.switchSession(s.path)}
                   class="flex-1 text-left px-3 py-2 min-w-0"
@@ -337,7 +362,14 @@
                   tabindex={open ? 0 : -1}
                 >
                   <div class="flex items-center gap-2">
-                    {#if ps.isStreaming && isActiveSession}
+                    {#if isSessionToolRunning}
+                      <span
+                        class="w-2 h-2 rounded-full bg-primary shrink-0 animate-pulse glow-primary"
+                        aria-label={isActiveSession
+                          ? 'Running tool'
+                          : 'Running tool in background'}
+                      ></span>
+                    {:else if ps.isStreaming && isActiveSession}
                       <span
                         class="w-2 h-2 rounded-full bg-success shrink-0 animate-pulse glow-success"
                         aria-label="Streaming"
@@ -365,7 +397,7 @@
                         ? 'text-base-content font-semibold tracking-[-0.01em]'
                         : 'text-base-content/68'}"
                     >
-                      {s.name ? s.name : s.firstMessage || '(empty)'}
+                      {sessionLabel}
                     </span>
                   </div>
                   {#if s.name && s.firstMessage}
@@ -387,7 +419,7 @@
                 </button>
                 <!-- Session actions — visible on row hover -->
                 <div
-                  class="touch-reveal flex flex-col justify-center gap-0.5 pr-1.5 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity"
+                  class="touch-reveal touch-reveal-lg flex flex-col justify-center gap-0.5 pr-1.5 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity"
                 >
                   <button
                     onclick={() => startSessionRename(s)}
