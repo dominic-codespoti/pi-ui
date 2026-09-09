@@ -6,7 +6,6 @@
 export interface NotificationPrefs {
   enabled: boolean;
   onComplete: boolean;
-  onSessionFinish: boolean;
 }
 /** localStorage flag marking the post-run permission nudge as seen. */
 export const NOTIF_NUDGE_SEEN_KEY = 'pifrontier:notif-nudge-seen';
@@ -14,7 +13,6 @@ export const NOTIF_NUDGE_SEEN_KEY = 'pifrontier:notif-nudge-seen';
 export const DEFAULT_NOTIFICATION_PREFS: NotificationPrefs = {
   enabled: true,
   onComplete: true,
-  onSessionFinish: true,
 };
 
 const STORAGE_KEY = 'pifrontier:notifications';
@@ -22,7 +20,22 @@ const STORAGE_KEY = 'pifrontier:notifications';
 export function loadNotificationPrefs(): NotificationPrefs {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) return { ...DEFAULT_NOTIFICATION_PREFS, ...JSON.parse(raw) };
+    if (raw) {
+      const parsed: unknown = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        const stored = parsed as Partial<NotificationPrefs>;
+        return {
+          enabled:
+            typeof stored.enabled === 'boolean'
+              ? stored.enabled
+              : DEFAULT_NOTIFICATION_PREFS.enabled,
+          onComplete:
+            typeof stored.onComplete === 'boolean'
+              ? stored.onComplete
+              : DEFAULT_NOTIFICATION_PREFS.onComplete,
+        };
+      }
+    }
   } catch {
     /* ignore */
   }

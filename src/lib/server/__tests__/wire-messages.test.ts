@@ -1,64 +1,12 @@
 import { describe, expect, test } from 'vitest';
 import {
-  trimMessagesForWire,
   boundMessagesForWire,
   MAX_WIRE_BLOCK_CHARS,
   MIN_WIRE_BLOCK_CHARS,
+  MAX_WIRE_AUX_CHARS,
+  MAX_WIRE_IMAGE_CHARS,
+  MAX_WIRE_TOOL_OUTPUT_CHARS,
 } from '../wire-messages';
-
-const big = 'x'.repeat(MAX_WIRE_BLOCK_CHARS + 5_000);
-
-describe('trimMessagesForWire', () => {
-  test('returns the same array identity when nothing exceeds the cap', () => {
-    const messages = [
-      { role: 'user', content: 'hello' },
-      { role: 'assistant', content: [{ type: 'text', text: 'hi' }] },
-    ];
-    expect(trimMessagesForWire(messages)).toBe(messages);
-  });
-
-  test('truncates oversized string content with a marker', () => {
-    const messages = [{ role: 'user', content: big }];
-    const result = trimMessagesForWire(messages);
-    const first = result[0] as { content: string };
-    expect(first.content.length).toBeLessThan(big.length);
-    expect(first.content).toContain('truncated for transfer');
-  });
-
-  test('truncates oversized text and thinking blocks, keeps small siblings intact', () => {
-    const small = { type: 'text', text: 'small' };
-    const messages = [
-      {
-        role: 'assistant',
-        content: [{ type: 'thinking', thinking: big }, small, { type: 'text', text: big }],
-      },
-    ];
-    const result = trimMessagesForWire(messages);
-    const msg = result[0] as { content: { type: string; text?: string; thinking?: string }[] };
-    expect(msg.content[0].thinking).toContain('truncated for transfer');
-    expect(msg.content[0].thinking!.length).toBeLessThan(big.length);
-    expect(msg.content[1]).toBe(small);
-    expect(msg.content[2].text).toContain('truncated for transfer');
-  });
-
-  test('never mutates the input messages', () => {
-    const messages = [{ role: 'assistant', content: [{ type: 'thinking', thinking: big }] }];
-    trimMessagesForWire(messages);
-    expect(messages[0].content[0].thinking).toBe(big);
-  });
-
-  test('respects a custom cap', () => {
-    const messages = [{ role: 'user', content: 'abcdef' }];
-    const result = trimMessagesForWire(messages, 3);
-    const first = result[0] as { content: string };
-    expect(first.content.startsWith('abc\n')).toBe(true);
-  });
-
-  test('passes through non-object and content-less entries untouched', () => {
-    const messages = [null, 42, { role: 'system' }, { content: { nested: true } }];
-    expect(trimMessagesForWire(messages)).toBe(messages);
-  });
-});
 
 describe('boundMessagesForWire', () => {
   test('returns the same array identity when nothing exceeds default caps', () => {
@@ -69,6 +17,68 @@ describe('boundMessagesForWire', () => {
     expect(result).toBe(messages);
     expect(result[0]).toBe(msg1);
     expect(result[1]).toBe(msg2);
+  });
+
+  test('elides oversized tool output at the strict boundary without mutating messages', () => {
+    const atLimit = {
+      role: 'toolResult',
+      toolCallId: 'at-limit',
+      content: [
+        { type: 'text', text: 'a'.repeat(MAX_WIRE_TOOL_OUTPUT_CHARS - 'small details'.length) },
+      ],
+      details: 'small details',
+    };
+    const oversized = {
+      role: 'toolResult',
+      toolCallId: 'oversized',
+      content: [{ type: 'text', text: 'x'.repeat(MAX_WIRE_TOOL_OUTPUT_CHARS + 1) }],
+      details: 'large details',
+      diff: 'diff',
+      renderedResultHtml: ['<pre>result</pre>'],
+    };
+
+    const result = boundMessagesForWire([atLimit, oversized]);
+    const bounded = result[1] as Record<string, unknown>;
+
+    expect(result[0]).toBe(atLimit);
+    expect(result[1]).not.toBe(oversized);
+    expect(bounded.outputElided).toBe(true);
+    expect(bounded.outputBytes).toBe(MAX_WIRE_TOOL_OUTPUT_CHARS + 1 + 'large details'.length);
+    expect(bounded.content).toBeUndefined();
+    expect(bounded.details).toBeUndefined();
+    expect(bounded.diff).toBeUndefined();
+    expect(bounded.renderedResultHtml).toBeUndefined();
+    expect(oversized.content[0].text).toHaveLength(MAX_WIRE_TOOL_OUTPUT_CHARS + 1);
+    expect(oversized.details).toBe('large details');
+  });
+
+  test('can preserve full tool output when elision is disabled', () => {
+    const message = {
+      role: 'toolResult',
+      toolCallId: 'call-1',
+      content: 'x'.repeat(MAX_WIRE_TOOL_OUTPUT_CHARS + 1),
+    };
+
+    const result = boundMessagesForWire([message], { elideToolOutput: false });
+
+    expect(result[0]).toBe(message);
+  });
+
+  test('elided tool output leaves the total budget for older conversation history', () => {
+    const older = { role: 'assistant', content: 'a'.repeat(600) };
+    const tool = { role: 'toolResult', toolCallId: 'call-1', content: 'x'.repeat(3000) };
+    const options = { blockCap: 1000, messageCap: 1000, totalBudget: 600 };
+
+    const result = boundMessagesForWire([older, tool], options);
+    const withoutElision = boundMessagesForWire([older, tool], {
+      ...options,
+      elideToolOutput: false,
+    });
+    const boundedOlder = result[0] as { content: string };
+    const unelidedOlder = withoutElision[0] as { content: string };
+
+    expect(boundedOlder.content).toBe(older.content);
+    expect(unelidedOlder.content).toContain('truncated for transfer');
   });
 
   test('maintains exact count and order invariance even under tiny budgets', () => {
@@ -200,6 +210,69 @@ describe('boundMessagesForWire', () => {
     expect(first.content).toContain(
       '… [pi-ui: 550 characters truncated for transfer — full text is preserved in the session file]'
     );
+  });
+
+  test('keeps content and rendered aux fields within the shared total budget', () => {
+    const totalBudget = 20_000;
+    const messages = [
+      {
+        role: 'assistant',
+        content: 'C'.repeat(totalBudget),
+        renderedResultHtml: ['R'.repeat(30_000), 'S'.repeat(30_000)],
+      },
+    ];
+
+    const result = boundMessagesForWire(messages, { totalBudget });
+    const bounded = result[0] as { content: string; renderedResultHtml: string[] };
+    const returnedChars = bounded.content.length + bounded.renderedResultHtml.join('').length;
+
+    expect(returnedChars).toBeLessThanOrEqual(totalBudget);
+  });
+
+  test('applies the image cap independently of the text block cap', () => {
+    const oversizedImage = 'o'.repeat(MAX_WIRE_IMAGE_CHARS + 1);
+    const survivingImage = 's'.repeat(100_000);
+    const messages = [
+      {
+        role: 'assistant',
+        content: [{ type: 'image', data: oversizedImage, mimeType: 'image/png' }],
+      },
+      {
+        role: 'assistant',
+        content: [{ type: 'image', data: survivingImage, mimeType: 'image/png' }],
+      },
+    ];
+
+    const result = boundMessagesForWire(messages);
+    const boundedOversized = result[0] as { content: { data?: string; text?: string }[] };
+    const boundedSurviving = result[1] as { content: { data?: string }[] };
+
+    expect(boundedOversized.content[0].data).toBeUndefined();
+    expect(boundedOversized.content[0].text).toContain('image omitted');
+    expect(boundedSurviving.content[0].data).toBe(survivingImage);
+  });
+
+  test('bounds derived HTML and omits oversized image data', () => {
+    const rendered = 'R'.repeat(MAX_WIRE_AUX_CHARS + 100);
+    const image = 'i'.repeat(MAX_WIRE_IMAGE_CHARS + 1);
+    const message = {
+      role: 'assistant',
+      content: [{ type: 'image', data: image, mimeType: 'image/png' }],
+      renderedCallHtml: [rendered],
+    };
+
+    const result = boundMessagesForWire([message]);
+    const bounded = result[0] as {
+      content: { data?: string; text?: string }[];
+      renderedCallHtml: string[];
+    };
+
+    expect(bounded).not.toBe(message);
+    expect(bounded.content[0].data).toBeUndefined();
+    expect(bounded.content[0].text).toContain('image omitted');
+    expect(bounded.renderedCallHtml[0]).toContain('truncated for transfer');
+    expect(message.content[0].data).toBe(image);
+    expect(message.renderedCallHtml[0]).toBe(rendered);
   });
 
   test('defaults match exported constants and contracts', () => {

@@ -250,8 +250,8 @@ if (values.cwd) process.env.PI_CWD = resolve(values.cwd);
 
 if (values.daemon && !process.env.PI_DAEMONIZED) {
   const pidFile = '/tmp/pi-ui.pid';
-  const child = Bun.spawn([process.execPath, ...process.argv.slice(1)], {
-    env: { ...process.env, PI_DAEMONIZED: '1' },
+  const runtimeArgs = process.execArgv.includes('--smol') ? ['--smol'] : [];
+  const child = Bun.spawn([process.execPath, ...runtimeArgs, ...process.argv.slice(1)], {
     stdio: ['ignore', 'ignore', 'ignore'],
     detached: true,
   });

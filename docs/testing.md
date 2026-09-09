@@ -2,21 +2,21 @@
 
 ## Layer 1 — Unit Tests (Vitest)
 
-| Aspect              | Value                                                                                        |
-| ------------------- | -------------------------------------------------------------------------------------------- |
-| Framework           | Vitest v4.1.11 (`@vitest/coverage-v8` v4.1.11)                                               |
-| Environment         | jsdom                                                                                        |
-| Setup               | `@testing-library/jest-dom/vitest` (auto-imported)                                           |
-| Test locations      | `src/**/*.test.ts` (36 test files across `lib/`, `server/`, `state/`, `components/`, `routes/`) |
-| Coverage            | v8 provider, 60% stmts/funcs/lines, 50% branches                                             |
-| Coverage exclusions | `src/lib/components/ui/**`, test files, service-worker                                       |
-| Mocking             | `vi.mock()` module mocking, `vi.mocked()` typed mocks, `vi.resetModules()` for fresh imports |
+| Aspect              | Value                                                                                           |
+| ------------------- | ----------------------------------------------------------------------------------------------- |
+| Framework           | Vitest v4.1.11 (`@vitest/coverage-v8` v4.1.11)                                                  |
+| Environment         | jsdom                                                                                           |
+| Setup               | `@testing-library/jest-dom/vitest` (auto-imported)                                              |
+| Test locations      | `src/**/*.test.ts` (33 test files across `lib/`, `server/`, `state/`, `components/`, `routes/`) |
+| Coverage            | v8 provider, 60% stmts/funcs/lines, 50% branches                                                |
+| Coverage exclusions | `src/lib/components/ui/**`, test files, service-worker                                          |
+| Mocking             | `vi.mock()` module mocking, `vi.mocked()` typed mocks, `vi.resetModules()` for fresh imports    |
 
-### Test Files by Area (36 Files)
+### Test Files by Area (33 Files)
 
 #### Client Core & Protocol Helpers (`src/lib/__tests__/`, `src/lib/`)
+
 - `src/lib/__tests__/client-messages.test.ts` — uid, extractTextContent, formatToolInput, agentMsgToUI, thinking levels, reconnectDelay, rawMessagesToUI
-- `src/lib/__tests__/composer-terminal-bridge.test.ts` — prompt routing and terminal input bridging
 - `src/lib/__tests__/diff-parser.test.ts` — unified diff parser and hunk formatting
 - `src/lib/__tests__/extension-modals.test.ts` — extension modal / confirm / input state transformations
 - `src/lib/__tests__/markdown.test.ts` — renderMarkdown, LaTeX math block rendering, memoization cache, highlightCode
@@ -29,19 +29,20 @@
 - `src/lib/__tests__/utils.test.ts` — cn, formatRelativeDate, type helpers
 
 #### Authentication & Security (`src/lib/auth/`)
+
 - `src/lib/auth/password.test.ts` — JWT round-trip, expiry, tamper detection, cookie parsing, WebCrypto signature verification
 - `src/lib/auth/rate-limiter.test.ts` — sliding window, block, IP normalization, time-travel via `__piRateLimit`
 
 #### State Management (`src/lib/state/__tests__/`)
-- `src/lib/state/__tests__/chat-store.test.ts` — chat message state, active turn tracking, streaming delta aggregation
-- `src/lib/state/__tests__/connection-store.test.ts` — WebSocket connection status, reconnect state machine, socket lifecycle
-- `src/lib/state/__tests__/panels-store.test.ts` — drawer & panel open/closed states, layout switching
+
 - `src/lib/state/__tests__/projects-state.test.ts` — project/session groups derivation, filtering, runtime indicators, handleMessage
 
 #### WebSocket Schemas (`src/lib/ws/__tests__/`)
+
 - `src/lib/ws/__tests__/server-message-schema.test.ts` — Valibot parsing & validation for server-to-client message schemas
 
 #### Server & Session Management (`src/lib/server/`, `src/lib/server/__tests__/`)
+
 - `src/lib/server/push-notifications.test.ts` — Web Push VAPID delivery & subscription persistence
 - `src/lib/server/__tests__/compaction-watchdog.test.ts` — auto-compaction trigger thresholds and watchdog lifecycle
 - `src/lib/server/__tests__/extension-completions.test.ts` — slash-command completions provider from active extensions
@@ -57,10 +58,12 @@
 - `src/lib/server/__tests__/ws-helpers.test.ts` — path utilities, serialization, semver, formatting
 
 #### UI Component Units (`src/lib/components/**/__tests__/`)
+
 - `src/lib/components/chat/__tests__/header-and-banners.test.ts` — banner rendering, offline notices, session headers
 - `src/lib/components/dialogs/__tests__/extension-overlays.test.ts` — extension modal overlays & custom dialog actions
 
 #### SvelteKit Route Handlers (`src/routes/__tests__/`)
+
 - `src/routes/__tests__/hooks.server.test.ts` — SvelteKit Handle guard logic, auth redirects, cookie validation
 - `src/routes/__tests__/login-page-server.test.ts` — login form actions, credentials verification, rate limit responses
 
@@ -77,17 +80,17 @@
 
 ## Layer 2 — E2E Tests (Playwright)
 
-| Aspect              | Value                                                                                           |
-| ------------------- | ----------------------------------------------------------------------------------------------- |
-| Framework           | Playwright v1.62+                                                                               |
-| Test dir            | `e2e/*.spec.ts` (23 spec files)                                                                 |
-| Browsers            | Chromium (`Desktop Chrome`) + Mobile (`Pixel 5`)                                               |
-| Parallelism         | `fullyParallel: false`, `workers: process.env.CI ? 2 : 4` (mock suite)                          |
-| CI retries          | 2                                                                                               |
-| Global Setup        | `e2e/global-setup.ts` creates scratch dirs `/tmp/pi-ui-e2e-agent` and `/tmp/pi-ui-e2e-workspace`|
-| Web Servers         | `webServer[0]`: `bun e2e/fake-llm.ts` on port 8787 (`http://127.0.0.1:8787/health`)<br>`webServer[1]`: `bun scripts/maybe-build.ts && PI_PASSWORD=... PI_CODING_AGENT_DIR=/tmp/pi-ui-e2e-agent PI_CWD=/tmp/pi-ui-e2e-workspace PORT=3000 bun run start` on `http://127.0.0.1:3000` |
-| Live Suite Split    | `testIgnore: ['e2e/live-agent.spec.ts', 'e2e/live-widget.spec.ts']` in `playwright.config.ts`. Handled serially (`workers: 1`) via `playwright.live.config.ts` |
-| Fixtures            | `mockWs` (intercepts `/ws` via `page.routeWebSocket`), `login` helper, `loginViaCookie`, `CONNECTED_PAYLOAD` factory |
+| Aspect           | Value                                                                                                                                                                                                                                                                              |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Framework        | Playwright v1.62+                                                                                                                                                                                                                                                                  |
+| Test dir         | `e2e/*.spec.ts` (23 spec files)                                                                                                                                                                                                                                                    |
+| Browsers         | Chromium (`Desktop Chrome`) + Mobile (`Pixel 5`)                                                                                                                                                                                                                                   |
+| Parallelism      | `fullyParallel: false`, `workers: process.env.CI ? 2 : 4` (mock suite)                                                                                                                                                                                                             |
+| CI retries       | 2                                                                                                                                                                                                                                                                                  |
+| Global Setup     | `e2e/global-setup.ts` creates scratch dirs `/tmp/pi-ui-e2e-agent` and `/tmp/pi-ui-e2e-workspace`                                                                                                                                                                                   |
+| Web Servers      | `webServer[0]`: `bun e2e/fake-llm.ts` on port 8787 (`http://127.0.0.1:8787/health`)<br>`webServer[1]`: `bun scripts/maybe-build.ts && PI_PASSWORD=... PI_CODING_AGENT_DIR=/tmp/pi-ui-e2e-agent PI_CWD=/tmp/pi-ui-e2e-workspace PORT=3000 bun run start` on `http://127.0.0.1:3000` |
+| Live Suite Split | `testIgnore: ['e2e/live-agent.spec.ts', 'e2e/live-widget.spec.ts']` in `playwright.config.ts`. Handled serially (`workers: 1`) via `playwright.live.config.ts`                                                                                                                     |
+| Fixtures         | `mockWs` (intercepts `/ws` via `page.routeWebSocket`), `login` helper, `loginViaCookie`, `CONNECTED_PAYLOAD` factory                                                                                                                                                               |
 
 ### Live vs. Mock Test Suite Separation
 
@@ -137,13 +140,13 @@
 
 ### Common Test Fixes & Troubleshooting
 
-| Symptom | Cause | Fix |
-| ------- | ----- | --- |
-| `chrome-error://chromewebdata/` | Login POST blocked by CSRF / origin check during test | Use `login` fixture or `loginViaCookie()` to attach cookie directly to context |
-| `page.routeWebSocket timed out` | WebSocket not connected or no handshake reply | Ensure mock handler sends `CONNECTED_PAYLOAD` on open and replies to `get_projects`/`get_all_sessions` |
-| Blank Screenshot | Captured before DOM or assets finished rendering | Add `await page.waitForTimeout(1000)` or wait on a specific locator (`locator('textarea')`) after `goto` |
-| `text=password` strict mode violation | Multiple elements match (label + hint span) | Use `getByText('password', { exact: true })` instead of `locator('text=password')` |
-| Duplicate inline login | Re-logging in when fixture already set cookie | Avoid repeating `login(page)` in test bodies if `login` was already invoked in `beforeEach` |
+| Symptom                               | Cause                                                 | Fix                                                                                                      |
+| ------------------------------------- | ----------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `chrome-error://chromewebdata/`       | Login POST blocked by CSRF / origin check during test | Use `login` fixture or `loginViaCookie()` to attach cookie directly to context                           |
+| `page.routeWebSocket timed out`       | WebSocket not connected or no handshake reply         | Ensure mock handler sends `CONNECTED_PAYLOAD` on open and replies to `get_projects`/`get_all_sessions`   |
+| Blank Screenshot                      | Captured before DOM or assets finished rendering      | Add `await page.waitForTimeout(1000)` or wait on a specific locator (`locator('textarea')`) after `goto` |
+| `text=password` strict mode violation | Multiple elements match (label + hint span)           | Use `getByText('password', { exact: true })` instead of `locator('text=password')`                       |
+| Duplicate inline login                | Re-logging in when fixture already set cookie         | Avoid repeating `login(page)` in test bodies if `login` was already invoked in `beforeEach`              |
 
 ---
 

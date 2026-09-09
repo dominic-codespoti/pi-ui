@@ -32,6 +32,46 @@ describe('session-watcher', () => {
     expect(fired).toBeGreaterThan(0);
   });
 
+  it('trails the debounce window across rapid events', async () => {
+    mkdirSync(ROOT, { recursive: true });
+    const file = join(ROOT, 'stream.jsonl');
+    let fired = 0;
+    const stop = startSessionWatch(
+      () => ROOT,
+      () => fired++
+    );
+    if (stop) stopHandles.push(stop);
+
+    writeFileSync(file, 'first\n');
+    await new Promise((r) => setTimeout(r, 350));
+    writeFileSync(file, 'second\n');
+    await new Promise((r) => setTimeout(r, 200));
+    expect(fired).toBe(0);
+    await new Promise((r) => setTimeout(r, 400));
+    expect(fired).toBe(1);
+  });
+
+  it('does not arm the debounce for ignored jsonl paths', async () => {
+    mkdirSync(ROOT, { recursive: true });
+    const file = join(ROOT, 'ignored.jsonl');
+    const seen: string[] = [];
+    let fired = 0;
+    const stop = startSessionWatch(
+      () => ROOT,
+      () => fired++,
+      (absolutePath) => {
+        seen.push(absolutePath);
+        return absolutePath === file;
+      }
+    );
+    if (stop) stopHandles.push(stop);
+
+    writeFileSync(file, 'ignored\n');
+    await new Promise((r) => setTimeout(r, 800));
+    expect(seen).toContain(file);
+    expect(fired).toBe(0);
+  });
+
   it('ignores non-jsonl writes', async () => {
     mkdirSync(ROOT, { recursive: true });
     let fired = 0;

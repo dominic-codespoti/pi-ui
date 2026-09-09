@@ -134,9 +134,7 @@ test.describe('Device session identity', () => {
     // (nothing, on a cold boot) — the localStorage identity is the pointer
     // that gets corrected, not left blank (a blank pointer would just
     // repeat the same guess after a restart).
-    await expect
-      .poll(() => new URL(page.url()).searchParams.has('session'))
-      .toBe(false);
+    await expect.poll(() => new URL(page.url()).searchParams.has('session')).toBe(false);
     await expect(page.getByText('Session not found.')).not.toBeVisible();
     await expect
       .poll(() =>

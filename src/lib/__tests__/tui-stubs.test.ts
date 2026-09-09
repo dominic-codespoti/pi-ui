@@ -7,9 +7,12 @@ import {
   StubTui,
   HeadlessTerminal,
   parseComponentTree,
+  boundParsedComponentTree,
   customEntriesForWire,
   applyMarkdownTransformers,
   renderTerminalLines,
+  boundedAnsiToHtmlLines,
+  boundTerminalLines,
   renderCustomMessage,
   stubKeybindings,
   callFactoryAndParse,
@@ -227,6 +230,32 @@ describe('renderTerminalLines', () => {
       },
     });
     expect(renderTerminalLines(broken)).toBeNull();
+  });
+
+  it('bounds terminal output by characters before producing duplicate render copies', () => {
+    expect(boundTerminalLines(['abc', 'def', 42, 'ignored'], 4)).toEqual(['abc', 'd']);
+  });
+
+  it('continues past invalid lines and bounds ANSI-expanded HTML', () => {
+    expect(boundTerminalLines([42, 'kept'], 5)).toEqual(['kept']);
+    expect(boundedAnsiToHtmlLines(['<'.repeat(20)], 10)[0].length).toBeLessThanOrEqual(10);
+  });
+
+  it('omits oversized parsed images and bounds parsed text', () => {
+    const image = boundParsedComponentTree(
+      { kind: 'image', label: '', data: 'x'.repeat(20), mimeType: 'image/png' },
+      100,
+      10
+    );
+    expect(image).toEqual({
+      kind: 'text',
+      label: '',
+      content: '[image omitted: too large for transfer]',
+    });
+
+    const text = boundParsedComponentTree({ kind: 'text', label: '', content: '0123456789' }, 4);
+    expect(text.kind).toBe('text');
+    if (text.kind === 'text') expect(text.content).toBe('0123');
   });
 });
 
@@ -461,6 +490,33 @@ describe('parseComponentTree — hand-rolled shapes', () => {
     }
   });
 
+  it('caps component-tree output in the authoritative bounding pass', () => {
+    const children = Array.from({ length: 1000 }, () => ({
+      text: 'child',
+      paddingX: 0,
+      paddingY: 0,
+    }));
+    const parsed = parseComponentTree({
+      children,
+      render: () => [],
+    } as unknown as Record<string, unknown>);
+    const bounded = boundParsedComponentTree(parsed);
+    expect(bounded.kind).toBe('container');
+    if (bounded.kind === 'container') expect(bounded.children.length).toBeLessThanOrEqual(255);
+  });
+
+  it('caps per-node item arrays in the authoritative bounding pass', () => {
+    const bounded = boundParsedComponentTree({
+      kind: 'select',
+      label: '',
+      options: Array.from({ length: 1000 }, (_, index) => ({
+        value: String(index),
+        label: `Option ${index}`,
+      })),
+    });
+    expect(bounded.kind).toBe('select');
+    if (bounded.kind === 'select') expect(bounded.options.length).toBeLessThanOrEqual(256);
+  });
   it('keeps keyboard-driven render wrappers interactive', () => {
     const component = {
       render: () => ['Paste the redirect URL below', '>'],

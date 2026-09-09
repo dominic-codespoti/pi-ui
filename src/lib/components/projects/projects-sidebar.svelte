@@ -153,13 +153,6 @@
   {@const isCollapsed = !ps.filter && ps.collapsed.has(g.cwd)}
   {@const isRenaming = renamingProject === g.cwd}
   {@const rootCount = g.sessions.filter((r) => r.depth === 0).length}
-  {@const anyRunning =
-    ((ps.isStreaming || Boolean(ps.activeToolName)) && isActive) ||
-    g.sessions.some(
-      (r) => ps.runningSessions.has(r.session.id) || ps.runningToolSessions.has(r.session.id)
-    )}
-  {@const anyUnchecked =
-    !anyRunning && g.sessions.some((r) => ps.uncheckedSessions.has(r.session.id))}
   <div
     class="group/dir relative rounded-2xl transition-colors duration-150 {isActive
       ? 'bg-base-content/[0.03]'
@@ -217,19 +210,6 @@
             >
               <TriangleAlert class="w-3 h-3" />missing
             </span>
-          {/if}
-          {#if anyRunning}
-            <span
-              class="w-1.5 h-1.5 rounded-full bg-success glow-success animate-pulse shrink-0"
-              aria-hidden="true"
-              title="Generating"
-            ></span>
-          {:else if anyUnchecked}
-            <span
-              class="w-1.5 h-1.5 rounded-full bg-primary glow-primary shrink-0"
-              aria-hidden="true"
-              title="Unchecked results"
-            ></span>
           {/if}
           {#if g.pinned}
             <Pin class="w-3 h-3 shrink-0 text-primary/45 group-hover/dir:hidden" />
@@ -295,12 +275,7 @@
           {@const isActiveSession = ps.activeSessionId === s.id}
           {@const isSubsessionsExpanded = ps.expandedSubsessions.has(s.id)}
           {@const isRenamingSession = renamingSession === s.path}
-          {@const hasUnchecked = ps.uncheckedSessions.has(s.id)}
-          {@const isBgRunning =
-            (ps.runningSessions.has(s.id) || ps.runningToolSessions.has(s.id)) && !isActiveSession}
-          {@const isSessionToolRunning =
-            (isActiveSession && Boolean(ps.activeToolName)) ||
-            (!isActiveSession && ps.runningToolSessions.has(s.id))}
+          {@const isSessionToolRunning = isActiveSession && Boolean(ps.activeToolName)}
           <div
             style="margin-left: {Math.min(row.depth, 3) * 14}px"
             class="group rounded-2xl transition-colors duration-150 {isActiveSession
@@ -365,24 +340,12 @@
                     {#if isSessionToolRunning}
                       <span
                         class="w-2 h-2 rounded-full bg-primary shrink-0 animate-pulse glow-primary"
-                        aria-label={isActiveSession
-                          ? 'Running tool'
-                          : 'Running tool in background'}
+                        aria-label="Running tool"
                       ></span>
                     {:else if ps.isStreaming && isActiveSession}
                       <span
                         class="w-2 h-2 rounded-full bg-success shrink-0 animate-pulse glow-success"
                         aria-label="Streaming"
-                      ></span>
-                    {:else if isBgRunning}
-                      <span
-                        class="w-2 h-2 rounded-full bg-success shrink-0 animate-pulse glow-success"
-                        aria-label="Running in background"
-                      ></span>
-                    {:else if hasUnchecked}
-                      <span
-                        class="w-2 h-2 rounded-full bg-primary shrink-0 glow-primary"
-                        aria-label="Unchecked result"
                       ></span>
                     {:else if s.parentSession}
                       <CornerDownRight

@@ -10,21 +10,33 @@
   const isLastInTurnMap = $state<Record<string, boolean>>({});
   let _prevTailKey = '';
   let _prevMarkedId: string | undefined;
+  let _prevSessionId: string | null | undefined;
+  let _prevMessages: UIMessage[] | null = null;
   $effect(() => {
-    const n = messages.length;
-    const lastMsg = n > 0 ? messages[n - 1] : undefined;
+    const currentSessionId = sessionId;
+    const currentMessages = messages;
+    if (currentSessionId !== _prevSessionId || currentMessages !== _prevMessages) {
+      for (const id of Object.keys(isLastInTurnMap)) delete isLastInTurnMap[id];
+      _prevSessionId = currentSessionId;
+      _prevMessages = currentMessages;
+      _prevTailKey = '';
+      _prevMarkedId = undefined;
+    }
+
+    const n = currentMessages.length;
+    const lastMsg = n > 0 ? currentMessages[n - 1] : undefined;
     const tailKey = lastMsg ? `${n}:${lastMsg.id}:${lastMsg.role}` : '';
     if (tailKey === _prevTailKey) return;
     _prevTailKey = tailKey;
     // Only the final turn's marker can change with the tail: appending a user
     // message opens a new empty turn and leaves the previous marker intact.
     if (lastMsg && lastMsg.role !== 'user' && _prevMarkedId !== undefined) {
-      isLastInTurnMap[_prevMarkedId] = false;
+      delete isLastInTurnMap[_prevMarkedId];
     }
     let newMarked: string | undefined;
     if (lastMsg && lastMsg.role !== 'user') {
       for (let i = n - 1; i >= 0; i--) {
-        const m = messages[i];
+        const m = currentMessages[i];
         if (m.role === 'user') break;
         if (m.role === 'assistant') {
           newMarked = m.id;
@@ -111,6 +123,13 @@
    */
   const MAX_MOUNTED_MESSAGES = 400;
   let mountedLimit = $state(MAX_MOUNTED_MESSAGES);
+
+  let _mountedSessionId: string | null | undefined;
+  $effect(() => {
+    if (sessionId === _mountedSessionId) return;
+    _mountedSessionId = sessionId;
+    mountedLimit = MAX_MOUNTED_MESSAGES;
+  });
   const visibleMessages = $derived(
     messages.length > mountedLimit ? messages.slice(-mountedLimit) : messages
   );

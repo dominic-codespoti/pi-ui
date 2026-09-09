@@ -127,7 +127,6 @@
     URL.revokeObjectURL(url);
   }
 
-
   function requestClose() {
     if (hasUnsaved) {
       if (!confirm('Discard unsaved changes?')) return;

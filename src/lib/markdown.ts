@@ -495,7 +495,57 @@ marked.use({
  *  mobile) and the throttled re-render during streaming compounds it — fall
  *  back to escaped plain text so a runaway reasoning/text block can't hang
  *  the tab. */
-const MAX_MARKDOWN_CHARS = 150_000;
+export const MAX_MARKDOWN_CHARS = 150_000;
+
+/** Minimum input size at which source-dump detection can bypass marked. */
+export const SOURCE_DUMP_MIN_CHARS = 16_000;
+/** Inputs at or above this size always use the escaped source-dump renderer. */
+export const SOURCE_DUMP_ABSOLUTE_CUTOFF_CHARS = 200_000;
+/** Number of leading characters inspected for a blank-line signal. */
+export const SOURCE_DUMP_BLANK_SCAN_CHARS = 4_000;
+/** Fraction of lines that must be indented to classify a source dump. */
+export const SOURCE_DUMP_INDENTED_LINE_RATIO = 0.3;
+
+function isSourceDump(src: string): boolean {
+  if (src.length < SOURCE_DUMP_MIN_CHARS) return false;
+  if (src.length >= SOURCE_DUMP_ABSOLUTE_CUTOFF_CHARS) return true;
+
+  let lineCount = 1;
+  let indentedLineCount = 0;
+  let atLineStart = true;
+  let lineHasContent = false;
+  let blankLineFound = false;
+
+  for (let i = 0; i < src.length; i++) {
+    const charCode = src.charCodeAt(i);
+    if (atLineStart) {
+      atLineStart = false;
+      if (
+        charCode === 9 ||
+        (charCode === 32 &&
+          src.charCodeAt(i + 1) === 32 &&
+          src.charCodeAt(i + 2) === 32 &&
+          src.charCodeAt(i + 3) === 32)
+      ) {
+        indentedLineCount++;
+      }
+    }
+
+    if (charCode === 10) {
+      if (i < SOURCE_DUMP_BLANK_SCAN_CHARS && !lineHasContent) {
+        blankLineFound = true;
+      }
+      lineCount++;
+      atLineStart = true;
+      lineHasContent = false;
+    } else if (charCode !== 32 && charCode !== 9 && charCode !== 13) {
+      lineHasContent = true;
+    }
+  }
+
+  if (!blankLineFound) return true;
+  return indentedLineCount / lineCount >= SOURCE_DUMP_INDENTED_LINE_RATIO;
+}
 
 /**
  * Convert a markdown string to sanitised HTML suitable for `{@html ...}`.
@@ -506,6 +556,9 @@ export function renderMarkdown(
   src: string,
   opts?: { skipHighlight?: boolean; onUnresolvedLang?: (lang: string) => void }
 ): string {
+  if (isSourceDump(src)) {
+    return `<pre><code>${escHtml(src)}</code></pre>`;
+  }
   if (src.length > MAX_MARKDOWN_CHARS) {
     return `<pre class="whitespace-pre-wrap break-words">${escHtml(src)}</pre>`;
   }

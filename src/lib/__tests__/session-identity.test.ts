@@ -57,7 +57,10 @@ describe('session identity', () => {
   it('returns null for corrupt or wrong-version payloads', () => {
     localStorage.setItem(IDENTITY_KEY, 'not json{');
     expect(loadIdentity()).toBeNull();
-    localStorage.setItem(IDENTITY_KEY, JSON.stringify({ v: 999, path: PATH, updatedAt: Date.now() }));
+    localStorage.setItem(
+      IDENTITY_KEY,
+      JSON.stringify({ v: 999, path: PATH, updatedAt: Date.now() })
+    );
     expect(loadIdentity()).toBeNull();
     localStorage.setItem(IDENTITY_KEY, JSON.stringify({ v: 1, path: '', updatedAt: Date.now() }));
     expect(loadIdentity()).toBeNull();

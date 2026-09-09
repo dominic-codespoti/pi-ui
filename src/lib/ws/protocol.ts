@@ -288,7 +288,7 @@ export interface ConnectedMessage {
   thinkingLevel: string;
   model: ModelInfo | null;
   availableModels: ModelInfo[];
-  /** Recent raw SDK message window at connect time. */
+  /** Recent raw SDK message window at connect time. Tool-result records may include outputElided?: boolean and outputBytes?: number metadata. */
   messages: unknown[];
   /** Partial SDK message currently being streamed; allows a switched session to resume rendering. */
   streamingMessage?: unknown;
@@ -340,14 +340,24 @@ export interface ConnectedMessage {
  *   (a) pi SDK AgentSessionEvents forwarded verbatim, or
  *   (b) custom server-emitted events:
  *
+ * There is exactly one live AgentSession. A `sessionId` stamp on a
+ * session-scoped event identifies that live session at the time the event was
+ * emitted. Clients compare the stamp with their active session and reject
+ * events buffered from a session they have already switched away from. The
+ * stamp is a stale-event guard, not multi-session routing.
+ *
+ * Session inventory events describe persisted `.jsonl` files discovered by the
+ * session/project catalogs; they do not represent resident or background
+ * sessions held in memory.
+ *
  * Custom server events (not from the SDK):
- *   { type: "model_changed",           model: ModelInfo | null; thinkingLevel?: string }
+ *   { type: "model_changed",           model: ModelInfo | null; thinkingLevel?: string; sessionId?: string }
  *   { type: "session_loaded",          sessionId, isStreaming, activeToolName?, thinkingLevel, model, availableModels, messages, contextUsage }
  *   { type: "sessions_list",           sessions: SessionSummary[] }
  *   { type: "all_sessions_list",       sessions: SessionSummary[] }
  *   { type: "session_updated",         session: SessionSummary }
- *     — coalesced live delta for ONE pooled session (message_end etc.).
- *       Keeps the sidebar fresh during turns without re-broadcasting the full
+ *     — coalesced live-session delta for message_end and similar activity.
+ *       Keeps the disk-backed sidebar fresh without re-broadcasting the full
  *       list per message; full all_sessions_list still fires on connect,
  *       switch, and structural changes (rename/remove/release).
  *   { type: "projects_list",           projects: ProjectInfo[] }
@@ -368,7 +378,7 @@ export interface ConnectedMessage {
  *   { type: "server_restarting" }
  *
  *   { type: "notification_webhook_url", url: string | null }
-
+ *
  *   { type: "slash_result",            command: string, message: string, level?: "info" | "warning" | "error" }
  *   { type: "file_content",            path: string, content: string, error?: string }
  *   { type: "older_messages",          messages: unknown[], totalMessageCount: number, messagesTruncated: boolean }
@@ -416,8 +426,9 @@ export interface ConnectedMessage {
  *       markdown transformers (registerMarkdownTransformer) rewrote text —
  *       the client replaces its streamed buffer with this sealed content.
  *
- *   Session runtime status (lightweight — no message content, just metadata):
- *   { type: "session_runtime",         sessionId: string, isRunning: boolean, unseen: boolean, lastActivity: number, activeToolName?: string }
+ *   Session runtime status for the single live session (lightweight — no
+ *   message content, just metadata):
+ *   { type: "session_runtime", sessionId: string, isRunning: boolean, lastActivity: number, activeToolName?: string }
  *
  *   Supported extension_ui_request methods:
  *     confirm    – dialog with confirm/cancel (title, message)
@@ -451,22 +462,23 @@ export type PiEvent = { type: string } & Record<string, unknown>;
 /** Custom server-authored events (not from the SDK). Typed so payload drift —
  *  a missing or renamed field — fails at compile time on the broadcast site. */
 export type ServerCustomEvent =
-  | { type: 'model_changed'; model: ModelInfo | null; thinkingLevel?: string }
+  | { type: 'model_changed'; model: ModelInfo | null; thinkingLevel?: string; sessionId?: string }
   | {
       type: 'session_loaded';
-      sessionId: string;
+      /** Correlation token for the initiating client; accept a snapshot only when it matches an in-flight switch_session/new_session request, and treat unstamped global broadcasts as foreign switches. */
       requestId?: string;
       isStreaming?: boolean;
       /** Name of the tool currently executing in this session (if any). */
       activeToolName?: string;
       thinkingLevel: string;
       model: ModelInfo | null;
-      availableModels: ModelInfo[];
+      /** History tool-result records may include outputElided?: boolean and outputBytes?: number metadata. */
       messages: unknown[];
       streamingMessage?: unknown;
       totalMessageCount?: number;
       messagesTruncated?: boolean;
       cwd?: string;
+      sessionPath?: string;
       sessionName?: string;
       isCompacting?: boolean;
       autoCompactionEnabled?: boolean;
@@ -482,38 +494,62 @@ export type ServerCustomEvent =
       tools?: Array<{ name: string; description: string; isBuiltin: boolean; origin?: string }>;
       activeToolNames?: string[];
     }
+  /** Full tool output fetched for an expanded history row. */
+  | {
+      type: 'tool_output';
+      sessionId: string;
+      toolCallId: string;
+      content?: string;
+      details?: string;
+      diff?: string;
+      renderedResultHtml?: string[];
+      error?: string;
+      requestId?: string;
+    }
   | { type: 'sessions_list'; sessions: SessionSummary[] }
   | { type: 'all_sessions_list'; sessions: SessionSummary[] }
   | { type: 'session_updated'; session: SessionSummary }
   | { type: 'projects_list'; projects: ProjectInfo[] }
   | { type: 'dir_completions'; prefix: string; entries: string[] }
-  | { type: 'file_completions'; query: string; entries: string[] }
-  | { type: 'available_models_changed'; availableModels: ModelInfo[]; sessionId?: string }
-  | { type: 'models_refresh_result'; success: boolean; message: string }
-  | { type: 'sessions_error'; message: string; requestId?: string }
-  | { type: 'fork_points'; entries: Array<{ entryId: string; text: string }> }
+  | { type: 'models_refresh_result'; success: boolean; message: string; sessionId?: string }
+  | {
+      type: 'sessions_error';
+      message: string;
+      /** Vestigial server echo; clients no longer use this for request correlation. */
+      requestId?: string;
+    }
+  | { type: 'fork_points'; entries: Array<{ entryId: string; text: string }>; sessionId?: string }
   | {
       type: 'tools_list';
       tools: Array<{ name: string; description: string; isBuiltin: boolean; origin?: string }>;
       activeToolNames: string[];
+      sessionId?: string;
     }
-  | { type: 'project_trust'; trust: ProjectTrustInfo }
-  | { type: 'runtime_diagnostics'; diagnostics: RuntimeDiagnostic[] }
-  | { type: 'extension_error'; error: ExtensionErrorNotice }
+  | { type: 'project_trust'; trust: ProjectTrustInfo; sessionId?: string }
+  | { type: 'runtime_diagnostics'; diagnostics: RuntimeDiagnostic[]; sessionId?: string }
+  | { type: 'extension_error'; error: ExtensionErrorNotice; sessionId?: string }
   | {
       type: 'extensions_list';
       extensions: ExtensionSummary[];
       errors: Array<{ path: string; error: string }>;
+      sessionId?: string;
     }
   | {
       type: 'packages_list';
       packages: ConfiguredPackageInfo[];
       updates?: PackageUpdateInfo[];
+      sessionId?: string;
     }
-  | { type: 'package_progress'; progress: PackageProgress }
-  | { type: 'package_result'; success: boolean; message: string }
+  | { type: 'package_progress'; progress: PackageProgress; sessionId?: string }
+  | { type: 'package_result'; success: boolean; message: string; sessionId?: string }
   | { type: 'session_stats'; stats: SessionStats }
-  | { type: 'export_result'; format: 'html' | 'jsonl'; path?: string; error?: string }
+  | {
+      type: 'export_result';
+      format: 'html' | 'jsonl';
+      path?: string;
+      error?: string;
+      sessionId?: string;
+    }
   | { type: 'skill_install_result'; success: boolean; name?: string; error?: string }
   | ({ type: 'update_status' } & UpdateStatus)
   | { type: 'update_progress'; target: UpdateTarget; command?: string; message: string }
@@ -534,24 +570,25 @@ export type ServerCustomEvent =
       messages: unknown[];
       totalMessageCount: number;
       messagesTruncated: boolean;
+      sessionId?: string;
     }
-  | { type: 'session_tree'; tree: TreeNode[] }
+  | { type: 'session_tree'; tree: TreeNode[]; sessionId?: string }
   | {
       type: 'command_completions';
       command: string;
       prefix: string;
       items: Array<{ value: string; label: string; description?: string }>;
+      sessionId?: string;
     }
   | { type: 'extension_completions'; trigger: string; query: string; items: unknown[] }
   | { type: 'settings'; settings: Record<string, unknown> }
   | { type: 'pong' }
-  | { type: 'agent_error'; error: string }
+  | { type: 'agent_error'; error: string; sessionId?: string }
   | { type: 'queue_restored'; text: string }
   | {
       type: 'session_runtime';
       sessionId: string;
       isRunning: boolean;
-      unseen: boolean;
       lastActivity: number;
       activeToolName?: string;
     }
@@ -600,6 +637,10 @@ export type ClientMessage =
   | { type: 'set_model'; provider: string; modelId: string }
   | { type: 'new_session'; targetCwd?: string; requestId?: string }
   | { type: 'switch_session'; path: string; requestId?: string }
+  /** Fetch the full output for an expanded tool-result history row. */
+  | { type: 'get_tool_output'; toolCallId: string; requestId?: string }
+  /** Request a fresh snapshot for the current session. */
+  | { type: 'resync_session'; requestId?: string }
   /** Request all sessions across all project directories. Server replies with all_sessions_list. */
   | { type: 'get_all_sessions' }
   /** Request the merged project list (registry + session dirs). Server replies with projects_list. */

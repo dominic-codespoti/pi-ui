@@ -113,9 +113,7 @@ test('session_updated delta moves a ran session to the top of its project', asyn
     })
   );
 
-  await expect
-    .poll(async () => (await rowY(page))[0])
-    .toBeLessThan((await rowY(page))[1]);
+  await expect.poll(async () => (await rowY(page))[0]).toBeLessThan((await rowY(page))[1]);
   [olderY, newerY] = await rowY(page);
   expect(olderY).toBeLessThan(newerY);
 });

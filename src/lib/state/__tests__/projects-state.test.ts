@@ -129,9 +129,6 @@ describe('ProjectsState', () => {
     projectsState.activeSessionId = null;
     projectsState.isStreaming = false;
     projectsState.activeToolName = undefined;
-    projectsState.uncheckedSessions.clear();
-    projectsState.runningSessions.clear();
-    projectsState.runningToolSessions.clear();
     projectsState.filter = '';
     projectsState.error = null;
     projectsState.pendingNewSession = false;
@@ -424,19 +421,6 @@ describe('ProjectsState', () => {
       } & Record<string, unknown>);
       expect(projectsState.allSessions).toHaveLength(1);
     });
-    it('prunes runtime markers for sessions removed from the full list', () => {
-      projectsState.runningSessions.add('gone-agent');
-      projectsState.runningToolSessions.add('gone-tool');
-      projectsState.uncheckedSessions.add('gone-result');
-
-      projectsState.handleMessage({ type: 'all_sessions_list', sessions: [{ id: 's1' }] } as {
-        type: string;
-      } & Record<string, unknown>);
-
-      expect(projectsState.runningSessions.has('gone-agent')).toBe(false);
-      expect(projectsState.runningToolSessions.has('gone-tool')).toBe(false);
-      expect(projectsState.uncheckedSessions.has('gone-result')).toBe(false);
-    });
 
     it('handles sessions_error', () => {
       projectsState.sessionLoading = true;
@@ -595,23 +579,10 @@ describe('ProjectsState', () => {
   });
 
   describe('actions', () => {
-    it('switchSession sends message and clears unchecked', () => {
+    it('switchSession sends a correlated switch request', () => {
       const send = vi.fn().mockReturnValue(true);
       projectsState.send = send;
-      projectsState.allSessions = [
-        {
-          id: 's1',
-          path: '/s1',
-          cwd: '',
-          name: '',
-          created: 1,
-          modified: 2,
-          messageCount: 0,
-          firstMessage: '',
-        },
-      ];
-      projectsState.uncheckedSessions.add('s1');
-      projectsState.switchSession('/s1');
+      expect(projectsState.switchSession('/s1')).toBe('ok');
       expect(send).toHaveBeenCalledWith(
         expect.objectContaining({
           type: 'switch_session',
@@ -619,10 +590,10 @@ describe('ProjectsState', () => {
           requestId: expect.any(String),
         })
       );
-      expect(projectsState.uncheckedSessions.has('s1')).toBe(false);
+      expect(projectsState.pendingRequestId).toEqual(expect.any(String));
     });
 
-    it('newSession sets pending and loading flags when send succeeds', () => {
+    it('newSession sends the new-session message and sets pending flags', () => {
       const send = vi.fn().mockReturnValue(true);
       projectsState.send = send;
       projectsState.newSession();
@@ -702,54 +673,46 @@ describe('ProjectsState', () => {
       expect(send).toHaveBeenCalledWith({ type: 'dir_complete', prefix: '~/projects/' });
     });
 
-    it('onSessionLoaded clears pending and loading flags', () => {
+    it('onSessionLoaded settles a pending operation and reports whether one was pending', () => {
       projectsState.pendingNewSession = true;
       projectsState.sessionLoading = true;
       expect(projectsState.onSessionLoaded()).toBe(true);
       expect(projectsState.pendingNewSession).toBe(false);
       expect(projectsState.sessionLoading).toBe(false);
+      expect(projectsState.onSessionLoaded()).toBe(false);
     });
-    it('rejects a late snapshot from a different session operation', () => {
-      const send = vi.fn().mockReturnValue(true);
-      projectsState.send = send;
-      projectsState.activeSessionId = 's1';
-      projectsState.switchSession('/s2');
-      const requestId = send.mock.calls[0][0].requestId as string;
-
-      expect(
-        projectsState.acceptsSessionLoaded({
-          sessionId: 's1',
-          sessionPath: '/s1',
-          requestId: 'stale-request',
-        })
-      ).toBe(false);
-      expect(projectsState.onSessionLoaded({ sessionId: 's1', requestId: 'stale-request' })).toBe(
-        false
-      );
+    it('a session_loaded snapshot without a token does not settle a pending switch', () => {
+      projectsState.send = vi.fn().mockReturnValue(true);
+      expect(projectsState.switchSession('/s2')).toBe('ok');
+      expect(projectsState.pendingSwitchPath).toBe('/s2');
+      expect(projectsState.onSessionLoaded()).toBe(false);
       expect(projectsState.sessionLoading).toBe(true);
-
-      expect(
-        projectsState.onSessionLoaded({
-          sessionId: 's2',
-          sessionPath: '/s2',
-          requestId,
-        })
-      ).toBe(false);
-      expect(projectsState.sessionLoading).toBe(false);
     });
 
-    it('invalidates timed-out operation replies', () => {
-      vi.useFakeTimers();
+    it('only the matching request token settles a pending switch', () => {
       const send = vi.fn().mockReturnValue(true);
       projectsState.send = send;
-      projectsState.activeSessionId = 's1';
-      projectsState.newSession();
-      const requestId = send.mock.calls[0][0].requestId as string;
+      expect(projectsState.switchSession('/s2')).toBe('ok');
+      const request = send.mock.calls[0][0];
+      if (!request || typeof request !== 'object' || !('requestId' in request)) {
+        throw new Error('switch request was not correlated');
+      }
+      const requestId = request.requestId;
+      if (typeof requestId !== 'string') throw new Error('request id was not a string');
+      expect(projectsState.onSessionLoaded('foreign-request')).toBe(false);
+      expect(projectsState.pendingRequestId).toBe(requestId);
+      expect(projectsState.onSessionLoaded(requestId)).toBe(true);
+      expect(projectsState.pendingRequestId).toBeNull();
+    });
 
-      vi.advanceTimersByTime(SESSION_OP_TIMEOUT_MS + 1);
-
-      expect(projectsState.acceptsSessionLoaded({ sessionId: 's2', requestId })).toBe(false);
-      expect(projectsState.sessionLoading).toBe(false);
+    it('clears optimistic URL rollback after a confirmed session load', () => {
+      projectsState.send = vi.fn().mockReturnValue(true);
+      projectsState.switchSession('/s2');
+      expect(projectsState.pendingUrlRevert).toBe(true);
+      const requestId = projectsState.pendingRequestId;
+      expect(requestId).toEqual(expect.any(String));
+      projectsState.onSessionLoaded(requestId ?? undefined);
+      expect(projectsState.pendingUrlRevert).toBe(false);
     });
 
     it('newSession arms a watchdog that re-enables the UI when unanswered', () => {
@@ -763,12 +726,13 @@ describe('ProjectsState', () => {
       expect(projectsState.sessionLoading).toBe(false);
       expect(projectsState.error).toBe('New chat timed out — server did not respond in time');
     });
-
     it('watchdog is cancelled by session_loaded', () => {
       vi.useFakeTimers();
       projectsState.send = vi.fn().mockReturnValue(true);
       projectsState.newSession();
-      projectsState.onSessionLoaded();
+      const requestId = projectsState.pendingRequestId;
+      expect(requestId).toEqual(expect.any(String));
+      expect(projectsState.onSessionLoaded(requestId ?? undefined)).toBe(true);
       vi.advanceTimersByTime(SESSION_OP_TIMEOUT_MS + 1);
       expect(projectsState.pendingNewSession).toBe(false);
       expect(projectsState.sessionLoading).toBe(false);
@@ -784,6 +748,7 @@ describe('ProjectsState', () => {
       expect(projectsState.sessionLoading).toBe(false);
       expect(projectsState.error).toBe('Session switch timed out');
     });
+
     it('sessions_error cancels the watchdog', () => {
       vi.useFakeTimers();
       projectsState.send = vi.fn().mockReturnValue(true);
@@ -809,23 +774,16 @@ describe('ProjectsState', () => {
       expect(projectsState.error).toBeNull();
     });
 
-    it('markUnchecked adds to unchecked set', () => {
-      projectsState.markUnchecked('s1');
-      expect(projectsState.uncheckedSessions.has('s1')).toBe(true);
-    });
-    it('derives unread activity from a non-active session', () => {
-      projectsState.activeSessionId = 'active';
-      projectsState.runningSessions.add('active');
-      projectsState.uncheckedSessions.add('active');
-      projectsState.uncheckedSessions.add('done');
-      expect(projectsState.backgroundActivity).toBe('unread');
-    });
+    it('reconcileActiveRuntime records the active session runtime', () => {
+      projectsState.reconcileActiveRuntime('active', true, 'bash');
+      expect(projectsState.activeSessionId).toBe('active');
+      expect(projectsState.isStreaming).toBe(true);
+      expect(projectsState.activeToolName).toBe('bash');
 
-    it('prioritizes running tool activity over unread activity', () => {
-      projectsState.activeSessionId = 'active';
-      projectsState.uncheckedSessions.add('done');
-      projectsState.runningToolSessions.add('tool-session');
-      expect(projectsState.backgroundActivity).toBe('running');
+      projectsState.reconcileActiveRuntime('active', false, undefined);
+      expect(projectsState.activeSessionId).toBe('active');
+      expect(projectsState.isStreaming).toBe(false);
+      expect(projectsState.activeToolName).toBeUndefined();
     });
 
     it('toggleCollapsed toggles and persists', () => {

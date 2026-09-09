@@ -9,10 +9,12 @@
  * invalidations instead.
  */
 import { mkdirSync, watch, type FSWatcher } from 'node:fs';
+import { resolve } from 'node:path';
 import { log } from './logger';
 
-/** Coalesce bursts of appends (a turn writes many lines) into one rescan. */
+/** Coalesce bursts of appends into one rescan, with a bound for continuous streams. */
 const DEBOUNCE_MS = 500;
+const MAX_DELAY_MS = 5_000;
 
 /**
  * Watch the sessions root recursively; call `onDirty` (debounced) whenever a
@@ -21,7 +23,8 @@ const DEBOUNCE_MS = 500;
  */
 export function startSessionWatch(
   getRoot: () => string,
-  onDirty: () => void
+  onDirty: () => void,
+  isIgnored?: (absolutePath: string) => boolean
 ): (() => void) | undefined {
   let root: string;
   try {
@@ -30,16 +33,35 @@ export function startSessionWatch(
     return undefined; // SDK not loaded yet — nothing to watch.
   }
   let timer: Timer | null = null;
+  let windowStartedAt: number | null = null;
   let watcher: FSWatcher;
   try {
     mkdirSync(root, { recursive: true });
     watcher = watch(root, { recursive: true }, (_event, filename) => {
-      if (filename && !filename.endsWith('.jsonl')) return;
-      if (timer) return;
-      timer = setTimeout(() => {
+      if (filename) {
+        const name = filename.toString();
+        if (!name.endsWith('.jsonl')) return;
+        if (isIgnored?.(resolve(root, name))) return;
+      }
+
+      const now = Date.now();
+      if (windowStartedAt === null) windowStartedAt = now;
+      if (timer) clearTimeout(timer);
+      const remaining = MAX_DELAY_MS - (now - windowStartedAt);
+      if (remaining <= 0) {
         timer = null;
+        windowStartedAt = now;
         onDirty();
-      }, DEBOUNCE_MS);
+        return;
+      }
+      timer = setTimeout(
+        () => {
+          timer = null;
+          windowStartedAt = null;
+          onDirty();
+        },
+        Math.min(DEBOUNCE_MS, remaining)
+      );
     });
   } catch (err) {
     log.warn('[pifrontier] session watcher: not watching', root, '-', err);
@@ -50,6 +72,8 @@ export function startSessionWatch(
   });
   return () => {
     if (timer) clearTimeout(timer);
+    timer = null;
+    windowStartedAt = null;
     watcher.close();
   };
 }

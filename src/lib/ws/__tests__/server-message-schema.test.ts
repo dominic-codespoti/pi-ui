@@ -46,12 +46,29 @@ describe('server-message-schema', () => {
       expect(parsed.value.availableModels).toHaveLength(1);
     }
   });
+  it('accepts partial extension UI snapshots but still rejects wrong field types', () => {
+    const connected = {
+      type: 'connected',
+      sessionId: 'sess-partial-ui',
+      isStreaming: false,
+      thinkingLevel: 'medium',
+      model: null,
+      availableModels: [],
+      messages: [],
+      extensionUiState: { terminalInputActive: true },
+    };
 
-  it('parses session_loaded with only required fields', () => {
+    const parsed = parseServerMessage(connected);
+    expect(parsed.ok).toBe(true);
+
+    const invalid = parseServerMessage({ ...connected, messages: 'x' });
+    expect(invalid.ok).toBe(false);
+  });
+
+  it('parses session_loaded without optional isStreaming', () => {
     const raw = {
       type: 'session_loaded',
       sessionId: 'sess-5678',
-      isStreaming: true,
       thinkingLevel: 'off',
       model: null,
       availableModels: [],
@@ -63,9 +80,41 @@ describe('server-message-schema', () => {
     if (parsed.ok) {
       expect(parsed.kind).toBe('custom');
       expect(parsed.value.sessionId).toBe('sess-5678');
-      expect(parsed.value.isStreaming).toBe(true);
+      expect(parsed.value.isStreaming).toBeUndefined();
       expect(parsed.value.model).toBeNull();
     }
+  });
+
+  it('validates newly registered custom event payloads', () => {
+    const validEvents = [
+      {
+        type: 'extension_error',
+        error: { extensionPath: '/tmp/example.ts', event: 'load', error: 'failed' },
+      },
+      { type: 'package_result', success: true, message: 'Package installed.' },
+      { type: 'agent_error', error: 'Agent failed.' },
+    ];
+
+    for (const raw of validEvents) {
+      const parsed = parseServerMessage(raw);
+      expect(parsed.ok).toBe(true);
+      if (parsed.ok) expect(parsed.kind).toBe('custom');
+    }
+
+    expect(
+      parseServerMessage({
+        type: 'extension_error',
+        error: { extensionPath: '/tmp/example.ts', event: 'load' },
+      }).ok
+    ).toBe(true);
+    expect(
+      parseServerMessage({
+        type: 'extension_error',
+        error: { extensionPath: '/tmp/example.ts', event: 'load', error: 42 },
+      }).ok
+    ).toBe(false);
+    expect(parseServerMessage({ type: 'package_result', success: true }).ok).toBe(false);
+    expect(parseServerMessage({ type: 'agent_error', error: 42 }).ok).toBe(false);
   });
 
   it('parses sessions_error with requestId and round-trips', () => {
@@ -240,7 +289,6 @@ describe('server-message-schema', () => {
       const res = v.safeParse(SessionLoadedSchema, {
         type: 'session_loaded',
         sessionId: 's2',
-        isStreaming: false,
         thinkingLevel: 'off',
         model: null,
         availableModels: [],

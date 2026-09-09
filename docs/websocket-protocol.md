@@ -53,7 +53,7 @@ Sent on WS open. Contains full session state.
 
 #### `session_loaded`
 
-Broadcast when session changes (switch, fork, edit rewind, or after successful compaction).
+Broadcast when the active session changes (switch, fork, edit rewind, or after successful compaction). Every tab receives one authoritative snapshot. `requestId`, when present, is a vestigial compatibility echo; clients do not require it to accept or apply the snapshot.
 
 ```ts
 {
@@ -81,6 +81,7 @@ Broadcast when session changes (switch, fork, edit rewind, or after successful c
   diagnostics?: RuntimeDiagnostic[];
   modelFallbackMessage?: string;
   sessionPath?: string;
+  /** Optional vestigial compatibility echo; clients do not use it for correlation. */
   requestId?: string;
   contextUsage?: ContextUsage;
   tools?: Array<{ name: string; description: string; isBuiltin: boolean; origin?: string }>;
@@ -89,7 +90,7 @@ Broadcast when session changes (switch, fork, edit rewind, or after successful c
 }
 ```
 
-Session operations may include a client-generated `requestId`; the server echoes it on the corresponding `session_loaded` or `sessions_error`. Clients correlate `requestId` to discard late snapshots from timed-out or superseded operations.
+Legacy session-operation callers may include a `requestId`, and the server may echo it on `session_loaded` or `sessions_error`. The token is vestigial: clients do not correlate operations with it or reject snapshots without it. The broadcast `session_loaded` snapshot is authoritative for every tab.
 
 #### Session Summaries & `parentSession`
 
@@ -124,13 +125,14 @@ When `parentSession` is present, clients organize sessions into hierarchical tre
 
 #### Custom Server Events
 
-- `model_changed` — `{ model: ModelInfo | null, thinkingLevel?: string }`; model selection or thinking level updated
+- `model_changed` — `{ model: ModelInfo | null, thinkingLevel?: string, sessionId?: string }`; model selection or thinking level updated for the stamped session
+- **Session stamps** — Session-scoped events include `sessionId` as a stale-event guard against frames buffered across a switch, not as routing among concurrent session runtimes
 - `thinking_level_changed` — `{ level: string }`; reasoning depth updated
 - `available_models_changed` — `{ availableModels: ModelInfo[], sessionId?: string }`; session-stamped refreshes from a prior session are ignored by clients
 - `models_refresh_result` — `{ success: boolean, message: string }`; completion status for a forced network model-catalog refresh
-- `sessions_error` — `{ message: string, requestId?: string }`; operation error echoed with optional `requestId` correlation
-- `session_runtime` — `{ sessionId: string, isRunning: boolean, unseen: boolean, lastActivity: number, activeToolName?: string }`; global runtime metadata broadcast across sessions
-- `session_updated` — `{ session: SessionSummary }`; coalesced live delta for one session (emitted on `message_end` turns)
+- `sessions_error` — `{ message: string, requestId?: string }`; operation error with an optional vestigial compatibility echo (clients do not correlate it)
+- `session_runtime` — `{ sessionId: string, isRunning: boolean, lastActivity: number, activeToolName?: string }`; runtime metadata for the single active session only; non-live sessions have no in-memory background run/unread state
+- `session_updated` — `{ session: SessionSummary }`; coalesced catalog delta for one session (emitted on `message_end` turns)
 - `all_sessions_list` / `sessions_list` — `{ sessions: SessionSummary[] }`; full session inventory
 - `projects_list` — `{ projects: ProjectInfo[] }`; merged list of registered and discovered session projects
 - `dir_completions` — `{ prefix: string, entries: string[] }`; filesystem directory completion matches
@@ -161,19 +163,19 @@ When `parentSession` is present, clients organize sessions into hierarchical tre
 
 #### Session Management
 
-| Type                                        | Payload                       | Purpose                                                                                |
-| ------------------------------------------- | ----------------------------- | -------------------------------------------------------------------------------------- |
-| `new_session`                               | `{ targetCwd?, requestId? }`  | Start a new session; echoes `requestId` in `session_loaded`/`sessions_error`           |
-| `switch_session`                            | `{ path, requestId? }`        | Switch to an existing session; echoes `requestId` in `session_loaded`/`sessions_error` |
-| `fork_session`                              | `{ entryId }`                 | Fork session at a specific entry                                                       |
-| `get_all_sessions`                          | —                             | Request all sessions across all project directories (replies with `all_sessions_list`) |
-| `get_session_tree`                          | —                             | Request session branch tree                                                            |
-| `get_fork_points`                           | —                             | Request user messages for forking                                                      |
-| `compact`                                   | —                             | Manually compact session context (carries updated `contextUsage`)                      |
-| `set_auto_compaction`                       | `{ enabled }`                 | Toggle auto-compaction                                                                 |
-| `set_auto_retry`                            | `{ enabled }`                 | Toggle auto-retry                                                                      |
-| `rename_session` / `rename_current_session` | `{ path, name }` / `{ name }` | Set session display name                                                               |
-| `delete_session`                            | `{ path }`                    | Delete a session file (active session protected)                                       |
+| Type                                        | Payload                       | Purpose                                                                                                          |
+| ------------------------------------------- | ----------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `new_session`                               | `{ targetCwd?, requestId? }`  | Start a new session; an optional legacy `requestId` may be echoed in `session_loaded`/`sessions_error`           |
+| `switch_session`                            | `{ path, requestId? }`        | Switch to an existing session; an optional legacy `requestId` may be echoed in `session_loaded`/`sessions_error` |
+| `fork_session`                              | `{ entryId }`                 | Fork session at a specific entry                                                                                 |
+| `get_all_sessions`                          | —                             | Request all sessions across all project directories (replies with `all_sessions_list`)                           |
+| `get_session_tree`                          | —                             | Request session branch tree                                                                                      |
+| `get_fork_points`                           | —                             | Request user messages for forking                                                                                |
+| `compact`                                   | —                             | Manually compact session context (carries updated `contextUsage`)                                                |
+| `set_auto_compaction`                       | `{ enabled }`                 | Toggle auto-compaction                                                                                           |
+| `set_auto_retry`                            | `{ enabled }`                 | Toggle auto-retry                                                                                                |
+| `rename_session` / `rename_current_session` | `{ path, name }` / `{ name }` | Set session display name                                                                                         |
+| `delete_session`                            | `{ path }`                    | Delete a session file (active session protected)                                                                 |
 
 #### Model & Provider
 
@@ -227,6 +229,12 @@ When `parentSession` is present, clients organize sessions into hierarchical tre
 | `request_restart`   | —                | Request single-use nonce for server restart                         |
 | `restart_server`    | `{ nonce? }`     | Restart server process                                              |
 
+## Session Switching
+
+The server retains exactly one live `AgentSession` at a time. Switching disposes the current runtime, opens the target from its on-disk `.jsonl` file, and broadcasts one authoritative bounded `session_loaded` snapshot to every tab. The `sessionId` on session-scoped events guards against frames buffered across a switch; it does not route among concurrent session runtimes.
+
+Switching back to a previous session re-reads its bounded message tail from disk instead of resuming from memory. This is intended design. Non-live sessions have no in-memory background run/unread state: sidebar liveness covers the active session, while other sessions update through the disk watcher.
+
 ## Edit Message Flow
 
 1. Client sends `{ type: 'edit_message', originalMessage, newMessage }`
@@ -241,7 +249,7 @@ When `parentSession` is present, clients organize sessions into hierarchical tre
 2. Client renders the dialog (`confirm`, `input`, `select`, `editor`, or `custom`).
 3. User interacts → client sends `extension_ui_response` (or `extension_custom_input` for raw terminal key streams).
 4. Server unblocks the session (5 min timeout).
-5. Widgets are replayed from `connected`/`session_loaded` and stamped broadcasts from other sessions are ignored by the client.
+5. Widgets are replayed from `connected`/`session_loaded`; stale stamped broadcasts buffered across a switch are ignored by the client.
 6. User dismissal sends `dismiss_widget`; the server disposes the factory and broadcasts removal to every tab.
 7. Display-only `CustomEntry` state (`pi.appendEntry`) rendered by `registerEntryRenderer` reaches the client as a synthetic `role:"custom"` message on `message_end` (flagged `fromEntry:true`, HTML pre-rendered server-side); history reloads interleave these notices with messages by timestamp.
 8. When extensions register markdown transformers (`registerMarkdownTransformer`), final user/assistant `message_end` payloads may arrive flagged `contentTransformed:true` — the client replaces its streamed buffer with the transformed text so live and reloaded views stay identical.
@@ -257,7 +265,7 @@ When `parentSession` is present, clients organize sessions into hierarchical tre
 ## Error Handling
 
 - `agent_error` events contain a human-readable error string from the SDK or server.
-- `sessions_error` events contain `{ message: string, requestId?: string }`. Clients correlate `requestId` with pending `new_session` or `switch_session` operations to reset loading state or display actionable alerts.
+- `sessions_error` events contain `{ message: string, requestId?: string }`; `requestId` is an optional vestigial compatibility echo, not a client correlation mechanism.
 - Server logs errors to console with `[pifrontier]` prefix.
 - File operations (`read_file` / `write_file`) enforce workspace boundary guards (`isInsideWorkspace`) and reject null-byte path injections (`\0`), returning explicit `error` fields in `file_content` / `file_saved`.
 - Client displays errors in the UI and allows retry.

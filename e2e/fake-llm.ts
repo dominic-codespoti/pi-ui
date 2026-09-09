@@ -8,7 +8,6 @@
  * No auth check — bound to 127.0.0.1 and only reachable during tests.
  */
 
-
 const PORT = Number(process.env.FAKE_LLM_PORT || 8787);
 
 const encoder = new TextEncoder();
@@ -105,7 +104,11 @@ const server = Bun.serve({
             created,
             model,
             choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-            usage: { prompt_tokens: 10, completion_tokens: chunks.length, total_tokens: 10 + chunks.length },
+            usage: {
+              prompt_tokens: 10,
+              completion_tokens: chunks.length,
+              total_tokens: 10 + chunks.length,
+            },
           })
         );
         controller.enqueue(encoder.encode('data: [DONE]\n\n'));

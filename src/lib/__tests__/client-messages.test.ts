@@ -200,6 +200,34 @@ describe('agentMsgToUI', () => {
     expect(result[0].toolInput).toBe('file.ts');
     expect(result[0].content).toBe('file content here');
   });
+  it('preserves elided tool output metadata without synthesising content', () => {
+    const map = new Map<string, { name: string; input: Record<string, unknown> }>();
+    map.set('call-elided', { name: 'bash', input: { command: 'npm test' } });
+
+    const result = agentMsgToUI(
+      {
+        role: 'tool_result',
+        timestamp: 1234,
+        toolCallId: 'call-elided',
+        outputElided: true,
+        outputBytes: 51239,
+        isError: false,
+      },
+      map
+    );
+
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({
+      role: 'tool',
+      toolName: 'bash',
+      toolCallId: 'call-elided',
+      toolInput: '$ npm test',
+      outputElided: true,
+      outputBytes: 51239,
+      content: '',
+      createdAt: 1234,
+    });
+  });
 
   it('converts SDK-shaped custom extension messages', () => {
     const result = agentMsgToUI({

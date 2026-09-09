@@ -46,6 +46,12 @@ export type UIMessage = {
   renderedThinking?: string;
   renderedCallHtml?: string[];
   renderedResultHtml?: string[];
+  // Full tool output was withheld from the wire.
+  outputElided?: boolean;
+  // Original tool output character count before elision.
+  outputBytes?: number;
+  // True while the client fetches withheld tool output.
+  outputLoading?: boolean;
   renderedNoticeHtml?: string[];
   level?: 'info' | 'warning' | 'error' | 'success';
   source?: string;
@@ -278,7 +284,6 @@ export function agentMsgToUI(
           role: 'tool' as const,
           toolName: 'bash',
           toolInput: cmd ? `$ ${cmd.split('\n')[0].trim()}` : undefined,
-          toolArgs: cmd ? { command: cmd } : undefined,
           content: output || '',
           isError: typeof msg.exitCode === 'number' && (msg.exitCode as number) !== 0,
           streaming: false,
@@ -321,21 +326,34 @@ export function agentMsgToUI(
           images = imgBlocks.map((b) => `data:${b.mimeType};base64,${b.data}`);
       }
 
-      return [
-        {
-          id: stableMsgId(msg, index),
-          role: 'tool' as const,
-          toolName,
-          toolCallId,
-          toolInput,
-          toolArgs: toolInfo?.input,
-          content,
-          images,
-          isError: (msg.isError as boolean | undefined) ?? false,
-          streaming: false,
-          createdAt: ts,
-        },
-      ];
+      const result: UIMessage = {
+        id: stableMsgId(msg, index),
+        role: 'tool' as const,
+        toolName,
+        toolCallId,
+        toolInput,
+        content,
+        images,
+        isError: (msg.isError as boolean | undefined) ?? false,
+        streaming: false,
+        createdAt: ts,
+      };
+      if (typeof msg.startMs === 'number') result.startMs = msg.startMs;
+      if (typeof msg.endMs === 'number') result.endMs = msg.endMs;
+      const rawUsage = msg.usage as
+        | { input?: number; output?: number; totalTokens?: number; cost?: { total?: number } }
+        | undefined;
+      if (rawUsage?.totalTokens !== undefined) {
+        result.usage = {
+          input: rawUsage.input ?? 0,
+          output: rawUsage.output ?? 0,
+          totalTokens: rawUsage.totalTokens,
+          cost: { total: rawUsage.cost?.total ?? 0 },
+        };
+      }
+      if (typeof msg.outputElided === 'boolean') result.outputElided = msg.outputElided;
+      if (typeof msg.outputBytes === 'number') result.outputBytes = msg.outputBytes;
+      return [result];
     }
     default: {
       const customType = msg.customType as string | undefined;

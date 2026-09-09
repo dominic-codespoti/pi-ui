@@ -19,6 +19,17 @@ describe('renderMarkdown', () => {
     expect(result).not.toContain('<script>');
     expect(result).toContain('&lt;script&gt;');
   });
+  it('renders large indented source as an escaped preformatted block', () => {
+    const source = Array.from(
+      { length: 1_000 },
+      (_, index) => `    const value${index} = '<tag>&';`
+    ).join('\n');
+    const result = renderMarkdown(source);
+
+    expect(result.startsWith('<pre><code>')).toBe(true);
+    expect(result).toContain('&lt;tag&gt;&amp;');
+    expect(result).not.toContain('<tag>&');
+  });
 
   it('highlights code blocks with known language', () => {
     const result = renderMarkdown('```ts\nconst x: number = 1;\n```');

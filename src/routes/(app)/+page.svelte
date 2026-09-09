@@ -35,7 +35,6 @@
   import type { ParsedComponent } from '#lib/tui-stubs.js';
   import { projectsState } from '#lib/state/projects-state.svelte.js';
   import { extensionUiState } from '#lib/state/extension-ui-state.svelte.js';
-  import { SessionViewCache } from '#lib/session-view-cache.js';
   import {
     rawMessagesToUI,
     uid,
@@ -47,7 +46,7 @@
   } from '#lib/client-messages.js';
   import { extensionOptionParts } from '#lib/extension-modals.js';
   import { saveSnapshot, loadSnapshot } from '#lib/session-snapshot.js';
-  import { saveIdentity, loadIdentity } from '#lib/session-identity.js';
+  import { saveIdentity, loadIdentity, clearIdentity } from '#lib/session-identity.js';
   import {
     TEXT_FILE_EXTENSIONS,
     fileToText,
@@ -61,6 +60,7 @@
     saveNotificationPrefs,
     urlBase64ToUint8Array,
   } from '#lib/notification-prefs.js';
+  import { clampThinkingLevelForModel, getSupportedThinkingLevels } from '#lib/thinking-levels.js';
   import { encodeTerminalKey, wrapBracketedPaste } from '#lib/terminal-key-encoder.js';
   import * as Tooltip from '#lib/components/ui/tooltip/index.js';
   import { Switch } from '#lib/components/ui/switch/index.js';
@@ -499,8 +499,16 @@
       if (!d?.type) return;
       if (d.type === 'pi_focus_session' && typeof d.sessionPath === 'string') {
         const target = projectsState.allSessions.find((s) => s.path === d.sessionPath);
-        if (target && target.id !== projectsState.activeSessionId) {
-          projectsState.switchSession(d.sessionPath);
+        // Notification deep links can name a session that is not in the
+        // sidebar's cached list yet (or that has disappeared from it). The
+        // server remains the authority on whether the path can be opened.
+        if (!target || target.id !== projectsState.activeSessionId) {
+          if (ws?.readyState === WebSocket.OPEN && _wsHandshakeComplete) {
+            projectsState.switchSession(d.sessionPath);
+          } else {
+            // Keep the latest click until the next application-level handshake.
+            pendingNotificationSessionPath = d.sessionPath;
+          }
         }
       } else if (d.type === 'pi_steer') {
         haptic();
@@ -803,31 +811,6 @@
   let sessionId = $state<string | null>(null);
   let thinkingLevel = $state('off');
   let model = $state<ModelInfo | null>(null);
-  /** Canonical order for sorting thinking levels — derives from SDK's ModelThinkingLevel. */
-  const THINKING_LEVEL_CANONICAL = [
-    'off',
-    'minimal',
-    'low',
-    'medium',
-    'high',
-    'xhigh',
-    'max',
-  ] as const;
-  type ThinkingLevel = (typeof THINKING_LEVEL_CANONICAL)[number];
-  function isThinkingLevel(level: string): level is ThinkingLevel {
-    return (THINKING_LEVEL_CANONICAL as readonly string[]).includes(level);
-  }
-  /** Derive supported levels from the model's thinkingLevelMap — no hardcoded list. */
-  function getSupportedThinkingLevels(m: ModelInfo | null): ThinkingLevel[] {
-    if (!m?.reasoning || !m.thinkingLevelMap) return ['off'];
-    return THINKING_LEVEL_CANONICAL.filter((level) => level in m.thinkingLevelMap!);
-  }
-  /** When the current level is invalid, default to the highest available level. */
-  function clampThinkingLevelForModel(m: ModelInfo | null, level: string): ThinkingLevel {
-    const available = getSupportedThinkingLevels(m);
-    if (isThinkingLevel(level) && available.includes(level)) return level;
-    return available[available.length - 1] ?? 'off';
-  }
   /** Thinking levels available for the current model — derived from model.thinkingLevelMap. */
   let availableThinkingLevels = $derived(getSupportedThinkingLevels(model));
   $effect(() => {
@@ -856,6 +839,8 @@
   let totalMessageCount = $state(0);
   /** How many raw SDK messages we've loaded so far (used for correct history pagination). */
   let totalRawMessagesLoaded = $state(0);
+  /** Prevent duplicate older-history requests from appending the same page twice. */
+  let olderMessagesLoading = $state(false);
   /** True while a session switch is in flight — shows skeleton instead of stale chat. */
   /* eslint-disable-next-line svelte/prefer-writable-derived */
   let sessionLoading = $state(false);
@@ -870,14 +855,68 @@
   let _optimisticPrevInput: string | null = null;
   /** Draft typed while an existing session is still opening. */
   let sessionSwitchDraft: string | null = null;
-  /**
-   * Path of the device-identity resume switch currently in flight (set right
-   * before calling `switchSession` from the `connected` handler), or null
-   * when no such switch is pending. Lets the `sessions_error` handler tell a
-   * stale/deleted identity apart from an ordinary user-initiated switch
-   * failure, so it can clear the bad pointer instead of retrying it forever.
-   */
-  let _identityRestoreTarget: string | null = null;
+  /** Boot target captured once before the initial snapshot is loaded. */
+  let bootResumePath: string | null = null;
+  /** Connected snapshot held back while the remembered boot session loads. */
+  let _bootServerSnapshot: ConnectedMessage | null = null;
+  /** Request token for the remembered-session boot switch. */
+  let _bootResumeRequestId: string | null = null;
+  /** Boot identity restore must not wait for the general 20 s op watchdog. */
+  const BOOT_RESUME_TIMEOUT_MS = 4_000;
+  let _bootResumeTimer: ReturnType<typeof setTimeout> | null = null;
+  function clearBootResumeTimer(): void {
+    if (_bootResumeTimer !== null) {
+      clearTimeout(_bootResumeTimer);
+      _bootResumeTimer = null;
+    }
+  }
+  function releaseBootResumeFallback(): void {
+    if (bootResumePath === null || _bootResumeRequestId === null) return;
+    // The timer handles a still-pending request; the effect below handles the
+    // store's normal timeout verdict. Ignore an already-settled operation.
+    if (!projectsState.sessionLoading && projectsState.error !== 'Session switch timed out') return;
+
+    const fallback = _bootServerSnapshot;
+    clearBootResumeTimer();
+    projectsState.cancelPendingOps();
+    projectsState.error = null;
+    bootResumePath = null;
+    _bootResumeRequestId = null;
+    _bootServerSnapshot = null;
+    clearIdentity();
+    if (fallback) {
+      applySessionState(fallback as unknown as Record<string, unknown>);
+      _lastVisibleSessionPath =
+        typeof fallback.sessionPath === 'string' ? fallback.sessionPath : undefined;
+      _lastVisibleSessionId =
+        typeof fallback.sessionId === 'string' ? fallback.sessionId : undefined;
+      resetSessionPanelState();
+      projectTrust = fallback.projectTrust ?? null;
+      runtimeDiagnostics = fallback.diagnostics ?? [];
+      resyncEditorMirror();
+      sessionStartTime = Date.now();
+      if (fallback.piVersion) piVersion = fallback.piVersion;
+      if (fallback.uiVersion) uiVersion = fallback.uiVersion;
+      if (fallback.sessionMode) sessionMode = fallback.sessionMode;
+      loadWebhookUrlFromServer(fallback.webhookUrl);
+      sessionLoading = false;
+      if (sessionPath) {
+        setSessionParam(sessionPath);
+        saveIdentity(sessionPath, sessionId ?? undefined, sessionName);
+        saveSnapshot(sessionPath, sessionName, messages);
+      } else {
+        clearIdentity();
+      }
+    } else {
+      sessionLoading = false;
+    }
+    showChatNotice('Session switch timed out', 'warning');
+  }
+  /** Last path rendered from an authoritative full snapshot. */
+  let _lastVisibleSessionPath: string | undefined;
+  /** Last session id rendered from an authoritative full snapshot. */
+  let _lastVisibleSessionId: string | undefined;
+  let _pendingEdit: { messages: UIMessage[]; input: string } | null = null;
   $effect(() => {
     if (projectsState.pendingNewSession && !_optimisticPrevMessages) {
       sessionSwitchDraft = null;
@@ -890,6 +929,7 @@
       totalRawMessagesLoaded = 0;
       totalMessageCount = 0;
       messagesTruncated = false;
+      olderMessagesLoading = false;
       activeStreamMsg = null;
       isStreaming = false;
       activeToolName = undefined;
@@ -899,11 +939,16 @@
       // Keep cwd until server confirms targetCwd; don't wipe model etc.
     }
   });
-  // If the optimistic new-chat times out or errors without a server reply,
-  // restore the previous messages and draft. session_loaded and sessions_error
-  // handle the normal paths; this covers the watchdog timeout.
+  // Explicit session errors restore the optimistic new-chat state locally.
+  // A watchdog timeout is different: the server may have created the new
+  // session successfully, so wait for resync_session's authoritative snapshot.
   $effect(() => {
-    if (!projectsState.pendingNewSession && _optimisticPrevMessages && projectsState.error) {
+    if (
+      !projectsState.pendingNewSession &&
+      _optimisticPrevMessages &&
+      projectsState.error &&
+      projectsState.error !== 'New chat timed out — server did not respond in time'
+    ) {
       messages = _optimisticPrevMessages;
       rebuildToolMessageIndex();
       if (_optimisticPrevInput !== null) input = _optimisticPrevInput;
@@ -911,15 +956,15 @@
       _optimisticPrevInput = null;
     }
   });
-  /**
-   * Keep the device's persisted session identity in sync with whatever the
-   * app is actually showing — the single choke point for every path that
-   * changes the active session (switch, new session, connected,
-   * fork/edit/rewind, reconnect). See session-identity.ts for why this
-   * lives in localStorage rather than only the `?session=` URL param.
-   */
   $effect(() => {
-    if (sessionId && sessionPath) saveIdentity(sessionPath, sessionId, sessionName);
+    if (
+      bootResumePath === null ||
+      _bootResumeRequestId === null ||
+      projectsState.sessionLoading ||
+      projectsState.error !== 'Session switch timed out'
+    )
+      return;
+    releaseBootResumeFallback();
   });
   let sessionStartTime = $state(0);
   /** Pending steered messages (queue_update) */
@@ -1451,9 +1496,16 @@
   let ws: WebSocket | null = null;
   /** True after this socket receives its application-level `connected` message. */
   let _wsHandshakeComplete = false;
+  /** Latest notification deep-link waiting for a live, handshaken socket. */
+  let pendingNotificationSessionPath: string | null = null;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let reconnectCountdown = $state(0);
   let reconnectInterval: ReturnType<typeof setInterval> | null = null;
+  /** Throttle recovery UI for malformed frames so repeated bad payloads do not flood the chat. */
+  let _invalidFrameNoticeAt = 0;
+  /** Resync requests are limited to one in flight and one attempt per five seconds. */
+  let _resyncRequestedAt = 0;
+  let _resyncInFlight = false;
   let sendHoldTimer: ReturnType<typeof setTimeout> | null = null;
   let sendHoldSubmitted = false;
   /** True while the send button is being held down toward the follow-up threshold — drives the progress ring. */
@@ -1471,30 +1523,28 @@
     if (showSessionPanel) projectsState.refresh();
   });
 
-  // ── Right-panel data fetch TTLs ───────────────────────────────────────────
-  // Panel content changes rarely while the server is running; caching avoids
-  // re-requesting (and resetting to skeletons) on every tab open. Cleared on
-  // reconnect so a fresh server is always re-read.
-  const PANEL_FETCH_TTL_MS = 60_000;
-  let lastProvidersFetch = $state(0);
-  let lastToolsFetch = $state(0);
-  let lastResourcesFetch = $state(0);
-  function resetPanelFetchCache() {
-    lastProvidersFetch = 0;
-    lastToolsFetch = 0;
-    lastResourcesFetch = 0;
+  // ── Right-panel data fetches ────────────────────────────────────────────────
+  function resetSessionPanelState() {
+    providers = [];
+    providerError = null;
+    providerKeyInputs = {};
+    resourcesSkills = [];
+    resourcesPrompts = [];
+    resourcesLoaded = false;
+    extensionsList = [];
+    extensionErrors = [];
+    extensionsLoaded = false;
+    packagesList = [];
+    packageUpdates = [];
+    packagesLoaded = false;
+    packageBusy = false;
+    packageProgress = null;
   }
 
   // ── Load providers when models tab is active ──────────────────────────────────
 
   $effect(() => {
-    if (
-      showRightPanel &&
-      rightPanelTab === 'models' &&
-      wsState === 'open' &&
-      Date.now() - lastProvidersFetch > PANEL_FETCH_TTL_MS
-    ) {
-      lastProvidersFetch = Date.now();
+    if (showRightPanel && rightPanelTab === 'models' && wsState === 'open' && sessionId) {
       send({ type: 'get_providers' });
       modelFilter = '';
     }
@@ -1519,19 +1569,16 @@
   }
 
   // ── Load tools when tools tab is active ─────────────────────────────────────
-  // Tools are now seeded from connected/session_loaded plus the async
-  // bindRpcHost push — no TTL polling. The tab only fetches when the list is
-  // still empty (cold shell connected with tools: []) and not recently tried,
-  // preventing duplicate get_tools storms from the old eager warmer.
+  // Tools are seeded from connected/session_loaded plus the async bindRpcHost
+  // push. The tab fetches only when the list is empty while the panel is open
+  // on a live session.
   $effect(() => {
     if (
       showRightPanel &&
       rightPanelTab === 'tools' &&
       wsState === 'open' &&
-      toolsList.length === 0 &&
-      Date.now() - lastToolsFetch > 5000
+      toolsList.length === 0
     ) {
-      lastToolsFetch = Date.now();
       send({ type: 'get_tools' });
     }
   });
@@ -1539,12 +1586,7 @@
   // ── Load resources when skills tab is active ─────────────────────────────────
 
   $effect(() => {
-    if (
-      showRightPanel &&
-      rightPanelTab === 'skills' &&
-      Date.now() - lastResourcesFetch > PANEL_FETCH_TTL_MS
-    ) {
-      lastResourcesFetch = Date.now();
+    if (showRightPanel && rightPanelTab === 'skills' && wsState === 'open' && sessionId) {
       resourcesLoaded = false;
       send({ type: 'get_resources' });
     }
@@ -1566,13 +1608,13 @@
   // ── Load extensions when settings extensions tab is active ──────────────────
 
   $effect(() => {
-    if (showSettingsPanel && settingsSection === 'extensions') {
+    if (showSettingsPanel && settingsSection === 'extensions' && wsState === 'open' && sessionId) {
       extensionsLoaded = false;
       send({ type: 'get_extensions' });
     }
   });
   $effect(() => {
-    if (showSettingsPanel && settingsSection === 'packages' && wsState === 'open') {
+    if (showSettingsPanel && settingsSection === 'packages' && wsState === 'open' && sessionId) {
       packagesLoaded = false;
       send({ type: 'get_packages' });
     }
@@ -1716,6 +1758,17 @@
     }
   }
 
+  function recoverFromInvalidFrame() {
+    const now = Date.now();
+    if (now - _invalidFrameNoticeAt >= 3_000) {
+      _invalidFrameNoticeAt = now;
+      showChatNotice('Received an invalid server update; refreshing the session.', 'warning');
+    }
+    if (_resyncInFlight || now - _resyncRequestedAt < 5_000) return;
+    _resyncRequestedAt = now;
+    if (send({ type: 'resync_session' })) _resyncInFlight = true;
+  }
+
   function connect() {
     if (document.hidden) return;
     // Belt-and-braces: connect() nulls the old socket's onclose before
@@ -1761,6 +1814,7 @@
       const parsedResult = parseServerMessage(raw);
       if (!parsedResult.ok) {
         console.warn('[pi-ui] invalid WS payload', parsedResult.issues);
+        recoverFromInvalidFrame();
         return;
       }
       const parsed = parsedResult.value as ServerMessage & Record<string, unknown>;
@@ -1784,6 +1838,7 @@
       // down by the resume force-close) must not clobber the current
       // connection's state or schedule spurious reconnects.
       if (ws !== socket) return;
+      olderMessagesLoading = false;
       modelRefreshLoading = false;
       flushPendingTerminalInputs();
       stopHeartbeat();
@@ -1833,12 +1888,13 @@
   function setSessionParam(path: string): void {
     const url = new URL(window.location.href);
     url.searchParams.set('session', path);
-    // Shallow navigation keeps the URL bar in sync without navigating or
-    // re-running load. `replace` avoids history spam on rapid session
-    // switches; `state` preserves the current page state (e.g. the mobile
-    // drawer marker) instead of resetting it — read untracked so effect-
-    // driven callers don't subscribe to page.state (see setUrlParams).
-    goto(url, { shallow: true, replace: true, state: untrack(() => page.state) }).catch(() => {
+    // Confirmed URL writes clear the optimistic marker used to distinguish a
+    // stale app-written query from a genuine deep link on the next boot.
+    goto(url, {
+      shallow: true,
+      replace: true,
+      state: { ...untrack(() => page.state), piUiOptimisticSession: null },
+    }).catch(() => {
       /* best-effort URL sync — never fail the WS flow */
     });
   }
@@ -1889,6 +1945,18 @@
     }
     return false;
   }
+  /** Apply the latest queued notification deep link after a live handshake. */
+  function flushPendingNotificationSession() {
+    const path = pendingNotificationSessionPath;
+    if (!path || ws?.readyState !== WebSocket.OPEN || !_wsHandshakeComplete) return;
+    pendingNotificationSessionPath = null;
+    const target = projectsState.allSessions.find((s) => s.path === path);
+    if (target && target.id === projectsState.activeSessionId) return;
+    if (projectsState.switchSession(path) !== 'ok') {
+      // Keep the intent if another session operation is still settling.
+      pendingNotificationSessionPath = path;
+    }
+  }
 
   function notifyPiEvent(title: string, body: string, tag: string, data?: Record<string, unknown>) {
     if (!notificationPrefs.enabled) return;
@@ -1905,12 +1973,10 @@
     }
   }
 
-  /** PWA app badge for unseen session count. */
+  /** Clear the PWA app badge after the active snapshot changes. */
   function updateAppBadge() {
     if ('setAppBadge' in navigator) {
-      const count = projectsState.uncheckedSessions.size;
-      if (count > 0) navigator.setAppBadge(count).catch(() => {});
-      else navigator.clearAppBadge().catch(() => {});
+      navigator.clearAppBadge().catch(() => {});
     }
   }
 
@@ -1938,16 +2004,12 @@
   // Give the shared projects store access to the live socket.
   projectsState.send = send;
   // Same for the extension UI store (modal answers need to send responses).
-  const viewCache = new SessionViewCache();
   projectsState.onBeforeSwitch = () => {
     // Stop any awaited key verdicts before the active session identity can
     // change. The store flips sessionLoading synchronously, but the local
     // mirror is an effect and can lag one turn behind a click.
     discardPendingTerminalInputs();
     sessionSwitchDraft = null;
-    if (sessionId) {
-      viewCache.save(sessionId, input, expandedUserMsgs, truncatedUserMsgs);
-    }
   };
   extensionUiState.send = send;
 
@@ -2014,34 +2076,14 @@
       const nextSessionId = payload.sessionId as string;
       if (nextSessionId !== prevSessionId) {
         const draftWhileSwitching = !projectsState.pendingNewSession ? sessionSwitchDraft : null;
-        if (prevSessionId) {
-          const draftToSave =
-            projectsState.pendingNewSession && _optimisticPrevInput !== null
-              ? _optimisticPrevInput
-              : input;
-          viewCache.save(prevSessionId, draftToSave, expandedUserMsgs, truncatedUserMsgs);
-        }
         sessionId = nextSessionId;
-        const restored = viewCache.restore(nextSessionId);
         if (projectsState.pendingNewSession) {
           // The composer stays live while the server creates the session.
-          // Keep that new draft instead of replacing it with the previous
-          // session's cached draft.
+          // Keep that new draft instead of replacing it with another session's draft.
           expandedUserMsgs = {};
           truncatedUserMsgs = {};
-        } else if (draftWhileSwitching !== null) {
-          // Keep text entered while an existing session was opening. The
-          // target session's cached draft is only a fallback when the user
-          // did not edit during the switch.
-          input = draftWhileSwitching;
-          expandedUserMsgs = {};
-          truncatedUserMsgs = {};
-        } else if (restored) {
-          input = restored.draft;
-          expandedUserMsgs = restored.expandedUserMsgs;
-          truncatedUserMsgs = restored.truncatedUserMsgs;
         } else {
-          input = '';
+          input = draftWhileSwitching ?? '';
           expandedUserMsgs = {};
           truncatedUserMsgs = {};
         }
@@ -2066,6 +2108,9 @@
     }
     const newModel = payload.model as ModelInfo | null | undefined;
     if (newModel !== undefined) model = newModel;
+    if (typeof payload.thinkingLevel === 'string') {
+      thinkingLevel = clampThinkingLevelForModel(model, payload.thinkingLevel);
+    }
     if (payload.availableModels !== undefined) {
       availableModels = (payload.availableModels as ModelInfo[]) ?? [];
     }
@@ -2074,18 +2119,24 @@
         (payload.tools as
           | { name: string; description: string; isBuiltin: boolean; origin?: string }[]
           | undefined) ?? [];
-      if (Array.isArray(payload.tools) && (payload.tools as unknown[]).length > 0)
-        lastToolsFetch = Date.now();
     }
     if (payload.activeToolNames !== undefined) {
       activeToolNames = (payload.activeToolNames as string[] | undefined) ?? [];
     }
     if (payload.cwd) cwd = payload.cwd as string;
-    if ('sessionPath' in payload) sessionPath = payload.sessionPath as string | undefined;
+    if ('sessionPath' in payload) {
+      sessionPath = typeof payload.sessionPath === 'string' ? payload.sessionPath : undefined;
+    } else if (payload.sessionMode === 'in-memory') {
+      sessionPath = undefined;
+    }
+    if ('sessionName' in payload) {
+      sessionName = typeof payload.sessionName === 'string' ? payload.sessionName : undefined;
+    }
     if ('messages' in payload) {
       const raw = (payload.messages as unknown[]) ?? [];
       const streamingMessage = payload.streamingMessage;
       messages = rawMessagesToUI(streamingMessage === undefined ? raw : [...raw, streamingMessage]);
+      olderMessagesLoading = false;
       rebuildToolMessageIndex();
       pruneUnresolvedLangs();
       activeStreamMsg = null;
@@ -2105,8 +2156,10 @@
     if (payload.extensionUiState && typeof payload.extensionUiState === 'object') {
       extensionUiState.applySnapshot(payload.extensionUiState as ExtensionUiStatePayload);
     } else if ('widgets' in payload) {
-      extensionUiState.clearWidgets();
-      extensionUiState.setTerminalInputActive(false);
+      // Legacy snapshots carry widgets as a top-level array. Treat the
+      // snapshot as a full session-scoped replacement, including title and
+      // other extension channels, before replaying the widgets.
+      extensionUiState.reset();
       for (const w of (payload.widgets as WidgetPayload[]) ?? []) {
         extensionUiState.applyWidget(w as unknown as Record<string, unknown>);
       }
@@ -2115,11 +2168,20 @@
       // previous session's extension UI behind (legacy/partial payloads).
       extensionUiState.reset();
     }
+    // Legacy full snapshots do not carry the newer extensionUiState title.
+    // Once the session changes, fall back to its name rather than retaining
+    // the previous session's extension-injected document title.
+    if (isFullSessionPayload && payload.extensionUiState === undefined) {
+      extensionUiState.setTitle(sessionName);
+    }
     // Sync the shared projects store with the active session.
     projectsState.cwd = cwd;
-    if ('sessionId' in payload) projectsState.activeSessionId = payload.sessionId as string;
-    projectsState.isStreaming = isStreaming;
-    projectsState.activeToolName = activeToolName;
+    if ('sessionId' in payload && typeof payload.sessionId === 'string') {
+      projectsState.reconcileActiveRuntime(payload.sessionId, isStreaming, activeToolName);
+    } else {
+      projectsState.isStreaming = isStreaming;
+      projectsState.activeToolName = activeToolName;
+    }
     // Restore queue state from payload (present on connected/session_loaded)
     if ('queuedSteering' in payload || 'queuedFollowUp' in payload) {
       queuedSteering = (payload.queuedSteering as string[]) ?? [];
@@ -2179,20 +2241,11 @@
 
   function handleServer(msg: ServerMessage) {
     // Reject events from a previous session that arrived late in the TCP buffer
-    // after a session switch. Only events tagged with sessionId are gated —
-    // global events (connected, model_changed, etc.) pass through without it.
-    // Events that set the initial sessionId are explicitly exempted.
-    // `session_runtime` is also exempted: it is a global sidebar-state
-    // broadcast (running dots / unseen markers for ANY pooled session, not
-    // just the active one). Gating it would freeze the background-session
-    // dots forever — a finished background session would keep its "running"
-    // dot and the "ready to check" marker could never appear.
-    // `session_updated` gets the same treatment: background sessions must
-    // keep their sidebar summaries (counts, name) fresh mid-turn.
+    // after a session switch. Snapshots establish active-session identity, while
+    // session_updated remains a disk-derived sidebar delta for any session.
     if (msg && typeof msg === 'object' && 'sessionId' in msg) {
       const msgType = (msg as Record<string, unknown>).type;
       if (
-        msgType !== 'session_runtime' &&
         msgType !== 'session_updated' &&
         msgType !== 'connected' &&
         msgType !== 'session_loaded'
@@ -2205,68 +2258,147 @@
     }
     switch (msg.type) {
       case 'connected': {
+        _resyncInFlight = false;
         const c = msg as ConnectedMessage;
-        applySessionState(c as unknown as Record<string, unknown>);
-        projectTrust = c.projectTrust ?? null;
+        const targetPath = bootResumePath;
+        const serverPath = typeof c.sessionPath === 'string' ? c.sessionPath : undefined;
+        const serverSessionId = typeof c.sessionId === 'string' ? c.sessionId : undefined;
+        const shouldResumeTarget = !!targetPath && targetPath !== serverPath;
+        const hadOrphanedSessionState =
+          projectsState.pendingNewSession ||
+          projectsState.sessionLoading ||
+          _optimisticPrevMessages !== null;
+
+        if (shouldResumeTarget) {
+          // Keep the hydrated boot target visible until its switch response
+          // arrives; the server's current session is only a fallback.
+          _bootServerSnapshot = c;
+        } else {
+          applySessionState(c as unknown as Record<string, unknown>);
+          _lastVisibleSessionPath = serverPath;
+          _lastVisibleSessionId = serverSessionId;
+          resetSessionPanelState();
+          projectTrust = c.projectTrust ?? null;
+          runtimeDiagnostics = c.diagnostics ?? [];
+          resyncEditorMirror();
+          sessionStartTime = Date.now();
+        }
         connectedPushVapidKey = c.pushVapidKey ?? null;
-        runtimeDiagnostics = c.diagnostics ?? [];
-        resyncEditorMirror();
-        sessionStartTime = Date.now();
         if (c.piVersion) piVersion = c.piVersion;
-        if (c.sessionMode) sessionMode = c.sessionMode;
+        if (c.uiVersion) uiVersion = c.uiVersion;
+        if (c.sessionMode && !shouldResumeTarget) sessionMode = c.sessionMode;
         loadWebhookUrlFromServer(c.webhookUrl);
-        sessionLoading = false;
         // A reconnect orphans any in-flight new_session/switch_session: its
-        // reply would land on the dead socket and the loading flags would
-        // stick forever (the connected payload below carries the real state).
+        // reply would land on the dead socket, and this connected payload is
+        // authoritative for the live server state.
         projectsState.cancelPendingOps();
+        if (!shouldResumeTarget) {
+          sessionLoading = false;
+          // applySessionState() has replaced optimistic state with the server
+          // snapshot. Never retain the old stash for a later operation.
+          if (hadOrphanedSessionState || _optimisticPrevMessages !== null) {
+            _optimisticPrevMessages = null;
+            _optimisticPrevInput = null;
+          }
+          sessionSwitchDraft = null;
+        } else {
+          sessionLoading = true;
+        }
         send({ type: 'get_project_trust' });
-        send({ type: 'get_packages' });
         // Warm the project/session lists so pickers have data immediately.
-        // force: the freshness guard would otherwise skip the request right
-        // after a reconnect (stale pre-reconnect lists are not fresh).
         projectsState.refresh({ force: true });
-        resetPanelFetchCache();
-        if (
-          Array.isArray((c as unknown as Record<string, unknown>).tools) &&
-          ((c as unknown as Record<string, unknown>).tools as unknown[]).length > 0
-        )
-          lastToolsFetch = Date.now();
         updateAppBadge();
         send({ type: 'get_settings' });
-        // Resume target, in priority order:
-        //  1. an explicit `?session=` URL param — deep link / in-tab nav, always wins
-        //  2. this device's last-known session (localStorage — survives a PWA cold
-        //     relaunch, unlike the URL, which the manifest `start_url` always resets)
-        //  3. neither present (first-ever open on this device) — accept whatever the
-        //     server defaulted to (continueRecent) and adopt it as the new identity
-        // Skip the redundant switch round trip when the target already matches the
-        // server's active session (the common resume path; keeps hydrated content on
-        // screen).
-        const savedPath = getSessionParam();
-        const targetPath = savedPath ?? loadIdentity()?.path ?? null;
-        if (targetPath && targetPath !== sessionPath) {
+
+        if (targetPath && shouldResumeTarget) {
           // switchSession arms the op watchdog and syncs the URL — same
-          // semantics as the manual send it replaces.
-          _identityRestoreTarget = targetPath;
-          projectsState.switchSession(targetPath);
-        } else if (sessionPath) {
-          setSessionParam(sessionPath);
-          saveSnapshot(sessionPath, sessionName, messages);
+          // semantics as the manual action it replaces.
+          const result = projectsState.switchSession(targetPath);
+          if (result === 'ok') {
+            _bootResumeRequestId = projectsState.pendingRequestId;
+            clearBootResumeTimer();
+            _bootResumeTimer = setTimeout(() => {
+              _bootResumeTimer = null;
+              releaseBootResumeFallback();
+            }, BOOT_RESUME_TIMEOUT_MS);
+          } else {
+            // The socket was open for connected, so this is only a defensive
+            // fallback for a race with another local operation.
+            _bootResumeRequestId = null;
+            bootResumePath = null;
+            _bootServerSnapshot = null;
+            applySessionState(c as unknown as Record<string, unknown>);
+            resetSessionPanelState();
+            projectTrust = c.projectTrust ?? null;
+            runtimeDiagnostics = c.diagnostics ?? [];
+            resyncEditorMirror();
+            sessionStartTime = Date.now();
+            sessionLoading = false;
+            if (sessionPath) {
+              setSessionParam(sessionPath);
+              saveIdentity(sessionPath, sessionId ?? undefined, sessionName);
+              saveSnapshot(sessionPath, sessionName, messages);
+            } else {
+              clearIdentity();
+            }
+          }
+        } else if (!shouldResumeTarget) {
+          bootResumePath = null;
+          _bootResumeRequestId = null;
+          _bootServerSnapshot = null;
+          if (sessionPath) {
+            setSessionParam(sessionPath);
+            saveIdentity(sessionPath, sessionId ?? undefined, sessionName);
+            saveSnapshot(sessionPath, sessionName, messages);
+          } else {
+            // In-memory sessions are intentionally not durable identities.
+            clearIdentity();
+          }
         }
+        flushPendingNotificationSession();
         break;
       }
 
       case 'session_loaded': {
         const sl = msg as Record<string, unknown>;
-        const identity = {
-          sessionId: typeof sl.sessionId === 'string' ? sl.sessionId : undefined,
-          sessionPath: typeof sl.sessionPath === 'string' ? sl.sessionPath : undefined,
-          requestId: typeof sl.requestId === 'string' ? sl.requestId : undefined,
-        };
-        if (!projectsState.acceptsSessionLoaded(identity)) break;
-        _identityRestoreTarget = null;
+        const requestId = typeof sl.requestId === 'string' ? sl.requestId : undefined;
+        // A response whose operation has already settled (or timed out) is
+        // stale and must not clobber the newer visible session.
+        if (requestId && projectsState.isRetiredRequest(requestId)) break;
+        const pendingRequestId = projectsState.pendingRequestId;
+        const pendingSwitchPath = projectsState.pendingSwitchPath;
+        const previousPath = _lastVisibleSessionPath;
+        const previousSessionId = _lastVisibleSessionId;
+        const loadedPath = typeof sl.sessionPath === 'string' ? sl.sessionPath : undefined;
+        const loadedSessionId = typeof sl.sessionId === 'string' ? sl.sessionId : undefined;
+        const ownResponse =
+          pendingRequestId !== null
+            ? requestId !== undefined
+              ? requestId === pendingRequestId
+              : pendingSwitchPath === null || pendingSwitchPath === loadedPath
+            : false;
+        // A requestId is authoritative when present. A stamped snapshot for
+        // another operation belongs to another tab (or an abandoned request),
+        // never this tab, even when its session path differs.
+        if (requestId !== undefined && !ownResponse) break;
+        const resyncResponse = projectsState.pendingResync;
+        const foreignPathChange =
+          !ownResponse &&
+          !resyncResponse &&
+          (loadedPath !== previousPath || loadedSessionId !== previousSessionId);
+        const foreignResponse = !ownResponse && pendingRequestId !== null;
+        const foreignSnapshot = foreignResponse || foreignPathChange;
+        if (foreignPathChange && bootResumePath !== null) {
+          // Keep the latest server truth available if the remembered target
+          // subsequently fails while another client changes the live session.
+          _bootServerSnapshot = sl as unknown as ConnectedMessage;
+        }
+        _resyncInFlight = false;
         applySessionState(sl);
+        _lastVisibleSessionPath =
+          loadedPath ?? (ownResponse ? pendingSwitchPath : sessionPath) ?? undefined;
+        _lastVisibleSessionId = sessionId ?? loadedSessionId;
+        resetSessionPanelState();
         projectTrust = (sl.projectTrust as ProjectTrustInfo | undefined) ?? null;
         runtimeDiagnostics = (sl.diagnostics as RuntimeDiagnostic[] | undefined) ?? [];
         resyncEditorMirror();
@@ -2274,26 +2406,87 @@
         if (sl.piVersion) piVersion = sl.piVersion as string;
         if (sl.uiVersion) uiVersion = sl.uiVersion as string;
         if (sl.sessionMode) sessionMode = sl.sessionMode as string;
-        sessionLoading = false;
-        projectsState.sessionLoading = false;
-        if (projectsState.onSessionLoaded(identity)) {
-          showSessionPanel = false;
-        }
+        const authoritativePath =
+          loadedPath ?? (ownResponse ? pendingSwitchPath : sessionPath) ?? undefined;
+        const settled = projectsState.onSessionLoaded(
+          ownResponse ? requestId : undefined,
+          loadedPath
+        );
+        sessionLoading = projectsState.sessionLoading;
+        if (settled) showSessionPanel = false;
         projectPickerOpen = false;
-        if (projectsState.pendingSwitchPath) {
-          // Persist URL from switchSession (replaces optimistically-set param)
-          setSessionParam(projectsState.pendingSwitchPath);
+
+        if (ownResponse) {
+          if (_bootResumeRequestId !== null) {
+            clearBootResumeTimer();
+            bootResumePath = null;
+            _bootResumeRequestId = null;
+            _bootServerSnapshot = null;
+          } else {
+            bootResumePath = null;
+          }
+          if (authoritativePath) {
+            setSessionParam(authoritativePath);
+            saveIdentity(authoritativePath, sessionId ?? undefined, sessionName);
+          } else {
+            clearIdentity();
+          }
           projectsState.pendingSwitchPath = null;
-        } else if (sessionPath) {
-          // Fork/clone/reload — persist the new session path so URL always matches
-          setSessionParam(sessionPath);
+        } else if (!foreignSnapshot) {
+          // A same-session resync is still authoritative for this device.
+          if (authoritativePath) {
+            setSessionParam(authoritativePath);
+            saveIdentity(authoritativePath, sessionId ?? undefined, sessionName);
+          } else {
+            clearIdentity();
+          }
+        } else if (foreignPathChange) {
+          showChatNotice('Another client switched the active session.', 'info');
         }
-        if (Array.isArray(sl.tools) && (sl.tools as unknown[]).length > 0)
-          lastToolsFetch = Date.now();
-        saveSnapshot(sessionPath, sessionName, messages);
-        // Optimistic new-chat succeeded — drop the stash.
+        saveSnapshot(authoritativePath, sessionName, messages);
+        _pendingEdit = null;
+        // Any accepted authoritative snapshot supersedes the optimistic
+        // empty-chat view, including a resync after a lost watchdog reply.
         _optimisticPrevMessages = null;
         _optimisticPrevInput = null;
+        break;
+      }
+
+      case 'tool_output': {
+        const toolFrame = msg as {
+          type: 'tool_output';
+          toolCallId: string;
+          content?: string;
+          details?: string;
+          diff?: string;
+          renderedResultHtml?: string[];
+          error?: string;
+        };
+        const tool = findToolMessage(toolFrame.toolCallId);
+        if (!tool) {
+          if (toolFrame.error) {
+            showChatNotice(`Failed to load tool output: ${toolFrame.error}`, 'error');
+          }
+          break;
+        }
+        tool.outputLoading = false;
+        if (toolFrame.error) {
+          showChatNotice(`Failed to load tool output: ${toolFrame.error}`, 'error');
+          break;
+        }
+        if (toolFrame.content !== undefined) tool.content = toolFrame.content;
+        if (toolFrame.details !== undefined) tool.details = toolFrame.details;
+        if (toolFrame.diff !== undefined) {
+          tool.diff = toolFrame.diff;
+          tool.lineCount = toolFrame.diff.split('\n').length;
+        }
+        if (toolFrame.renderedResultHtml !== undefined) {
+          tool.renderedResultHtml = toolFrame.renderedResultHtml;
+        }
+        tool.outputElided = false;
+        if (tool.content && tool.lineCount === undefined) {
+          tool.lineCount = tool.content.split('\n').length;
+        }
         break;
       }
 
@@ -2320,26 +2513,49 @@
 
       case 'sessions_error': {
         const errMsg = (msg as Record<string, unknown>).message ?? 'Unknown session error';
+        const wasIdentityRestore = bootResumePath !== null && _bootResumeRequestId !== null;
+        const fallback = wasIdentityRestore ? _bootServerSnapshot : null;
+        // Let the shared state validate correlation before changing any local
+        // UI. Retired/foreign errors must not clear a newer operation or
+        // surface a notice; a matching request settles the operation and
+        // reverts its optimistic URL in the store.
+        if (!projectsState.handleMessage(msg as PiEvent)) break;
+        olderMessagesLoading = false;
+        // Render the operation error in the chat transcript only. Leaving the
+        // shared error field set also creates a hidden copy in the off-canvas
+        // projects panel, which can mask the visible notice for consumers.
+        projectsState.error = null;
         if (sessionSwitchDraft !== null) {
           input = sessionSwitchDraft;
           sessionSwitchDraft = null;
         }
-        // A failed device-identity resume (stale/deleted session) is not a
-        // user action gone wrong — silently correct the bad pointer instead
-        // of greeting a cold boot with an error toast. The server's
-        // already-active session stays displayed, so re-stamp that as the
-        // identity rather than leaving no pointer behind (a bare clear
-        // would just repeat the server's continueRecent guess if the
-        // process ever restarts before the next real switch).
-        const wasIdentityRestore =
-          _identityRestoreTarget !== null &&
-          _identityRestoreTarget === projectsState.pendingSwitchPath;
-        _identityRestoreTarget = null;
         if (wasIdentityRestore) {
-          saveIdentity(sessionPath, sessionId ?? undefined, sessionName);
+          clearBootResumeTimer();
+          // The remembered path is unavailable. Drop that dead pointer, then
+          // reveal the connected session that was held back during boot.
+          clearIdentity();
+          bootResumePath = null;
+          _bootResumeRequestId = null;
+          _bootServerSnapshot = null;
+          if (fallback) {
+            applySessionState(fallback as unknown as Record<string, unknown>);
+            _lastVisibleSessionPath =
+              typeof fallback.sessionPath === 'string' ? fallback.sessionPath : undefined;
+            resetSessionPanelState();
+            projectTrust = fallback.projectTrust ?? null;
+            runtimeDiagnostics = fallback.diagnostics ?? [];
+            resyncEditorMirror();
+            sessionStartTime = Date.now();
+            if (fallback.piVersion) piVersion = fallback.piVersion;
+            if (fallback.uiVersion) uiVersion = fallback.uiVersion;
+            if (fallback.sessionMode) sessionMode = fallback.sessionMode;
+            loadWebhookUrlFromServer(fallback.webhookUrl);
+          }
         } else {
-          showChatNotice(errMsg as string, 'warning');
+          bootResumePath = null;
         }
+        showChatNotice(errMsg as string, 'warning');
+
         // Restore optimistic new-chat if it failed — don't leave empty chat or draft.
         if (_optimisticPrevMessages) {
           messages = _optimisticPrevMessages;
@@ -2352,7 +2568,15 @@
         rebuildToolMessageIndex();
         sessionLoading = false;
         projectsState.sessionLoading = false;
-        projectsState.handleMessage(msg as PiEvent);
+        if (wasIdentityRestore && fallback) {
+          if (sessionPath) {
+            setSessionParam(sessionPath);
+            saveIdentity(sessionPath, sessionId ?? undefined, sessionName);
+            saveSnapshot(sessionPath, sessionName, messages);
+          } else {
+            clearIdentity();
+          }
+        }
         break;
       }
 
@@ -2387,6 +2611,9 @@
       }
 
       case 'agent_start':
+        // The first agent_start proves the server accepted the edit rewind;
+        // keep the optimistic history and stop retaining its rollback copy.
+        _pendingEdit = null;
         isStreaming = true;
         projectsState.isStreaming = true;
         requestWakeLock();
@@ -2442,6 +2669,22 @@
         activeStreamMsg = null;
         releaseWakeLock();
         const errMsg = (msg as { error?: string }).error ?? 'Unknown error';
+        if (_optimisticPrevMessages || projectsState.pendingNewSession) {
+          if (_optimisticPrevMessages) {
+            messages = _optimisticPrevMessages;
+            _optimisticPrevMessages = null;
+          }
+          if (_optimisticPrevInput !== null) input = _optimisticPrevInput;
+          _optimisticPrevInput = null;
+          rebuildToolMessageIndex();
+          projectsState.cancelPendingOps();
+          sessionLoading = false;
+        }
+        if (restorePendingEdit()) {
+          // The error may be unrelated to the edit because edit_message has
+          // no request token. Resync so the authoritative server history wins.
+          send({ type: 'resync_session' });
+        }
         showChatNotice(`Agent error: ${errMsg}`, 'error');
         break;
       }
@@ -2476,11 +2719,24 @@
                 totalTokens: number;
                 cost: { total: number };
               };
-              content?: { type: string; data?: string; mimeType?: string }[];
+              content?: {
+                type: string;
+                text?: string;
+                thinking?: string;
+                data?: string;
+                mimeType?: string;
+              }[];
               stopReason?: string;
               errorMessage?: string;
             }
           | undefined;
+        if (endMsg?.role === 'custom') {
+          // Custom extension entries arrive as ordinary message_start/end
+          // pairs. They are not assistant bubbles, but still belong in the
+          // conversation and use the same conversion as loaded history.
+          const [custom] = rawMessagesToUI([endMsg]);
+          if (custom) messages.push(custom);
+        }
         if (endMsg?.role === 'assistant') {
           const a = activeStreamMsg;
           if (a) {
@@ -2489,13 +2745,26 @@
             if (endMsg.stopReason === 'aborted') {
               a.aborted = true;
               a.content = 'Operation aborted';
-            } else if (endMsg.usage) {
-              a.usage = {
-                input: endMsg.usage.input,
-                output: endMsg.usage.output,
-                totalTokens: endMsg.usage.totalTokens,
-                cost: { total: endMsg.usage.cost?.total ?? 0 },
-              };
+            } else {
+              // Replace streamed buffers with the sealed message only when
+              // the final payload actually contains those block types. A
+              // tool-only or wire-truncated final message must not erase text
+              // that arrived through deltas.
+              const finalText = extractTextContent(endMsg.content ?? []);
+              const finalThinking = (endMsg.content ?? [])
+                .filter((b) => b.type === 'thinking')
+                .map((b) => b.thinking ?? '')
+                .join('');
+              if (finalText) a.content = finalText;
+              if (finalThinking) a.thinking = finalThinking;
+              if (endMsg.usage) {
+                a.usage = {
+                  input: endMsg.usage.input,
+                  output: endMsg.usage.output,
+                  totalTokens: endMsg.usage.totalTokens,
+                  cost: { total: endMsg.usage.cost?.total ?? 0 },
+                };
+              }
               // Extract any image blocks from the final message content
               if (endMsg.content) {
                 const imgBlocks = endMsg.content.filter(
@@ -2535,28 +2804,36 @@
         const toolCallId = msg.toolCallId as string | undefined;
         const details = (msg.args ?? msg.input ?? msg.details) as
           Record<string, unknown> | undefined;
-        const toolMessage: UIMessage = {
-          id: uid(),
-          role: 'tool',
-          content: '',
-          toolName,
-          toolCallId,
-          toolInput: formatToolInput(toolName, details),
-          toolArgs: details,
-          renderedCallHtml: msg.renderedCallHtml as string[] | undefined,
-          streaming: true,
-          expanded: toolsExpandedGlobal,
-          startMs: Date.now(),
-          createdAt: Date.now(),
-        };
-        messages.push(toolMessage);
-        indexToolMessage(messages[messages.length - 1]);
+        const renderedCallHtml = msg.renderedCallHtml as string[] | undefined;
+        let toolMessage = ensureToolMessage(toolCallId, toolName, details, renderedCallHtml);
+        if (!toolMessage) {
+          toolMessage = createToolMessage(toolName, toolCallId, details, renderedCallHtml);
+          messages.push(toolMessage);
+          indexToolMessage(toolMessage);
+        }
+        toolMessage.toolName = toolName;
+        toolMessage.toolInput = formatToolInput(toolName, details);
+        toolMessage.renderedCallHtml = renderedCallHtml;
+        toolMessage.streaming = true;
+        toolMessage.isError = false;
+        toolMessage.outputLoading = false;
+        toolMessage.outputElided = false;
+        toolMessage.endMs = undefined;
         break;
       }
 
       case 'tool_execution_update': {
         const updateId = msg.toolCallId as string | undefined;
-        const t = updateId ? findToolMessage(updateId) : lastStreaming('tool');
+        const details = (msg.args ?? msg.input ?? msg.details) as
+          Record<string, unknown> | undefined;
+        const t = updateId
+          ? ensureToolMessage(
+              updateId,
+              (msg.toolName as string | undefined) ?? activeToolName ?? 'tool',
+              details,
+              msg.renderedCallHtml as string[] | undefined
+            )
+          : lastStreaming('tool');
         if (t) {
           const partial = msg.partialResult as
             { content?: { type: string; text?: string }[] } | undefined;
@@ -2570,7 +2847,16 @@
 
       case 'tool_execution_end': {
         const endId = msg.toolCallId as string | undefined;
-        const t = endId ? findToolMessage(endId) : lastStreaming('tool');
+        const details = (msg.args ?? msg.input ?? msg.details) as
+          Record<string, unknown> | undefined;
+        const t = endId
+          ? ensureToolMessage(
+              endId,
+              (msg.toolName as string | undefined) ?? activeToolName ?? 'tool',
+              details,
+              msg.renderedCallHtml as string[] | undefined
+            )
+          : lastStreaming('tool');
         if (t) {
           if (msg.renderedResultHtml) t.renderedResultHtml = msg.renderedResultHtml as string[];
           t.streaming = false;
@@ -2613,6 +2899,35 @@
             }
           }
         }
+        break;
+      }
+
+      case 'bash_execution_update': {
+        const bashId = msg.id as string | undefined;
+        const delta = msg.delta as string | undefined;
+        const bash = bashId ? ensureToolMessage(bashId, 'bash') : undefined;
+        if (bash && delta) {
+          bash.content += delta;
+          bash.streaming = true;
+          bash.lineCount = bash.content.split('\n').length;
+        }
+        break;
+      }
+
+      case 'extension_flag_result': {
+        const name = (msg.name as string | undefined) ?? 'unknown';
+        const success = Boolean(msg.success);
+        showChatNotice(
+          success
+            ? `Extension flag "${name}" updated.`
+            : `Failed to update extension flag "${name}".`,
+          success ? 'info' : 'error'
+        );
+        break;
+      }
+
+      case 'shutdown_requested': {
+        showChatNotice('Server is shutting down; reconnecting automatically.', 'warning');
         break;
       }
 
@@ -2930,10 +3245,6 @@
             | undefined) ?? [];
 
         activeToolNames = (msg.activeToolNames as string[] | undefined) ?? [];
-        // Mark fetch time so tab-gated requests know tools are fresh — prevents
-        // duplicate get_tools after the server-seeded connected/session_loaded
-        // payloads plus the async bindRpcHost push.
-        lastToolsFetch = Date.now();
         break;
       }
 
@@ -2974,9 +3285,12 @@
         packageProgress = null;
         if (msg.success) send({ type: 'get_packages' });
         break;
-      case 'session_stats':
-        sessionStats = msg.stats as SessionStats;
+      case 'session_stats': {
+        const stats = msg.stats as SessionStats | undefined;
+        if (!stats || stats.sessionId !== sessionId) break;
+        sessionStats = stats;
         break;
+      }
 
       case 'export_result':
         exportFeedback = msg.error
@@ -3127,6 +3441,15 @@
           message: string;
           level?: 'info' | 'warning' | 'error';
         };
+        if (result.command === 'shell' && sessionId) {
+          const shell = findToolMessage(`shell-${sessionId}`);
+          if (shell) {
+            shell.streaming = false;
+            shell.endMs = Date.now();
+            shell.isError = result.level === 'error';
+            if (!shell.content && result.message) shell.content = result.message;
+          }
+        }
         messages.push({
           id: uid(),
           role: 'notice',
@@ -3160,7 +3483,10 @@
           messages: unknown[];
           totalMessageCount: number;
           messagesTruncated: boolean;
+          sessionId?: string;
         };
+        if (older.sessionId && older.sessionId !== sessionId) break;
+        olderMessagesLoading = false;
         const olderUi = rawMessagesToUI(older.messages);
         messages.unshift(...olderUi);
         for (let i = 0; i < olderUi.length; i++) indexToolMessage(messages[i]);
@@ -3212,8 +3538,6 @@
         const rt = msg as unknown as {
           sessionId: string;
           isRunning: boolean;
-          unseen: boolean;
-          lastActivity: number;
           activeToolName?: string;
         };
         const isRunning = Boolean(rt.isRunning);
@@ -3221,39 +3545,13 @@
           typeof rt.activeToolName === 'string' && rt.activeToolName.length > 0
             ? rt.activeToolName
             : undefined;
-        // Ignore stale updates from a previously-active session after switching
         if (rt.sessionId === sessionId) {
           isStreaming = isRunning;
           activeToolName = toolName;
-          projectsState.isStreaming = isRunning;
-          projectsState.activeToolName = toolName;
+          projectsState.reconcileActiveRuntime(rt.sessionId, isRunning, toolName);
           if (isRunning || toolName) requestWakeLock();
           else releaseWakeLock();
         }
-        if ((isRunning || toolName || rt.unseen) && rt.sessionId !== sessionId) {
-          projectsState.markUnchecked(rt.sessionId);
-        }
-        if (isRunning) projectsState.runningSessions.add(rt.sessionId);
-        else projectsState.runningSessions.delete(rt.sessionId);
-        if (toolName) projectsState.runningToolSessions.add(rt.sessionId);
-        else projectsState.runningToolSessions.delete(rt.sessionId);
-        if (
-          notificationPrefs.onSessionFinish &&
-          !isRunning &&
-          !toolName &&
-          rt.unseen &&
-          rt.sessionId !== sessionId &&
-          document.hidden
-        ) {
-          const sessPath = projectsState.allSessions.find((s) => s.id === rt.sessionId)?.path;
-          notifyPiEvent(
-            'Session Finished',
-            `Session ${rt.sessionId.slice(0, 8)} has new results.`,
-            `pi-session-${rt.sessionId}`,
-            sessPath ? { kind: 'session_finished', sessionPath: sessPath } : undefined
-          );
-        }
-        updateAppBadge();
         break;
       }
 
@@ -3288,8 +3586,17 @@
   }
 
   function loadOlderMessages() {
-    if (!send({ type: 'load_messages', count: 50, alreadyHasCount: totalRawMessagesLoaded }))
+    if (olderMessagesLoading || !messagesTruncated || totalRawMessagesLoaded >= totalMessageCount)
       return;
+    if (
+      send({
+        type: 'load_messages',
+        count: 50,
+        alreadyHasCount: totalRawMessagesLoaded,
+      })
+    ) {
+      olderMessagesLoading = true;
+    }
   }
 
   // ── Modal actions ────────────────────────────────────────────────────────────
@@ -3446,17 +3753,46 @@
     send({ type: 'fork_session', entryId });
     showForkDialog = false;
   }
+  function cloneMessagesForEdit(source: UIMessage[]): UIMessage[] {
+    return source.map((message) => ({
+      ...message,
+      images: message.images?.slice(),
+      toolArgs: message.toolArgs ? { ...message.toolArgs } : undefined,
+      usage: message.usage ? { ...message.usage, cost: { ...message.usage.cost } } : undefined,
+      compaction: message.compaction ? { ...message.compaction } : undefined,
+      renderedCallHtml: message.renderedCallHtml?.slice(),
+      renderedResultHtml: message.renderedResultHtml?.slice(),
+      renderedNoticeHtml: message.renderedNoticeHtml?.slice(),
+    }));
+  }
+  function restorePendingEdit(): boolean {
+    if (!_pendingEdit) return false;
+    messages = _pendingEdit.messages;
+    input = _pendingEdit.input;
+    _pendingEdit = null;
+    rebuildToolMessageIndex();
+    return true;
+  }
   function editMessage(originalText: string, newText: string) {
-    if (wsState !== 'open' || isStreaming) return;
+    if (wsState !== 'open' || isStreaming || _pendingEdit) return;
     // Find the message in local state (last matching user message)
     const idx = messages.findLastIndex((m) => m.role === 'user' && m.content === originalText);
     if (idx === -1) return;
-    // Update content first, then truncate after this message
-    messages[idx].content = newText;
-    messages = messages.slice(0, idx + 1);
+    _pendingEdit = { messages: cloneMessagesForEdit(messages), input };
+    // Update content first, then truncate after this message without mutating
+    // the objects retained by the rollback snapshot.
+    messages = messages
+      .slice(0, idx + 1)
+      .map((message, messageIndex) =>
+        messageIndex === idx ? { ...message, content: newText } : message
+      );
     rebuildToolMessageIndex();
     // Send to server — server rewinds session and resends
-    send({ type: 'edit_message', originalMessage: originalText, newMessage: newText });
+    if (!send({ type: 'edit_message', originalMessage: originalText, newMessage: newText })) {
+      restorePendingEdit();
+      showChatNotice('Unable to edit message while disconnected.', 'warning');
+      return;
+    }
     scrollBottom();
   }
 
@@ -3586,6 +3922,46 @@
       }
     }
     return undefined;
+  }
+
+  function createToolMessage(
+    toolName: string,
+    toolCallId: string | undefined,
+    details?: Record<string, unknown>,
+    renderedCallHtml?: string[]
+  ): UIMessage {
+    return {
+      id: uid(),
+      role: 'tool',
+      content: '',
+      toolName,
+      toolCallId,
+      toolInput: formatToolInput(toolName, details),
+      renderedCallHtml,
+      streaming: true,
+      expanded: toolsExpandedGlobal,
+      startMs: Date.now(),
+      createdAt: Date.now(),
+    };
+  }
+
+  function ensureToolMessage(
+    toolCallId: string | undefined,
+    toolName: string,
+    details?: Record<string, unknown>,
+    renderedCallHtml?: string[]
+  ): UIMessage | undefined {
+    if (!toolCallId) return undefined;
+    const existing = findToolMessage(toolCallId);
+    if (existing) return existing;
+    const created = createToolMessage(toolName, toolCallId, details, renderedCallHtml);
+    messages.push(created);
+    // `$state` deep-wraps objects when they enter the messages array. Index
+    // that wrapped value so later event mutations invalidate the rendered row;
+    // indexing the pre-push object bypasses Svelte's proxy.
+    const reactive = messages[messages.length - 1];
+    indexToolMessage(reactive);
+    return reactive;
   }
 
   /** One pending scroll per frame — token deltas and WS frames call this often. */
@@ -4695,13 +5071,25 @@
   onMount(() => {
     // Paint the last conversation immediately on cold start (mobile OSes
     // discard backgrounded PWAs; without this the user stares at a splash
-    // until the WS delivers `connected`). Live server state replaces the
-    // snapshot wholesale — stable message ids keep that swap cheap. Prefer
-    // the URL param (explicit nav) but fall back to the persisted device
-    // identity — a PWA relaunch from the home screen has no URL param at
-    // all, and without this the cached tail would be validated against
-    // `null` (any session) instead of the one we actually intend to resume.
-    const snap = loadSnapshot(getSessionParam() ?? loadIdentity()?.path ?? null);
+    // until the WS delivers `connected`). A URL written by this app while a
+    // switch was still pending may be stale after a reload, so the durable
+    // device identity outranks that one URL only. Genuine deep links keep
+    // their normal precedence.
+    const urlSessionPath = getSessionParam();
+    const storedIdentityPath = loadIdentity()?.path ?? null;
+    let appOwnedOptimisticUrl = false;
+    try {
+      const marker = (history.state as Record<string, unknown> | null)?.piUiOptimisticSession;
+      appOwnedOptimisticUrl = marker === urlSessionPath && typeof marker === 'string';
+    } catch {
+      /* history unavailable */
+    }
+    bootResumePath =
+      appOwnedOptimisticUrl && storedIdentityPath
+        ? storedIdentityPath
+        : (urlSessionPath ?? storedIdentityPath);
+    const snap = loadSnapshot(bootResumePath);
+    if (snap) _lastVisibleSessionPath = bootResumePath ?? undefined;
     if (snap) {
       messages = snap.messages;
       rebuildToolMessageIndex();
@@ -4815,6 +5203,7 @@
   onDestroy(() => {
     releaseWakeLock();
     if (sendHoldTimer) clearTimeout(sendHoldTimer);
+    clearBootResumeTimer();
     if (_fileCompleteTimer) clearTimeout(_fileCompleteTimer);
     if (_editorMirrorTimer) {
       clearTimeout(_editorMirrorTimer);
@@ -5003,21 +5392,6 @@
                     <rect x="3" y="4" width="18" height="16" rx="2"></rect>
                     <path d="M9 4v16"></path>
                   </svg>
-                  {#if projectsState.backgroundActivity}
-                    <span
-                      class="absolute -right-0.5 -top-0.5 h-2 w-2 rounded-full border border-base-200 {projectsState.backgroundActivity ===
-                      'running'
-                        ? 'bg-success glow-success animate-pulse'
-                        : 'bg-primary glow-primary'}"
-                      role="status"
-                      aria-label={projectsState.backgroundActivity === 'running'
-                        ? 'Background session running'
-                        : 'Background session results'}
-                      title={projectsState.backgroundActivity === 'running'
-                        ? 'Background session running'
-                        : 'Background session results'}
-                    ></span>
-                  {/if}
                 </button>
               {/snippet}
             </Tooltip.Trigger>
@@ -5509,7 +5883,21 @@
             msg.thinkingExpanded = !msg.thinkingExpanded;
           }}
           onToggleTool={(msg) => {
-            if (msg.content || msg.diff || msg.images?.length) msg.expanded = !msg.expanded;
+            const expanding = !msg.expanded;
+            msg.expanded = expanding;
+            if (
+              expanding &&
+              msg.outputElided &&
+              !msg.content &&
+              !msg.outputLoading &&
+              msg.toolCallId
+            ) {
+              msg.outputLoading = true;
+              if (!send({ type: 'get_tool_output', toolCallId: msg.toolCallId })) {
+                msg.outputLoading = false;
+                showChatNotice('Unable to load tool output while disconnected.', 'warning');
+              }
+            }
           }}
           onProjectPickerToggle={(e) => {
             e.stopPropagation();
@@ -6645,26 +7033,6 @@
                           }}
                           disabled={!notificationPrefs.enabled}
                           aria-label="Toggle response complete notification"
-                        />
-                      </div>
-                      <div
-                        class="flex items-center gap-3 px-4 py-3 {notificationPrefs.enabled
-                          ? ''
-                          : 'opacity-40 pointer-events-none'}"
-                      >
-                        <div class="flex-1 min-w-0">
-                          <p class="text-sm text-base-content/75">Background Session Finished</p>
-                          <p class="text-xs text-base-content/35 mt-0.5">
-                            Notify when a session you're not watching finishes.
-                          </p>
-                        </div>
-                        <Switch
-                          checked={notificationPrefs.onSessionFinish}
-                          onCheckedChange={(v) => {
-                            notificationPrefs.onSessionFinish = v;
-                          }}
-                          disabled={!notificationPrefs.enabled}
-                          aria-label="Toggle background session notification"
                         />
                       </div>
                     </div>

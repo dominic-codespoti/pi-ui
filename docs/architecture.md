@@ -33,9 +33,9 @@
 │                                    │  │   → tools_list/commands  │  │ │
 │                                    │  └──────────────────────────┼──┘ │
 │  ┌────────────────────────┐        │                             │    │
-│  │ Session pool (LRU)     │◄───────│ sessionPool Map             │    │
-│  │ • keyed by sid/cwd     │        │ (hostBound flag, diag)      │    │
-│  │ • idle cleanup 30 min  │        └─────────────────────────────┼────┘
+│  │ Single live session    │◄───────│ live AgentSession binding   │    │
+│  │ • exactly one runtime  │        │ (hostBound flag, diag)      │    │
+│  │ • switch disposes/opens│        └─────────────────────────────┼────┘
 │  └────────────────────────┘                                      │
 │                                                                  │
 │  ┌────────────────────────┐        ┌─────────────────────────────┼────┐
@@ -45,7 +45,7 @@
 │  └────────────────────────┘                                      │
 │                                                                  ▼
 │  Dependency: @earendil-works/pi-coding-agent SDK        Extension RPC
-│  (~136 MB on first import, ~32 MB RSS idle)             (tools, dialogs)
+│  (~136 MB on first import, ~32 MB RSS baseline)          (tools, dialogs)
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -57,19 +57,19 @@
 4. **First WebSocket connect** at `/ws`:
    - JWT cookie validated
    - pi SDK lazily imported
-   - **Cold start** (no pooled session): sends a shell `connected` immediately (0 messages) so the client paints instantly from its snapshot cache; full initial history follows as `session_loaded` with max 100 messages once the SDK finishes parsing the JSONL session file. Extension host binding (`bindRpcHost`) runs in the background to avoid blocking initial UI paint.
-   - **Warm reconnect**: reuses the pooled `AgentSession` and sends `connected` with max 100 messages directly (bounded for wire transfer).
+   - **Cold start** (no live session): sends a shell `connected` immediately (0 messages) so the client paints instantly from its snapshot cache; full initial history follows as `session_loaded` with max 100 messages once the SDK finishes parsing the JSONL session file. Extension host binding (`bindRpcHost`) runs in the background to avoid blocking initial UI paint.
+   - **Warm reconnect**: reuses the live `AgentSession` and sends `connected` with max 100 messages directly (bounded for wire transfer).
    - SDK events forwarded to all WS clients via `server.publish()`
 5. **On client disconnect**: 15s grace period before cancelling pending extension dialogs
-6. **Session switch**: saves current UI state in `SessionViewCache` (input drafts, collapsed/expanded user message views), correlates requests via `requestId`, preserves old session in pool, registers new one, and broadcasts `session_loaded` with max 100 messages
+6. **Session switch**: disposes the current live `AgentSession`, opens the target from its on-disk `.jsonl` file, and broadcasts one authoritative bounded `session_loaded` snapshot (max 100 messages) to every tab.
 
-## Session Pool
+## Single Live Session
 
-- Sessions are managed in a server-side `sessionPool` Map tracking runtime instances, active state, diagnostics, and a `hostBound` flag (indicating whether background `bindRpcHost` extension host binding completed).
-- Idle sessions are evicted after 30 minutes.
-- Reconnecting to an existing pool entry reuses the session (preserves in-progress state).
-- `activeSession()` returns the current session; throws if none.
-- Session discovery scans the session storage directory and walks subagent `tasks/` subdirectories (`<parent_stem>/tasks/*.jsonl`) with line-by-line streaming and a persisted mtime/size stat cache.
+- The server retains exactly one live `AgentSession` runtime at a time, with diagnostics and a `hostBound` flag indicating whether background `bindRpcHost` extension host binding completed.
+- Switching disposes the current runtime before opening the target session from its on-disk `.jsonl` file; reconnecting while that session remains live reuses it.
+- Switching back to a previous session re-reads its bounded message tail from disk instead of resuming from memory. This is intended design.
+- Non-live sessions have no in-memory background run/unread state. Sidebar liveness covers the active session; other sessions update through the filesystem watcher.
+- Session catalogs (`session-catalog.ts` / `project-catalog.ts`) surface non-live sessions from on-disk `.jsonl` files. Discovery scans the session storage directory and walks subagent `tasks/` subdirectories (`<parent_stem>/tasks/*.jsonl`) with line-by-line streaming and a persisted mtime/size stat cache.
 - A recursive filesystem watcher (`startSessionWatch`) monitors session directory updates and invalidates the session scan cache with debouncing.
 
 ## SDK Integration
@@ -108,7 +108,6 @@ Both the SDK and SvelteKit handler are lazy-loaded to minimize startup memory:
 - **`Bun.serve()`** — Single server handles both HTTP and WebSocket
 - **`server.publish('pi', payload)`** — Bun's built-in pub/sub for broadcasting to all WS clients
 - **`server.upgrade(req)`** — WebSocket upgrade handling
-- **`globalThis`** for shared state — bcrypt hash, JWT secret, rate limit data, session pool
-- **`boundMessagesForWire`** — Character-budgeted wire message bounding (per-block cap 80 KB, per-message cap 128 KB, total budget 512 KB, falling back to 512-byte min caps for older messages) preventing WS payload stalls on giant reasoning or file outputs.
+- **`globalThis`** for shared state — bcrypt hash, JWT secret, rate limit data, and the single live session binding
+- **`boundMessagesForWire`** — Character-budgeted wire message bounding (per-block cap 80 KB, per-message cap 128 KB). `totalBudget` (512 KB) is a hard ceiling covering both message content and rendered extension aux fields; `MAX_WIRE_AUX_TOTAL_CHARS` (256 KB) is a sub-cap inside that total. These bounds prevent WS payload stalls on giant reasoning or file outputs. Derived extension HTML, parsed component trees, terminal lines, and session trees have independent node/character caps.
 - **Valibot validation (`parseServerMessage`)** — Strict schema validation for incoming server-sent WebSocket payloads on the client to ensure type safety and early detection of payload mismatches.
-- **`SessionViewCache`** — Client-side caching of session-specific transient view state (input drafts, expanded user messages, truncated user message toggles) across session switches.

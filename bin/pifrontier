@@ -14,4 +14,4 @@ while [ -h "$SELF" ]; do
     *) SELF="$DIR/$LINK" ;;
   esac
 done
-exec bun "$(dirname "$SELF")/pifrontier.ts" "$@"
+exec bun --smol run "$(dirname "$SELF")/pifrontier.ts" "$@"

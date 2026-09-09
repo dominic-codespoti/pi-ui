@@ -9,7 +9,11 @@
 
 import type { AgentSession, MarkdownTransformer } from '@earendil-works/pi-coding-agent';
 import type { Terminal } from '@earendil-works/pi-tui';
-// ── Stubs ────────────────────────────────────────────────────────────────────
+import {
+  MAX_WIRE_AUX_CHARS,
+  MAX_WIRE_AUX_TOTAL_CHARS,
+  MAX_WIRE_IMAGE_CHARS,
+} from './wire-limits.ts';
 
 /** Strips ANSI escape codes from a string. */
 /* eslint-disable no-control-regex -- matching literal ESC/BEL control bytes is the point */
@@ -451,15 +455,53 @@ export class StubTui {
     return null;
   }
 }
-/** Render an interactive custom() TUI at its live column width; null on failure. Non-string lines are dropped. */
+/** Bound terminal output before retaining or sending both clean and HTML copies. */
+export function boundTerminalLines(
+  lines: readonly unknown[],
+  maxChars: number = MAX_WIRE_AUX_CHARS
+): string[] {
+  const bounded: string[] = [];
+  let remaining = Math.max(0, maxChars);
+  for (const line of lines) {
+    if (typeof line !== 'string') continue;
+    if (remaining <= 0) break;
+    const value = line.length > remaining ? line.slice(0, remaining) : line;
+    bounded.push(value);
+    remaining -= value.length;
+    if (value.length < line.length) break;
+  }
+  return bounded;
+}
+
+/** Convert terminal lines to HTML while bounding the expanded output. */
+export function boundedAnsiToHtmlLines(
+  lines: readonly unknown[],
+  maxChars: number = MAX_WIRE_AUX_CHARS
+): string[] {
+  const bounded: string[] = [];
+  let remaining = Math.max(0, maxChars);
+  for (const line of lines) {
+    if (typeof line !== 'string') continue;
+    if (remaining <= 0) break;
+    const source = line.length > remaining ? line.slice(0, remaining) : line;
+    const html = ansiToHtml(source);
+    const value = html.length > remaining ? html.slice(0, remaining) : html;
+    bounded.push(value);
+    remaining -= value.length;
+    if (source.length < line.length || value.length < html.length) break;
+  }
+  return bounded;
+}
+
+/** Render an interactive custom() TUI at its live column width; null on failure. */
 export function renderTerminalLines(
   tui: StubTui
 ): { cleanLines: string[]; htmlLines: string[] } | null {
   try {
     const rawLines = tui.render();
     if (!Array.isArray(rawLines)) return null;
-    const lines = rawLines.filter((line): line is string => typeof line === 'string');
-    return { cleanLines: lines.map(stripAnsi), htmlLines: lines.map(ansiToHtml) };
+    const lines = boundTerminalLines(rawLines);
+    return { cleanLines: lines.map(stripAnsi), htmlLines: boundedAnsiToHtmlLines(lines) };
   } catch {
     return null;
   }
@@ -577,6 +619,170 @@ export type ParsedComponent =
   | ParsedImage
   | ParsedMarkdown
   | ParsedSettings;
+
+const MAX_PARSED_COMPONENT_NODES = 256;
+// Bounds per-node item arrays during the authoritative bounding pass.
+const MAX_PARSED_COMPONENT_ITEMS = 256;
+const MAX_COMPONENT_TREE_DEPTH = 128;
+
+/**
+ * Copy a parsed extension component tree into a bounded wire-safe shape.
+ * Images are omitted as a whole when they cannot fit; sending a partial
+ * base64 string would only create a broken image while retaining its cost.
+ */
+export function boundParsedComponentTree(
+  parsed: ParsedComponent,
+  maxChars: number = MAX_WIRE_AUX_TOTAL_CHARS,
+  maxImageChars: number = MAX_WIRE_IMAGE_CHARS,
+  maxNodes: number = MAX_PARSED_COMPONENT_NODES
+): ParsedComponent {
+  let remaining = Math.max(0, maxChars);
+  let nodes = 0;
+  const nodeLimit = Math.max(1, Math.floor(maxNodes));
+  const imageLimit = Math.max(0, maxImageChars);
+
+  const take = (value: string): string => {
+    if (remaining <= 0) return '';
+    if (value.length <= remaining) {
+      remaining -= value.length;
+      return value;
+    }
+    const out = value.slice(0, remaining);
+    remaining = 0;
+    return out;
+  };
+
+  const walk = (node: ParsedComponent): ParsedComponent | null => {
+    if (nodes++ >= nodeLimit) return null;
+    switch (node.kind) {
+      case 'container': {
+        const children: ParsedComponent[] = [];
+        for (const child of node.children) {
+          if (nodes >= nodeLimit) break;
+          const bounded = walk(child);
+          if (bounded) children.push(bounded);
+        }
+        return {
+          kind: 'container',
+          children,
+          ...(node.direction ? { direction: node.direction } : {}),
+          ...(node.path ? { path: node.path } : {}),
+        };
+      }
+      case 'select': {
+        const options: ParsedSelect['options'] = [];
+        for (const option of node.options) {
+          if (options.length >= MAX_PARSED_COMPONENT_ITEMS || remaining <= 0) break;
+          options.push({
+            value: take(option.value),
+            label: take(option.label),
+            ...(option.description !== undefined ? { description: take(option.description) } : {}),
+          });
+        }
+        return {
+          kind: 'select',
+          label: take(node.label),
+          options,
+          ...(node.path ? { path: node.path } : {}),
+        };
+      }
+      case 'input':
+        return {
+          kind: 'input',
+          label: take(node.label),
+          ...(node.placeholder !== undefined ? { placeholder: take(node.placeholder) } : {}),
+          ...(node.value !== undefined ? { value: take(node.value) } : {}),
+          ...(node.multiline !== undefined ? { multiline: node.multiline } : {}),
+          ...(node.path ? { path: node.path } : {}),
+        };
+      case 'text':
+        return {
+          kind: 'text',
+          label: take(node.label),
+          content: take(node.content),
+          ...(node.monoPreserve !== undefined ? { monoPreserve: node.monoPreserve } : {}),
+          ...(node.path ? { path: node.path } : {}),
+        };
+      case 'button':
+        return {
+          kind: 'button',
+          label: take(node.label),
+          ...(node.variant !== undefined ? { variant: node.variant } : {}),
+          ...(node.path ? { path: node.path } : {}),
+        };
+      case 'checkbox':
+        return {
+          kind: 'checkbox',
+          label: take(node.label),
+          checked: node.checked,
+          ...(node.path ? { path: node.path } : {}),
+        };
+      case 'progress':
+        return {
+          kind: 'progress',
+          label: take(node.label),
+          progress: node.progress,
+          ...(node.path ? { path: node.path } : {}),
+        };
+      case 'loader':
+        return {
+          kind: 'loader',
+          label: take(node.label),
+          ...(node.cancellable !== undefined ? { cancellable: node.cancellable } : {}),
+          ...(node.path ? { path: node.path } : {}),
+        };
+      case 'image': {
+        const label = take(node.label);
+        if (node.data.length > imageLimit || node.data.length > remaining) {
+          return {
+            kind: 'text',
+            label,
+            content: take('[image omitted: too large for transfer]'),
+            ...(node.path ? { path: node.path } : {}),
+          };
+        }
+        const data = take(node.data);
+        return {
+          kind: 'image',
+          label,
+          data,
+          mimeType: take(node.mimeType),
+          ...(node.path ? { path: node.path } : {}),
+        };
+      }
+      case 'markdown':
+        return {
+          kind: 'markdown',
+          content: take(node.content),
+          ...(node.path ? { path: node.path } : {}),
+        };
+      case 'settings': {
+        const items: ParsedSettingItem[] = [];
+        for (const item of node.items) {
+          if (items.length >= MAX_PARSED_COMPONENT_ITEMS || remaining <= 0) break;
+          const values =
+            item.values === undefined
+              ? undefined
+              : item.values.slice(0, MAX_PARSED_COMPONENT_ITEMS).map((value) => take(value));
+          items.push({
+            id: take(item.id),
+            label: take(item.label),
+            ...(item.description !== undefined ? { description: take(item.description) } : {}),
+            currentValue: take(item.currentValue),
+            ...(values !== undefined ? { values } : {}),
+          });
+        }
+        return {
+          kind: 'settings',
+          items,
+          ...(node.path ? { path: node.path } : {}),
+        };
+      }
+    }
+  };
+
+  return walk(parsed) ?? { kind: 'text', label: '', content: '' };
+}
 
 // ── Component tree walker ─────────────────────────────────────────────────────
 
@@ -741,8 +947,12 @@ export function parseComponentTree(
   comp: Record<string, unknown>,
   width: number = 80,
   path: number[] = [],
-  nodeMap?: Map<string, Record<string, unknown>>
+  nodeMap?: Map<string, Record<string, unknown>>,
+  depth: number = 0
 ): ParsedComponent {
+  // Stop hostile or cyclic trees from overflowing the stack before wire bounding.
+  if (depth >= MAX_COMPONENT_TREE_DEPTH) return { kind: 'text', label: '', content: '' };
+  const childDepth = depth + 1;
   const register = (node: ParsedComponent): ParsedComponent => {
     if (nodeMap) nodeMap.set(path.join('.'), comp);
     (node as { path?: number[] }).path = path;
@@ -844,12 +1054,13 @@ export function parseComponentTree(
         : 'vertical';
 
     const parsedChildren: ParsedComponent[] = [];
-    children.forEach((child, i) => {
-      const parsed = parseComponentTree(child, width, [...path, i], nodeMap);
+    for (let i = 0; i < children.length; i++) {
+      const child = children[i];
+      const parsed = parseComponentTree(child, width, [...path, i], nodeMap, childDepth);
       // Skip empty text results (from spacers, empty containers)
-      if (parsed.kind === 'text' && !parsed.content) return;
+      if (parsed.kind === 'text' && !parsed.content) continue;
       parsedChildren.push(parsed);
-    });
+    }
     if (parsedChildren.length === 0) {
       return { kind: 'text', label: '', content: '' };
     }
@@ -876,12 +1087,9 @@ export function parseComponentTree(
   // ── Fallback: try render() for unknown components ─────────────────────
   if (typeof comp.render === 'function') {
     try {
-      const lines = comp.render(width) as string[];
+      const lines = comp.render(width);
       if (Array.isArray(lines) && lines.length > 0) {
-        const content = lines
-          .map((l) => stripAnsi(l))
-          .join('\n')
-          .trim();
+        const content = boundTerminalLines(lines).map(stripAnsi).join('\n').trim();
         if (content) return register({ kind: 'text', label: '', content, monoPreserve: true });
       }
     } catch {
@@ -961,13 +1169,21 @@ function buildToolRenderContext(
   };
 }
 
-/** Run a rendered `Component` through the same ansiToHtml pipeline setWidget uses. Returns undefined on any failure or empty output. */
+/** Run a rendered `Component` through the same ansiToHtml pipeline setWidget uses.
+ * Derived HTML is capped before it can be retained in a UI message or replay
+ * payload; the source session data remains untouched. */
 function componentToHtmlLines(component: unknown): string[] | undefined {
-  if (!component || typeof (component as { render?: unknown }).render !== 'function')
+  if (
+    !component ||
+    typeof component !== 'object' ||
+    !('render' in component) ||
+    typeof component.render !== 'function'
+  )
     return undefined;
-  const lines = (component as { render: (width: number) => string[] }).render(80);
+  const lines = component.render(80);
   if (!Array.isArray(lines) || lines.length === 0) return undefined;
-  return lines.map((l: string) => ansiToHtml(l));
+  const output = boundedAnsiToHtmlLines(lines);
+  return output.length > 0 ? output : undefined;
 }
 
 /**
@@ -1051,7 +1267,7 @@ export function renderCustomMessage(sess: AgentSession, msg: unknown): unknown {
   }
 }
 
-/** Array wrapper for history payloads — copy-on-write, same convention as `trimMessagesForWire`. */
+/** Array wrapper for history payloads — copy-on-write, same convention as `boundMessagesForWire`. */
 export function renderCustomMessagesForWire(sess: AgentSession, messages: unknown[]): unknown[] {
   let changed = false;
   const out = messages.map((msg) => {
@@ -1067,7 +1283,7 @@ export function renderCustomMessagesForWire(sess: AgentSession, messages: unknow
 /**
  * Apply all registered markdown transformers (registration order) to one
  * user/assistant message — copy-on-write, same convention as
- * `trimMessagesForWire`. Mirrors what pi's interactive transcript does before
+ * `boundMessagesForWire`. Mirrors what pi's interactive transcript does before
  * rendering markdown; the LLM context is never touched.
  */
 export function applyMarkdownTransformers<T>(sess: AgentSession, msg: T): T {
@@ -1270,12 +1486,12 @@ export async function callFactoryAndParse(
     if (!component || typeof component !== 'object') return null;
 
     const parsed = parseComponentTree(component);
-    // Inject title if the component didn't provide one
+    // Inject title if the component didn't provide one.
     if (title && parsed.kind !== 'container') {
       const p = parsed as unknown as { label?: string };
-      if (!p.label) p.label = title;
+      if (!p.label) p.label = title.slice(0, MAX_WIRE_AUX_CHARS);
     }
-    return parsed;
+    return boundParsedComponentTree(parsed);
   } catch {
     return null;
   }

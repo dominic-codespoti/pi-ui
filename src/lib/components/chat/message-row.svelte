@@ -600,7 +600,8 @@
     msg.content ||
     msg.diff ||
     msg.images?.length ||
-    msg.renderedResultHtml?.length
+    msg.renderedResultHtml?.length ||
+    msg.outputElided
   )}
   <div class="flex flex-col trace-step tool-step" class:msg-in={isNewest}>
     <!-- Flat flex row: [status][icon][label][detail][time] -->
@@ -613,8 +614,8 @@
         : ''}"
       disabled={!hasOutput && !msg.streaming}
     >
-      <!-- Status: chevron (expandable) | spinner (streaming) | check | error -->
-      {#if msg.streaming}
+      <!-- Status: chevron (expandable) | spinner (streaming/loading) | check | error -->
+      {#if msg.streaming || msg.outputLoading}
         <Loader class="w-2.5 h-2.5 flex-shrink-0 animate-spin" style="opacity:0.5" />
       {:else if msg.isError}
         <CircleX class="w-2.5 h-2.5 flex-shrink-0 text-destructive/70" />
@@ -658,7 +659,18 @@
       </span>
     </button>
     {#if msg.expanded && !msg.streaming}
-      {#if msg.renderedResultHtml}
+      {#if msg.outputLoading}
+        <div
+          class="trace-output mt-1 flex items-center gap-2 text-xs text-base-content/45 italic py-1.5 px-2"
+        >
+          <Loader class="w-3 h-3 flex-shrink-0 animate-spin" style="opacity:0.6" />
+          <span
+            >Loading full output{#if msg.outputBytes}
+              <span class="text-base-content/35">({msg.outputBytes.toLocaleString()} chars)</span
+              >{/if}…</span
+          >
+        </div>
+      {:else if msg.renderedResultHtml}
         <div
           class="trace-output mt-1 text-xs leading-relaxed select-text py-1.5 px-2 bg-base-content/[0.025] rounded-r font-mono"
         >
