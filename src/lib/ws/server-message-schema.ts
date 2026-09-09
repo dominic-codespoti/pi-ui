@@ -475,9 +475,20 @@ export const OlderMessagesSchema = v.looseObject({
 export const SessionRuntimeSchema = v.looseObject({
   type: v.literal('session_runtime'),
   sessionId: v.string(),
+  phase: v.optional(
+    v.union([
+      v.literal('idle'),
+      v.literal('running'),
+      v.literal('awaiting-input'),
+      v.literal('error'),
+    ])
+  ),
   isRunning: v.boolean(),
   lastActivity: v.number(),
   activeToolName: v.optional(v.string()),
+  unread: v.optional(v.boolean()),
+  needsAttention: v.optional(v.boolean()),
+  resident: v.optional(v.boolean()),
 });
 
 export const ExtensionTerminalInputResultSchema = v.looseObject({

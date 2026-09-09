@@ -231,14 +231,17 @@ describe('server-message-schema', () => {
     const sessionRuntime = parseServerMessage({
       type: 'session_runtime',
       sessionId: 's-1',
+      phase: 'idle',
       isRunning: false,
-      activeToolName: 'read',
-      unseen: false,
       lastActivity: 1234567890,
+      unread: false,
+      needsAttention: false,
+      resident: true,
     });
     expect(sessionRuntime.ok).toBe(true);
     if (sessionRuntime.ok && sessionRuntime.kind === 'custom') {
-      expect(sessionRuntime.value.activeToolName).toBe('read');
+      expect(sessionRuntime.value.phase).toBe('idle');
+      expect(sessionRuntime.value.activeToolName).toBeUndefined();
     }
 
     const olderMsgs = parseServerMessage({
@@ -256,6 +259,29 @@ describe('server-message-schema', () => {
       data: 'abc',
     });
     expect(termInput.ok).toBe(true);
+  });
+  it('validates extended and legacy session_runtime frames', () => {
+    const full = {
+      type: 'session_runtime',
+      sessionId: 's-runtime',
+      phase: 'running',
+      isRunning: true,
+      lastActivity: 1700000000000,
+      unread: true,
+      needsAttention: false,
+      resident: true,
+    };
+
+    expect(parseServerMessage(full).ok).toBe(true);
+    expect(
+      parseServerMessage({
+        type: 'session_runtime',
+        sessionId: 's-legacy',
+        isRunning: false,
+        lastActivity: 1700000000000,
+      }).ok
+    ).toBe(true);
+    expect(parseServerMessage({ ...full, phase: 'paused' }).ok).toBe(false);
   });
 
   it('reports validation issues when a known custom schema has invalid fields', () => {

@@ -8,6 +8,7 @@ import {
   pathBasename,
   SESSION_OP_TIMEOUT_MS,
   type ProjectGroup,
+  type SessionRuntimeStatus as ProjectsSessionRuntimeStatus,
 } from '../projects-state.svelte';
 
 /** Minimal SessionSummary with per-field overrides for tree/filter fixtures. */
@@ -20,6 +21,19 @@ const mkSession = (id: string, overrides: Partial<SessionSummary> = {}): Session
   modified: 0,
   messageCount: 0,
   firstMessage: '',
+  ...overrides,
+});
+const mkRuntime = (
+  sessionId: string,
+  overrides: Partial<Omit<ProjectsSessionRuntimeStatus, 'sessionId'>> = {}
+): ProjectsSessionRuntimeStatus => ({
+  sessionId,
+  phase: 'idle',
+  isRunning: false,
+  lastActivity: 0,
+  unread: false,
+  needsAttention: false,
+  resident: true,
   ...overrides,
 });
 
@@ -129,6 +143,7 @@ describe('ProjectsState', () => {
     projectsState.activeSessionId = null;
     projectsState.isStreaming = false;
     projectsState.activeToolName = undefined;
+    projectsState.runtime.clear();
     projectsState.filter = '';
     projectsState.error = null;
     projectsState.pendingNewSession = false;
@@ -784,6 +799,73 @@ describe('ProjectsState', () => {
       expect(projectsState.activeSessionId).toBe('active');
       expect(projectsState.isStreaming).toBe(false);
       expect(projectsState.activeToolName).toBeUndefined();
+    });
+    it('upserts runtime snapshots by session id', () => {
+      const first = mkRuntime('s1', { phase: 'running', isRunning: true, lastActivity: 10 });
+      projectsState.applyRuntime(first);
+      projectsState.applyRuntime({
+        ...first,
+        phase: 'idle',
+        isRunning: false,
+        lastActivity: 20,
+      });
+
+      expect(projectsState.runtime.size).toBe(1);
+      expect(projectsState.runtime.get('s1')).toMatchObject({
+        phase: 'idle',
+        isRunning: false,
+        lastActivity: 20,
+      });
+    });
+
+    it('prunes runtime snapshots when the authoritative session list changes', () => {
+      const s1 = mkSession('s1');
+      const s2 = mkSession('s2');
+      projectsState.applyState({ sessions: [s1, s2] });
+      projectsState.applyRuntime(mkRuntime('s1', { isRunning: true, phase: 'running' }));
+      projectsState.applyRuntime(mkRuntime('s2', { unread: true }));
+
+      projectsState.applyState({ sessions: [s1] });
+
+      expect(projectsState.runtime.has('s1')).toBe(true);
+      expect(projectsState.runtime.has('s2')).toBe(false);
+    });
+
+    it('reports running, tool, unread, attention, and project activity', () => {
+      const running = mkRuntime('running', {
+        phase: 'running',
+        isRunning: true,
+        activeToolName: 'bash',
+      });
+      const attention = mkRuntime('attention', {
+        phase: 'error',
+        needsAttention: true,
+      });
+      const unread = mkRuntime('unread', { unread: true });
+      projectsState.applyRuntime(running);
+      projectsState.applyRuntime(attention);
+      projectsState.applyRuntime(unread);
+
+      expect(projectsState.isSessionRunning('running')).toBe(true);
+      expect(projectsState.sessionToolName('running')).toBe('bash');
+      expect(projectsState.sessionNeedsAttention('attention')).toBe(true);
+      expect(projectsState.isSessionUnread('unread')).toBe(true);
+      expect(
+        projectsState.projectActivity({
+          cwd: '/p',
+          name: 'P',
+          pinned: false,
+          exists: true,
+          registered: true,
+          sessionCount: 3,
+          lastActivity: 0,
+          sessions: buildSessionRows([
+            mkSession('running'),
+            mkSession('attention'),
+            mkSession('unread'),
+          ]),
+        })
+      ).toBe('running');
     });
 
     it('toggleCollapsed toggles and persists', () => {

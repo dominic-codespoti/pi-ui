@@ -98,6 +98,7 @@ import {
   type WidgetPlacement,
   type ExtensionUiStatePayload,
   type TreeNode,
+  type SessionPhase,
 } from './src/lib/ws/protocol.ts';
 import {
   applyMarkdownTransformersToMessages,
@@ -1134,6 +1135,7 @@ function createDialogPromise<T>(
       resolve: (response) => {
         if (entry.timeoutId) clearTimeout(entry.timeoutId);
         ui.pendingDialogs.delete(id);
+        if (ownerSessionId) scheduleSessionRuntimeBroadcast(ownerSessionId);
         finalizeExtensionResponse(id);
         pendingRequestOwners.delete(id);
         resolve(parseResponse(response));
@@ -1141,6 +1143,7 @@ function createDialogPromise<T>(
     };
     ui.pendingDialogs.set(id, entry);
     pendingRequestOwners.set(id, ownerSessionId);
+    if (ownerSessionId) scheduleSessionRuntimeBroadcast(ownerSessionId);
     broadcast({
       type: 'extension_ui_request',
       id,
@@ -1159,6 +1162,11 @@ function createDialogPromise<T>(
 
 /** Number of currently-connected WS clients (browser tabs). */
 let connectedClients = 0;
+/** Number of connected sockets currently focused on each resident session. */
+const focusedSessionCounts = new Map<string, number>();
+function hasFocusedSocket(sid: string): boolean {
+  return (focusedSessionCounts.get(sid) ?? 0) > 0;
+}
 /** Timer that fires when the grace period for pending extension UI requests expires. */
 let _pendingRequestsTimeout: Timer | null = null;
 /** Cancel orphaned extension UI requests after all clients disconnect. */
@@ -1519,6 +1527,7 @@ const uiContext: ServerExtensionUIContext = {
                     /* ignore */
                   }
                   ui.pendingDialogs.delete(id);
+                  if (owner) scheduleSessionRuntimeBroadcast(owner);
                   finalizeExtensionResponse(id);
                   pendingRequestOwners.delete(id);
                   resolve(
@@ -1532,6 +1541,7 @@ const uiContext: ServerExtensionUIContext = {
               };
               ui.pendingDialogs.set(id, entry);
               pendingRequestOwners.set(id, owner);
+              if (owner) scheduleSessionRuntimeBroadcast(owner);
               broadcast({
                 type: 'extension_ui_request',
                 id,
@@ -2053,9 +2063,8 @@ function teardownWidget(key: string, owner: string | null): void {
 
 /**
  * Dispose every resource and pending request owned by a session. Silent — no
- * broadcasts: a disposed session is never the active session, so no client
- * displays its UI (multi-tab: disposal skips any session a tab has active
- * because the server's active session gates disposal).
+ * broadcasts: the caller emits any required lifecycle tombstone before
+ * removing the resident entry.
  */
 function disposeUi(sid: string): void {
   // Clear the terminal-input registry FIRST — a session whose extension only
@@ -2311,7 +2320,12 @@ async function getSDK(): Promise<typeof PiSDKNS> {
         scheduleSessionListRefresh();
         scheduleProjectsRefresh();
       },
-      (absolutePath) => absolutePath === live?.path
+      (absolutePath) => {
+        for (const entry of resident.values()) {
+          if (entry.path === absolutePath) return true;
+        }
+        return false;
+      }
     );
     return _sdk!;
   })();
@@ -2325,7 +2339,7 @@ async function getSDK(): Promise<typeof PiSDKNS> {
 
 interface ManagedSession {
   session: AgentSession;
-  /** Unsubscribe from the active-event-forwarding subscription (null when inactive). */
+  /** Unsubscribe from per-session event forwarding (null when inactive). */
   forwardingUnsub: (() => void) | null;
   /** Unsubscribe from the runtime-status subscription (always active). */
   runtimeUnsub: (() => void) | null;
@@ -2342,6 +2356,8 @@ interface ManagedSession {
   lastActivity: number;
   /** Pending coalesced session_runtime broadcast timer (null when none scheduled). */
   runtimeBroadcastTimer: Timer | null;
+  /** Last serialized runtime payload that was broadcast. */
+  runtimeStatusJson: string | null;
   /** Diagnostics from service/session creation. */
   diagnostics: RuntimeDiagnostic[];
   /** Whether the host contract has completed for this session. */
@@ -2350,6 +2366,10 @@ interface ManagedSession {
   bindingPending: boolean;
   /** Cached first user/assistant text for O(1) session-list updates. */
   firstMessage: string;
+  /** Whether a completed turn has reported an error. */
+  lastTurnError: boolean;
+  /** Whether a completed turn needs attention in an unfocused session. */
+  unread: boolean;
   /** Pending graceful extension shutdown request. */
   shutdownRequested: boolean;
   modelFallbackMessage?: string;
@@ -2358,21 +2378,76 @@ interface ManagedSession {
    *  (that call scans every entry the session has ever had). */
   sessionName: string | undefined;
 }
-/** The one live SDK session overlays the disk-backed session catalog. */
-let live: ManagedSession | null = null;
+const MAX_RESIDENT_SESSIONS = 2;
+const resident = new Map<string, ManagedSession>();
+let selectedSessionId: string | null = null;
+
 function activeSessionId(): string | null {
-  return live?.session.sessionId ?? null;
+  return selectedSessionId;
 }
 function managedSessionFor(sid: string): ManagedSession | undefined {
-  return live?.session.sessionId === sid ? live : undefined;
+  return resident.get(sid);
+}
+function activeSessionOrNullEntry(): ManagedSession | null {
+  return selectedSessionId ? (resident.get(selectedSessionId) ?? null) : null;
+}
+function residentFor(path: string): ManagedSession | undefined {
+  for (const entry of resident.values()) {
+    if (entry.path === path) return entry;
+  }
+  return undefined;
+}
+function residentEntries(): IterableIterator<ManagedSession> {
+  return resident.values();
 }
 
-/** Mechanical teardown of the live entry: unsubscribe, dispose the SDK
+function hasPendingExtensionDialog(sid: string): boolean {
+  return (uiStateBuckets.get(sid)?.pendingDialogs.size ?? 0) > 0;
+}
+
+function sessionPhaseFor(
+  sid: string,
+  entry: Pick<ManagedSession, 'isRunning' | 'activeToolName' | 'activeToolCalls' | 'lastTurnError'>
+): SessionPhase {
+  if (hasPendingExtensionDialog(sid)) return 'awaiting-input';
+  if (entry.isRunning || entry.activeToolName || entry.activeToolCalls.size > 0) return 'running';
+  if (entry.lastTurnError) return 'error';
+  return 'idle';
+}
+
+function isPinned(entry: ManagedSession): boolean {
+  return (
+    entry.isRunning ||
+    entry.activeToolName !== undefined ||
+    entry.activeToolCalls.size > 0 ||
+    hasPendingExtensionDialog(entry.session.sessionId)
+  );
+}
+
+function evictResidents(): void {
+  while (resident.size > MAX_RESIDENT_SESSIONS) {
+    let candidate: ManagedSession | undefined;
+    for (const entry of resident.values()) {
+      if (entry.session.sessionId === selectedSessionId || isPinned(entry)) continue;
+      if (!candidate || entry.lastActivity < candidate.lastActivity) candidate = entry;
+    }
+    if (!candidate) {
+      log.warn(
+        `[pifrontier] Resident session cap exceeded (${resident.size}/${MAX_RESIDENT_SESSIONS}); all entries are pinned or selected.`
+      );
+      return;
+    }
+    disposeSession(candidate.session.sessionId, 'capacity');
+  }
+}
+
+/** Mechanical teardown of one resident entry: unsubscribe, dispose the SDK
  * session, drop UI state, and release its catalog overlay. */
-function disposeLiveSession(reason: string): void {
-  const entry = live;
+function disposeSession(sid: string, reason: string): void {
+  const entry = resident.get(sid);
   if (!entry) return;
-  const sid = entry.session.sessionId;
+  resident.delete(sid);
+  if (selectedSessionId === sid) selectedSessionId = null;
   if (entry.runtimeBroadcastTimer) {
     clearTimeout(entry.runtimeBroadcastTimer);
     entry.runtimeBroadcastTimer = null;
@@ -2382,7 +2457,7 @@ function disposeLiveSession(reason: string): void {
   try {
     entry.forwardingUnsub?.();
   } catch (err) {
-    log.error(`[pifrontier] Error unsubscribing active events for ${sid}:`, err);
+    log.error(`[pifrontier] Error unsubscribing events for ${sid}:`, err);
   }
   try {
     entry.runtimeUnsub?.();
@@ -2398,7 +2473,6 @@ function disposeLiveSession(reason: string): void {
   entry.runtimeUnsub = null;
   disposeUi(sid);
   sessionCatalog.apply({ kind: 'release', id: sid });
-  live = null;
   log.info(`[pifrontier] Released session ${sid} from memory (${reason}).`);
 }
 
@@ -2457,14 +2531,15 @@ const projectCatalog = new ProjectCatalog(sessionCatalog);
 
 projectCatalog.onChange(() => scheduleProjectsRefresh());
 
-/** The currently-active AgentSession (throws if none). */
+/** The selected AgentSession (throws if none). */
 function activeSession(): AgentSession {
-  if (!live) throw new Error('No active session');
-  return live.session;
+  const entry = activeSessionOrNullEntry();
+  if (!entry) throw new Error('No active session');
+  return entry.session;
 }
-/** The currently-active AgentSession or null. */
+/** The selected AgentSession or null. */
 function activeSessionOrNull(): AgentSession | null {
-  return live?.session ?? null;
+  return activeSessionOrNullEntry()?.session ?? null;
 }
 function extensionFlagValuesFor(): Map<string, boolean | string> {
   const stored = readSettings().extensionFlags;
@@ -2554,15 +2629,12 @@ async function createSdkSession(
 ): Promise<CreatedSdkSession> {
   const tCreate = Date.now();
   const sdk = await getSDK();
-  const source = activeSessionOrNull();
   const settingsManager = sdk.SettingsManager.create(targetCwd, sdk.getAgentDir(), {
     projectTrusted: false,
   });
   const services = await sdk.createAgentSessionServices({
     cwd: targetCwd,
     agentDir: sdk.getAgentDir(),
-    settingsManager,
-    modelRuntime: source?.modelRuntime,
     extensionFlagValues: extensionFlagValuesFor(),
     resourceLoaderReloadOptions: {
       resolveProjectTrust: async () => resolveProjectTrust(targetCwd, settingsManager),
@@ -2617,7 +2689,7 @@ function requestExtensionShutdown(sid: string): void {
   if (!entry || entry.shutdownRequested) return;
   entry.shutdownRequested = true;
   const finish = () => {
-    if (live !== entry) return;
+    if (managedSessionFor(sid)?.session !== entry.session) return;
     broadcast({ type: 'shutdown_requested', sessionId: sid });
     void _shutdown();
   };
@@ -2648,8 +2720,7 @@ function commandContextActionsFor(
       withSessionMutationLock(async () => {
         const sessionFile = session.sessionFile;
         if (!sessionFile) throw new Error('Cannot fork an in-memory session');
-        const manager = sdkOrThrow().SessionManager.open(sessionFile);
-        const forkPath = manager.createBranchedSession(entryId);
+        const forkPath = session.sessionManager.createBranchedSession(entryId);
         if (!forkPath) throw new Error('Failed to create branched session');
         const forkManager = sdkOrThrow().SessionManager.open(forkPath);
         const created = await createSdkSession(
@@ -2678,9 +2749,17 @@ function commandContextActionsFor(
         ) {
           throw new Error('Session not found');
         }
+        const existing = residentFor(resolvedPath);
+        if (existing) {
+          selectedSessionId = existing.session.sessionId;
+          rememberActiveSession(existing.session);
+          await setActiveSession(existing.session, existing.cwd, undefined, undefined, true);
+          await options?.withSession?.(replacementContextFor(existing.session));
+          return { cancelled: false };
+        }
         const manager = sdkOrThrow().SessionManager.open(resolvedPath);
         const created = await createSdkSession(
-          manager.getCwd() || cwd,
+          manager.getCwd() || session.sessionManager.getCwd() || cwd,
           manager,
           'resume',
           session.sessionFile
@@ -2723,11 +2802,7 @@ async function bindRpcHost(session: AgentSession): Promise<void> {
     },
   });
 }
-/**
- * Start extension binding without making session creation wait. The live
- * entry remains explicitly "not ready" until bindRpcHost resolves, and stale
- * completions never publish tools for a session that is no longer active.
- */
+/** Start extension binding without making session creation wait. */
 function startHostBinding(sid: string, session: AgentSession): void {
   const entry = managedSessionFor(sid);
   if (!entry || entry.hostBound || entry.bindingPending) return;
@@ -2735,11 +2810,11 @@ function startHostBinding(sid: string, session: AgentSession): void {
   const startedAt = Date.now();
   void bindRpcHost(session)
     .then(() => {
-      if (live !== entry) return;
+      if (managedSessionFor(sid)?.session !== session) return;
       entry.bindingPending = false;
       entry.hostBound = true;
       log.info(`[pifrontier] bindRpcHost ${sid} done in ${Date.now() - startedAt}ms`);
-      if (connectedClients === 0 || activeSessionId() !== sid) {
+      if (connectedClients === 0) {
         return;
       }
       broadcast({ type: 'tools_list', ...toolsPayloadFor(session), ...stampOwner(sid) });
@@ -2755,7 +2830,7 @@ function startHostBinding(sid: string, session: AgentSession): void {
       });
     })
     .catch((err) => {
-      if (live === entry) entry.bindingPending = false;
+      if (managedSessionFor(sid)?.session === session) entry.bindingPending = false;
       log.error(`[pifrontier] bindRpcHost for ${sid} failed:`, err);
     });
 }
@@ -2773,10 +2848,8 @@ async function reloadSessionHost(sid: string, session: AgentSession): Promise<vo
   }));
   entry.bindingPending = false;
   entry.hostBound = true;
-  // Reload can yield while another tab switches sessions. Its rebuilt host
-  // state is still valid, but the full snapshot belongs only to the session
-  // that is active when the reload settles.
-  if (activeSessionId() !== sid) return;
+  // Reload can yield while another session is selected. Its rebuilt host
+  // state remains valid, and its stamped snapshots are useful to all clients.
   broadcastSessionLoaded(session);
   broadcast({
     type: 'runtime_diagnostics',
@@ -2844,7 +2917,8 @@ function rememberActiveSession(sess: AgentSession): void {
  * Sessions are saved to disk as .jsonl files under ~/.pi/agent/sessions/.
  */
 async function ensureSession(): Promise<AgentSession> {
-  if (live) return live.session;
+  const selected = activeSessionOrNull();
+  if (selected) return selected;
   if (!_sessionInitPromise) {
     const init = (async () => {
       const start = Date.now();
@@ -2904,11 +2978,12 @@ async function ensureSession(): Promise<AgentSession> {
       // Register immediately without waiting for bind — bindExtensions can be
       // slow with 34+ tools/extensions and previously blocked the cold-start
       // session_loaded for seconds. See setActiveSession for the same pattern.
-      registerSession(sid, sess, cwdV, false, created);
-      rememberActiveSession(sess);
-      syncWidgetFactories(sid);
-      startHostBinding(sid, sess);
-      projectCatalog.apply({ kind: 'touch', path: sess.sessionManager.getCwd() || cwd });
+      const entry = registerSession(sid, sess, cwdV, false, created);
+      selectedSessionId = entry.session.sessionId;
+      rememberActiveSession(entry.session);
+      syncWidgetFactories(entry.session.sessionId);
+      startHostBinding(entry.session.sessionId, entry.session);
+      projectCatalog.apply({ kind: 'touch', path: entry.session.sessionManager.getCwd() || cwd });
       log.info(
         `[pifrontier] Pi session ready: ${sess.sessionId} (${sm.isPersisted() ? 'persisted' : 'in-memory'}) in ${Date.now() - start}ms (bind in background)`
       );
@@ -2927,10 +3002,10 @@ async function ensureSession(): Promise<AgentSession> {
   return _sessionInitPromise!;
 }
 /**
- * Event forwarder for the active session's SDK events → all browser tabs.
+ * Event forwarder for resident SDK sessions → all browser tabs.
  *
- * - Tags every event with sessionId so clients can drop late-arriving events
- *   from a previously-active session after a switch.
+ * - Tags every event with sessionId so clients can route events to the
+ *   corresponding session view after a switch.
  * - `message_update`: the SDK includes the FULL partial message on every
  *   delta — on long reasoning turns that is quadratic WS traffic and the
  *   primary cause of huge-chat meltdowns. The client applies deltas
@@ -2945,9 +3020,9 @@ function makeEventForwarder(
   const pendingToolArgs = new Map<string, unknown>();
   return (event) => {
     // Normal completion/turn-end events must release argument payloads even
-    // when forwarding is disabled or the session is no longer active.
+    // when no browser is connected.
     if (event.type === 'agent_end') pendingToolArgs.clear();
-    if (live?.session !== sess || connectedClients === 0) {
+    if (connectedClients === 0) {
       if (event.type === 'tool_execution_end') pendingToolArgs.delete(event.toolCallId);
       return;
     }
@@ -3019,15 +3094,26 @@ function makeEventForwarder(
     }
   };
 }
-/** Register the live session before (or after) its RPC host binding. */
+/** Register a resident session before (or after) its RPC host binding. */
 function registerSession(
   sid: string,
   sess: AgentSession,
   cwdV: string,
   hostBound: boolean,
   created?: CreatedSdkSession
-): void {
+): ManagedSession {
   const path = sess.sessionManager.getSessionFile() ?? null;
+  const existing = path ? residentFor(path) : undefined;
+  if (existing) {
+    if (existing.session !== sess) {
+      try {
+        sess.dispose();
+      } catch (err) {
+        log.error(`[pifrontier] Error disposing duplicate session ${sid}:`, err);
+      }
+    }
+    return existing;
+  }
   const entry: ManagedSession = {
     session: sess,
     forwardingUnsub: null,
@@ -3040,20 +3126,22 @@ function registerSession(
     isRunning: sess.isStreaming,
     lastActivity: Date.now(),
     runtimeBroadcastTimer: null,
+    runtimeStatusJson: null,
     diagnostics: created?.diagnostics ?? [],
     sessionName: sess.sessionManager.getSessionName(),
     hostBound,
     bindingPending: false,
     firstMessage: firstMessageForSession(sess),
+    lastTurnError: false,
     shutdownRequested: false,
+    unread: false,
     ...(created?.modelFallbackMessage
       ? { modelFallbackMessage: created.modelFallbackMessage }
       : {}),
   };
-  live = entry;
-  // The live summary overlays the disk scan so the sidebar sees the session
-  // without waiting for a file scan or the first message_end.
+  resident.set(sid, entry);
   sessionCatalog.apply({ kind: 'upsert', session: liveSummary(sess, entry) });
+  evictResidents();
 
   entry.runtimeUnsub = sess.subscribe((event) => {
     switch (event.type) {
@@ -3061,12 +3149,19 @@ function registerSession(
         entry.activeToolCalls.clear();
         entry.activeToolName = undefined;
         entry.isRunning = true;
+        entry.lastTurnError = false;
         break;
-      case 'agent_end':
+      case 'agent_end': {
         entry.activeToolCalls.clear();
         entry.activeToolName = undefined;
         entry.isRunning = false;
         entry.lastActivity = Date.now();
+        const finalMessage = event.messages.at(-1) as
+          { role?: string; stopReason?: string } | undefined;
+        if (!event.willRetry && finalMessage?.role === 'assistant') {
+          entry.lastTurnError = finalMessage.stopReason === 'error';
+        }
+        if (!event.willRetry && !hasFocusedSocket(sid)) entry.unread = true;
         // Closed-app notification (Web Push). The SW suppresses pushes when a
         // page is visible, and tags dedupe against the page's own hidden-tab
         // notifications — payloads carry no message text.
@@ -3079,6 +3174,7 @@ function registerSession(
           ...(entry.path ? { sessionPath: entry.path } : {}),
         });
         break;
+      }
       case 'tool_execution_start':
         entry.activeToolCalls.set(event.toolCallId, event.toolName);
         entry.activeToolName = event.toolName;
@@ -3093,7 +3189,7 @@ function registerSession(
       case 'message_end':
         entry.lastActivity = Date.now();
         if (!entry.firstMessage) entry.firstMessage = firstMessageForSession(sess);
-        // Live summary replaces the disk parse — the file is not re-read.
+        // Resident summary replaces the disk parse — the file is not re-read.
         sessionCatalog.apply({ kind: 'upsert', session: liveSummary(sess, entry) });
         break;
       case 'session_info_changed':
@@ -3116,6 +3212,7 @@ function registerSession(
           reason?: string;
           errorMessage?: string;
         };
+        if (ce.errorMessage && !ce.willRetry) entry.lastTurnError = true;
         log.info(
           `[pifrontier] session ${sid}: compaction_end (reason: ${ce.reason ?? 'auto'}, ` +
             `aborted: ${ce.aborted ?? false}, willRetry: ${ce.willRetry ?? false}` +
@@ -3123,64 +3220,76 @@ function registerSession(
         );
         // A successful compaction rewrites the client's context. Defer the
         // snapshot until the SDK has cleared isCompacting.
-        if (!ce.aborted && !ce.willRetry && !ce.errorMessage && activeSessionId() === sid) {
+        if (!ce.aborted && !ce.willRetry && !ce.errorMessage) {
           setTimeout(() => {
-            if (activeSessionId() !== sid) return;
             const current = managedSessionFor(sid)?.session;
             if (!current) return;
             broadcastSessionLoaded(current);
           }, 0);
         }
-        // Compaction rewrote the session — refresh the live summary while the
-        // SDK's compacted messages are authoritative.
+        // Compaction rewrote the session — refresh the resident summary while
+        // the SDK's compacted messages are authoritative.
         entry.lastActivity = Date.now();
         refreshSessionSummary(sess);
         break;
       }
     }
-    // Coalesce runtime snapshots for bursty turns; the sidebar only needs the
-    // settled state.
-    if (entry.runtimeBroadcastTimer) return;
-    entry.runtimeBroadcastTimer = setTimeout(() => {
-      entry.runtimeBroadcastTimer = null;
-      if (live !== entry) return;
-      if (connectedClients === 0) return;
-      broadcastSessionRuntime(sid, entry);
-      broadcast({
-        type: 'session_updated',
-        session: serializeSession(liveSummary(sess, entry)),
-        ...stampOwner(sid),
-      });
-    }, 300);
+    scheduleSessionRuntimeBroadcast(sid, entry);
   });
 
   entry.forwardingUnsub = sess.subscribe(makeEventForwarder(sid, sess));
+  broadcastSessionRuntime(sid, entry);
+  return entry;
 }
 function sessionRuntimePayload(
   sid: string,
-  entry: Pick<ManagedSession, 'isRunning' | 'activeToolName' | 'lastActivity'>
+  entry: Pick<
+    ManagedSession,
+    'isRunning' | 'activeToolName' | 'activeToolCalls' | 'lastActivity' | 'unread' | 'lastTurnError'
+  >
 ) {
+  const phase = sessionPhaseFor(sid, entry);
   return {
     type: 'session_runtime' as const,
     sessionId: sid,
-    isRunning: entry.isRunning,
+    phase,
+    isRunning: phase === 'running',
     ...(entry.activeToolName ? { activeToolName: entry.activeToolName } : {}),
-    unseen: false,
     lastActivity: entry.lastActivity,
+    unread: entry.unread,
+    needsAttention: phase === 'awaiting-input' || phase === 'error',
+    resident: true,
   };
 }
-
 function sendSessionRuntime(
   sink: { send(data: string): unknown },
   sid: string,
-  entry: Pick<ManagedSession, 'isRunning' | 'activeToolName' | 'lastActivity'>
+  entry: ManagedSession
 ): void {
   sink.send(JSON.stringify(sessionRuntimePayload(sid, entry)));
 }
 
-/** Broadcast a runtime-status update for the live session. */
+function scheduleSessionRuntimeBroadcast(sid: string, knownEntry?: ManagedSession): void {
+  const entry = knownEntry ?? managedSessionFor(sid);
+  if (!entry || entry.runtimeBroadcastTimer) return;
+  entry.runtimeBroadcastTimer = setTimeout(() => {
+    entry.runtimeBroadcastTimer = null;
+    if (managedSessionFor(sid) !== entry || connectedClients === 0) return;
+    broadcastSessionRuntime(sid, entry);
+    broadcast({
+      type: 'session_updated',
+      session: serializeSession(liveSummary(entry.session, entry)),
+      ...stampOwner(sid),
+    });
+  }, 300);
+}
+
 function broadcastSessionRuntime(sid: string, entry: ManagedSession): void {
-  broadcast(sessionRuntimePayload(sid, entry));
+  const payload = sessionRuntimePayload(sid, entry);
+  const json = JSON.stringify(payload);
+  if (json === entry.runtimeStatusJson) return;
+  entry.runtimeStatusJson = json;
+  broadcast(payload);
 }
 
 /**
@@ -3235,7 +3344,7 @@ function snapshotModels(sess: AgentSession): ModelInfo[] {
   sess.modelRuntime
     .getAvailable() // coalesced by the runtime; never blocks
     .then(() => {
-      if (activeSessionId() !== sessionId || live?.session !== sess || connectedClients === 0) {
+      if (managedSessionFor(sessionId)?.session !== sess || connectedClients === 0) {
         return;
       }
       const fresh = sess.modelRuntime
@@ -3409,39 +3518,48 @@ async function setActiveSession(
   }
 ): Promise<void> {
   const newId = newSession.sessionId;
-  if (live && live.session !== newSession) disposeLiveSession('switching');
-
-  if (!live) {
-    // Register immediately without waiting for bind — bindExtensions can be
-    // slow with 34+ tools/extensions and previously blocked the new-chat
-    // response for seconds. The session is usable for messaging before
-    // host-bound details are available; the binding completion publishes them.
-    registerSession(
+  const path = newSession.sessionManager.getSessionFile() ?? null;
+  const existing = path ? residentFor(path) : undefined;
+  let session = newSession;
+  let entry = managedSessionFor(newId);
+  if (existing && existing.session !== newSession) {
+    try {
+      newSession.dispose();
+    } catch (err) {
+      log.error(`[pifrontier] Error disposing duplicate session ${newId}:`, err);
+    }
+    session = existing.session;
+    entry = existing;
+  } else if (!entry) {
+    selectedSessionId = newId;
+    entry = registerSession(
       newId,
       newSession,
       newCwd || newSession.sessionManager.getCwd() || cwd,
       hostAlreadyBound,
       created
     );
+    session = entry.session;
   }
-  const entry = live;
-  if (!entry) throw new Error('Failed to register live session');
-  rememberActiveSession(newSession);
-  if (!entry.hostBound && !entry.bindingPending) startHostBinding(newId, newSession);
-  syncWidgetFactories(newId);
+  const targetId = session.sessionId;
+  selectedSessionId = targetId;
+  if (!entry) throw new Error('Failed to register session');
+  rememberActiveSession(session);
+  if (!entry.hostBound && !entry.bindingPending) startHostBinding(targetId, session);
+  syncWidgetFactories(targetId);
   if (!entry.forwardingUnsub) {
-    entry.forwardingUnsub = newSession.subscribe(makeEventForwarder(newId, newSession));
+    entry.forwardingUnsub = session.subscribe(makeEventForwarder(targetId, session));
   }
 
-  broadcastSessionLoaded(newSession, requestId, requester);
+  broadcastSessionLoaded(session, requestId, requester);
   if (entry.hostBound) {
     broadcast({
       type: 'commands_list',
-      commands: extensionCommandsFor(newSession),
-      ...stampOwner(newId),
+      commands: extensionCommandsFor(session),
+      ...stampOwner(targetId),
     });
   }
-  projectCatalog.apply({ kind: 'touch', path: newSession.sessionManager.getCwd() || cwd });
+  projectCatalog.apply({ kind: 'touch', path: session.sessionManager.getCwd() || cwd });
   scheduleSessionListRefresh();
 }
 
@@ -3510,6 +3628,27 @@ interface WSData {
   _expTimer?: Timer;
   /** True once the close handler ran — guards the async open() against installing timers on a dead socket. */
   closed?: boolean;
+  /** Session currently visible in this socket's client. */
+  focusedSessionId?: string;
+}
+
+function targetedResidentFor(
+  wsData: WSData,
+  msg: { sessionId?: string; requestId?: string },
+  send: (data: string) => unknown
+): ManagedSession | undefined {
+  const sid = msg.sessionId ?? wsData.focusedSessionId ?? selectedSessionId;
+  const entry = sid ? managedSessionFor(sid) : undefined;
+  if (!entry) {
+    send(
+      JSON.stringify({
+        type: 'sessions_error',
+        ...(msg.requestId !== undefined ? { requestId: msg.requestId } : {}),
+        message: 'Session is not resident.',
+      })
+    );
+  }
+  return entry;
 }
 
 let server: Server<WSData>;
@@ -3706,8 +3845,10 @@ try {
             }
           }
 
-          // Send the live runtime snapshot only to the reconnecting socket.
-          if (live) sendSessionRuntime(ws, live.session.sessionId, live);
+          // Send runtime snapshots for every resident session to the reconnecting socket.
+          for (const entry of residentEntries()) {
+            sendSessionRuntime(ws, entry.session.sessionId, entry);
+          }
 
           // Periodic token check (every 60s) — closes expired or revoked
           // sockets even when the client is idle.
@@ -3759,9 +3900,32 @@ try {
 
         try {
           switch (msg.type) {
+            case 'session_focus': {
+              const previous = ws.data.focusedSessionId;
+              const next = msg.sessionId;
+              if (previous && previous !== next) {
+                const count = focusedSessionCounts.get(previous) ?? 0;
+                if (count <= 1) focusedSessionCounts.delete(previous);
+                else focusedSessionCounts.set(previous, count - 1);
+              }
+              if (next && previous !== next) {
+                focusedSessionCounts.set(next, (focusedSessionCounts.get(next) ?? 0) + 1);
+              }
+              ws.data.focusedSessionId = next ?? undefined;
+              if (next) {
+                const entry = managedSessionFor(next);
+                if (entry) {
+                  entry.unread = false;
+                  broadcastSessionRuntime(next, entry);
+                }
+              }
+              break;
+            }
             case 'prompt': {
+              const target = targetedResidentFor(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
               try {
-                const s = activeSession();
+                const s = target.session;
                 const imageContent = msg.images?.length
                   ? msg.images.map((img) => ({
                       type: 'image' as const,
@@ -3805,10 +3969,11 @@ try {
               }
               break;
             }
-
             case 'steer': {
+              const target = targetedResidentFor(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
               try {
-                const s = activeSession();
+                const s = target.session;
                 const images = msg.images?.map((img) => ({
                   type: 'image' as const,
                   data: img.data,
@@ -3832,8 +3997,10 @@ try {
             }
 
             case 'follow_up': {
+              const target = targetedResidentFor(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
               try {
-                const s = activeSession();
+                const s = target.session;
                 const images = msg.images?.map((img) => ({
                   type: 'image' as const,
                   data: img.data,
@@ -3855,9 +4022,10 @@ try {
               }
               break;
             }
-
             case 'abort': {
-              const s = activeSession();
+              const target = targetedResidentFor(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
+              const s = target.session;
               // Clear queued steering/follow-up messages before abort so they
               // don't continue processing after the abort takes effect.
               const cleared = s.clearQueue();
@@ -3916,7 +4084,9 @@ try {
 
             case 'get_tool_output': {
               const toolCallId = msg.toolCallId;
-              const sess = activeSessionOrNull();
+              const target = targetedResidentFor(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
+              const sess = target.session;
               const base = {
                 type: 'tool_output' as const,
                 sessionId: sess?.sessionId ?? '',
@@ -3985,11 +4155,23 @@ try {
                     );
                     return;
                   }
-                  const current = live;
+                  const current = activeSessionOrNullEntry();
                   if (current?.path === resolvedPath) {
                     // Nothing changed, so the authoritative snapshot is enough;
                     // sidebar refresh scheduling can remain skipped.
                     broadcastSessionLoaded(current.session, requestId, ws);
+                    return;
+                  }
+                  const existing = residentFor(resolvedPath);
+                  if (existing) {
+                    await setActiveSession(
+                      existing.session,
+                      existing.cwd,
+                      undefined,
+                      requestId,
+                      true,
+                      ws
+                    );
                     return;
                   }
                   const sm = _sdk!.SessionManager.open(resolvedPath);
@@ -4307,16 +4489,15 @@ try {
                   );
                   break;
                 }
-                const sm = _sdk!.SessionManager.open(target.path);
-                sm.appendSessionInfo(msg.name);
+                const residentTarget = residentFor(target.path);
+                if (residentTarget) residentTarget.session.setSessionName(msg.name);
+                else {
+                  const sm = _sdk!.SessionManager.open(target.path);
+                  sm.appendSessionInfo(msg.name);
+                }
                 // Patch the live overlay and force the next scan to re-parse
                 // that one file; onChange broadcasts the new list.
                 sessionCatalog.apply({ kind: 'rename', path: msg.path, name: msg.name });
-                // If renaming the active session, also fire the SDK event so all
-                // connected browsers see the name change via session_info_changed.
-                if (msg.path === activeSession().sessionFile) {
-                  activeSession().setSessionName(msg.name);
-                }
                 ws.send(JSON.stringify({ type: 'sessions_list', sessions: [] }));
               } catch (err) {
                 log.error('[pifrontier] rename_session error:', err);
@@ -4349,17 +4530,20 @@ try {
                 // Path came from the scan/catalog — already validated.
                 await rm(target.path);
 
-                // Clean up live-session resources before removing its file.
-                const liveEntry = managedSessionFor(target.id);
-                if (liveEntry) {
+                // Clean up resident-session resources before removing its file.
+                const residentEntry = managedSessionFor(target.id);
+                if (residentEntry) {
                   broadcast({
                     type: 'session_runtime',
                     sessionId: target.id,
+                    phase: 'idle',
                     isRunning: false,
-                    unseen: false,
                     lastActivity: Date.now(),
+                    unread: false,
+                    needsAttention: false,
+                    resident: false,
                   });
-                  disposeLiveSession('deleted');
+                  disposeSession(target.id, 'deleted');
                 }
                 // Drop the overlay entry and force the next scan; onChange
                 // broadcasts the new list (sidebar + projects).
@@ -4459,18 +4643,21 @@ try {
                     );
                     continue;
                   }
-                  // A project delete must not leak live-session UI state,
+                  // A project delete must not leak resident-session UI state,
                   // timers, or subscriptions for any session it removes.
-                  const liveEntry = managedSessionFor(session.id);
-                  if (liveEntry) {
+                  const residentEntry = managedSessionFor(session.id);
+                  if (residentEntry) {
                     broadcast({
                       type: 'session_runtime',
                       sessionId: session.id,
+                      phase: 'idle',
                       isRunning: false,
-                      unseen: false,
                       lastActivity: Date.now(),
+                      unread: false,
+                      needsAttention: false,
+                      resident: false,
                     });
-                    disposeLiveSession('deleted');
+                    disposeSession(session.id, 'deleted');
                   }
                 }
                 projectCatalog.apply({ kind: 'remove', path: target });
@@ -4940,7 +5127,6 @@ try {
                       const { session: clonedSession } = await _sdk!.createAgentSession({
                         cwd,
                         sessionManager: clonedSm,
-                        modelRuntime: activeSession().modelRuntime,
                         model: activeSession().model,
                       });
                       await setActiveSession(clonedSession);
@@ -4951,7 +5137,6 @@ try {
                     const { session: clonedSession } = await _sdk!.createAgentSession({
                       cwd: clonedSm.getCwd() || cwd,
                       sessionManager: clonedSm,
-                      modelRuntime: activeSession().modelRuntime,
                       model: activeSession().model,
                     });
                     await setActiveSession(clonedSession);
@@ -5791,8 +5976,7 @@ try {
                   const entryId = (msg as { type: 'fork_session'; entryId: string }).entryId;
                   const sessionFile = activeSession().sessionFile;
                   if (!sessionFile) throw new Error('Active session is not persisted');
-                  const sm = _sdk!.SessionManager.open(sessionFile);
-                  const forkPath = sm.createBranchedSession(entryId);
+                  const forkPath = activeSession().sessionManager.createBranchedSession(entryId);
                   if (!forkPath) throw new Error('Failed to create branched session');
                   const sm2 = _sdk!.SessionManager.open(forkPath);
                   const created = await createSdkSession(
@@ -6119,6 +6303,13 @@ try {
       close(ws) {
         ws.data.closed = true;
         ws.unsubscribe(WS_TOPIC);
+        const focused = ws.data.focusedSessionId;
+        if (focused) {
+          const count = focusedSessionCounts.get(focused) ?? 0;
+          if (count <= 1) focusedSessionCounts.delete(focused);
+          else focusedSessionCounts.set(focused, count - 1);
+        }
+        connectedClients = Math.max(0, connectedClients - 1);
         // Clear the periodic token expiry check
         if (ws.data._expTimer) {
           clearInterval(ws.data._expTimer);
@@ -6197,15 +6388,16 @@ const _shutdown = async () => {
     /* ignore */
   }
   _stopSessionWatch?.();
-  // Dispose the live session so background agent work stops cleanly.
-  if (live?.session.isStreaming) {
+  // Abort and dispose every resident session so background agent work stops cleanly.
+  for (const entry of residentEntries()) {
+    if (!entry.session.isStreaming) continue;
     try {
-      live.session.abort();
+      entry.session.abort();
     } catch {
       /* agent may already be done */
     }
   }
-  disposeLiveSession('shutdown');
+  for (const sid of [...resident.keys()]) disposeSession(sid, 'shutdown');
   // Flush any debounced session-scan cache write so the next start is
   // stat-only for unchanged files.
   try {

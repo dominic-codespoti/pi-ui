@@ -334,17 +334,20 @@ export interface ConnectedMessage {
   /** Names of active/enabled tools. */
   activeToolNames?: string[];
 }
+export type SessionPhase = 'idle' | 'running' | 'awaiting-input' | 'error';
 
 /**
  * All other server messages are either:
  *   (a) pi SDK AgentSessionEvents forwarded verbatim, or
  *   (b) custom server-emitted events:
  *
- * There is exactly one live AgentSession. A `sessionId` stamp on a
- * session-scoped event identifies that live session at the time the event was
- * emitted. Clients compare the stamp with their active session and reject
- * events buffered from a session they have already switched away from. The
- * stamp is a stale-event guard, not multi-session routing.
+ * Several AgentSessions may be resident at once. A `sessionId` stamp on a
+ * session-scoped event identifies the resident session that emitted it, so
+ * clients route each event to that session rather than treating the stamp as
+ * a stale-event guard for one active session.
+ *
+ * `connected` and `session_loaded` snapshots describe the session this client
+ * is looking at; `session_runtime` deltas may describe any resident session.
  *
  * Session inventory events describe persisted `.jsonl` files discovered by the
  * session/project catalogs; they do not represent resident or background
@@ -426,9 +429,9 @@ export interface ConnectedMessage {
  *       markdown transformers (registerMarkdownTransformer) rewrote text —
  *       the client replaces its streamed buffer with this sealed content.
  *
- *   Session runtime status for the single live session (lightweight — no
- *   message content, just metadata):
- *   { type: "session_runtime", sessionId: string, isRunning: boolean, lastActivity: number, activeToolName?: string }
+ *   Session runtime status for each resident or persisted session (lightweight —
+ *   no message content, just metadata):
+ *   { type: "session_runtime", sessionId: string, phase: SessionPhase, isRunning: boolean, activeToolName?: string, lastActivity: number, unread: boolean, needsAttention: boolean, resident: boolean }
  *
  *   Supported extension_ui_request methods:
  *     confirm    – dialog with confirm/cancel (title, message)
@@ -588,9 +591,20 @@ export type ServerCustomEvent =
   | {
       type: 'session_runtime';
       sessionId: string;
+      /** Canonical status for this session. */
+      phase: SessionPhase;
+      /** Retained for migration; equals phase === 'running'. */
       isRunning: boolean;
-      lastActivity: number;
+      /** Name of the tool currently executing, omitted when none is active. */
       activeToolName?: string;
+      /** Epoch milliseconds of the latest session activity. */
+      lastActivity: number;
+      /** Drives sidebar dots when a run ended while no socket had this session focused. */
+      unread: boolean;
+      /** Drives sidebar dots for awaiting-input and error phases. */
+      needsAttention: boolean;
+      /** False when this status came from disk rather than a live session. */
+      resident: boolean;
     }
   | { type: 'extension_ui_state'; sessionId: string; ui: ExtensionUiStatePayload }
   | { type: 'extension_terminal_input_active'; active: boolean; sessionId?: string }
@@ -620,27 +634,42 @@ export type ServerMessage = ConnectedMessage | ServerCustomEvent | PiEvent;
 
 // ── Browser → Server ─────────────────────────────────────────────────────────
 
+// Session-scoped messages accept an optional target. Resolution falls back from explicit
+// `sessionId` to that socket's focused session, then to the server's selected session.
 export type ClientMessage =
   | {
       type: 'prompt';
+      sessionId?: string;
       message: string;
       images?: Array<{ data: string; mimeType: string }>;
       streamingBehavior?: 'steer' | 'followUp';
     }
-  | { type: 'steer'; message: string; images?: Array<{ data: string; mimeType: string }> }
-  | { type: 'follow_up'; message: string; images?: Array<{ data: string; mimeType: string }> }
-  | { type: 'abort' }
-  | { type: 'abort_compaction' }
-  | { type: 'abort_branch_summary' }
-  | { type: 'abort_retry' }
-  | { type: 'set_thinking_level'; level: string }
-  | { type: 'set_model'; provider: string; modelId: string }
+  | {
+      type: 'steer';
+      sessionId?: string;
+      message: string;
+      images?: Array<{ data: string; mimeType: string }>;
+    }
+  | {
+      type: 'follow_up';
+      sessionId?: string;
+      message: string;
+      images?: Array<{ data: string; mimeType: string }>;
+    }
+  | { type: 'abort'; sessionId?: string }
+  | { type: 'abort_compaction'; sessionId?: string }
+  | { type: 'abort_branch_summary'; sessionId?: string }
+  | { type: 'abort_retry'; sessionId?: string }
+  | { type: 'set_thinking_level'; sessionId?: string; level: string }
+  | { type: 'set_model'; sessionId?: string; provider: string; modelId: string }
   | { type: 'new_session'; targetCwd?: string; requestId?: string }
   | { type: 'switch_session'; path: string; requestId?: string }
+  /** Tell the server which session this socket is looking at; drives unread and visibility semantics. */
+  | { type: 'session_focus'; sessionId: string | null }
   /** Fetch the full output for an expanded tool-result history row. */
-  | { type: 'get_tool_output'; toolCallId: string; requestId?: string }
+  | { type: 'get_tool_output'; sessionId?: string; toolCallId: string; requestId?: string }
   /** Request a fresh snapshot for the current session. */
-  | { type: 'resync_session'; requestId?: string }
+  | { type: 'resync_session'; sessionId?: string; requestId?: string }
   /** Request all sessions across all project directories. Server replies with all_sessions_list. */
   | { type: 'get_all_sessions' }
   /** Request the merged project list (registry + session dirs). Server replies with projects_list. */
@@ -666,16 +695,23 @@ export type ClientMessage =
    * keystroke/paste — see `#lib/terminal-key-encoder.js` — and is passed straight to
    * the component.
    */
-  | { type: 'extension_custom_input'; id: string; data: string }
+  | { type: 'extension_custom_input'; sessionId?: string; id: string; data: string }
   /** Report the interactive custom overlay's live viewport so the server's headless terminal renders at the real size. */
-  | { type: 'extension_custom_resize'; id: string; columns: number; rows: number }
-  | { type: 'extension_terminal_input'; id: string; data: string; sessionId: string }
-  | { type: 'extension_editor_text_change'; text: string; sessionId: string }
+  | {
+      type: 'extension_custom_resize';
+      sessionId?: string;
+      id: string;
+      columns: number;
+      rows: number;
+    }
+  | { type: 'extension_terminal_input'; sessionId?: string; id: string; data: string }
+  | { type: 'extension_editor_text_change'; sessionId?: string; text: string }
   /** Interaction with a parsed component inside an open custom() dialog — the
    * server invokes the corresponding LIVE callback (onSelect/onClick/onToggle/
    * onSubmit/updateValue) on the component at `path` and re-parses the tree. */
   | {
       type: 'extension_component_event';
+      sessionId?: string;
       id: string;
       path: number[];
       event: 'select' | 'click' | 'toggle' | 'submit' | 'setting';
@@ -684,6 +720,7 @@ export type ClientMessage =
   /** Response to a blocking extension_ui_request (select / confirm / input / editor / custom). */
   | {
       type: 'extension_ui_response';
+      sessionId?: string;
       id: string;
       value?: string;
       confirmed?: boolean;
@@ -704,28 +741,28 @@ export type ClientMessage =
   /** Permanently delete a session file (cannot delete the active session). */
   | { type: 'delete_session'; path: string }
   /** Manually compact the session context (aborts running agent first). */
-  | { type: 'compact' }
+  | { type: 'compact'; sessionId?: string }
   /** Enable or disable automatic context compaction. */
-  | { type: 'set_auto_compaction'; enabled: boolean }
+  | { type: 'set_auto_compaction'; sessionId?: string; enabled: boolean }
   /** Enable or disable automatic retry on transient errors. */
-  | { type: 'set_auto_retry'; enabled: boolean }
+  | { type: 'set_auto_retry'; sessionId?: string; enabled: boolean }
   /** Request the list of fork-able user message entry IDs. Server replies with fork_points. */
-  | { type: 'get_fork_points' }
+  | { type: 'get_fork_points'; sessionId?: string }
   /** Fork the session at the given entry ID, creating a new branched session. */
-  | { type: 'fork_session'; entryId: string }
+  | { type: 'fork_session'; sessionId?: string; entryId: string }
   /** Edit a user message: server finds the entry, rewinds session, and resends. */
-  | { type: 'edit_message'; originalMessage: string; newMessage: string }
+  | { type: 'edit_message'; sessionId?: string; originalMessage: string; newMessage: string }
   /** Request the full list of tools and which are active. Server replies with tools_list. */
-  | { type: 'get_tools' }
+  | { type: 'get_tools'; sessionId?: string }
   /** Set the active tool set by name. */
-  | { type: 'set_active_tools'; toolNames: string[] }
+  | { type: 'set_active_tools'; sessionId?: string; toolNames: string[] }
   /** Request skills and prompt templates. Server replies with resources_list. */
   | { type: 'get_resources' }
   | { type: 'get_extensions' }
   | { type: 'get_project_trust'; cwd?: string }
   | { type: 'set_project_trust'; cwd: string; decision: ProjectTrustDecision }
   | { type: 'set_extension_flag'; name: string; value: boolean | string }
-  | { type: 'invoke_extension_shortcut'; shortcut: string }
+  | { type: 'invoke_extension_shortcut'; sessionId?: string; shortcut: string }
   | { type: 'get_packages' }
   | {
       type: 'install_package';
@@ -753,18 +790,18 @@ export type ClientMessage =
   /** Restart the server process in-place (re-exec with same args + env). */
   | { type: 'restart_server'; nonce?: string }
   /** Execute a built-in slash command in the server session context. */
-  | { type: 'run_builtin'; command: string; args?: string }
+  | { type: 'run_builtin'; sessionId?: string; command: string; args?: string }
   /** Request aggregate counts, token usage, and cost for the active session. */
-  | { type: 'get_session_stats' }
+  | { type: 'get_session_stats'; sessionId?: string }
   /** Export the active session branch. */
-  | { type: 'export_session'; format: 'html' | 'jsonl' }
+  | { type: 'export_session'; sessionId?: string; format: 'html' | 'jsonl' }
   /** Request the session tree data for visual display. Server replies with session_tree. */
-  | { type: 'get_session_tree' }
+  | { type: 'get_session_tree'; sessionId?: string }
   | { type: 'read_file'; path: string }
   /** Write file content from the file viewer modal's edit mode. */
   | { type: 'write_file'; path: string; content: string }
   /** Request older messages before the current window. Server replies with older_messages. */
-  | { type: 'load_messages'; count: number; alreadyHasCount: number }
+  | { type: 'load_messages'; sessionId?: string; count: number; alreadyHasCount: number }
   /** Request argument completions for an extension slash command. Server replies with command_completions. */
   | { type: 'get_command_completions'; command: string; prefix: string }
   /** Set the notification webhook URL (ntfy.sh, Pushover, Gotify, etc.). Empty string clears. */

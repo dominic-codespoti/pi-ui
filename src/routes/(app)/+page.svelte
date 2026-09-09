@@ -1945,6 +1945,10 @@
     }
     return false;
   }
+  /** Tell the server which session this socket currently has in view. */
+  function sendSessionFocus(focusedSessionId: string | null): void {
+    send({ type: 'session_focus', sessionId: focusedSessionId });
+  }
   /** Apply the latest queued notification deep link after a live handshake. */
   function flushPendingNotificationSession() {
     const path = pendingNotificationSessionPath;
@@ -2247,6 +2251,7 @@
       const msgType = (msg as Record<string, unknown>).type;
       if (
         msgType !== 'session_updated' &&
+        msgType !== 'session_runtime' &&
         msgType !== 'connected' &&
         msgType !== 'session_loaded'
       ) {
@@ -2283,6 +2288,7 @@
           resyncEditorMirror();
           sessionStartTime = Date.now();
         }
+        if (sessionId ?? serverSessionId) sendSessionFocus(sessionId ?? serverSessionId ?? null);
         connectedPushVapidKey = c.pushVapidKey ?? null;
         if (c.piVersion) piVersion = c.piVersion;
         if (c.uiVersion) uiVersion = c.uiVersion;
@@ -2333,6 +2339,7 @@
             runtimeDiagnostics = c.diagnostics ?? [];
             resyncEditorMirror();
             sessionStartTime = Date.now();
+            if (sessionId) sendSessionFocus(sessionId);
             sessionLoading = false;
             if (sessionPath) {
               setSessionParam(sessionPath);
@@ -2395,6 +2402,7 @@
         }
         _resyncInFlight = false;
         applySessionState(sl);
+        if (sessionId ?? loadedSessionId) sendSessionFocus(sessionId ?? loadedSessionId ?? null);
         _lastVisibleSessionPath =
           loadedPath ?? (ownResponse ? pendingSwitchPath : sessionPath) ?? undefined;
         _lastVisibleSessionId = sessionId ?? loadedSessionId;
@@ -3536,19 +3544,36 @@
 
       case 'session_runtime': {
         const rt = msg as unknown as {
+          type: 'session_runtime';
           sessionId: string;
+          phase: 'idle' | 'running' | 'awaiting-input' | 'error';
           isRunning: boolean;
           activeToolName?: string;
+          lastActivity: number;
+          unread: boolean;
+          needsAttention: boolean;
+          resident: boolean;
         };
-        const isRunning = Boolean(rt.isRunning);
-        const toolName =
-          typeof rt.activeToolName === 'string' && rt.activeToolName.length > 0
-            ? rt.activeToolName
-            : undefined;
+        projectsState.applyRuntime({
+          sessionId: rt.sessionId,
+          phase: rt.phase,
+          isRunning: Boolean(rt.isRunning),
+          ...(typeof rt.activeToolName === 'string' && rt.activeToolName.length > 0
+            ? { activeToolName: rt.activeToolName }
+            : {}),
+          lastActivity: rt.lastActivity,
+          unread: rt.unread,
+          needsAttention: rt.needsAttention,
+          resident: rt.resident,
+        });
         if (rt.sessionId === sessionId) {
+          const isRunning = Boolean(rt.isRunning);
+          const toolName =
+            typeof rt.activeToolName === 'string' && rt.activeToolName.length > 0
+              ? rt.activeToolName
+              : undefined;
           isStreaming = isRunning;
           activeToolName = toolName;
-          projectsState.reconcileActiveRuntime(rt.sessionId, isRunning, toolName);
           if (isRunning || toolName) requestWakeLock();
           else releaseWakeLock();
         }
@@ -5242,8 +5267,10 @@
       // Last reliable moment to persist before a possible OS freeze/discard
       saveSnapshot(sessionPath, sessionName, messages);
       releaseWakeLock();
+      sendSessionFocus(null);
     } else {
       // Wake lock: re-acquire if still streaming
+      if (sessionId) sendSessionFocus(sessionId);
       if (isStreaming) requestWakeLock();
       // Reconnection: resume if WS is down
       if (_pageHiddenAt > 0) {

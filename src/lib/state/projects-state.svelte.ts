@@ -15,6 +15,18 @@ import { goto } from '$app/navigation';
 import { page } from '$app/state';
 import type { ClientMessage, ProjectInfo, SessionSummary } from '#lib/ws/protocol.js';
 
+/** Runtime status for one session, keyed by session id in `ProjectsState.runtime`. */
+export interface SessionRuntimeStatus {
+  sessionId: string;
+  phase: 'idle' | 'running' | 'awaiting-input' | 'error';
+  isRunning: boolean;
+  activeToolName?: string;
+  lastActivity: number;
+  unread: boolean;
+  needsAttention: boolean;
+  resident: boolean;
+}
+
 /** A project with its sessions attached — the unit the UI renders. */
 export interface ProjectGroup extends ProjectInfo {
   sessions: SessionRow[];
@@ -161,6 +173,19 @@ class ProjectsState {
   isStreaming = $state(false);
   /** Name of the active session's running tool (if any). */
   activeToolName = $state<string | undefined>(undefined);
+  /** Authoritative liveness for every session currently resident on the server. */
+  runtime = new SvelteMap<string, SessionRuntimeStatus>();
+  /** Highest-priority activity in any non-active session. */
+  backgroundActivity = $derived.by<'running' | 'unread' | null>(() => {
+    const active = this.activeSessionId;
+    for (const [id, status] of this.runtime) {
+      if (id !== active && (status.phase === 'running' || status.activeToolName)) return 'running';
+    }
+    for (const [id, status] of this.runtime) {
+      if (id !== active && status.unread) return 'unread';
+    }
+    return null;
+  });
 
   /** Sidebar search text. */
   filter = $state('');
@@ -291,6 +316,56 @@ class ProjectsState {
     if (this.activeProject) return this.activeProject.name;
     return this.cwd ? pathBasename(this.cwd) : '';
   });
+  /** Whether a session is actively running according to its runtime frame. */
+  isSessionRunning(id: string): boolean {
+    return this.runtime.get(id)?.phase === 'running';
+  }
+
+  /** The currently executing tool for a session, if any. */
+  sessionToolName(id: string): string | undefined {
+    return this.runtime.get(id)?.activeToolName;
+  }
+
+  /** Whether a session finished while no client was focused on it. */
+  isSessionUnread(id: string): boolean {
+    return this.runtime.get(id)?.unread ?? false;
+  }
+
+  /** Whether a session is awaiting input or has entered an error state. */
+  sessionNeedsAttention(id: string): boolean {
+    return this.runtime.get(id)?.needsAttention ?? false;
+  }
+
+  /** Highest-priority runtime state across the sessions in one project. */
+  projectActivity(group: ProjectGroup): 'running' | 'unread' | null {
+    if (
+      group.sessions.some(
+        (row) =>
+          this.isSessionRunning(row.session.id) || Boolean(this.sessionToolName(row.session.id))
+      )
+    ) {
+      return 'running';
+    }
+    if (group.sessions.some((row) => this.isSessionUnread(row.session.id))) return 'unread';
+    return null;
+  }
+
+  /** Remove runtime snapshots for sessions deleted from the authoritative list. */
+  private pruneRuntimeState(): void {
+    const knownIds = new Set(this.allSessions.map((session) => session.id));
+    for (const id of this.runtime.keys()) {
+      if (!knownIds.has(id)) this.runtime.delete(id);
+    }
+  }
+
+  /** Upsert the latest server-authoritative runtime snapshot for a session. */
+  applyRuntime(status: SessionRuntimeStatus): void {
+    this.runtime.set(status.sessionId, status);
+    if (status.sessionId === this.activeSessionId) {
+      this.isStreaming = status.isRunning;
+      this.activeToolName = status.activeToolName;
+    }
+  }
 
   // ── Server message intake ────────────────────────────────────────────────
   /**
@@ -301,7 +376,10 @@ class ProjectsState {
    */
   applyState(payload: { projects?: ProjectInfo[]; sessions?: SessionSummary[] }): void {
     if (payload.projects !== undefined) this.projects = payload.projects;
-    if (payload.sessions !== undefined) this.allSessions = payload.sessions;
+    if (payload.sessions !== undefined) {
+      this.allSessions = payload.sessions;
+      this.pruneRuntimeState();
+    }
   }
 
   /** Refresh both lists — called on connect (force) and when the sidebar opens. */
@@ -383,16 +461,24 @@ class ProjectsState {
         return false;
     }
   }
-
   /** Reconcile the active session's authoritative runtime snapshot. */
   reconcileActiveRuntime(
     sessionId: string,
     isRunning: boolean,
     activeToolName: string | undefined
   ): void {
+    const previous = this.runtime.get(sessionId);
     this.activeSessionId = sessionId;
-    this.isStreaming = isRunning;
-    this.activeToolName = activeToolName;
+    this.applyRuntime({
+      sessionId,
+      phase: isRunning ? 'running' : 'idle',
+      isRunning,
+      ...(activeToolName ? { activeToolName } : {}),
+      lastActivity: previous?.lastActivity ?? Date.now(),
+      unread: previous?.unread ?? false,
+      needsAttention: previous?.needsAttention ?? false,
+      resident: previous?.resident ?? true,
+    });
   }
 
   // ── Actions ──────────────────────────────────────────────────────────────

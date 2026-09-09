@@ -153,6 +153,7 @@
   {@const isCollapsed = !ps.filter && ps.collapsed.has(g.cwd)}
   {@const isRenaming = renamingProject === g.cwd}
   {@const rootCount = g.sessions.filter((r) => r.depth === 0).length}
+  {@const projectActivity = ps.projectActivity(g)}
   <div
     class="group/dir relative rounded-2xl transition-colors duration-150 {isActive
       ? 'bg-base-content/[0.03]'
@@ -210,6 +211,19 @@
             >
               <TriangleAlert class="w-3 h-3" />missing
             </span>
+          {/if}
+          {#if projectActivity === 'running'}
+            <span
+              class="w-1.5 h-1.5 rounded-full bg-success glow-success animate-pulse shrink-0"
+              aria-label="Background session running"
+              title="Generating"
+            ></span>
+          {:else if projectActivity === 'unread'}
+            <span
+              class="w-1.5 h-1.5 rounded-full bg-primary glow-primary shrink-0"
+              aria-label="Unchecked result"
+              title="Unchecked results"
+            ></span>
           {/if}
           {#if g.pinned}
             <Pin class="w-3 h-3 shrink-0 text-primary/45 group-hover/dir:hidden" />
@@ -275,7 +289,10 @@
           {@const isActiveSession = ps.activeSessionId === s.id}
           {@const isSubsessionsExpanded = ps.expandedSubsessions.has(s.id)}
           {@const isRenamingSession = renamingSession === s.path}
-          {@const isSessionToolRunning = isActiveSession && Boolean(ps.activeToolName)}
+          {@const isSessionToolRunning = Boolean(ps.sessionToolName(s.id))}
+          {@const isSessionRunning = ps.isSessionRunning(s.id)}
+          {@const needsAttention = ps.sessionNeedsAttention(s.id)}
+          {@const hasUnread = ps.isSessionUnread(s.id)}
           <div
             style="margin-left: {Math.min(row.depth, 3) * 14}px"
             class="group rounded-2xl transition-colors duration-150 {isActiveSession
@@ -340,12 +357,22 @@
                     {#if isSessionToolRunning}
                       <span
                         class="w-2 h-2 rounded-full bg-primary shrink-0 animate-pulse glow-primary"
-                        aria-label="Running tool"
+                        aria-label={isActiveSession ? 'Running tool' : 'Running tool in background'}
                       ></span>
-                    {:else if ps.isStreaming && isActiveSession}
+                    {:else if isSessionRunning}
                       <span
                         class="w-2 h-2 rounded-full bg-success shrink-0 animate-pulse glow-success"
-                        aria-label="Streaming"
+                        aria-label={isActiveSession ? 'Streaming' : 'Running in background'}
+                      ></span>
+                    {:else if needsAttention}
+                      <span
+                        class="w-2 h-2 rounded-full bg-warning shrink-0 animate-pulse"
+                        aria-label="Session needs attention"
+                      ></span>
+                    {:else if hasUnread}
+                      <span
+                        class="w-2 h-2 rounded-full bg-primary shrink-0 glow-primary"
+                        aria-label="Unchecked result"
                       ></span>
                     {:else if s.parentSession}
                       <CornerDownRight
