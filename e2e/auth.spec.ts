@@ -22,6 +22,6 @@ test.describe('Auth flow', () => {
   test('after login, page does not redirect back to login', async ({ page, login }) => {
     await login(page, 'test-password');
     await page.goto('/');
-    await expect(page).toHaveURL('/');
+    await expect(page).toHaveURL((url) => url.pathname === '/');
   });
 });

@@ -8,26 +8,35 @@ import type { Page } from '@playwright/test';
 
 async function openProjectsSidebar(page: Page) {
   const search = page.locator('input[aria-label="Filter projects and sessions"]');
+  const panel = page.locator('[role="complementary"][aria-label^="projects"]');
   // Sidebar content is lazily mounted (module loads on first open) and the
-  // panel is a fixed off-canvas drawer on mobile — never wait for the element,
-  // judge existence + actual position instead.
+  // panel is a fixed off-canvas drawer on mobile — use its state attribute,
+  // not its transitioning geometry, to decide whether it is open.
+  const waitForPanelTransition = async () => {
+    await panel.evaluate(async (element) => {
+      const animations = element.getAnimations();
+      if (animations.length === 0) return;
+      await Promise.all(animations.map((animation) => animation.finished.catch(() => undefined)));
+    });
+  };
   const isOpen = async () => {
     try {
-      await search.waitFor({ state: 'attached', timeout: 300 });
+      await panel.waitFor({ state: 'attached', timeout: 300 });
     } catch {
       return false;
     }
-    const box = await search.boundingBox();
-    return !!box && box.width > 0 && box.x >= -1;
+    await waitForPanelTransition();
+    return (await panel.getAttribute('aria-hidden')) === 'false';
   };
-  if (await isOpen()) return;
   const toggle = page.locator('[aria-label="Toggle session panel"]');
   // The toggle's listener may not be attached yet during initial hydration —
   // verify the drawer actually opened and retry if the click no-opped.
-  for (let i = 0; i < 5; i++) {
-    if (await isOpen()) break;
-    await toggle.click();
-    await page.waitForTimeout(250); // drawer slide-in transition (220ms)
+  if (!(await isOpen())) {
+    for (let i = 0; i < 5; i++) {
+      if (await isOpen()) break;
+      await toggle.click();
+      await page.waitForTimeout(250); // drawer slide-in transition (220ms)
+    }
   }
   await expect(search).toBeVisible({ timeout: 3000 });
 }
@@ -76,7 +85,7 @@ test.describe('Session status orbs', () => {
       let switchCount = 0;
       const bgTimer = setInterval(() => {
         if (bgRunning) {
-          ws.send(JSON.stringify(sessionRuntimePayload('s3', true, true)));
+          ws.send(JSON.stringify(sessionRuntimePayload('s3', { phase: 'running' })));
         }
       }, 300);
       ws.onMessage((data) => {
@@ -93,9 +102,13 @@ test.describe('Session status orbs', () => {
           clearInterval(bgTimer);
           // Real server also re-broadcasts runtime snapshots after a switch.
           ws.send(JSON.stringify(sessionLoadedFor(msg.path)));
-          ws.send(JSON.stringify(sessionRuntimePayload('s1', false, false)));
-          // Switch #2 is "back to s1" — s3's background run finished unseen.
-          ws.send(JSON.stringify(sessionRuntimePayload('s3', false, switchCount === 2)));
+          ws.send(JSON.stringify(sessionRuntimePayload('s1', { phase: 'idle' })));
+          // Switch #2 is "back to s1" — s3's background run finished unread.
+          ws.send(
+            JSON.stringify(
+              sessionRuntimePayload('s3', { phase: 'idle', unread: switchCount === 2 })
+            )
+          );
         }
       });
       ws.send(JSON.stringify(CONNECTED_S1));
@@ -104,31 +117,36 @@ test.describe('Session status orbs', () => {
 
     await openProjectsSidebar(page);
     await expect(page.getByText('hello world')).toBeVisible({ timeout: 3000 });
+    const backgroundRow = page.getByRole('button', { name: /hello world/ });
 
     // s3 running in background → green pulsing orb (broadcast persists until
     // the first click, so this can never miss the transient state).
-    await expect(page.getByLabel('Running in background')).toBeVisible({ timeout: 3000 });
+    await expect(backgroundRow.getByLabel('Running in background')).toBeVisible({ timeout: 3000 });
 
     // Open (check) s3 → orb goes grey.
-    await page.getByRole('button', { name: /hello world/ }).click();
-    await expect(page.getByLabel('Running in background')).toHaveCount(0);
-    await expect(page.getByLabel('Unchecked result')).toHaveCount(0);
+    await backgroundRow.click();
+    await expect(backgroundRow.getByLabel('Running in background')).toHaveCount(0);
+    await expect(backgroundRow.getByLabel('Unchecked result')).toHaveCount(0);
 
     // Leave to s1 → s3 finished while background → "ready to check" orb.
-    await page.getByRole('button', { name: /Bug fix/ }).click();
-    await expect(page.getByLabel('Unchecked result')).toBeVisible({ timeout: 3000 });
-    await expect(page.getByLabel('Running in background')).toHaveCount(0);
+    await openProjectsSidebar(page);
+    await page.getByRole('button', { name: /Bug fix|Fix the login bug/ }).click();
+    await openProjectsSidebar(page);
+    await expect(backgroundRow.getByLabel('Unchecked result')).toBeVisible({ timeout: 3000 });
+    await expect(backgroundRow.getByLabel('Running in background')).toHaveCount(0);
 
     // Open s3 again → grey.
-    await page.getByRole('button', { name: /hello world/ }).click();
-    await expect(page.getByLabel('Unchecked result')).toHaveCount(0);
+    await backgroundRow.click();
+    await expect(backgroundRow.getByLabel('Unchecked result')).toHaveCount(0);
 
     // Leave again → s3 must STAY grey (regression: a finished background
     // session used to flash green "Running in background" forever because its
     // runtime updates were dropped while non-active).
-    await page.getByRole('button', { name: /Bug fix/ }).click();
-    await expect(page.getByLabel('Running in background')).toHaveCount(0);
-    await expect(page.getByLabel('Unchecked result')).toHaveCount(0);
+    await openProjectsSidebar(page);
+    await page.getByRole('button', { name: /Bug fix|Fix the login bug/ }).click();
+    await openProjectsSidebar(page);
+    await expect(backgroundRow.getByLabel('Running in background')).toHaveCount(0);
+    await expect(backgroundRow.getByLabel('Unchecked result')).toHaveCount(0);
   });
 
   test('active session streams with a green orb and greys out on finish', async ({
@@ -141,7 +159,7 @@ test.describe('Session status orbs', () => {
       let running = true;
       const timer = setInterval(() => {
         if (running) {
-          ws.send(JSON.stringify(sessionRuntimePayload('s1', true, false)));
+          ws.send(JSON.stringify(sessionRuntimePayload('s1', { phase: 'running' })));
         }
       }, 300);
       ws.onMessage((data) => {
@@ -156,8 +174,8 @@ test.describe('Session status orbs', () => {
           running = false;
           clearInterval(timer);
           ws.send(JSON.stringify(sessionLoadedFor(msg.path)));
-          ws.send(JSON.stringify(sessionRuntimePayload('s1', false, false)));
-          ws.send(JSON.stringify(sessionRuntimePayload('s3', false, false)));
+          ws.send(JSON.stringify(sessionRuntimePayload('s1', { phase: 'idle' })));
+          ws.send(JSON.stringify(sessionRuntimePayload('s3', { phase: 'idle' })));
         }
       });
       ws.send(JSON.stringify(CONNECTED_S1));
@@ -180,7 +198,11 @@ test.describe('Session status orbs', () => {
       let bgRunning = true;
       const bgTimer = setInterval(() => {
         if (bgRunning) {
-          ws.send(JSON.stringify(sessionRuntimePayload('s3', true, false, 'example_tool')));
+          ws.send(
+            JSON.stringify(
+              sessionRuntimePayload('s3', { phase: 'running', activeToolName: 'example_tool' })
+            )
+          );
         }
       }, 300);
       ws.onMessage((data) => {

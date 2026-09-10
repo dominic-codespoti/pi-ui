@@ -10,19 +10,19 @@ Key constraints: ESM-only, Bun ≥1.0.0, no TTS, no Workbox, no node-pty.
 
 ## Architecture & Data Flow
 
-Bun server bridges pi SDK events to browser over WebSocket. Key flow: CLI → server.ts → Bun.serve() → SvelteKit (HTTP) + WebSocket → pi SDK session → events broadcast to all clients.
+Bun server bridges pi SDK events to browser over WebSocket. Key flow: CLI → server.ts → Bun.serve() → SvelteKit (HTTP) + WebSocket → resident pi SDK sessions → events broadcast to all clients.
 
 - Pi as near-pass-through — SDK events forwarded with a `sessionId` tag; `message_update` is stripped of its full partial message (only `assistantMessageEvent` + role forwarded) to avoid quadratic WS traffic on long reasoning turns
 - Lazy SDK load (~136 MB) on first WS connect; lazy SvelteKit handler (~30 MB) on first HTTP
 - Background `bindRpcHost` — extensions and tools are bound asynchronously on session initialization, broadcasting updated `tools_list` and `commands_list` without blocking early socket connection or session creation
-- The server retains exactly one live `AgentSession`; switching disposes the current session and opens the target. The active session path is persisted under `src/lib/server/ui-settings.ts` as `lastSession` and resumed on boot before `SessionManager.continueRecent`. Switching to an already-live path is a no-op snapshot re-send. Non-live sessions exist only as on-disk `.jsonl` files surfaced through `session-catalog.ts` / `project-catalog.ts` and the `session-watcher.ts` filesystem watcher. Switching back re-reads the bounded message tail from disk. There is no in-memory background run/unread state for non-live sessions: sidebar liveness covers the active session, while other sessions update through the disk watcher.
+- The server retains a resident `Map<sessionId, ManagedSession>` rather than a singleton session runtime. `selectedSessionId` is the server default and each socket has a `focusedSessionId`; switching changes selection without disposing the previous resident. Residency is capped by count (`PI_UI_MAX_RESIDENT_SESSIONS`, default 4) and estimated parsed-history bytes (`PI_UI_MAX_RESIDENT_HISTORY_MB`, default 48 MiB), with both limits env-overridable and bounded. Running sessions, sessions with an active tool or pending extension dialog, and sessions in `awaiting-input` are pinned, while least-recently-active (LRU) unpinned residents are evicted (project outliers are preferred to reduce extension-cache churn). Admission keeps one resident per `.jsonl` path because the SDK has no session-file locking. Residents own per-session services and all resident events are forwarded with their `sessionId`; a separate concurrent-run cap (`PI_UI_MAX_CONCURRENT_RUNS`, default 2) queues work beyond the limit. Non-resident sessions remain disk-backed catalog entries, with idle sidebar status until resident again.
 - Optimistic new-chat stash — when creating a new session, previous messages are stashed and cleared immediately for instant UI feedback, restoring on watchdog timeout or error
 - Extension UI requests block session until response (5 min timeout); terminal input flow bridges browser key events to headless extension TUI handlers with optimistic/awaited key classification
 - CSRF disabled (`csrf.trustedOrigins: ['*']` in `vite.config.ts`) — Bun URL construction conflicts with SvelteKit's origin check; login server action has its own origin check
 - Message editing via `edit_message` — rewinds session via `navigateTree()`, resends. See `pi-sdk-session-manipulation` skill
 - Real-time context usage ring — `contextUsage` (tokens, contextWindow, percent) streamed in `connected`/`session_loaded`/SDK events and displayed in chat header ring indicator
 - History payloads (`connected`/`session_loaded`/`older_messages`) are size-bounded: the last 100 messages (`MAX_INITIAL_MESSAGES`), with an 80 KB per-block cap and 128 KB per-message cap. Oversized tool-result output is elided above `MAX_WIRE_TOOL_OUTPUT_CHARS` (2,000 characters), retaining `outputElided`/`outputBytes` metadata and fetched on demand via `get_tool_output`. `totalBudget` (512 KB) is a hard ceiling covering both message content and rendered extension aux fields; `MAX_WIRE_AUX_TOTAL_CHARS` (256 KB) is a sub-cap inside that total in `src/lib/server/wire-messages.ts`. A failed `connected` send retries without history instead of closing the socket. The requester receives exactly one `session_loaded` per stamped request.
-- Session lists never use SDK `SessionManager.list/listAll` (they load every file fully and build `allMessagesText` — OOM risk at multi-hundred-MB stores). Listing goes through two catalogs in `src/lib/server/`: `session-catalog.ts` (merged session list — `session-scan.ts` streams line-by-line with a per-file (mtime,size) cache persisted to `~/.pi/agent/pi-ui-session-scan.json`; restarts are stat-only, composed with a live session overlay so the active session's file is never re-read after every message, watched via `session-watcher.ts` with trailing 500 ms debounce, a 5 s max coalescing window, and live-path `isIgnored` exclusion) and `project-catalog.ts` (merged project list — persisted registry + live session counts, debounced sync-write persistence). `switch_session` validates with targeted `hasFile` rather than a full `list()`; catalogs are warmed after `Bun.serve`; `projects_list` broadcasts are deduped. Both are singletons with a single `apply()` mutation chokepoint, a `list()` read, and `onChange()` change events
+- Session lists never use SDK `SessionManager.list/listAll` (they load every file fully and build `allMessagesText` — OOM risk at multi-hundred-MB stores). Listing goes through two catalogs in `src/lib/server/`: `session-catalog.ts` (merged session list — `session-scan.ts` streams line-by-line with a per-file (mtime,size) cache persisted to `~/.pi/agent/pi-ui-session-scan.json`; restarts are stat-only, composed with a resident-session overlay so resident session files are never re-read after every message, watched via `session-watcher.ts` with trailing 500 ms debounce, a 5 s max coalescing window, and resident-path `isIgnored` exclusion) and `project-catalog.ts` (merged project list — persisted registry + resident session counts, debounced sync-write persistence). `switch_session` validates with targeted `hasFile` rather than a full `list()`; catalogs are warmed after `Bun.serve`; `projects_list` broadcasts are deduped. Both are singletons with a single `apply()` mutation chokepoint, a `list()` read, and `onChange()` change events
 - Valibot runtime validation — incoming WebSocket server messages are parsed through `parseServerMessage` with loose schemas (`server-message-schema.ts`), separating valid custom/SDK events from malformed frames
 - Markdown & LaTeX rendering — marked parser with LaTeX block/inline extensions (`@earendil-works/pi-tui/dist/latex.js`), wrapped by `memoizedRenderMarkdown` using an FNV-1a hash key with LRU cache bounds (300 entries / 4,000,000 characters)
 - Logging via `src/lib/server/logger.ts` — sd-daemon `<N>` priority prefixes under systemd (`JOURNAL_STREAM` set), ISO timestamps otherwise; `uncaughtException`/`unhandledRejection` are logged and contained (process keeps serving)
@@ -82,7 +82,7 @@ bun run format            # prettier --write .
 
 # Tests
 bun test src/lib/auth     # Bun-native test runner for auth/rate-limiter (timeout 15s)
-bun run test:unit         # vitest run (jsdom — 33 test files, 442 tests)
+bun run test:unit         # vitest run (jsdom — 34 test files, 451 tests)
 bun run test:unit:watch   # vitest (watch mode)
 bun run test:coverage     # vitest run --coverage (v8 provider)
 bun run test:e2e          # playwright test (chains mock E2E suite + live agent suite)
@@ -142,7 +142,7 @@ bun run test:ci           # check + check:sw + check:server + lint + test:unit +
 
 - **`switch(msg.type)` routing**: server.ts dispatches ~76 ClientMessage types in one large switch. Notable handlers: `prompt` (send to SDK), `edit_message` (rewind + resend via `navigateTree`), `fork_session` (branch session at entry)
 - **Lazy imports**: SDK and SvelteKit handler both lazy-imported on first use
-- **`globalThis` for state**: bcrypt hash, JWT secret, rate limit data, and the single live session binding are stored on `globalThis`
+- **`globalThis` for state**: bcrypt hash, JWT secret, and rate limit data are stored on `globalThis`; resident sessions and selection are maintained in the server module
 - **Bun pub/sub**: `server.publish('pi', payload)` sends to all WS clients
 - **JSON-file persistence**: `project-registry.ts` uses atomic write (`tmp + rename`) to `~/.pi/agent/pi-ui-projects.json`
 - **isInsideWorkspace(path)**: resolves symlinks, checks separator-suffixed root prefix. Path traversal guard on `read_file`/`write_file`
@@ -151,6 +151,7 @@ bun run test:ci           # check + check:sw + check:server + lint + test:unit +
 ### Utility Modules
 
 - **`client-messages.ts`** — `UIMessage` type conversion pipeline: `agentMsgToUI()` maps SDK messages → flat `UIMessage[]`; `rawMessagesToUI()` single-pass batch converter; `formatToolInput()` extracts per-tool one-line summaries; `reconnectDelay()` exponential backoff 1s→30s with jitter; `outputElided`/`outputBytes`/`outputLoading` track lazy tool-result output
+- **`session-view-cache.ts`** — Bounded LRU of three per-session client views (messages, streams, tools, expansion, draft, context, queues); clones views while stripping base64 image data and attachments from inactive-session state
 - **`thinking-levels.ts`** — `THINKING_LEVEL_CANONICAL` ('off', 'minimal', 'low', 'medium', 'high', 'max'), `getSupportedThinkingLevels()`, and `clampThinkingLevelForModel()`
 - **`attachments.ts`** — File attachment handling: `prepareImage()` (in-browser downscale ≤1600px, base64 encoding ≤3 MB), `fileToText()`, accepted text extensions
 - **`terminal-key-encoder.ts`** — Encodes browser key events into terminal byte sequences
@@ -170,13 +171,14 @@ bun run test:ci           # check + check:sw + check:server + lint + test:unit +
 
 - **ConnectedMessage**: sent server→client on WS open (session state, models, thinkingLevel, contextUsage, tools, activeToolNames, truncated messages)
 - **ServerMessage** includes `tool_output` for requester-only lazy tool-result responses
-- **ClientMessage**: union of ~76 tagged types:
+- **ClientMessage**: union of ~76 tagged types; messages targeting an existing session accept optional `sessionId` (path-based `switch_session`, `rename_session`, and `delete_session` remain path-targeted) and resolve explicit target → socket `focusedSessionId` → server `selectedSessionId`
 - - Session lifecycle: `new_session`, `switch_session`, `fork_session`, `rename_session`, `delete_session`
+- - Session focus: `session_focus` updates the socket's visible session and unread semantics
 - - Messaging: `prompt`, `edit_message`, `steer`, `follow_up`, `abort`
-- - Model & settings: `set_model`, `set_thinking_level`, `model_changed` (includes `model` and `thinkingLevel`), `update_settings`
+- - Model & settings: `set_model`, `set_thinking_level`, `set_settings`
 - - Projects: `get_projects`, `get_all_sessions`, `pin_project`, `rename_project`, `delete_project` (removes project dir & all sessions)
-- - Extensions & tools: `get_tools`, `toggle_tool`, `extension_ui_response`, `extension_terminal_input` (interactive terminal input loop)
-- - Filesystem & completions: `read_file`, `write_file`, `get_file_completions`, `get_dir_completions`, `get_command_completions`
+- - Extensions & tools: `get_tools`, `set_active_tools`, `extension_ui_response`, `extension_terminal_input` (interactive terminal input loop)
+- - Filesystem & completions: `read_file`, `write_file`, `dir_complete`, `file_complete`, `get_command_completions`
 - - Session recovery: `get_tool_output`, `resync_session`
 
 > **Deep dive:** [`docs/websocket-protocol.md`](docs/websocket-protocol.md) — full message type reference, edit flow, extension UI flow
@@ -194,41 +196,40 @@ bun run test:ci           # check + check:sw + check:server + lint + test:unit +
 
 ## Important Files
 
-| File                                                   | Role                                                                                               |
-| ------------------------------------------------------ | -------------------------------------------------------------------------------------------------- |
-| `server.ts`                                            | Main Bun server (~5490 lines) — WS routing, single live session, SDK bridge, extension UI, updates |
-| `bin/pifrontier.ts`                                    | CLI entry — arg parsing, password prompt, daemon mode, update flow, server import                  |
-| `src/hooks.server.ts`                                  | SvelteKit auth guard — JWT validation, redirect to `/login`                                        |
-| `src/routes/(app)/+page.svelte`                        | Main chat UI (~7294 lines) — WS connect, message stream, STT, settings, tool/panel rendering       |
-| `src/routes/(auth)/login/+page.server.ts`              | Login action — CSRF, rate limit, verify password, set JWT cookie                                   |
-| `src/lib/auth/password.ts`                             | Password hashing, JWT create/verify, cookie helpers                                                |
-| `src/lib/auth/rate-limiter.ts`                         | IP-based login rate limiter                                                                        |
-| `src/lib/ws/protocol.ts`                               | Shared WS message types (ConnectedMessage, ServerMessage, ~76 ClientMessage types)                 |
-| `src/lib/ws/server-message-schema.ts`                  | Valibot runtime validation schemas (`parseServerMessage`) for inbound WS messages                  |
-| `src/lib/state/projects-state.svelte.ts`               | Runes-based projects/sessions state singleton                                                      |
-| `src/lib/state/extension-ui-state.svelte.ts`           | Extension modals, widgets, status texts, and action responses state singleton                      |
-| `src/lib/client-messages.ts`                           | UIMessage type, SDK→UI conversion, tool formatting                                                 |
-| `src/lib/server/wire-messages.ts`                      | Payload budget bounding (`boundMessagesForWire`)                                                   |
-| `src/lib/server/extension-tools.ts`                    | Tool activation and extension tool discovery helpers                                               |
-| `src/lib/server/extension-completions.ts`              | Slash command argument completions resolver for extensions                                         |
-| `src/lib/server/ws-helpers.ts`                         | Shared helpers (serializeModel, serializeSession, semver, GitHub URL, etc.)                        |
-| `src/lib/components/chat/message-list.svelte`          | Message stream rendering, tool execution cards, thinking blocks, code blocks                       |
-| `src/lib/components/chat/chat-header.svelte`           | Header bar with model selector, session title, context ring, and panel toggles                     |
-| `src/lib/components/chat/status-banners.svelte`        | Top banner alerts (disconnected, read-only mode, server notifications)                             |
-| `src/lib/components/panels/right-panel.svelte`         | Sidebar tabbed panel for models, tools, skills, prompts, extensions, stats                         |
-| `src/lib/components/panels/settings-panel.svelte`      | User settings dialog for appearance, themes, notifications, and dev options                        |
-| `src/lib/components/dialogs/extension-overlays.svelte` | Modal dialogs and overlay renderer for extension interactions                                      |
-| `src/lib/markdown.ts`                                  | Configured marked + hljs + LaTeX renderer + FNV-1a LRU memoization                                 |
-| `src/lib/tui-stubs.ts`                                 | Server-side pi-tui stub bridge, component tree parser, markdown transformer runner                 |
-| `src/lib/diff-parser.ts`                               | Unified diff parser                                                                                |
-| `e2e/fixtures.ts`                                      | Playwright custom fixtures — `mockWs`, `login`                                                     |
-| `e2e/global-setup.ts`                                  | E2E test suite scratch directory initialization and fake LLM config                                |
-| `e2e/mocks/payloads.ts`                                | Mock WS message factory functions                                                                  |
-| `scripts/dev.ts`                                       | Dev orchestrator (parallel Vite + WS server)                                                       |
-| `scripts/maybe-build.ts`                               | Incremental build cache freshness check                                                            |
-| `benchmark.ts`                                         | Playwright-based WS latency benchmark                                                              |
-| `static/manifest.webmanifest`                          | PWA manifest                                                                                       |
-| `.env.example`                                         | Required env vars documented                                                                       |
+| File                                                   | Role                                                                                                |
+| ------------------------------------------------------ | --------------------------------------------------------------------------------------------------- |
+| `server.ts`                                            | Main Bun server (~6570 lines) — WS routing, resident session map, SDK bridge, extension UI, updates |
+| `src/routes/(app)/+page.svelte`                        | Main chat UI (~8650 lines) — WS connect, message stream, STT, settings, tool/panel rendering        |
+| `src/hooks.server.ts`                                  | SvelteKit auth guard — JWT validation, redirect to `/login`                                         |
+| `src/routes/(auth)/login/+page.server.ts`              | Login action — CSRF, rate limit, verify password, set JWT cookie                                    |
+| `src/lib/auth/password.ts`                             | Password hashing, JWT create/verify, cookie helpers                                                 |
+| `src/lib/auth/rate-limiter.ts`                         | IP-based login rate limiter                                                                         |
+| `src/lib/ws/protocol.ts`                               | Shared WS message types (ConnectedMessage, ServerMessage, ~76 ClientMessage types)                  |
+| `src/lib/ws/server-message-schema.ts`                  | Valibot runtime validation schemas (`parseServerMessage`) for inbound WS messages                   |
+| `src/lib/state/projects-state.svelte.ts`               | Runes-based projects/sessions state singleton                                                       |
+| `src/lib/state/extension-ui-state.svelte.ts`           | Extension modals, widgets, status texts, and action responses state singleton                       |
+| `src/lib/client-messages.ts`                           | UIMessage type, SDK→UI conversion, tool formatting                                                  |
+| `src/lib/server/wire-messages.ts`                      | Payload budget bounding (`boundMessagesForWire`)                                                    |
+| `src/lib/server/extension-tools.ts`                    | Tool activation and extension tool discovery helpers                                                |
+| `src/lib/server/extension-completions.ts`              | Slash command argument completions resolver for extensions                                          |
+| `src/lib/server/ws-helpers.ts`                         | Shared helpers (serializeModel, serializeSession, semver, GitHub URL, etc.)                         |
+| `src/lib/components/chat/message-list.svelte`          | Message stream rendering, tool execution cards, thinking blocks, code blocks                        |
+| `src/lib/components/chat/chat-header.svelte`           | Header bar with model selector, session title, context ring, and panel toggles                      |
+| `src/lib/components/chat/status-banners.svelte`        | Top banner alerts (disconnected, read-only mode, server notifications)                              |
+| `src/lib/components/panels/right-panel.svelte`         | Sidebar tabbed panel for models, tools, skills, prompts, extensions, stats                          |
+| `src/lib/components/panels/settings-panel.svelte`      | User settings dialog for appearance, themes, notifications, and dev options                         |
+| `src/lib/components/dialogs/extension-overlays.svelte` | Modal dialogs and overlay renderer for extension interactions                                       |
+| `src/lib/markdown.ts`                                  | Configured marked + hljs + LaTeX renderer + FNV-1a LRU memoization                                  |
+| `src/lib/tui-stubs.ts`                                 | Server-side pi-tui stub bridge, component tree parser, markdown transformer runner                  |
+| `src/lib/diff-parser.ts`                               | Unified diff parser                                                                                 |
+| `e2e/fixtures.ts`                                      | Playwright custom fixtures — `mockWs`, `login`                                                      |
+| `e2e/global-setup.ts`                                  | E2E test suite scratch directory initialization and fake LLM config                                 |
+| `e2e/mocks/payloads.ts`                                | Mock WS message factory functions                                                                   |
+| `scripts/dev.ts`                                       | Dev orchestrator (parallel Vite + WS server)                                                        |
+| `scripts/maybe-build.ts`                               | Incremental build cache freshness check                                                             |
+| `benchmark.ts`                                         | Playwright-based WS latency benchmark                                                               |
+| `static/manifest.webmanifest`                          | PWA manifest                                                                                        |
+| `.env.example`                                         | Required env vars documented                                                                        |
 
 ---
 
@@ -258,10 +259,10 @@ bun run test:ci           # check + check:sw + check:server + lint + test:unit +
 
 ## Testing & QA
 
-Three layers: **Unit** (Vitest, jsdom — 33 test files, 442 tests), **E2E** (Playwright with mock WebSocket + Live SDK suite), **CI** (GitHub Actions). The Bun-native auth suite still has one pre-existing failure: `password.test.ts` uses `vi.resetModules()`, which Bun's runner does not implement; it passes under Vitest.
+Three layers: **Unit** (Vitest, jsdom — 34 test files, 451 tests), **E2E** (Playwright with mock WebSocket + Live SDK suite), **CI** (GitHub Actions). The Bun-native auth suite still has one pre-existing failure: `password.test.ts` uses `vi.resetModules()`, which Bun's runner does not implement; it passes under Vitest.
 
 ```bash
-bun run test:unit         # vitest run (jsdom — 33 test files, 442 tests)
+bun run test:unit         # vitest run (jsdom — 34 test files, 451 tests)
 bun run test:e2e          # playwright test (chains mock suite + live agent suite)
 bun run test:e2e:fast     # playwright test --project=chromium (mock suite only)
 bun run test:e2e:live     # playwright test -c playwright.live.config.ts (live suite only)

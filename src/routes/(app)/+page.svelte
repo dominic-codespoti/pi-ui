@@ -4,7 +4,7 @@
   import { goto } from '$app/navigation';
   import { page } from '$app/state';
   import { resolve } from '$app/paths';
-  import { SvelteMap } from 'svelte/reactivity';
+  import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 
   import type {
     ServerMessage,
@@ -27,6 +27,7 @@
     PackageUpdateInfo,
     PackageProgress,
     SessionStats,
+    ContextUsage,
   } from '#lib/ws/protocol.js';
   import type { PiEvent } from '#lib/ws/protocol.js';
   import { parseServerMessage } from '#lib/ws/server-message-schema.js';
@@ -46,6 +47,7 @@
   } from '#lib/client-messages.js';
   import { extensionOptionParts } from '#lib/extension-modals.js';
   import { saveSnapshot, loadSnapshot } from '#lib/session-snapshot.js';
+  import { SessionViewCache, type SessionView } from '#lib/session-view-cache.js';
   import { saveIdentity, loadIdentity, clearIdentity } from '#lib/session-identity.js';
   import {
     TEXT_FILE_EXTENSIONS,
@@ -573,6 +575,8 @@
   // is replaced and updated incrementally for live tool events.
   // eslint-disable-next-line svelte/prefer-svelte-reactivity -- non-reactive lookup index
   const toolMessagesById = new Map<string, UIMessage>();
+  /** Inactive session transcripts and UI-only state, bounded by the cache's LRU cap. */
+  const sessionViewCache = new SessionViewCache();
 
   let input = $state('');
   /** Images staged for the next prompt (base64 data + display src). */
@@ -855,7 +859,8 @@
   let _optimisticPrevInput: string | null = null;
   /** Draft typed while an existing session is still opening. */
   let sessionSwitchDraft: string | null = null;
-  /** Boot target captured once before the initial snapshot is loaded. */
+  /** Draft supplied by the Web Share Target; it outranks cached session drafts once. */
+  let shareTargetDraft: string | null = null;
   let bootResumePath: string | null = null;
   /** Connected snapshot held back while the remembered boot session loads. */
   let _bootServerSnapshot: ConnectedMessage | null = null;
@@ -916,9 +921,15 @@
   let _lastVisibleSessionPath: string | undefined;
   /** Last session id rendered from an authoritative full snapshot. */
   let _lastVisibleSessionId: string | undefined;
+  /** The optimistic new-chat reset already saved this outgoing view. */
+  let _optimisticViewSavedSessionId: string | null = null;
   let _pendingEdit: { messages: UIMessage[]; input: string } | null = null;
   $effect(() => {
     if (projectsState.pendingNewSession && !_optimisticPrevMessages) {
+      if (sessionId) {
+        saveVisibleSessionView(sessionId);
+        _optimisticViewSavedSessionId = sessionId;
+      }
       sessionSwitchDraft = null;
       discardPendingTerminalInputs();
       _optimisticPrevMessages = messages.slice();
@@ -954,6 +965,7 @@
       if (_optimisticPrevInput !== null) input = _optimisticPrevInput;
       _optimisticPrevMessages = null;
       _optimisticPrevInput = null;
+      _optimisticViewSavedSessionId = null;
     }
   });
   $effect(() => {
@@ -1977,10 +1989,58 @@
     }
   }
 
-  /** Clear the PWA app badge after the active snapshot changes. */
+  /** Keep the PWA badge equal to the number of unread resident sessions. */
   function updateAppBadge() {
-    if ('setAppBadge' in navigator) {
-      navigator.clearAppBadge().catch(() => {});
+    if (!('setAppBadge' in navigator)) return;
+    const badge = navigator as Navigator & {
+      setAppBadge(count?: number): Promise<void>;
+      clearAppBadge(): Promise<void>;
+    };
+    if (projectsState.unreadCount > 0) {
+      badge.setAppBadge(projectsState.unreadCount).catch(() => {});
+    } else {
+      badge.clearAppBadge().catch(() => {});
+    }
+  }
+
+  $effect(() => {
+    // Read the count so the effect re-runs when it changes; updateAppBadge
+    // reads it again to decide between setAppBadge and clearAppBadge.
+    void projectsState.unreadCount;
+    updateAppBadge();
+  });
+
+  /** Deduplicate one completion alert per resident run (lastActivity is its run token). */
+  const _notifiedBackgroundCompletions = new SvelteSet<string>();
+  function notifyBackgroundCompletion(sessionRuntime: {
+    sessionId: string;
+    lastActivity: number;
+  }): void {
+    const key = `${sessionRuntime.sessionId}:${sessionRuntime.lastActivity}`;
+    if (_notifiedBackgroundCompletions.has(key)) return;
+    _notifiedBackgroundCompletions.add(key);
+    if (_notifiedBackgroundCompletions.size > 64) {
+      const oldest = _notifiedBackgroundCompletions.values().next().value;
+      if (typeof oldest === 'string') _notifiedBackgroundCompletions.delete(oldest);
+    }
+
+    const summary = projectsState.allSessions.find((item) => item.id === sessionRuntime.sessionId);
+    const name =
+      summary?.name?.trim() ||
+      summary?.firstMessage?.trim() ||
+      summary?.path.split('/').filter(Boolean).pop() ||
+      sessionRuntime.sessionId;
+    if (document.hidden) {
+      if (notificationPrefs.onComplete) {
+        notifyPiEvent(
+          'Response Complete',
+          `${name} finished responding.`,
+          `pi-agent-end-${sessionRuntime.sessionId}-${sessionRuntime.lastActivity}`,
+          { kind: 'response_complete', sessionId: sessionRuntime.sessionId }
+        );
+      }
+    } else {
+      showChatNotice(`${name} finished responding.`, 'info');
     }
   }
 
@@ -2073,24 +2133,118 @@
     if (sessionId) send({ type: 'extension_editor_text_change', text: input, sessionId });
   }
 
+  function currentContextUsage(): ContextUsage | null {
+    if (contextUsageTokens === null && contextUsageWindow <= 0) return null;
+    return {
+      tokens: contextUsageTokens,
+      contextWindow: contextUsageWindow,
+      percent:
+        contextUsageTokens !== null && contextUsageWindow > 0
+          ? (contextUsageTokens / contextUsageWindow) * 100
+          : null,
+    };
+  }
+
+  /** Save the visible session before its state is replaced by another snapshot. */
+  function saveVisibleSessionView(sid: string): void {
+    const expanded = new Set(
+      Object.entries(expandedUserMsgs)
+        .filter(([, value]) => value)
+        .map(([id]) => id)
+    );
+    const truncated = new Set(
+      Object.entries(truncatedUserMsgs)
+        .filter(([, value]) => value)
+        .map(([id]) => id)
+    );
+    sessionViewCache.save(sid, {
+      messages,
+      activeStreamMsg,
+      toolsById: new Map(toolMessagesById),
+      expandedUserMsgs: expanded,
+      truncatedUserMsgs: truncated,
+      draft: input,
+      contextUsage: currentContextUsage(),
+      queuedSteering,
+      queuedFollowUp,
+      scrollAtBottom: isAtBottom,
+    });
+  }
+
+  /** Bind a retained inactive view to the page's visible-session state. */
+  function restoreSessionView(view: SessionView): void {
+    const activeId = view.activeStreamMsg?.id;
+    messages = view.messages;
+    rebuildToolMessageIndex();
+    activeStreamMsg = activeId
+      ? (messages.find((message) => message.id === activeId) ?? null)
+      : null;
+    expandedUserMsgs = Object.fromEntries([...view.expandedUserMsgs].map((id) => [id, true]));
+    truncatedUserMsgs = Object.fromEntries([...view.truncatedUserMsgs].map((id) => [id, true]));
+    input = view.draft;
+    queuedSteering = view.queuedSteering.slice();
+    queuedFollowUp = view.queuedFollowUp.slice();
+    contextUsageTokens = view.contextUsage?.tokens ?? null;
+    contextUsageWindow = view.contextUsage?.contextWindow ?? 0;
+    isAtBottom = view.scrollAtBottom;
+
+    const streamingTool = messages.find((message) => message.role === 'tool' && message.streaming);
+    isStreaming = Boolean(activeStreamMsg?.streaming || streamingTool);
+    activeToolName = streamingTool?.toolName;
+    const compaction = [...messages]
+      .reverse()
+      .find((message) => message.noticeKind === 'compaction' && message.streaming);
+    isCompacting = Boolean(compaction);
+    compactionStartedAt = compaction?.compaction?.startedAt ?? null;
+    for (const message of messages) {
+      if (
+        (message.content && !message.renderedContent) ||
+        (message.thinking && !message.renderedThinking)
+      ) {
+        scheduleContentRender(message);
+      }
+    }
+  }
+
   // ── Server event handling ────────────────────────────────────────────────────
   function applySessionState(payload: Record<string, unknown>) {
     const prevSessionId = sessionId;
-    if ('sessionId' in payload) {
-      const nextSessionId = payload.sessionId as string;
+    if (typeof payload.sessionId === 'string') {
+      const nextSessionId = payload.sessionId;
       if (nextSessionId !== prevSessionId) {
         const draftWhileSwitching = !projectsState.pendingNewSession ? sessionSwitchDraft : null;
+        const sharedDraft = shareTargetDraft;
+        if (
+          prevSessionId &&
+          _optimisticViewSavedSessionId !== prevSessionId &&
+          !projectsState.pendingNewSession
+        ) {
+          saveVisibleSessionView(prevSessionId);
+        }
+        const restored = !projectsState.pendingNewSession
+          ? sessionViewCache.restore(nextSessionId)
+          : null;
         sessionId = nextSessionId;
+        attachedImages = [];
+        attachedFiles = [];
         if (projectsState.pendingNewSession) {
           // The composer stays live while the server creates the session.
           // Keep that new draft instead of replacing it with another session's draft.
           expandedUserMsgs = {};
           truncatedUserMsgs = {};
+        } else if (restored) {
+          restoreSessionView(restored);
+          // A draft typed while the switch was in flight belongs to the new
+          // visible session and takes precedence over its cached draft.
+          if (sharedDraft !== null) input = sharedDraft;
+          else if (draftWhileSwitching !== null) input = draftWhileSwitching;
         } else {
-          input = draftWhileSwitching ?? '';
+          input = sharedDraft ?? draftWhileSwitching ?? '';
           expandedUserMsgs = {};
           truncatedUserMsgs = {};
         }
+        shareTargetDraft = null;
+        _optimisticViewSavedSessionId = null;
         // A key round-trip for the previous session must never be applied to
         // or routed toward the new one (its late verdict would insert text or
         // even submit into the wrong composer).
@@ -2243,10 +2397,403 @@
     }
   }
 
+  function backgroundLastStreaming(
+    view: SessionView,
+    role: UIMessage['role']
+  ): UIMessage | undefined {
+    for (let i = view.messages.length - 1; i >= 0; i--) {
+      const message = view.messages[i];
+      if (message.role === role && message.streaming) return message;
+    }
+    return undefined;
+  }
+
+  function backgroundFindTool(view: SessionView, toolCallId: string): UIMessage | undefined {
+    const indexed = view.toolsById.get(toolCallId);
+    if (indexed) return indexed;
+    for (let i = view.messages.length - 1; i >= 0; i--) {
+      const message = view.messages[i];
+      if (message.role === 'tool' && message.toolCallId === toolCallId) {
+        view.toolsById.set(toolCallId, message);
+        return message;
+      }
+    }
+    return undefined;
+  }
+
+  function backgroundEnsureTool(
+    view: SessionView,
+    toolCallId: string | undefined,
+    toolName: string,
+    details?: Record<string, unknown>,
+    renderedCallHtml?: string[]
+  ): UIMessage | undefined {
+    if (!toolCallId) return undefined;
+    const existing = backgroundFindTool(view, toolCallId);
+    if (existing) return existing;
+    const created: UIMessage = {
+      id: uid(),
+      role: 'tool',
+      content: '',
+      toolName,
+      toolCallId,
+      toolInput: formatToolInput(toolName, details),
+      renderedCallHtml,
+      streaming: true,
+      expanded: toolsExpandedGlobal,
+      startMs: Date.now(),
+      createdAt: Date.now(),
+    };
+    view.messages.push(created);
+    view.toolsById.set(toolCallId, created);
+    return created;
+  }
+
+  function backgroundSeal(view: SessionView): void {
+    for (let i = view.messages.length - 1; i >= 0; i--) {
+      const message = view.messages[i];
+      if (
+        message.streaming &&
+        message.role === 'assistant' &&
+        !message.content &&
+        !message.thinking
+      ) {
+        view.messages.splice(i, 1);
+      } else if (message.streaming) {
+        message.streaming = false;
+        delete message.renderedContent;
+        delete message.renderedThinking;
+      }
+    }
+    view.activeStreamMsg = null;
+  }
+
+  /**
+   * Apply a session-scoped live event to an inactive resident view. This path
+   * intentionally never invokes markdown rendering, scroll handling, or any
+   * page-level reactive state; the view is rendered only after it is selected.
+   */
+  function applyBackgroundFrame(msg: ServerMessage, sid: string): boolean {
+    const view = sessionViewCache.restore(sid);
+    if (!view) return false;
+    const frame = msg as unknown as Record<string, unknown>;
+    switch (frame.type) {
+      case 'agent_start':
+        return true;
+      case 'agent_error':
+        backgroundSeal(view);
+        return true;
+      case 'agent_end':
+        backgroundSeal(view);
+        return true;
+      case 'message_start': {
+        const message = frame.message as { role?: string } | undefined;
+        if (message?.role === 'assistant') {
+          const assistant = freshAssistant();
+          view.messages.push(assistant);
+          view.activeStreamMsg = assistant;
+        }
+        return true;
+      }
+      case 'message_update': {
+        const event = frame.assistantMessageEvent as { type?: string; delta?: string } | undefined;
+        const active = view.activeStreamMsg;
+        if (!active || typeof event?.delta !== 'string') return true;
+        if (event.type === 'text_delta') {
+          active.content += event.delta;
+          delete active.renderedContent;
+        } else if (event.type === 'thinking_delta') {
+          active.thinking = (active.thinking ?? '') + event.delta;
+          delete active.renderedThinking;
+        }
+        return true;
+      }
+      case 'message_end': {
+        const endMessage = frame.message as
+          | {
+              role?: string;
+              content?: { type: string; text?: string; thinking?: string }[];
+              usage?: {
+                input: number;
+                output: number;
+                totalTokens: number;
+                cost?: { total?: number };
+              };
+              stopReason?: string;
+            }
+          | undefined;
+        if (endMessage?.role === 'custom') {
+          const [custom] = rawMessagesToUI([endMessage]);
+          if (custom) {
+            custom.images = undefined;
+            view.messages.push(custom);
+          }
+        }
+        if (endMessage?.role === 'assistant') {
+          const active = view.activeStreamMsg;
+          if (active) {
+            active.endMs = Date.now();
+            active.streaming = false;
+            delete active.renderedContent;
+            delete active.renderedThinking;
+            if (endMessage.stopReason === 'aborted') {
+              active.aborted = true;
+              active.content = 'Operation aborted';
+            } else {
+              const content = endMessage.content ?? [];
+              const text = extractTextContent(content);
+              const thinking = content
+                .filter((block) => block.type === 'thinking')
+                .map((block) => block.thinking ?? block.text ?? '')
+                .join('');
+              if (text) active.content = text;
+              if (thinking) active.thinking = thinking;
+              if (endMessage.usage) {
+                active.usage = {
+                  input: endMessage.usage.input,
+                  output: endMessage.usage.output,
+                  totalTokens: endMessage.usage.totalTokens,
+                  cost: { total: endMessage.usage.cost?.total ?? 0 },
+                };
+              }
+            }
+          }
+        }
+        view.activeStreamMsg = null;
+        const context = frame.contextUsage as ContextUsage | undefined;
+        if (context) view.contextUsage = { ...context };
+        return true;
+      }
+      case 'tool_execution_start': {
+        const toolName = (frame.toolName as string | undefined) ?? 'tool';
+        const toolCallId = frame.toolCallId as string | undefined;
+        const details = (frame.args ?? frame.input ?? frame.details) as
+          Record<string, unknown> | undefined;
+        const tool = backgroundEnsureTool(
+          view,
+          toolCallId,
+          toolName,
+          details,
+          frame.renderedCallHtml as string[] | undefined
+        );
+        if (tool) {
+          tool.toolName = toolName;
+          tool.toolInput = formatToolInput(toolName, details);
+          tool.renderedCallHtml = frame.renderedCallHtml as string[] | undefined;
+          tool.streaming = true;
+          tool.isError = false;
+          tool.outputLoading = false;
+          tool.outputElided = false;
+          tool.endMs = undefined;
+        }
+        return true;
+      }
+      case 'tool_execution_update': {
+        const toolCallId = frame.toolCallId as string | undefined;
+        const details = (frame.args ?? frame.input ?? frame.details) as
+          Record<string, unknown> | undefined;
+        const tool = toolCallId
+          ? backgroundEnsureTool(
+              view,
+              toolCallId,
+              (frame.toolName as string | undefined) ?? 'tool',
+              details,
+              frame.renderedCallHtml as string[] | undefined
+            )
+          : backgroundLastStreaming(view, 'tool');
+        if (tool) {
+          const partial = frame.partialResult as
+            { content?: { type: string; text?: string }[] } | undefined;
+          if (partial?.content) {
+            tool.content = extractTextContent(partial.content);
+            delete tool.renderedResultHtml;
+          }
+          if (frame.renderedResultHtml)
+            tool.renderedResultHtml = frame.renderedResultHtml as string[];
+        }
+        return true;
+      }
+      case 'tool_execution_end': {
+        const toolCallId = frame.toolCallId as string | undefined;
+        const details = (frame.args ?? frame.input ?? frame.details) as
+          Record<string, unknown> | undefined;
+        const tool = toolCallId
+          ? backgroundEnsureTool(
+              view,
+              toolCallId,
+              (frame.toolName as string | undefined) ?? 'tool',
+              details,
+              frame.renderedCallHtml as string[] | undefined
+            )
+          : backgroundLastStreaming(view, 'tool');
+        if (tool) {
+          if (frame.renderedResultHtml)
+            tool.renderedResultHtml = frame.renderedResultHtml as string[];
+          tool.streaming = false;
+          tool.isError = (frame.isError as boolean | undefined) ?? false;
+          const result = frame.result as
+            | { content?: { type: string; text?: string }[]; details?: { diff?: string } }
+            | undefined;
+          if (result?.content) tool.content = extractTextContent(result.content);
+          const diff = result?.details?.diff;
+          if (diff) {
+            tool.diff = diff;
+            tool.lineCount = diff.split('\\n').length;
+            tool.expanded = true;
+          } else if (tool.content) {
+            tool.lineCount = tool.content.split('\\n').length;
+            if (tool.isError || (tool.lineCount <= 8 && tool.content.length <= 400)) {
+              tool.expanded = true;
+            }
+          }
+        }
+        return true;
+      }
+      case 'bash_execution_update': {
+        const bashId = frame.id as string | undefined;
+        const bash = bashId ? backgroundEnsureTool(view, bashId, 'bash') : undefined;
+        const delta = frame.delta as string | undefined;
+        if (bash && delta) {
+          bash.content += delta;
+          bash.streaming = true;
+          bash.lineCount = bash.content.split('\\n').length;
+          delete bash.renderedResultHtml;
+        }
+        return true;
+      }
+      case 'tool_output': {
+        const toolCallId = frame.toolCallId as string | undefined;
+        if (!toolCallId) return true;
+        const tool = backgroundFindTool(view, toolCallId);
+        if (!tool) return true;
+        if (frame.content !== undefined) tool.content = frame.content as string;
+        if (frame.details !== undefined) tool.details = frame.details as string;
+        if (frame.diff !== undefined) {
+          tool.diff = frame.diff as string;
+          tool.lineCount = tool.diff.split('\\n').length;
+        }
+        if (frame.renderedResultHtml !== undefined)
+          tool.renderedResultHtml = frame.renderedResultHtml as string[];
+        tool.outputElided = false;
+        return true;
+      }
+      case 'queue_update':
+        view.queuedSteering = (frame.steering as string[] | undefined) ?? [];
+        view.queuedFollowUp = (frame.followUp as string[] | undefined) ?? [];
+        return true;
+      case 'compaction_start': {
+        const startedAt = Date.now();
+        const reason = (frame.reason as string | undefined) ?? '';
+        const beforeTokens = view.contextUsage?.tokens ?? undefined;
+        view.messages.push({
+          id: uid(),
+          role: 'notice',
+          content:
+            reason === 'manual'
+              ? 'compacting context…'
+              : `auto-compacting context (${reason || 'automatic'})…`,
+          noticeKind: 'compaction',
+          compaction: {
+            reason: reason || 'automatic',
+            status: 'running',
+            startedAt,
+            ...(beforeTokens !== undefined ? { tokensBefore: beforeTokens } : {}),
+          },
+          streaming: true,
+          createdAt: startedAt,
+        });
+        return true;
+      }
+      case 'compaction_end': {
+        const notice = [...view.messages]
+          .reverse()
+          .find(
+            (message) =>
+              message.role === 'notice' && message.noticeKind === 'compaction' && message.streaming
+          );
+        if (notice) {
+          notice.streaming = false;
+          const previous = notice.compaction;
+          const aborted = (frame.aborted as boolean | undefined) ?? false;
+          const willRetry = (frame.willRetry as boolean | undefined) ?? false;
+          const errorMessage = frame.errorMessage as string | undefined;
+          const result = frame.result as
+            { estimatedTokensAfter?: number; tokensBefore?: number } | undefined;
+          const startedAt = previous?.startedAt ?? notice.createdAt;
+          const endedAt = Date.now();
+          const status: CompactionNoticeDetails['status'] = willRetry
+            ? 'retrying'
+            : errorMessage
+              ? 'failed'
+              : aborted
+                ? 'aborted'
+                : 'completed';
+          notice.compaction = {
+            ...(previous ?? { status: 'running', startedAt }),
+            status,
+            startedAt,
+            endedAt,
+            durationMs: Math.max(0, endedAt - startedAt),
+            ...(result?.tokensBefore !== undefined ? { tokensBefore: result.tokensBefore } : {}),
+            ...(result?.estimatedTokensAfter !== undefined
+              ? { tokensAfter: result.estimatedTokensAfter }
+              : {}),
+            ...(errorMessage ? { errorMessage } : {}),
+            willRetry,
+          };
+          notice.content = errorMessage
+            ? `compaction failed: ${errorMessage}`
+            : aborted
+              ? 'compaction aborted'
+              : willRetry
+                ? 'compaction failed · retrying…'
+                : 'context compacted';
+        }
+        const context = frame.contextUsage as ContextUsage | undefined;
+        if (context) view.contextUsage = { ...context };
+        return true;
+      }
+      case 'auto_retry_start': {
+        const attempt = (frame.attempt as number | undefined) ?? 1;
+        const max = (frame.maxAttempts as number | undefined) ?? 1;
+        const delayS = Math.round(((frame.delayMs as number | undefined) ?? 0) / 1000);
+        const errorMessage = (frame.errorMessage as string | undefined) ?? '';
+        view.messages.push({
+          id: uid(),
+          role: 'notice',
+          content: `retrying (${attempt}/${max}${delayS > 0 ? `, ${delayS}s` : ''})${errorMessage ? ` — ${errorMessage}` : ''}`,
+          noticeKind: 'retry',
+          streaming: true,
+          createdAt: Date.now(),
+        });
+        return true;
+      }
+      case 'auto_retry_end': {
+        const notice = [...view.messages]
+          .reverse()
+          .find(
+            (message) =>
+              message.role === 'notice' && message.noticeKind === 'retry' && message.streaming
+          );
+        if (notice) {
+          notice.streaming = false;
+          const success = (frame.success as boolean | undefined) ?? false;
+          const finalError = frame.finalError as string | undefined;
+          notice.content = success
+            ? 'retry succeeded'
+            : `retry failed${finalError ? `: ${finalError}` : ''}`;
+        }
+        return true;
+      }
+      default:
+        return true;
+    }
+  }
+
   function handleServer(msg: ServerMessage) {
-    // Reject events from a previous session that arrived late in the TCP buffer
-    // after a session switch. Snapshots establish active-session identity, while
-    // session_updated remains a disk-derived sidebar delta for any session.
+    // Snapshots establish active-session identity, session_runtime and
+    // session_updated are global inventory/status frames. Other stamped
+    // events belong to the visible session or to an inactive cached view.
     if (msg && typeof msg === 'object' && 'sessionId' in msg) {
       const msgType = (msg as Record<string, unknown>).type;
       if (
@@ -2257,6 +2804,9 @@
       ) {
         const sid = (msg as Record<string, unknown>).sessionId;
         if (typeof sid === 'string' && sid !== sessionId) {
+          // If this resident session has no retained view, the authoritative
+          // snapshot on a future switch will rebuild it from disk.
+          applyBackgroundFrame(msg, sid);
           return;
         }
       }
@@ -3554,6 +4104,7 @@
           needsAttention: boolean;
           resident: boolean;
         };
+        const previousRuntime = projectsState.runtime.get(rt.sessionId);
         projectsState.applyRuntime({
           sessionId: rt.sessionId,
           phase: rt.phase,
@@ -3576,6 +4127,8 @@
           activeToolName = toolName;
           if (isRunning || toolName) requestWakeLock();
           else releaseWakeLock();
+        } else if (previousRuntime?.phase === 'running' && rt.phase !== 'running' && rt.unread) {
+          notifyBackgroundCompletion(rt);
         }
         break;
       }
@@ -5120,6 +5673,26 @@
       rebuildToolMessageIndex();
       if (snap.sessionName) sessionName = snap.sessionName;
     }
+    // Web Share Target (static/manifest.webmanifest → share_target, method GET,
+    // action "/") lands here as ?share_title=&share_text=&share_url= — fold
+    // whatever's present into the composer, then scrub the params so a
+    // refresh doesn't re-populate it. Set this before connecting so the
+    // initial connected snapshot cannot replace the shared draft with a
+    // cached/empty draft.
+    try {
+      const shareParams = new URLSearchParams(window.location.search);
+      const sharedTitle = shareParams.get('share_title');
+      const sharedText = shareParams.get('share_text');
+      const sharedUrl = shareParams.get('share_url');
+      if (sharedTitle || sharedText || sharedUrl) {
+        shareTargetDraft = [sharedTitle, sharedText, sharedUrl].filter(Boolean).join('\n');
+        input = shareTargetDraft;
+        setUrlParams({ share_title: null, share_text: null, share_url: null });
+        tick().then(autoResizeTextarea);
+      }
+    } catch {
+      /* URL unavailable */
+    }
     connect();
     inputEl?.focus();
     // Prefetch the lazily-loaded sidebar modules once the main thread is
@@ -5135,23 +5708,6 @@
       import('#lib/components/panels/right-panel.svelte').catch(() => {});
       import('#lib/components/projects/projects-sidebar.svelte').catch(() => {});
     });
-    // Web Share Target (static/manifest.webmanifest → share_target, method GET,
-    // action "/") lands here as ?share_title=&share_text=&share_url= — fold
-    // whatever's present into the composer, then scrub the params so a
-    // refresh doesn't re-populate it.
-    try {
-      const shareParams = new URLSearchParams(window.location.search);
-      const sharedTitle = shareParams.get('share_title');
-      const sharedText = shareParams.get('share_text');
-      const sharedUrl = shareParams.get('share_url');
-      if (sharedTitle || sharedText || sharedUrl) {
-        input = [sharedTitle, sharedText, sharedUrl].filter(Boolean).join('\n');
-        setUrlParams({ share_title: null, share_text: null, share_url: null });
-        tick().then(autoResizeTextarea);
-      }
-    } catch {
-      /* URL unavailable */
-    }
     _mq = window.matchMedia('(max-width: 767px)');
     isMobile = _mq.matches;
     _mqHandler = (e: MediaQueryListEvent) => {

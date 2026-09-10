@@ -168,7 +168,7 @@ log.info('[pifrontier] Password initialised.');
 
 // ── 2. Helpers ────────────────────────────────────────────────────────────────
 
-import { existsSync, realpathSync } from 'node:fs';
+import { existsSync, realpathSync, statSync } from 'node:fs';
 
 /** Max messages sent on initial connect/session-switch. Older messages can be
  *  loaded on demand. Keeps the WS payload small and the client render fast. */
@@ -2345,6 +2345,8 @@ interface ManagedSession {
   runtimeUnsub: (() => void) | null;
   cwd: string;
   path: string | null;
+  /** Estimated parsed history retained by this resident. */
+  historyBytes: number;
   createdAt: number;
   /** True while the agent is generating (agent_start … agent_end). */
   isRunning: boolean;
@@ -2378,7 +2380,46 @@ interface ManagedSession {
    *  (that call scans every entry the session has ever had). */
   sessionName: string | undefined;
 }
-const MAX_RESIDENT_SESSIONS = 2;
+
+function boundedEnvInt(name: string, fallback: number, min: number, max: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) {
+    log.warn(`[pifrontier] Ignoring invalid ${name}=${JSON.stringify(raw)}; using ${fallback}.`);
+    return fallback;
+  }
+  const value = Math.floor(parsed);
+  const clamped = Math.min(max, Math.max(min, value));
+  if (clamped !== value) {
+    log.warn(
+      `[pifrontier] Clamped ${name}=${JSON.stringify(raw)} to ${clamped} (range ${min}..${max}).`
+    );
+  }
+  return clamped;
+}
+
+/** The SessionManager-only measurement in §3 was ~6.9× the .jsonl bytes.
+ *  Five is a deliberately conservative parsed-history estimate for admission. */
+const PARSED_HISTORY_MULTIPLIER = 5;
+const MAX_RESIDENT_SESSIONS = boundedEnvInt('PI_UI_MAX_RESIDENT_SESSIONS', 4, 1, 32);
+const MAX_RESIDENT_HISTORY_MB = boundedEnvInt('PI_UI_MAX_RESIDENT_HISTORY_MB', 48, 1, 4096);
+const MAX_RESIDENT_HISTORY_BYTES = MAX_RESIDENT_HISTORY_MB * 1024 * 1024;
+const MAX_CONCURRENT_RUNS = boundedEnvInt('PI_UI_MAX_CONCURRENT_RUNS', 2, 1, 32);
+
+type QueuedRunMode = 'prompt' | 'steer' | 'followUp';
+type QueuedRun = {
+  mode: QueuedRunMode;
+  message: string;
+  images?: Array<{ type: 'image'; data: string; mimeType: string }>;
+  sequence: number;
+};
+
+/** Runs waiting for a concurrency slot, grouped by resident session. */
+const queuedRuns = new Map<string, QueuedRun[]>();
+let nextQueuedRunSequence = 0;
+/** Reservations close the race between dispatching prompt() and agent_start. */
+const runReservations = new Set<string>();
 const resident = new Map<string, ManagedSession>();
 let selectedSessionId: string | null = null;
 
@@ -2401,6 +2442,76 @@ function residentEntries(): IterableIterator<ManagedSession> {
   return resident.values();
 }
 
+function queuedStateFor(sess: AgentSession): { steering: string[]; followUp: string[] } {
+  const pending = queuedRuns.get(sess.sessionId) ?? [];
+  return {
+    steering: [
+      ...sess.getSteeringMessages(),
+      ...pending.filter((run) => run.mode === 'steer').map((run) => run.message),
+    ],
+    followUp: [
+      ...sess.getFollowUpMessages(),
+      ...pending
+        .filter((run) => run.mode === 'followUp' || run.mode === 'prompt')
+        .map((run) => run.message),
+    ],
+  };
+}
+
+function broadcastQueueState(entry: ManagedSession): void {
+  const state = queuedStateFor(entry.session);
+  broadcast({ type: 'queue_update', sessionId: entry.session.sessionId, ...state });
+}
+
+function hasQueuedRuns(sid: string): boolean {
+  return (queuedRuns.get(sid)?.length ?? 0) > 0;
+}
+
+function queueRun(entry: ManagedSession, run: Omit<QueuedRun, 'sequence'>): void {
+  const sid = entry.session.sessionId;
+  const queue = queuedRuns.get(sid) ?? [];
+  queue.push({ ...run, sequence: nextQueuedRunSequence++ });
+  queuedRuns.set(sid, queue);
+  log.info(
+    `[pifrontier] Queued ${run.mode} for session ${sid}; concurrency cap is ${MAX_CONCURRENT_RUNS}.`
+  );
+  broadcastQueueState(entry);
+}
+
+function concurrentRunCount(): number {
+  let count = 0;
+  for (const entry of resident.values()) {
+    const sid = entry.session.sessionId;
+    // Reservations cover the short interval before the SDK emits agent_start.
+    if (sessionPhaseFor(sid, entry) === 'running' || runReservations.has(sid)) count += 1;
+  }
+  return count;
+}
+
+function residentCwdPeerCount(entry: ManagedSession): number {
+  let peers = 0;
+  for (const other of resident.values()) {
+    if (other !== entry && other.cwd === entry.cwd) peers += 1;
+  }
+  return peers;
+}
+
+function historyBytesForPath(path: string | null): number {
+  if (!path) return 0;
+  try {
+    return statSync(path).size * PARSED_HISTORY_MULTIPLIER;
+  } catch (err) {
+    log.debug(`[pifrontier] Could not stat resident session history ${path}:`, err);
+    return 0;
+  }
+}
+
+function residentHistoryBytes(): number {
+  let total = 0;
+  for (const entry of resident.values()) total += entry.historyBytes;
+  return total;
+}
+
 function hasPendingExtensionDialog(sid: string): boolean {
   return (uiStateBuckets.get(sid)?.pendingDialogs.size ?? 0) > 0;
 }
@@ -2418,6 +2529,7 @@ function sessionPhaseFor(
 function isPinned(entry: ManagedSession): boolean {
   return (
     entry.isRunning ||
+    runReservations.has(entry.session.sessionId) ||
     entry.activeToolName !== undefined ||
     entry.activeToolCalls.size > 0 ||
     hasPendingExtensionDialog(entry.session.sessionId)
@@ -2425,15 +2537,31 @@ function isPinned(entry: ManagedSession): boolean {
 }
 
 function evictResidents(): void {
-  while (resident.size > MAX_RESIDENT_SESSIONS) {
+  while (
+    resident.size > MAX_RESIDENT_SESSIONS ||
+    residentHistoryBytes() > MAX_RESIDENT_HISTORY_BYTES
+  ) {
     let candidate: ManagedSession | undefined;
+    let candidatePeers = Infinity;
     for (const entry of resident.values()) {
       if (entry.session.sessionId === selectedSessionId || isPinned(entry)) continue;
-      if (!candidate || entry.lastActivity < candidate.lastActivity) candidate = entry;
+      const cwdPeers = residentCwdPeerCount(entry);
+      // Prefer removing a project outlier to avoid repeatedly invalidating the
+      // SDK's process-global extension factory cache. LRU breaks same-project ties.
+      if (
+        !candidate ||
+        cwdPeers < candidatePeers ||
+        (cwdPeers === candidatePeers && entry.lastActivity < candidate.lastActivity)
+      ) {
+        candidate = entry;
+        candidatePeers = cwdPeers;
+      }
     }
     if (!candidate) {
       log.warn(
-        `[pifrontier] Resident session cap exceeded (${resident.size}/${MAX_RESIDENT_SESSIONS}); all entries are pinned or selected.`
+        `[pifrontier] Resident policy exceeded (count ${resident.size}/${MAX_RESIDENT_SESSIONS}, ` +
+          `history ${(residentHistoryBytes() / 1024 / 1024).toFixed(1)}/${MAX_RESIDENT_HISTORY_MB} MB); ` +
+          'all entries are pinned or selected.'
       );
       return;
     }
@@ -2447,6 +2575,9 @@ function disposeSession(sid: string, reason: string): void {
   const entry = resident.get(sid);
   if (!entry) return;
   resident.delete(sid);
+  queuedRuns.delete(sid);
+  runReservations.delete(sid);
+  sessionMutationQueues.delete(sid);
   if (selectedSessionId === sid) selectedSessionId = null;
   if (entry.runtimeBroadcastTimer) {
     clearTimeout(entry.runtimeBroadcastTimer);
@@ -2473,6 +2604,19 @@ function disposeSession(sid: string, reason: string): void {
   entry.runtimeUnsub = null;
   disposeUi(sid);
   sessionCatalog.apply({ kind: 'release', id: sid });
+  // Tombstone: the sidebar must stop showing live status for a session that is
+  // no longer resident (evicted for capacity, deleted, or shut down). Unread
+  // survives eviction — it is about the user, not about residency.
+  broadcast({
+    type: 'session_runtime',
+    sessionId: sid,
+    phase: 'idle',
+    isRunning: false,
+    lastActivity: entry.lastActivity,
+    unread: entry.unread,
+    needsAttention: false,
+    resident: false,
+  });
   log.info(`[pifrontier] Released session ${sid} from memory (${reason}).`);
 }
 
@@ -2484,6 +2628,7 @@ let _sessionInitPromise: Promise<AgentSession> | null = null;
  * sessions or interleave live-session updates. A rejected operation
  * does not jam the queue for the next one. */
 let _sessionMutationQueue: Promise<unknown> = Promise.resolve();
+const sessionMutationQueues = new Map<string, Promise<unknown>>();
 function withSessionMutationLock<T>(operation: () => Promise<T>): Promise<T> {
   const run = _sessionMutationQueue.then(operation, operation);
   _sessionMutationQueue = run.then(
@@ -2491,6 +2636,112 @@ function withSessionMutationLock<T>(operation: () => Promise<T>): Promise<T> {
     () => undefined
   );
   return run;
+}
+function withPerSessionMutationLock<T>(sid: string, operation: () => Promise<T>): Promise<T> {
+  const previous = sessionMutationQueues.get(sid) ?? Promise.resolve();
+  const run = previous.then(operation, operation);
+  sessionMutationQueues.set(
+    sid,
+    run.then(
+      () => undefined,
+      () => undefined
+    )
+  );
+  return run;
+}
+function reserveRunSlot(entry: ManagedSession): boolean {
+  const sid = entry.session.sessionId;
+  if (entry.isRunning || runReservations.has(sid)) return false;
+  if (concurrentRunCount() >= MAX_CONCURRENT_RUNS) return false;
+  runReservations.add(sid);
+  return true;
+}
+
+async function invokeRun(
+  entry: ManagedSession,
+  message: string,
+  images?: Array<{ type: 'image'; data: string; mimeType: string }>
+): Promise<void> {
+  const sid = entry.session.sessionId;
+  _promptsInFlight.add(sid);
+  try {
+    await entry.session.prompt(message, images ? { images } : undefined);
+  } finally {
+    _promptsInFlight.delete(sid);
+    runReservations.delete(sid);
+    scheduleQueuedRuns();
+  }
+}
+
+function startQueuedRun(entry: ManagedSession, run: QueuedRun): void {
+  const sid = entry.session.sessionId;
+  void withPerSessionMutationLock(sid, async () => {
+    if (managedSessionFor(sid) !== entry || !runReservations.has(sid)) return;
+    if (entry.session.isStreaming || _promptsInFlight.has(sid)) {
+      runReservations.delete(sid);
+      const queue = queuedRuns.get(sid) ?? [];
+      queue.unshift(run);
+      queuedRuns.set(sid, queue);
+      broadcastQueueState(entry);
+      scheduleQueuedRuns();
+      return;
+    }
+    try {
+      await invokeRun(entry, run.message, run.images);
+    } catch (err) {
+      log.error(`[pifrontier] queued ${run.mode} error for session ${sid}:`, err);
+      broadcast({ type: 'agent_error', error: String(err), sessionId: sid });
+    }
+  }).catch((err) => {
+    log.error(`[pifrontier] queued run dispatch error for session ${sid}:`, err);
+  });
+}
+
+let queuedRunScheduler: Promise<void> = Promise.resolve();
+function scheduleQueuedRuns(): void {
+  const run = queuedRunScheduler.then(drainQueuedRuns, drainQueuedRuns);
+  queuedRunScheduler = run.then(
+    () => undefined,
+    () => undefined
+  );
+}
+
+function drainQueuedRuns(): void {
+  while (concurrentRunCount() < MAX_CONCURRENT_RUNS) {
+    let candidateEntry: ManagedSession | undefined;
+    let candidateRun: QueuedRun | undefined;
+    for (const [sid, queue] of queuedRuns) {
+      if (queue.length === 0) {
+        queuedRuns.delete(sid);
+        continue;
+      }
+      const entry = managedSessionFor(sid);
+      if (
+        !entry ||
+        entry.session.isStreaming ||
+        _promptsInFlight.has(sid) ||
+        runReservations.has(sid)
+      ) {
+        continue;
+      }
+      const run = queue[0];
+      if (!candidateRun || run.sequence < candidateRun.sequence) {
+        candidateEntry = entry;
+        candidateRun = run;
+      }
+    }
+    if (!candidateEntry || !candidateRun) return;
+    const queue = queuedRuns.get(candidateEntry.session.sessionId);
+    if (!queue || queue.shift() !== candidateRun) return;
+    if (queue.length === 0) queuedRuns.delete(candidateEntry.session.sessionId);
+    if (!reserveRunSlot(candidateEntry)) {
+      queue.unshift(candidateRun);
+      queuedRuns.set(candidateEntry.session.sessionId, queue);
+      return;
+    }
+    broadcastQueueState(candidateEntry);
+    startQueuedRun(candidateEntry, candidateRun);
+  }
 }
 
 // ── Session catalog ───────────────────────────────────────────────────────────
@@ -2920,7 +3171,7 @@ async function ensureSession(): Promise<AgentSession> {
   const selected = activeSessionOrNull();
   if (selected) return selected;
   if (!_sessionInitPromise) {
-    const init = (async () => {
+    const init = withSessionMutationLock(async () => {
       const start = Date.now();
       const sdk = await getSDK();
       log.info(`[pifrontier] Starting pi session in ${cwd} …`);
@@ -2975,6 +3226,9 @@ async function ensureSession(): Promise<AgentSession> {
       const sess = created.session;
       const sid = sess.sessionId;
       const cwdV = sess.sessionManager.getCwd() || cwd;
+      // Protect the startup session from immediate capacity eviction while
+      // registerSession installs its resident entry.
+      selectedSessionId = sid;
       // Register immediately without waiting for bind — bindExtensions can be
       // slow with 34+ tools/extensions and previously blocked the cold-start
       // session_loaded for seconds. See setActiveSession for the same pattern.
@@ -2988,7 +3242,7 @@ async function ensureSession(): Promise<AgentSession> {
         `[pifrontier] Pi session ready: ${sess.sessionId} (${sm.isPersisted() ? 'persisted' : 'in-memory'}) in ${Date.now() - start}ms (bind in background)`
       );
       return sess;
-    })();
+    });
     _sessionInitPromise = init;
     void init.then(
       () => {
@@ -3089,6 +3343,9 @@ function makeEventForwarder(
         ? boundMessagesForWire(event.messages)
         : event.messages;
       broadcast({ ...event, messages, sessionId: sid });
+    } else if (event.type === 'queue_update') {
+      const state = queuedStateFor(sess);
+      broadcast({ ...event, ...state, sessionId: sid });
     } else {
       broadcast({ ...event, sessionId: sid });
     }
@@ -3114,6 +3371,14 @@ function registerSession(
     }
     return existing;
   }
+  const historyBytes = historyBytesForPath(path);
+  const crossingCwd = [...resident.values()].some((existing) => existing.cwd !== cwdV);
+  if (crossingCwd) {
+    log.debug(
+      `[pifrontier] Registering session ${sid} in cwd ${cwdV} alongside residents from other cwds; ` +
+        'the SDK extension factory cache may be invalidated.'
+    );
+  }
   const entry: ManagedSession = {
     session: sess,
     forwardingUnsub: null,
@@ -3122,6 +3387,7 @@ function registerSession(
     activeToolCalls: new Map(),
     cwd: cwdV,
     path,
+    historyBytes,
     createdAt: Date.now(),
     isRunning: sess.isStreaming,
     lastActivity: Date.now(),
@@ -3146,6 +3412,7 @@ function registerSession(
   entry.runtimeUnsub = sess.subscribe((event) => {
     switch (event.type) {
       case 'agent_start':
+        runReservations.delete(sid);
         entry.activeToolCalls.clear();
         entry.activeToolName = undefined;
         entry.isRunning = true;
@@ -3163,16 +3430,19 @@ function registerSession(
         }
         if (!event.willRetry && !hasFocusedSocket(sid)) entry.unread = true;
         // Closed-app notification (Web Push). The SW suppresses pushes when a
-        // page is visible, and tags dedupe against the page's own hidden-tab
-        // notifications — payloads carry no message text.
+        // page is visible, and this tag matches the page's hidden-tab tag so one
+        // completion cannot produce duplicate notifications. Include the
+        // session and completion timestamp so concurrent sessions remain
+        // independently visible.
         void sendPushNotification({
           kind: 'response_complete',
           title: 'Response Complete',
           body: 'pi finished responding.',
-          tag: 'pi-agent-end',
+          tag: `pi-agent-end-${sid}-${entry.lastActivity}`,
           sessionId: sid,
           ...(entry.path ? { sessionPath: entry.path } : {}),
         });
+        if (!event.willRetry) scheduleQueuedRuns();
         break;
       }
       case 'tool_execution_start':
@@ -3404,8 +3674,7 @@ function broadcastSessionLoaded(
     isCompacting: sess.isCompacting,
     autoCompactionEnabled: sess.autoCompactionEnabled,
     autoRetryEnabled: sess.autoRetryEnabled,
-    queuedSteering: sess.getSteeringMessages(),
-    queuedFollowUp: sess.getFollowUpMessages(),
+    ...queuedStateFor(sess),
     piVersion: PI_SDK_VERSION,
     uiVersion: UI_VERSION,
     sessionMode: sess.sessionManager.isPersisted() ? 'persisted' : 'in-memory',
@@ -3632,18 +3901,19 @@ interface WSData {
   focusedSessionId?: string;
 }
 
-function targetedResidentFor(
+function targetEntry(
   wsData: WSData,
-  msg: { sessionId?: string; requestId?: string },
+  msg: object,
   send: (data: string) => unknown
 ): ManagedSession | undefined {
-  const sid = msg.sessionId ?? wsData.focusedSessionId ?? selectedSessionId;
+  const fields = msg as { sessionId?: string; requestId?: string };
+  const sid = fields.sessionId ?? wsData.focusedSessionId ?? selectedSessionId;
   const entry = sid ? managedSessionFor(sid) : undefined;
   if (!entry) {
     send(
       JSON.stringify({
         type: 'sessions_error',
-        ...(msg.requestId !== undefined ? { requestId: msg.requestId } : {}),
+        ...(fields.requestId !== undefined ? { requestId: fields.requestId } : {}),
         message: 'Session is not resident.',
       })
     );
@@ -3779,8 +4049,7 @@ try {
                 autoCompactionEnabled: sess.autoCompactionEnabled,
                 autoRetryEnabled: sess.autoRetryEnabled,
                 sessionMode: sess.sessionManager.isPersisted() ? 'persisted' : 'in-memory',
-                queuedSteering: sess.getSteeringMessages(),
-                queuedFollowUp: sess.getFollowUpMessages(),
+                ...queuedStateFor(sess),
                 pushVapidKey: ensureVapidKeys().publicKey,
                 piVersion: PI_SDK_VERSION,
                 contextUsage: sess.getContextUsage(),
@@ -3922,178 +4191,227 @@ try {
               break;
             }
             case 'prompt': {
-              const target = targetedResidentFor(ws.data, msg, (data) => ws.send(data));
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
               if (!target) break;
-              try {
-                const s = target.session;
-                const imageContent = msg.images?.length
-                  ? msg.images.map((img) => ({
-                      type: 'image' as const,
-                      data: img.data,
-                      mimeType: img.mimeType,
-                    }))
-                  : undefined;
-                const options = {
-                  ...(imageContent ? { images: imageContent } : {}),
-                  ...(s.isStreaming && msg.streamingBehavior
-                    ? { streamingBehavior: msg.streamingBehavior }
-                    : {}),
-                } satisfies Parameters<AgentSession['prompt']>[1];
-                if (s.isStreaming && !msg.streamingBehavior) {
-                  ws.send(
-                    JSON.stringify({
-                      type: 'agent_error',
-                      error: 'Streaming input requires a steer or follow-up mode.',
-                    })
-                  );
-                  break;
-                }
-                if (_promptsInFlight.has(s.sessionId) && !s.isStreaming) {
-                  ws.send(
-                    JSON.stringify({
-                      type: 'agent_error',
-                      error: 'Prompt already in progress on another tab.',
-                    })
-                  );
-                  break;
-                }
-                _promptsInFlight.add(s.sessionId);
+              await withPerSessionMutationLock(target.session.sessionId, async () => {
                 try {
-                  await s.prompt(msg.message, options);
-                } finally {
-                  _promptsInFlight.delete(s.sessionId);
+                  const s = target.session;
+                  const imageContent = msg.images?.length
+                    ? msg.images.map((img) => ({
+                        type: 'image' as const,
+                        data: img.data,
+                        mimeType: img.mimeType,
+                      }))
+                    : undefined;
+                  const options = {
+                    ...(imageContent ? { images: imageContent } : {}),
+                    ...(s.isStreaming && msg.streamingBehavior
+                      ? { streamingBehavior: msg.streamingBehavior }
+                      : {}),
+                  } satisfies Parameters<AgentSession['prompt']>[1];
+                  if (s.isStreaming) {
+                    if (!msg.streamingBehavior) {
+                      ws.send(
+                        JSON.stringify({
+                          type: 'agent_error',
+                          error: 'Streaming input requires a steer or follow-up mode.',
+                        })
+                      );
+                      return;
+                    }
+                    await s.prompt(msg.message, options);
+                    return;
+                  }
+                  if (_promptsInFlight.has(s.sessionId)) {
+                    ws.send(
+                      JSON.stringify({
+                        type: 'agent_error',
+                        error: 'Prompt already in progress on another tab.',
+                      })
+                    );
+                    return;
+                  }
+                  if (hasQueuedRuns(s.sessionId) || !reserveRunSlot(target)) {
+                    queueRun(target, {
+                      mode: 'prompt',
+                      message: msg.message,
+                      ...(imageContent ? { images: imageContent } : {}),
+                    });
+                    return;
+                  }
+                  await invokeRun(target, msg.message, imageContent);
+                } catch (err) {
+                  log.error('[pifrontier] prompt error:', err);
+                  ws.send(JSON.stringify({ type: 'agent_error', error: String(err) }));
                 }
-              } catch (err) {
-                log.error('[pifrontier] prompt error:', err);
-                ws.send(JSON.stringify({ type: 'agent_error', error: String(err) }));
-              }
+              });
               break;
             }
             case 'steer': {
-              const target = targetedResidentFor(ws.data, msg, (data) => ws.send(data));
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
               if (!target) break;
-              try {
-                const s = target.session;
-                const images = msg.images?.map((img) => ({
-                  type: 'image' as const,
-                  data: img.data,
-                  mimeType: img.mimeType,
-                }));
-                if (s.isStreaming || _promptsInFlight.has(s.sessionId)) {
-                  await s.steer(msg.message, images);
-                } else {
-                  _promptsInFlight.add(s.sessionId);
-                  try {
-                    await s.prompt(msg.message, images ? { images } : undefined);
-                  } finally {
-                    _promptsInFlight.delete(s.sessionId);
+              await withPerSessionMutationLock(target.session.sessionId, async () => {
+                try {
+                  const s = target.session;
+                  const images = msg.images?.map((img) => ({
+                    type: 'image' as const,
+                    data: img.data,
+                    mimeType: img.mimeType,
+                  }));
+                  if (s.isStreaming || _promptsInFlight.has(s.sessionId)) {
+                    await s.steer(msg.message, images);
+                  } else {
+                    if (hasQueuedRuns(s.sessionId) || !reserveRunSlot(target)) {
+                      queueRun(target, {
+                        mode: 'steer',
+                        message: msg.message,
+                        ...(images ? { images } : {}),
+                      });
+                      return;
+                    }
+                    await invokeRun(target, msg.message, images);
                   }
+                } catch (err) {
+                  log.error('[pifrontier] steer error:', err);
+                  ws.send(JSON.stringify({ type: 'agent_error', error: String(err) }));
                 }
-              } catch (err) {
-                log.error('[pifrontier] steer error:', err);
-                ws.send(JSON.stringify({ type: 'agent_error', error: String(err) }));
-              }
+              });
               break;
             }
 
             case 'follow_up': {
-              const target = targetedResidentFor(ws.data, msg, (data) => ws.send(data));
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
               if (!target) break;
-              try {
-                const s = target.session;
-                const images = msg.images?.map((img) => ({
-                  type: 'image' as const,
-                  data: img.data,
-                  mimeType: img.mimeType,
-                }));
-                if (s.isStreaming) {
-                  await s.followUp(msg.message, images);
-                } else {
-                  _promptsInFlight.add(s.sessionId);
-                  try {
-                    await s.prompt(msg.message, images ? { images } : undefined);
-                  } finally {
-                    _promptsInFlight.delete(s.sessionId);
+              await withPerSessionMutationLock(target.session.sessionId, async () => {
+                try {
+                  const s = target.session;
+                  const images = msg.images?.map((img) => ({
+                    type: 'image' as const,
+                    data: img.data,
+                    mimeType: img.mimeType,
+                  }));
+                  if (s.isStreaming) {
+                    await s.followUp(msg.message, images);
+                  } else {
+                    if (hasQueuedRuns(s.sessionId) || !reserveRunSlot(target)) {
+                      queueRun(target, {
+                        mode: 'followUp',
+                        message: msg.message,
+                        ...(images ? { images } : {}),
+                      });
+                      return;
+                    }
+                    await invokeRun(target, msg.message, images);
                   }
+                } catch (err) {
+                  log.error('[pifrontier] followUp error:', err);
+                  ws.send(JSON.stringify({ type: 'agent_error', error: String(err) }));
                 }
-              } catch (err) {
-                log.error('[pifrontier] followUp error:', err);
-                ws.send(JSON.stringify({ type: 'agent_error', error: String(err) }));
-              }
+              });
               break;
             }
             case 'abort': {
-              const target = targetedResidentFor(ws.data, msg, (data) => ws.send(data));
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
               if (!target) break;
-              const s = target.session;
-              // Clear queued steering/follow-up messages before abort so they
-              // don't continue processing after the abort takes effect.
-              const cleared = s.clearQueue();
-              s.abortBash();
-              await s.abort();
-              // Restore any queued text to the requesting tab's composer so the
-              // user can re-submit it.
-              const allQueued = [...cleared.steering, ...cleared.followUp];
-              if (allQueued.length > 0) {
-                ws.send(
-                  JSON.stringify({
-                    type: 'queue_restored',
-                    text: allQueued.join('\n\n'),
-                  })
-                );
-              }
+              await withPerSessionMutationLock(target.session.sessionId, async () => {
+                // Clear queued steering/follow-up messages before abort so they
+                // don't continue processing after the abort takes effect.
+                const s = target.session;
+                const cleared = s.clearQueue();
+                const deferred = queuedRuns.get(s.sessionId) ?? [];
+                queuedRuns.delete(s.sessionId);
+                runReservations.delete(s.sessionId);
+                broadcastQueueState(target);
+                s.abortBash();
+                await s.abort();
+                // Restore any queued text to the requesting tab's composer so the
+                // user can re-submit it.
+                const allQueued = [
+                  ...cleared.steering,
+                  ...cleared.followUp,
+                  ...deferred.map((run) => run.message),
+                ];
+                if (allQueued.length > 0) {
+                  ws.send(
+                    JSON.stringify({
+                      type: 'queue_restored',
+                      text: allQueued.join('\n\n'),
+                    })
+                  );
+                }
+              });
               break;
             }
 
-            case 'set_thinking_level':
-              activeSession().setThinkingLevel(
-                msg.level as Parameters<AgentSession['setThinkingLevel']>[0]
-              );
+            case 'abort_compaction': {
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
+              await withPerSessionMutationLock(target.session.sessionId, async () => {
+                target.session.abortCompaction();
+              });
               break;
+            }
+            case 'abort_branch_summary':
+            case 'abort_retry': {
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
+              await withPerSessionMutationLock(target.session.sessionId, async () => {
+                await target.session.abort();
+              });
+              break;
+            }
+
+            case 'set_thinking_level': {
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
+              await withPerSessionMutationLock(target.session.sessionId, async () => {
+                target.session.setThinkingLevel(
+                  msg.level as Parameters<AgentSession['setThinkingLevel']>[0]
+                );
+              });
+              break;
+            }
 
             case 'set_model': {
-              const ownerSessionId = activeSessionId();
-              const ownerSession = activeSessionOrNull();
-              if (!ownerSessionId || !ownerSession) break;
-              const model = ownerSession.modelRuntime.getModel(msg.provider, msg.modelId);
-              if (!model) {
-                log.warn(`[pifrontier] set_model: model not found: ${msg.provider}/${msg.modelId}`);
-                break;
-              }
-              try {
-                await ownerSession.setModel(model);
-                if (
-                  activeSessionId() !== ownerSessionId ||
-                  managedSessionFor(ownerSessionId)?.session !== ownerSession
-                ) {
-                  break;
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
+              await withPerSessionMutationLock(target.session.sessionId, async () => {
+                const ownerSession = target.session;
+                const model = ownerSession.modelRuntime.getModel(msg.provider, msg.modelId);
+                if (!model) {
+                  log.warn(
+                    `[pifrontier] set_model: model not found: ${msg.provider}/${msg.modelId}`
+                  );
+                  return;
                 }
-                broadcast({
-                  type: 'model_changed',
-                  model: serializeModel(model),
-                  ...stampOwner(ownerSessionId),
-                });
-              } catch (err) {
-                log.error('[pifrontier] set_model error:', err);
-                if (activeSessionId() === ownerSessionId) {
+                try {
+                  await ownerSession.setModel(model);
+                  if (managedSessionFor(ownerSession.sessionId)?.session !== ownerSession) return;
+                  broadcast({
+                    type: 'model_changed',
+                    model: serializeModel(model),
+                    ...stampOwner(ownerSession.sessionId),
+                  });
+                } catch (err) {
+                  log.error('[pifrontier] set_model error:', err);
                   sendSlashResult(ws, 'set_model', `Failed to switch model: ${err}`, 'error');
                 }
-              }
+              });
               break;
             }
 
             case 'get_tool_output': {
               const toolCallId = msg.toolCallId;
-              const target = targetedResidentFor(ws.data, msg, (data) => ws.send(data));
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
               if (!target) break;
               const sess = target.session;
               const base = {
                 type: 'tool_output' as const,
-                sessionId: sess?.sessionId ?? '',
+                sessionId: sess.sessionId,
                 toolCallId,
                 ...(msg.requestId !== undefined ? { requestId: msg.requestId } : {}),
               };
-              const output = sess ? toolOutputForWire(sess, toolCallId) : null;
+              const output = toolOutputForWire(sess, toolCallId);
               ws.send(
                 JSON.stringify(
                   output
@@ -4105,8 +4423,9 @@ try {
             }
 
             case 'resync_session': {
-              const sess = await ensureSession();
-              broadcastSessionLoaded(sess, msg.requestId, ws, true);
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
+              broadcastSessionLoaded(target.session, msg.requestId, ws, true);
               break;
             }
 
@@ -4157,6 +4476,8 @@ try {
                   }
                   const current = activeSessionOrNullEntry();
                   if (current?.path === resolvedPath) {
+                    current.unread = false;
+                    broadcastSessionRuntime(current.session.sessionId, current);
                     // Nothing changed, so the authoritative snapshot is enough;
                     // sidebar refresh scheduling can remain skipped.
                     broadcastSessionLoaded(current.session, requestId, ws);
@@ -4164,6 +4485,7 @@ try {
                   }
                   const existing = residentFor(resolvedPath);
                   if (existing) {
+                    existing.unread = false;
                     await setActiveSession(
                       existing.session,
                       existing.cwd,
@@ -4200,6 +4522,13 @@ try {
             }
             case 'extension_ui_response': {
               const owner = pendingRequestOwners.get(msg.id) ?? null;
+              const target = targetEntry(
+                ws.data,
+                owner ? { ...msg, sessionId: owner } : msg,
+                (data) => ws.send(data)
+              );
+              if (!target) break;
+              if (owner && owner !== target.session.sessionId) break;
               const pending = existingUiStateFor(owner)?.pendingDialogs.get(msg.id);
               if (pending) {
                 pending.resolve(msg as unknown as Record<string, unknown>);
@@ -4210,8 +4539,10 @@ try {
             case 'dismiss_widget': {
               const key = msg.key as string | undefined;
               if (!key) break;
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
               const owner = widgetOwnerFor(key);
-              if (owner === undefined) break;
+              if (owner === undefined || (owner && owner !== target.session.sessionId)) break;
               teardownWidget(key, owner);
               break;
             }
@@ -4221,22 +4552,24 @@ try {
               const data = msg.data as string | undefined;
               if (!customId || data === undefined) break;
               const owner = pendingRequestOwners.get(customId) ?? null;
-              const ui = existingUiStateFor(owner);
+              const target = targetEntry(
+                ws.data,
+                owner ? { ...msg, sessionId: owner } : msg,
+                (data) => ws.send(data)
+              );
+              if (!target) break;
+              const resolvedOwner = owner ?? target.session.sessionId;
+              const ui = existingUiStateFor(resolvedOwner);
               const component = ui?.interactiveCustomComponents.get(customId);
               if (!component) break;
               try {
                 // `data` is the raw terminal byte sequence the browser encoded for
-                // this keystroke/paste (see src/lib/terminal-key-encoder.ts) — pass
-                // it straight through, exactly as real stdin would deliver it.
-                if (typeof component.handleInput === 'function') {
-                  component.handleInput(data);
-                }
+                // this keystroke/paste — pass it straight through, exactly as real
+                // stdin would deliver it.
+                if (typeof component.handleInput === 'function') component.handleInput(data);
               } catch (err) {
                 log.error('[pifrontier] extension_custom_input error:', err);
               } finally {
-                // Always flush, even on a throw — otherwise a bad keystroke
-                // leaves the client's terminal render stale with no signal
-                // that anything happened.
                 flushInteractiveRender(customId);
               }
               break;
@@ -4245,18 +4578,29 @@ try {
               const resizeId = msg.id as string | undefined;
               if (!resizeId) break;
               const owner = pendingRequestOwners.get(resizeId) ?? null;
-              const tui = existingUiStateFor(owner)?.interactiveCustomComponents.get(resizeId);
+              const target = targetEntry(
+                ws.data,
+                owner ? { ...msg, sessionId: owner } : msg,
+                (data) => ws.send(data)
+              );
+              if (!target) break;
+              const resolvedOwner = owner ?? target.session.sessionId;
+              const tui =
+                existingUiStateFor(resolvedOwner)?.interactiveCustomComponents.get(resizeId);
               if (!tui?.terminal?.setSize) break;
               const columns = typeof msg.columns === 'number' ? msg.columns : 80;
               const rows = typeof msg.rows === 'number' ? msg.rows : 24;
               tui.terminal.setSize(columns, rows);
               break;
             }
+
             case 'extension_terminal_input': {
               const inputId = msg.id as string | undefined;
               const data = msg.data as string | undefined;
               if (!inputId || typeof data !== 'string') break;
-              const owner = (msg.sessionId as string | undefined) || activeSessionId() || null;
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
+              const owner = target.session.sessionId;
               const verdict = terminalInputRegistry.dispatch(owner, data);
               broadcast({
                 type: 'extension_terminal_input_result',
@@ -4267,23 +4611,30 @@ try {
               });
               break;
             }
-
             case 'extension_editor_text_change': {
               const text = msg.text as string | undefined;
               if (typeof text !== 'string') break;
-              const owner = (msg.sessionId as string | undefined) || activeSessionId() || null;
-              uiStateFor(owner).editorText = text;
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
+              uiStateFor(target.session.sessionId).editorText = text;
               break;
             }
 
             case 'extension_component_event': {
               const dialogId = msg.id as string | undefined;
               if (!dialogId) break;
+              const owner = pendingRequestOwners.get(dialogId) ?? null;
+              const target = targetEntry(
+                ws.data,
+                owner ? { ...msg, sessionId: owner } : msg,
+                (data) => ws.send(data)
+              );
+              if (!target) break;
+              const resolvedOwner = owner ?? target.session.sessionId;
               const path = (msg.path as number[] | undefined) ?? [];
               const event = msg.event as string;
               const value = msg.value as string | undefined;
-              const owner = pendingRequestOwners.get(dialogId) ?? null;
-              const dlg = existingUiStateFor(owner)?.activeCustomDialogs.get(dialogId);
+              const dlg = existingUiStateFor(resolvedOwner)?.activeCustomDialogs.get(dialogId);
               const node = dlg?.nodeMap.get(path.join('.'));
               let handled = false;
               try {
@@ -4366,23 +4717,22 @@ try {
             }
 
             case 'get_providers': {
-              // Panel fetches can arrive as soon as the socket opens — before
-              // `connected`. Wait for session creation (including any pending
-              // project-trust prompt) instead of throwing "No active session".
-              const sess = await ensureSession();
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
               ws.send(
                 JSON.stringify({
                   type: 'providers_list',
-                  providers: await getProviders(sess.modelRuntime),
-                  sessionId: sess.sessionId,
+                  providers: await getProviders(target.session.modelRuntime),
+                  sessionId: target.session.sessionId,
                 })
               );
               break;
             }
             case 'refresh_models': {
-              const refreshOwnerSessionId = activeSessionId();
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
               try {
-                const sess = await ensureSession();
+                const sess = target.session;
                 const sessionId = sess.sessionId;
                 const result = await sess.modelRuntime.refresh({
                   allowNetwork: true,
@@ -4395,9 +4745,7 @@ try {
                   : errors.length > 0
                     ? `Model refresh completed with ${errors.length} provider ${
                         errors.length === 1 ? 'error' : 'errors'
-                      }: ${errors
-                        .map(([provider, error]) => `${provider}: ${error.message}`)
-                        .join('; ')}`
+                      }: ${errors.map(([provider, error]) => `${provider}: ${error.message}`).join('; ')}`
                     : 'Models refreshed.';
                 if (!ws.data.closed) {
                   ws.send(
@@ -4415,7 +4763,7 @@ try {
                   ws.send(
                     JSON.stringify({
                       type: 'models_refresh_result',
-                      sessionId: refreshOwnerSessionId ?? undefined,
+                      sessionId: target.session.sessionId,
                       success: false,
                       message: `Model refresh failed: ${String(err)}`,
                     })
@@ -4426,12 +4774,11 @@ try {
             }
 
             case 'set_provider_key': {
-              const providerOwnerSessionId = activeSessionId();
-              const providerRuntime = activeSessionOrNull()?.modelRuntime;
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
+              const providerOwnerSessionId = target.session.sessionId;
+              const providerRuntime = target.session.modelRuntime;
               try {
-                if (!providerOwnerSessionId || !providerRuntime) {
-                  throw new Error('No active session');
-                }
                 await mutateProviderAuth(
                   msg.provider,
                   providerOwnerSessionId,
@@ -4443,7 +4790,7 @@ try {
                 ws.send(
                   JSON.stringify({
                     type: 'providers_error',
-                    sessionId: providerOwnerSessionId ?? undefined,
+                    sessionId: providerOwnerSessionId,
                     message: String(err),
                   })
                 );
@@ -4452,12 +4799,11 @@ try {
             }
 
             case 'remove_provider_key': {
-              const providerOwnerSessionId = activeSessionId();
-              const providerRuntime = activeSessionOrNull()?.modelRuntime;
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
+              const providerOwnerSessionId = target.session.sessionId;
+              const providerRuntime = target.session.modelRuntime;
               try {
-                if (!providerOwnerSessionId || !providerRuntime) {
-                  throw new Error('No active session');
-                }
                 await mutateProviderAuth(
                   msg.provider,
                   providerOwnerSessionId,
@@ -4469,93 +4815,100 @@ try {
                 ws.send(
                   JSON.stringify({
                     type: 'providers_error',
-                    sessionId: providerOwnerSessionId ?? undefined,
+                    sessionId: providerOwnerSessionId,
                     message: String(err),
                   })
                 );
               }
               break;
             }
-
             case 'rename_session': {
-              try {
-                // Security: only accept paths of known sessions — never trust raw user paths.
-                // (Session files live under ~/.pi, outside cwd, so containment checks don't apply.)
-                const known = await sessionCatalog.list();
-                const target = known.find((s) => s.path === msg.path);
-                if (!target) {
-                  ws.send(
-                    JSON.stringify({ type: 'sessions_error', message: 'Session not found.' })
-                  );
-                  break;
+              await withSessionMutationLock(async () => {
+                try {
+                  // Security: only accept paths of known sessions — never trust raw user paths.
+                  const known = await sessionCatalog.list();
+                  const target = known.find((s) => s.path === msg.path);
+                  if (!target) {
+                    ws.send(
+                      JSON.stringify({ type: 'sessions_error', message: 'Session not found.' })
+                    );
+                    return;
+                  }
+                  const residentTarget = residentFor(target.path);
+                  if (!residentTarget) {
+                    ws.send(
+                      JSON.stringify({
+                        type: 'sessions_error',
+                        message: 'Session is not resident.',
+                      })
+                    );
+                    return;
+                  }
+                  residentTarget.session.setSessionName(msg.name);
+                  sessionCatalog.apply({ kind: 'rename', path: msg.path, name: msg.name });
+                  ws.send(JSON.stringify({ type: 'sessions_list', sessions: [] }));
+                } catch (err) {
+                  log.error('[pifrontier] rename_session error:', err);
+                  ws.send(JSON.stringify({ type: 'sessions_error', message: String(err) }));
                 }
-                const residentTarget = residentFor(target.path);
-                if (residentTarget) residentTarget.session.setSessionName(msg.name);
-                else {
-                  const sm = _sdk!.SessionManager.open(target.path);
-                  sm.appendSessionInfo(msg.name);
-                }
-                // Patch the live overlay and force the next scan to re-parse
-                // that one file; onChange broadcasts the new list.
-                sessionCatalog.apply({ kind: 'rename', path: msg.path, name: msg.name });
-                ws.send(JSON.stringify({ type: 'sessions_list', sessions: [] }));
-              } catch (err) {
-                log.error('[pifrontier] rename_session error:', err);
-                ws.send(JSON.stringify({ type: 'sessions_error', message: String(err) }));
-              }
+              });
               break;
             }
 
             case 'delete_session': {
-              try {
-                // Validate the path is a known session file — never trust raw user paths.
-                // list() because the sidebar offers deletion across all projects.
-                const list = await sessionCatalog.list();
-                const target = list.find((s) => s.path === msg.path);
-                if (!target) {
-                  ws.send(
-                    JSON.stringify({ type: 'sessions_error', message: 'Session not found.' })
-                  );
-                  break;
+              await withSessionMutationLock(async () => {
+                try {
+                  // Validate the path is a known session file — never trust raw user paths.
+                  const list = await sessionCatalog.list();
+                  const target = list.find((s) => s.path === msg.path);
+                  if (!target) {
+                    ws.send(
+                      JSON.stringify({ type: 'sessions_error', message: 'Session not found.' })
+                    );
+                    return;
+                  }
+                  if (target.id === activeSessionId()) {
+                    ws.send(
+                      JSON.stringify({
+                        type: 'sessions_error',
+                        message: 'Cannot delete the active session.',
+                      })
+                    );
+                    return;
+                  }
+                  const residentEntry = managedSessionFor(target.id);
+                  if (residentEntry && isPinned(residentEntry)) {
+                    ws.send(
+                      JSON.stringify({
+                        type: 'sessions_error',
+                        message: 'Cannot delete a running or busy resident session.',
+                      })
+                    );
+                    return;
+                  }
+                  await rm(target.path);
+                  if (residentEntry) {
+                    broadcast({
+                      type: 'session_runtime',
+                      sessionId: target.id,
+                      phase: 'idle',
+                      isRunning: false,
+                      lastActivity: Date.now(),
+                      unread: false,
+                      needsAttention: false,
+                      resident: false,
+                    });
+                    disposeSession(target.id, 'deleted');
+                  }
+                  sessionCatalog.apply({ kind: 'remove', path: target.path });
+                  ws.send(JSON.stringify({ type: 'sessions_list', sessions: [] }));
+                } catch (err) {
+                  log.error('[pifrontier] delete_session error:', err);
+                  ws.send(JSON.stringify({ type: 'sessions_error', message: String(err) }));
                 }
-                if (target.id === activeSession().sessionId) {
-                  ws.send(
-                    JSON.stringify({
-                      type: 'sessions_error',
-                      message: 'Cannot delete the active session.',
-                    })
-                  );
-                  break;
-                }
-                // Path came from the scan/catalog — already validated.
-                await rm(target.path);
-
-                // Clean up resident-session resources before removing its file.
-                const residentEntry = managedSessionFor(target.id);
-                if (residentEntry) {
-                  broadcast({
-                    type: 'session_runtime',
-                    sessionId: target.id,
-                    phase: 'idle',
-                    isRunning: false,
-                    lastActivity: Date.now(),
-                    unread: false,
-                    needsAttention: false,
-                    resident: false,
-                  });
-                  disposeSession(target.id, 'deleted');
-                }
-                // Drop the overlay entry and force the next scan; onChange
-                // broadcasts the new list (sidebar + projects).
-                sessionCatalog.apply({ kind: 'remove', path: target.path });
-                ws.send(JSON.stringify({ type: 'sessions_list', sessions: [] }));
-              } catch (err) {
-                log.error('[pifrontier] delete_session error:', err);
-                ws.send(JSON.stringify({ type: 'sessions_error', message: String(err) }));
-              }
+              });
               break;
             }
-
             case 'get_all_sessions': {
               try {
                 // The live session is in the overlay, so the merged list needs
@@ -4608,64 +4961,78 @@ try {
                 );
                 break;
               }
-              projectCatalog.apply({ kind: 'remove', path: target });
+              await withSessionMutationLock(async () => {
+                projectCatalog.apply({ kind: 'remove', path: target });
+              });
               break;
             }
-
             case 'delete_project': {
-              try {
-                const target = (msg as { type: 'delete_project'; cwd: string }).cwd ?? '';
-                if (!target.trim()) {
-                  ws.send(
-                    JSON.stringify({ type: 'sessions_error', message: 'No project specified.' })
-                  );
-                  break;
-                }
-                if (target === (activeSessionOrNull()?.sessionManager.getCwd() || cwd)) {
-                  ws.send(
-                    JSON.stringify({
-                      type: 'sessions_error',
-                      message: 'Cannot delete the active project.',
-                    })
-                  );
-                  break;
-                }
-                // listForCwd already includes nested/subagent sessions — they
-                // share the parent project's cwd, so no separate walk needed.
-                const sessions = await sessionCatalog.listForCwd(target);
-                for (const session of sessions) {
-                  try {
-                    await rm(session.path);
-                  } catch (err) {
-                    log.error(
-                      `[pifrontier] delete_project: failed to remove ${session.path}:`,
-                      err
+              await withSessionMutationLock(async () => {
+                try {
+                  const target = (msg as { type: 'delete_project'; cwd: string }).cwd ?? '';
+                  if (!target.trim()) {
+                    ws.send(
+                      JSON.stringify({ type: 'sessions_error', message: 'No project specified.' })
                     );
-                    continue;
+                    return;
                   }
-                  // A project delete must not leak resident-session UI state,
-                  // timers, or subscriptions for any session it removes.
-                  const residentEntry = managedSessionFor(session.id);
-                  if (residentEntry) {
-                    broadcast({
-                      type: 'session_runtime',
-                      sessionId: session.id,
-                      phase: 'idle',
-                      isRunning: false,
-                      lastActivity: Date.now(),
-                      unread: false,
-                      needsAttention: false,
-                      resident: false,
-                    });
-                    disposeSession(session.id, 'deleted');
+                  if (target === (activeSessionOrNull()?.sessionManager.getCwd() || cwd)) {
+                    ws.send(
+                      JSON.stringify({
+                        type: 'sessions_error',
+                        message: 'Cannot delete the active project.',
+                      })
+                    );
+                    return;
                   }
+                  // listForCwd already includes nested/subagent sessions.
+                  const sessions = await sessionCatalog.listForCwd(target);
+                  if (
+                    sessions.some((session) => {
+                      const residentEntry = managedSessionFor(session.id);
+                      return residentEntry !== undefined && isPinned(residentEntry);
+                    })
+                  ) {
+                    ws.send(
+                      JSON.stringify({
+                        type: 'sessions_error',
+                        message: 'Cannot delete a project with a running or busy resident session.',
+                      })
+                    );
+                    return;
+                  }
+                  for (const session of sessions) {
+                    try {
+                      await rm(session.path);
+                    } catch (err) {
+                      log.error(
+                        `[pifrontier] delete_project: failed to remove ${session.path}:`,
+                        err
+                      );
+                      continue;
+                    }
+                    const residentEntry = managedSessionFor(session.id);
+                    if (residentEntry) {
+                      broadcast({
+                        type: 'session_runtime',
+                        sessionId: session.id,
+                        phase: 'idle',
+                        isRunning: false,
+                        lastActivity: Date.now(),
+                        unread: false,
+                        needsAttention: false,
+                        resident: false,
+                      });
+                      disposeSession(session.id, 'deleted');
+                    }
+                  }
+                  projectCatalog.apply({ kind: 'remove', path: target });
+                  ws.send(JSON.stringify({ type: 'sessions_list', sessions: [] }));
+                } catch (err) {
+                  log.error('[pifrontier] delete_project error:', err);
+                  ws.send(JSON.stringify({ type: 'sessions_error', message: String(err) }));
                 }
-                projectCatalog.apply({ kind: 'remove', path: target });
-                ws.send(JSON.stringify({ type: 'sessions_list', sessions: [] }));
-              } catch (err) {
-                log.error('[pifrontier] delete_project error:', err);
-                ws.send(JSON.stringify({ type: 'sessions_error', message: String(err) }));
-              }
+              });
               break;
             }
 
@@ -4749,11 +5116,13 @@ try {
             }
 
             case 'file_complete': {
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
               try {
                 const query = (
                   (msg as { type: 'file_complete'; query: string }).query ?? ''
                 ).toLowerCase();
-                const root = activeSession().sessionManager.getCwd() || cwd;
+                const root = target.session.sessionManager.getCwd() || cwd;
                 // Per-prefix cache — the client re-sends the same query while
                 // typing/backspacing, and a depth-3 walk per keystroke is
                 // wasted I/O on large repos. 5 s TTL keeps results fresh enough
@@ -4813,6 +5182,8 @@ try {
               break;
             }
             case 'get_extension_autocomplete': {
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
               let timeoutId: Timer | undefined;
               try {
                 const { trigger, query } = msg as {
@@ -4820,9 +5191,7 @@ try {
                   trigger: string;
                   query: string;
                 };
-                const provider = activeSessionId()
-                  ? autocompleteProviderFor(activeSessionId()!)
-                  : null;
+                const provider = autocompleteProviderFor(target.session.sessionId);
                 if (!provider) {
                   ws.send(
                     JSON.stringify({ type: 'extension_completions', trigger, query, items: [] })
@@ -4859,49 +5228,57 @@ try {
             }
 
             case 'compact': {
-              const sess = activeSession();
-              if (sess.isStreaming) {
-                sendSlashResult(
-                  ws,
-                  'compact',
-                  'Wait for the agent to finish before compacting.',
-                  'warning'
-                );
-                break;
-              }
-              if (sess.isCompacting) {
-                sendSlashResult(ws, 'compact', 'Compaction is already in progress.', 'warning');
-                break;
-              }
-              // The SDK's compaction watchdog (see compaction-watchdog.ts) bounds
-              // this call: a wedged compaction is aborted after COMPACTION_TIMEOUT_MS
-              // and the client spinner is sealed with a synthetic compaction_end.
-              const t0 = Date.now();
-              sess
-                .compact()
-                .then((result) => {
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
+              await withPerSessionMutationLock(target.session.sessionId, async () => {
+                const sess = target.session;
+                if (sess.isStreaming) {
+                  sendSlashResult(
+                    ws,
+                    'compact',
+                    'Wait for the agent to finish before compacting.',
+                    'warning'
+                  );
+                  return;
+                }
+                if (sess.isCompacting) {
+                  sendSlashResult(ws, 'compact', 'Compaction is already in progress.', 'warning');
+                  return;
+                }
+                // The SDK's compaction watchdog bounds this call.
+                const t0 = Date.now();
+                try {
+                  const result = await sess.compact();
                   log.info(
                     `[pifrontier] compact: finished in ${Date.now() - t0}ms` +
                       `${result ? ` (tokensBefore=${result.tokensBefore}, after=${result.estimatedTokensAfter})` : ''}`
                   );
-                })
-                .catch((err) => {
+                } catch (err) {
                   log.error(`[pifrontier] compact error after ${Date.now() - t0}ms:`, err);
-                });
+                }
+              });
               break;
             }
 
             case 'set_auto_compaction': {
-              activeSession().setAutoCompactionEnabled(msg.enabled);
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
+              target.session.setAutoCompactionEnabled(msg.enabled);
               break;
             }
 
             case 'set_auto_retry': {
-              activeSession().setAutoRetryEnabled(msg.enabled);
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
+              target.session.setAutoRetryEnabled(msg.enabled);
               break;
             }
 
             case 'run_builtin': {
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
+              const session = target.session;
+
               const command = String(
                 (msg as { type: 'run_builtin'; command: string; args?: string }).command ?? ''
               ).toLowerCase();
@@ -4914,10 +5291,7 @@ try {
               // concurrently with agent.prompt(). Read-only/independent commands
               // (session, export, share, changelog, name, tree, shell, extension
               // commands) are unaffected and stay allowed mid-stream.
-              if (
-                ['reload', 'clone', 'login', 'logout'].includes(command) &&
-                activeSession().isStreaming
-              ) {
+              if (['reload', 'clone', 'login', 'logout'].includes(command) && session.isStreaming) {
                 sendSlashResult(
                   ws,
                   command,
@@ -4938,7 +5312,7 @@ try {
                     // Keystrokes during the reload window fall back to native
                     // composer behavior, and the re-registration broadcasts
                     // active:true again.
-                    const reloadSid = activeSessionId() ?? null;
+                    const reloadSid = session.sessionId;
                     if (reloadSid && terminalInputRegistry.has(reloadSid)) {
                       terminalInputRegistry.clear(reloadSid);
                       broadcast({
@@ -4947,7 +5321,7 @@ try {
                         ...stampOwner(reloadSid),
                       });
                     }
-                    await activeSession().reload();
+                    await session.reload();
                     sendSlashResult(
                       ws,
                       command,
@@ -4956,28 +5330,26 @@ try {
                     ws.send(
                       JSON.stringify({
                         type: 'tools_list',
-                        tools: activeSession()
-                          .getAllTools()
-                          .map((t) => ({
-                            name: t.name,
-                            description: t.description,
-                            isBuiltin: t.sourceInfo.source === 'builtin',
-                            origin: t.sourceInfo.source,
-                          })),
-                        activeToolNames: activeSession().getActiveToolNames(),
+                        tools: session.getAllTools().map((t) => ({
+                          name: t.name,
+                          description: t.description,
+                          isBuiltin: t.sourceInfo.source === 'builtin',
+                          origin: t.sourceInfo.source,
+                        })),
+                        activeToolNames: session.getActiveToolNames(),
                       })
                     );
                     ws.send(
                       JSON.stringify({
                         type: 'commands_list',
-                        commands: extensionCommandsFor(activeSession()),
-                        ...stampOwner(activeSessionId()),
+                        commands: extensionCommandsFor(session),
+                        ...stampOwner(session.sessionId),
                       })
                     );
                     break;
                   }
                   case 'login': {
-                    const runtime = activeSession().modelRuntime;
+                    const runtime = session.modelRuntime;
                     const providerInfos = await getProviders(runtime);
                     const providerRef = args?.trim().toLowerCase();
                     const loginCandidates = runtime.getProviders().filter((provider) => {
@@ -5013,7 +5385,7 @@ try {
                         'Select a provider to log in',
                         labels,
                         undefined,
-                        activeSessionId()
+                        session.sessionId
                       );
                       if (!selected) break;
                       const index = labels.indexOf(selected);
@@ -5039,7 +5411,7 @@ try {
                         `Select authentication method for ${loginProvider.name}`,
                         authChoices.map((choice) => choice.label),
                         undefined,
-                        activeSessionId()
+                        session.sessionId
                       );
                       if (!selected) break;
                       const choice = authChoices.find((candidate) => candidate.label === selected);
@@ -5058,7 +5430,7 @@ try {
                     }
 
                     try {
-                      const authOwnerSession = activeSession();
+                      const authOwnerSession = session;
                       await mutateProviderAuth(
                         loginProvider.id,
                         authOwnerSession.sessionId,
@@ -5080,7 +5452,7 @@ try {
                   }
                   case 'logout': {
                     const providerRef = args?.trim();
-                    const ownerSession = activeSession();
+                    const ownerSession = session;
                     const ownerSessionId = ownerSession.sessionId;
                     const runtime = ownerSession.modelRuntime;
                     const provider = providerRef || ownerSession.model?.provider;
@@ -5115,19 +5487,19 @@ try {
                     break;
                   }
                   case 'clone': {
-                    const leafId = activeSession().sessionManager.getLeafId();
+                    const leafId = session.sessionManager.getLeafId();
                     if (!leafId) {
                       sendSlashResult(ws, command, 'No session branch to clone yet.', 'warning');
                       break;
                     }
-                    const newPath = activeSession().sessionManager.createBranchedSession(leafId);
+                    const newPath = session.sessionManager.createBranchedSession(leafId);
                     if (!newPath) {
                       // Fallback — create a fresh persisted session
                       const clonedSm = _sdk!.SessionManager.create(cwd);
                       const { session: clonedSession } = await _sdk!.createAgentSession({
                         cwd,
                         sessionManager: clonedSm,
-                        model: activeSession().model,
+                        model: session.model,
                       });
                       await setActiveSession(clonedSession);
                       sendSlashResult(ws, command, 'Cloned to a fresh session.');
@@ -5137,14 +5509,14 @@ try {
                     const { session: clonedSession } = await _sdk!.createAgentSession({
                       cwd: clonedSm.getCwd() || cwd,
                       sessionManager: clonedSm,
-                      model: activeSession().model,
+                      model: session.model,
                     });
                     await setActiveSession(clonedSession);
                     sendSlashResult(ws, command, `Cloned current branch to ${newPath}.`);
                     break;
                   }
                   case 'tree': {
-                    const tree = activeSession().sessionManager.getTree();
+                    const tree = session.sessionManager.getTree();
                     const treeBudget: TreeSerializationBudget = {
                       remaining: MAX_SESSION_TREE_NODES,
                     };
@@ -5174,8 +5546,8 @@ try {
                     break;
                   }
                   case 'session': {
-                    const stats = activeSession().getSessionStats();
-                    const context = activeSession().getContextUsage();
+                    const stats = session.getSessionStats();
+                    const context = session.getContextUsage();
                     const lines = [
                       `Session: ${stats.sessionId}`,
                       `File: ${stats.sessionFile ?? '(not persisted)'}`,
@@ -5195,14 +5567,12 @@ try {
                   case 'export': {
                     const format = args.toLowerCase().includes('json') ? 'jsonl' : 'html';
                     const out =
-                      format === 'jsonl'
-                        ? activeSession().exportToJsonl()
-                        : await activeSession().exportToHtml();
+                      format === 'jsonl' ? session.exportToJsonl() : await session.exportToHtml();
                     sendSlashResult(ws, command, `Exported current session to ${out}.`);
                     break;
                   }
                   case 'share': {
-                    const out = await activeSession().exportToHtml();
+                    const out = await session.exportToHtml();
                     sendSlashResult(
                       ws,
                       command,
@@ -5227,13 +5597,13 @@ try {
                       sendSlashResult(
                         ws,
                         command,
-                        activeSession().sessionName
-                          ? `Session name: ${activeSession().sessionName}`
+                        session.sessionName
+                          ? `Session name: ${session.sessionName}`
                           : 'No session name set.'
                       );
                       break;
                     }
-                    activeSession().setSessionName(args);
+                    session.setSessionName(args);
                     sendSlashResult(ws, command, `Session renamed to ${args}.`);
                     break;
                   }
@@ -5242,7 +5612,7 @@ try {
                       sendSlashResult(ws, command, 'Usage: ! <command>', 'warning');
                       break;
                     }
-                    const sess = activeSession();
+                    const sess = session;
                     try {
                       const result = await sess.executeBash(
                         args,
@@ -5280,7 +5650,9 @@ try {
                     // Extension commands — route through prompt() which handles them via _tryExecuteExtensionCommand
                     // Use prompt() even during streaming (SDK handles extension commands during streaming)
                     try {
-                      await activeSession().prompt(args);
+                      await withPerSessionMutationLock(session.sessionId, async () => {
+                        await session.prompt(args);
+                      });
                     } catch (e) {
                       sendSlashResult(ws, command, String(e), 'error');
                     }
@@ -5302,11 +5674,14 @@ try {
             }
 
             case 'get_session_stats': {
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
               try {
                 ws.send(
                   JSON.stringify({
                     type: 'session_stats',
-                    stats: (await ensureSession()).getSessionStats(),
+                    stats: target.session.getSessionStats(),
+                    sessionId: target.session.sessionId,
                   })
                 );
               } catch (err) {
@@ -5317,9 +5692,10 @@ try {
             }
 
             case 'export_session': {
-              const ownerSessionId = activeSessionId();
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
               try {
-                const session = activeSession();
+                const session = target.session;
                 const path =
                   msg.format === 'html' ? await session.exportToHtml() : session.exportToJsonl();
                 ws.send(
@@ -5327,7 +5703,7 @@ try {
                     type: 'export_result',
                     format: msg.format,
                     path,
-                    sessionId: ownerSessionId ?? undefined,
+                    sessionId: session.sessionId,
                   })
                 );
               } catch (err) {
@@ -5337,7 +5713,7 @@ try {
                     type: 'export_result',
                     format: msg.format,
                     error: String(err),
-                    sessionId: ownerSessionId ?? undefined,
+                    sessionId: target.session.sessionId,
                   })
                 );
               }
@@ -5345,9 +5721,10 @@ try {
             }
 
             case 'get_session_tree': {
-              const ownerSessionId = activeSessionId();
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
               try {
-                const sess = activeSession();
+                const sess = target.session;
                 const tree = sess.sessionManager.getTree();
                 const treeBudget: TreeSerializationBudget = {
                   remaining: MAX_SESSION_TREE_NODES,
@@ -5370,16 +5747,17 @@ try {
                   JSON.stringify({
                     type: 'session_tree',
                     tree: [],
-                    sessionId: ownerSessionId ?? undefined,
+                    sessionId: target.session.sessionId,
                   })
                 );
               }
               break;
             }
             case 'get_fork_points': {
-              const ownerSessionId = activeSessionId();
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
               try {
-                const sess = activeSession();
+                const sess = target.session;
                 const entries = sess.getUserMessagesForForking();
                 ws.send(
                   JSON.stringify({ type: 'fork_points', entries, sessionId: sess.sessionId })
@@ -5390,7 +5768,7 @@ try {
                   JSON.stringify({
                     type: 'fork_points',
                     entries: [],
-                    sessionId: ownerSessionId ?? undefined,
+                    sessionId: target.session.sessionId,
                   })
                 );
               }
@@ -5398,14 +5776,11 @@ try {
             }
 
             case 'get_tools': {
-              const ownerSessionId = activeSessionId();
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
               try {
                 const t0 = Date.now();
-                const sess = activeSessionOrNull();
-                if (!sess) {
-                  ws.send(JSON.stringify({ type: 'tools_list', tools: [], activeToolNames: [] }));
-                  break;
-                }
+                const sess = target.session;
                 const payload = toolsPayloadFor(sess);
                 const dt = Date.now() - t0;
                 if (dt > 50)
@@ -5426,7 +5801,7 @@ try {
                     type: 'tools_list',
                     tools: [],
                     activeToolNames: [],
-                    sessionId: ownerSessionId ?? undefined,
+                    sessionId: target.session.sessionId,
                   })
                 );
               }
@@ -5434,30 +5809,32 @@ try {
             }
 
             case 'set_active_tools': {
-              try {
-                activeSession().setActiveToolsByName(msg.toolNames as string[]);
-              } catch (err) {
-                log.error('[pifrontier] set_active_tools error:', err);
-                // The client's toggle is optimistic — a failed update must
-                // correct it back to the session's real active-tool state,
-                // not leave the UI showing a change that never took effect.
-                const sess = activeSessionOrNull();
-                if (sess)
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
+              await withPerSessionMutationLock(target.session.sessionId, async () => {
+                try {
+                  target.session.setActiveToolsByName(msg.toolNames as string[]);
+                } catch (err) {
+                  log.error('[pifrontier] set_active_tools error:', err);
+                  // The client's toggle is optimistic — correct it back to the
+                  // session's real active-tool state when the update fails.
                   ws.send(
                     JSON.stringify({
                       type: 'tools_list',
-                      ...toolsPayloadFor(sess),
-                      sessionId: sess.sessionId,
+                      ...toolsPayloadFor(target.session),
+                      sessionId: target.session.sessionId,
                     })
                   );
-              }
+                }
+              });
               break;
             }
 
             case 'get_resources': {
-              const ownerSessionId = activeSessionId();
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
               try {
-                const sess = await ensureSession();
+                const sess = target.session;
                 const { skills } = sess.resourceLoader.getSkills();
                 const { prompts } = sess.resourceLoader.getPrompts();
                 const skillSummaries: SkillSummary[] = skills.map((skill) => ({
@@ -5488,7 +5865,7 @@ try {
                 ws.send(
                   JSON.stringify({
                     type: 'resources_list',
-                    sessionId: ownerSessionId ?? undefined,
+                    sessionId: target.session.sessionId,
                     skills: [],
                     prompts: [],
                   })
@@ -5497,11 +5874,16 @@ try {
               break;
             }
             case 'get_project_trust': {
-              const ownerSessionId = activeSessionId();
+              const ownerTarget =
+                (msg as { type: 'get_project_trust'; cwd?: string }).cwd === undefined
+                  ? targetEntry(ws.data, msg, (data) => ws.send(data))
+                  : undefined;
+              if ((msg as { cwd?: string }).cwd === undefined && !ownerTarget) break;
+              const ownerSessionId = ownerTarget?.session.sessionId;
               try {
                 const targetCwd = resolve(
                   (msg as { type: 'get_project_trust'; cwd?: string }).cwd ??
-                    activeSession().sessionManager.getCwd() ??
+                    ownerTarget?.session.sessionManager.getCwd() ??
                     cwd
                 );
                 ws.send(
@@ -5529,7 +5911,9 @@ try {
               break;
             }
             case 'set_project_trust': {
-              const ownerSessionId = activeSessionId();
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
+              const ownerSessionId = target.session.sessionId;
               try {
                 const request = msg as {
                   type: 'set_project_trust';
@@ -5537,9 +5921,7 @@ try {
                   decision: ProjectTrustDecision;
                 };
                 const targetCwd = resolve(request.cwd);
-                // 'session' trusts the active session in memory only — the store
-                // is left untouched so the next startup still asks. 'ask' resets
-                // to undecided (store cleared + session untrusted).
+                // 'session' trusts the target session in memory only.
                 if (request.decision !== 'session') {
                   trustStore().set(
                     targetCwd,
@@ -5550,10 +5932,8 @@ try {
                         : null
                   );
                 }
-                const sess = activeSessionOrNull();
-                if (sess && resolve(sess.sessionManager.getCwd() || cwd) === targetCwd) {
-                  // Trust level is a per-session in-memory flag on the settings
-                  // manager; persisted decisions already landed in the store above.
+                const sess = target.session;
+                if (resolve(sess.sessionManager.getCwd() || cwd) === targetCwd) {
                   sess.settingsManager.setProjectTrusted(
                     request.decision === 'trusted' || request.decision === 'session'
                   );
@@ -5576,17 +5956,17 @@ try {
               }
               break;
             }
-
             case 'get_command_completions': {
               const { command, prefix } = msg as {
                 type: 'get_command_completions';
                 command: string;
                 prefix: string;
               };
-              const ownerSessionId = activeSessionId();
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
               try {
                 const items = await getCommandArgumentCompletions(
-                  activeSession().extensionRunner,
+                  target.session.extensionRunner,
                   command,
                   prefix
                 );
@@ -5596,7 +5976,7 @@ try {
                     command,
                     prefix,
                     items,
-                    sessionId: ownerSessionId ?? undefined,
+                    sessionId: target.session.sessionId,
                   })
                 );
               } catch (err) {
@@ -5607,17 +5987,17 @@ try {
                     command,
                     prefix,
                     items: [],
-                    sessionId: ownerSessionId ?? undefined,
+                    sessionId: target.session.sessionId,
                   })
                 );
               }
               break;
             }
-
             case 'get_extensions': {
-              const ownerSessionId = activeSessionId();
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
               try {
-                const sess = await ensureSession();
+                const sess = target.session;
                 const { extensions, errors } = sess.resourceLoader.getExtensions();
                 const runner = sess.extensionRunner;
                 const diagnostics = [
@@ -5679,16 +6059,17 @@ try {
                     type: 'extensions_list',
                     extensions: [],
                     errors: [],
-                    sessionId: ownerSessionId ?? undefined,
+                    sessionId: target.session.sessionId,
                   })
                 );
               }
               break;
             }
             case 'get_packages': {
-              const ownerSessionId = activeSessionId();
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
               try {
-                const { manager } = packageManagerFor(await ensureSession());
+                const { manager } = packageManagerFor(target.session);
                 const packages = manager.listConfiguredPackages().map((pkg) => ({
                   source: pkg.source,
                   scope: pkg.scope,
@@ -5701,7 +6082,7 @@ try {
                     type: 'packages_list',
                     packages,
                     updates,
-                    sessionId: ownerSessionId ?? undefined,
+                    sessionId: target.session.sessionId,
                   })
                 );
               } catch (err) {
@@ -5711,7 +6092,7 @@ try {
                     type: 'packages_list',
                     packages: [],
                     updates: [],
-                    sessionId: ownerSessionId ?? undefined,
+                    sessionId: target.session.sessionId,
                   })
                 );
               }
@@ -5721,9 +6102,11 @@ try {
             case 'install_package':
             case 'remove_package':
             case 'update_packages': {
-              const ownerSessionId = activeSessionId();
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
+              const ownerSessionId = target.session.sessionId;
               try {
-                const sess = activeSession();
+                const sess = target.session;
                 const { manager } = packageManagerFor(sess);
                 manager.setProgressCallback((progress) =>
                   broadcast({ type: 'package_progress', progress, sessionId: sess.sessionId })
@@ -5751,7 +6134,7 @@ try {
                     type: 'package_result',
                     success: false,
                     message: String(err),
-                    sessionId: ownerSessionId ?? undefined,
+                    sessionId: ownerSessionId,
                   })
                 );
               }
@@ -5759,16 +6142,17 @@ try {
             }
 
             case 'check_package_updates': {
-              const ownerSessionId = activeSessionId();
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
               try {
-                const { manager } = packageManagerFor(activeSession());
+                const { manager } = packageManagerFor(target.session);
                 const updates = await manager.checkForAvailableUpdates();
                 ws.send(
                   JSON.stringify({
                     type: 'packages_list',
                     packages: manager.listConfiguredPackages(),
                     updates,
-                    sessionId: ownerSessionId ?? undefined,
+                    sessionId: target.session.sessionId,
                   })
                 );
               } catch (err) {
@@ -5778,17 +6162,18 @@ try {
                     type: 'packages_list',
                     packages: [],
                     updates: [],
-                    sessionId: ownerSessionId ?? undefined,
+                    sessionId: target.session.sessionId,
                   })
                 );
               }
               break;
             }
-
             case 'set_package_filter': {
-              const ownerSessionId = activeSessionId();
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
+              const ownerSessionId = target.session.sessionId;
               try {
-                const sess = activeSession();
+                const sess = target.session;
                 const { settings } = packageManagerFor(sess);
                 const projectScope = msg.source.startsWith('project:');
                 const packages = projectScope
@@ -5824,8 +6209,10 @@ try {
               break;
             }
             case 'set_extension_flag': {
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
               try {
-                const sess = activeSession();
+                const sess = target.session;
                 const flag = sess.extensionRunner.getFlags().get(msg.name);
                 if (!flag) throw new Error(`Unknown extension flag: ${msg.name}`);
                 if (
@@ -5843,6 +6230,7 @@ try {
                     name: msg.name,
                     value: msg.value,
                     success: true,
+                    sessionId: sess.sessionId,
                   })
                 );
               } catch (err) {
@@ -5853,8 +6241,10 @@ try {
             }
 
             case 'invoke_extension_shortcut': {
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
               try {
-                const sess = activeSession();
+                const sess = target.session;
                 const shortcuts = sess.extensionRunner.getShortcuts({});
                 const shortcut = [...shortcuts.values()].find(
                   (entry) => String(entry.shortcut) === msg.shortcut
@@ -5869,13 +6259,14 @@ try {
             }
 
             case 'get_commands': {
-              const ownerSessionId = activeSessionId();
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
               try {
                 ws.send(
                   JSON.stringify({
                     type: 'commands_list',
-                    commands: extensionCommandsFor(activeSession()),
-                    ...stampOwner(ownerSessionId),
+                    commands: extensionCommandsFor(target.session),
+                    ...stampOwner(target.session.sessionId),
                   })
                 );
               } catch (err) {
@@ -5884,7 +6275,7 @@ try {
                   JSON.stringify({
                     type: 'commands_list',
                     commands: [],
-                    ...stampOwner(ownerSessionId),
+                    ...stampOwner(target.session.sessionId),
                   })
                 );
               }
@@ -5892,6 +6283,9 @@ try {
             }
 
             case 'install_skill': {
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
+              const sess = target.session;
               try {
                 const rawUrl = resolveGitHubRawUrl(msg.url as string);
                 // Security: only allow fetching from trusted hosts to prevent SSRF.
@@ -5905,7 +6299,7 @@ try {
                         error: `Blocked: only GitHub URLs are allowed (got ${parsedUrl.hostname}).`,
                       })
                     );
-                    break;
+                    return;
                   }
                 } catch {
                   ws.send(
@@ -5915,14 +6309,10 @@ try {
                       error: 'Invalid URL.',
                     })
                   );
-                  break;
+                  return;
                 }
-                // redirect:'error' — the host whitelist above is checked pre-fetch only,
-                // so following redirects could smuggle content from arbitrary hosts.
-                if (
-                  msg.scope === 'project' &&
-                  !activeSession().settingsManager.isProjectTrusted()
-                ) {
+                // redirect:'error' — the host whitelist above is checked pre-fetch only.
+                if (msg.scope === 'project' && !sess.settingsManager.isProjectTrusted()) {
                   throw new Error('Project resources are not trusted for this session.');
                 }
                 const res = await fetch(rawUrl, { redirect: 'error' });
@@ -5934,12 +6324,12 @@ try {
                       error: `HTTP ${res.status}: ${res.statusText}`,
                     })
                   );
-                  break;
+                  return;
                 }
                 const content = await res.text();
                 const fileName = basename(rawUrl.split('?')[0]);
                 const safeFileName = fileName.endsWith('.md') ? fileName : `${fileName}.md`;
-                const sessionCwd = activeSession().sessionManager.getCwd() || cwd;
+                const sessionCwd = sess.sessionManager.getCwd() || cwd;
                 const destDir =
                   (msg.scope as string) === 'user'
                     ? join(_sdk!.getAgentDir(), 'skills')
@@ -5947,9 +6337,7 @@ try {
                 await mkdir(destDir, { recursive: true });
                 const destPath = join(destDir, safeFileName);
                 await writeFile(destPath, content, 'utf8');
-                const sess = activeSession();
                 await reloadSessionHost(sess.sessionId, sess);
-                // Extract skill name from frontmatter or filename
                 const nameMatch = content.match(/^---[\s\S]*?^name:\s*(.+)$/m);
                 const skillName = nameMatch
                   ? nameMatch[1].trim()
@@ -5971,21 +6359,28 @@ try {
             }
 
             case 'fork_session': {
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
               await withSessionMutationLock(async () => {
                 try {
+                  const source = target.session;
                   const entryId = (msg as { type: 'fork_session'; entryId: string }).entryId;
-                  const sessionFile = activeSession().sessionFile;
+                  const sessionFile = source.sessionFile;
                   if (!sessionFile) throw new Error('Active session is not persisted');
-                  const forkPath = activeSession().sessionManager.createBranchedSession(entryId);
+                  const forkPath = source.sessionManager.createBranchedSession(entryId);
                   if (!forkPath) throw new Error('Failed to create branched session');
                   const sm2 = _sdk!.SessionManager.open(forkPath);
                   const created = await createSdkSession(
-                    activeCwd(),
+                    source.sessionManager.getCwd() || cwd,
                     sm2,
                     'fork',
-                    activeSession().sessionFile
+                    sessionFile
                   );
-                  await setActiveSession(created.session, activeCwd(), created);
+                  await setActiveSession(
+                    created.session,
+                    source.sessionManager.getCwd() || cwd,
+                    created
+                  );
                 } catch (err) {
                   log.error('[pifrontier] fork_session error:', err);
                   ws.send(JSON.stringify({ type: 'sessions_error', message: String(err) }));
@@ -5995,35 +6390,39 @@ try {
             }
 
             case 'edit_message': {
-              try {
-                const s = activeSession();
-                if (s.isStreaming) {
-                  ws.send(
-                    JSON.stringify({
-                      type: 'agent_error',
-                      error: 'Cannot edit while the agent is streaming.',
-                    })
-                  );
-                  break;
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
+              await withPerSessionMutationLock(target.session.sessionId, async () => {
+                try {
+                  const s = target.session;
+                  if (s.isStreaming) {
+                    ws.send(
+                      JSON.stringify({
+                        type: 'agent_error',
+                        error: 'Cannot edit while the agent is streaming.',
+                      })
+                    );
+                    return;
+                  }
+                  const { originalMessage, newMessage } = msg as {
+                    type: 'edit_message';
+                    originalMessage: string;
+                    newMessage: string;
+                  };
+                  if (!s.sessionManager.isPersisted())
+                    throw new Error('Cannot edit in an in-memory session');
+                  const userMsgs = s.getUserMessagesForForking();
+                  // Find the last matching entry (most recent occurrence of the original text)
+                  const match = [...userMsgs].reverse().find((m) => m.text === originalMessage);
+                  if (!match) throw new Error('Could not find the original message to edit');
+                  await s.navigateTree(match.entryId);
+                  refreshSessionSummary(s);
+                  await s.prompt(newMessage);
+                } catch (err) {
+                  log.error('[pifrontier] edit_message error:', err);
+                  ws.send(JSON.stringify({ type: 'agent_error', error: String(err) }));
                 }
-                const { originalMessage, newMessage } = msg as {
-                  type: 'edit_message';
-                  originalMessage: string;
-                  newMessage: string;
-                };
-                if (!s.sessionManager.isPersisted())
-                  throw new Error('Cannot edit in an in-memory session');
-                const userMsgs = s.getUserMessagesForForking();
-                // Find the last matching entry (most recent occurrence of the original text)
-                const match = [...userMsgs].reverse().find((m) => m.text === originalMessage);
-                if (!match) throw new Error('Could not find the original message to edit');
-                await s.navigateTree(match.entryId);
-                refreshSessionSummary(s);
-                await s.prompt(newMessage);
-              } catch (err) {
-                log.error('[pifrontier] edit_message error:', err);
-                ws.send(JSON.stringify({ type: 'agent_error', error: String(err) }));
-              }
+              });
               break;
             }
 
@@ -6159,12 +6558,14 @@ try {
             }
 
             case 'load_messages': {
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
               try {
                 const count = Math.min(
                   (msg as { count?: number }).count ?? 50,
                   MAX_INITIAL_MESSAGES
                 );
-                const s = activeSession();
+                const s = target.session;
                 const all = s.messages;
                 const total = all.length;
                 const alreadyHasCount = Math.min(
@@ -6187,19 +6588,12 @@ try {
                 );
               } catch (err) {
                 log.error('[pifrontier] load_messages error:', err);
-                // messages:[] + messagesTruncated:false tells the client
-                // there's nothing more to load right now — but the real
-                // totalMessageCount must still be sent, or a transient
-                // failure would wrongly convince the client the session is
-                // shorter than it is and break pagination for the rest of
-                // the session.
-                const sess = activeSessionOrNull();
                 ws.send(
                   JSON.stringify({
                     type: 'older_messages',
-                    sessionId: sess?.sessionId,
+                    sessionId: target.session.sessionId,
                     messages: [],
-                    totalMessageCount: sess?.messages.length ?? 0,
+                    totalMessageCount: target.session.messages.length,
                     messagesTruncated: false,
                   })
                 );
@@ -6309,6 +6703,7 @@ try {
           if (count <= 1) focusedSessionCounts.delete(focused);
           else focusedSessionCounts.set(focused, count - 1);
         }
+        ws.data.focusedSessionId = undefined;
         connectedClients = Math.max(0, connectedClients - 1);
         // Clear the periodic token expiry check
         if (ws.data._expTimer) {

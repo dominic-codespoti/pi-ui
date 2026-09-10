@@ -26,12 +26,16 @@ function rawPublicKeyBase64Url(): string {
 }
 
 /** The service-worker global, for worker-scope evaluates. */
+type SwClient = {
+  visibilityState?: string;
+  postMessage?: (message: unknown) => void;
+};
 type SwScope = typeof globalThis & {
   registration: ServiceWorkerRegistration & {
     showNotification: (title: string, options?: NotificationOptions) => Promise<void>;
   };
   clients: {
-    matchAll: () => Promise<Array<{ visibilityState?: string }>>;
+    matchAll: (options?: unknown) => Promise<SwClient[]>;
   };
   PushEvent: new (type: string, init: { data?: string }) => Event;
 };
@@ -140,59 +144,94 @@ test.describe('PWA notifications', () => {
       expect(subMsg.keys?.auth).toBe('auth-key');
     });
 
-    await page.evaluate(() => navigator.serviceWorker.ready);
-    let sw = context.serviceWorkers()[0];
-    expect(sw).toBeTruthy();
-    // Headless Chromium stops an idle service worker after ~30 s, and a stopped
-    // worker's Playwright handle evaluates as 'Target … has been closed'. A
-    // heartbeat timer keeps this test's worker alive for the whole run.
-    await sw.evaluate(() => {
-      const scope = globalThis as unknown as { __piKeepAlive?: ReturnType<typeof setInterval> };
-      scope.__piKeepAlive ??= setInterval(() => {}, 10_000);
-    });
-    /** Chromium may still swap the worker (update check) — re-resolve the live
-     *  handle before sw.evaluate, or evaluate throws 'closed'. */
+    let sw: ServiceWorker;
+    /** Resolve the currently running worker; Chromium may respawn it at any time. */
     const refreshSw = async (): Promise<void> => {
       await page.evaluate(() => navigator.serviceWorker.ready);
       const workers = context.serviceWorkers();
       if (workers.length > 0) sw = workers[workers.length - 1];
       else sw = await context.waitForEvent('serviceworker', { timeout: 10_000 });
     };
+    /** Re-resolve once when Chromium replaces the worker between operations. */
+    const evaluateSw = async <T, A = undefined>(
+      pageFunction: (arg: A) => T | Promise<T>,
+      arg?: A
+    ): Promise<T> => {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        await refreshSw();
+        try {
+          return (await sw.evaluate(pageFunction, arg as A)) as T;
+        } catch (error) {
+          if (
+            attempt === 1 ||
+            !/Service worker restarted|Target .* has been closed|context or browser has been closed/.test(
+              String(error)
+            )
+          ) {
+            throw error;
+          }
+        }
+      }
+      throw new Error('Service worker evaluation did not complete');
+    };
+
+    await page.evaluate(() => {
+      const holder = globalThis as Record<string, unknown>;
+      holder.__piTestNotifCalls = [];
+      holder.__piTestPushShown = [];
+      navigator.serviceWorker.addEventListener('message', (event) => {
+        const data = event.data as {
+          type?: string;
+          call?: NotifCall;
+          title?: string;
+        };
+        if (data?.type === '__pi_test_notification' && data.call) {
+          (holder.__piTestNotifCalls as NotifCall[]).push(data.call);
+        } else if (data?.type === '__pi_test_push_shown' && typeof data.title === 'string') {
+          (holder.__piTestPushShown as string[]).push(data.title);
+        }
+      });
+    });
 
     await test.step('2 sw notification surface', async () => {
-      await sw.evaluate(() => {
+      await evaluateSw(async () => {
         const scope = globalThis as unknown as SwScope;
-        const calls: NotifCall[] = [];
+        const clients = await scope.clients.matchAll({ type: 'window', includeUncontrolled: true });
         scope.registration.showNotification = async (
           title: string,
           options?: NotificationOptions
         ) => {
-          calls.push({ title, options });
+          clients[0]?.postMessage?.({
+            type: '__pi_test_notification',
+            call: { title, options },
+          });
         };
-        (globalThis as Record<string, unknown>).__notifCalls = calls;
-      });
-      await page.evaluate(() => {
-        void navigator.serviceWorker.ready.then((reg) => {
-          reg.active?.postMessage({
+        let completion: Promise<unknown> = Promise.resolve();
+        const event = new MessageEvent('message', {
+          data: {
             type: 'show_notification',
             title: 'Response Complete',
             body: 'pi finished responding.',
             tag: 'pi-agent-end',
             data: { kind: 'response_complete' },
-          });
-        });
+          },
+        }) as MessageEvent & { waitUntil: (promise: Promise<unknown>) => void };
+        event.waitUntil = (promise) => {
+          completion = promise;
+        };
+        scope.dispatchEvent(event);
+        await completion;
       });
       await expect
         .poll(() =>
-          sw.evaluate(() => {
-            const holder = globalThis as Record<string, unknown>;
-            return ((holder.__notifCalls ?? []) as NotifCall[]).length;
-          })
+          page.evaluate(
+            () => ((globalThis as Record<string, unknown>).__piTestNotifCalls as unknown[]).length
+          )
         )
         .toBe(1);
-      const surface = await sw.evaluate(() => {
+      const surface = await page.evaluate(() => {
         const holder = globalThis as Record<string, unknown>;
-        const calls = (holder.__notifCalls ?? []) as NotifCall[];
+        const calls = (holder.__piTestNotifCalls ?? []) as NotifCall[];
         return {
           title: calls[0].title,
           tag: calls[0].options?.tag,
@@ -227,7 +266,6 @@ test.describe('PWA notifications', () => {
     });
 
     await test.step('4 steer action', async () => {
-      await refreshSw();
       await page.evaluate(() => {
         void navigator.serviceWorker.ready.then((reg) => {
           reg.active?.postMessage({ type: 'click_simulate', action: 'steer', data: {} });
@@ -242,50 +280,51 @@ test.describe('PWA notifications', () => {
     });
 
     await test.step('5 push visibility gate', async () => {
-      await refreshSw();
-      await sw.evaluate(() => {
-        const scope = globalThis as unknown as SwScope;
-        const shown: string[] = [];
-        scope.registration.showNotification = async (title: string) => {
-          shown.push(title);
-        };
-        (globalThis as Record<string, unknown>).__pushShown = shown;
-        scope.clients.matchAll = async () => [{ visibilityState: 'visible' }];
-      });
-      const firePush = (title: string) =>
-        sw.evaluate((t) => {
-          const scope = globalThis as unknown as SwScope;
-          scope.dispatchEvent(
-            new scope.PushEvent('push', {
+      const firePush = (title: string, visible: boolean) =>
+        evaluateSw(
+          async ({ title: pushTitle, visible: pushVisible }) => {
+            const scope = globalThis as unknown as SwScope;
+            const testScope = scope as SwScope & { __piTestClients?: SwClient[] };
+            const clients =
+              testScope.__piTestClients ??
+              (await scope.clients.matchAll({ type: 'window', includeUncontrolled: true }));
+            testScope.__piTestClients = clients;
+            scope.clients.matchAll = async () =>
+              pushVisible ? [{ visibilityState: 'visible' }] : [];
+            scope.registration.showNotification = async (shownTitle: string) => {
+              clients[0]?.postMessage?.({ type: '__pi_test_push_shown', title: shownTitle });
+            };
+            let completion: Promise<unknown> = Promise.resolve();
+            const event = new scope.PushEvent('push', {
               data: JSON.stringify({
                 kind: 'response_complete',
-                title: t,
+                title: pushTitle,
                 body: 'b',
-                tag: `tag-${t}`,
+                tag: `tag-${pushTitle}`,
               }),
-            })
-          );
-        }, title);
-      await firePush('visible-push');
+            }) as Event & { waitUntil: (promise: Promise<unknown>) => void };
+            event.waitUntil = (promise) => {
+              completion = promise;
+            };
+            scope.dispatchEvent(event);
+            await completion;
+          },
+          { title, visible }
+        );
+      await firePush('visible-push', true);
       await page.waitForTimeout(400);
       expect(
-        await sw.evaluate(() => {
-          const holder = globalThis as Record<string, unknown>;
-          return (holder.__pushShown ?? []) as string[];
-        })
+        await page.evaluate(
+          () => ((globalThis as Record<string, unknown>).__piTestPushShown ?? []) as string[]
+        )
       ).toEqual([]);
 
-      await sw.evaluate(() => {
-        const scope = globalThis as unknown as SwScope;
-        scope.clients.matchAll = async () => [];
-      });
-      await firePush('background-push');
+      await firePush('background-push', false);
       await expect
         .poll(() =>
-          sw.evaluate(() => {
-            const holder = globalThis as Record<string, unknown>;
-            return (holder.__pushShown ?? []) as string[];
-          })
+          page.evaluate(
+            () => ((globalThis as Record<string, unknown>).__piTestPushShown ?? []) as string[]
+          )
         )
         .toEqual(['background-push']);
     });

@@ -141,23 +141,39 @@ export function agentStartPayload() {
 }
 
 /**
- * Runtime-status broadcast for any pooled session (active or background).
- * Drives the sidebar orbs: green pulse while running, violet when done with
- * unseen results, grey once checked.
+ * Runtime status for any resident session (active or background).
+ * Drives the sidebar orbs and mirrors the session_runtime wire contract.
  */
-export function sessionRuntimePayload(
-  sessionId: string,
-  isRunning: boolean,
-  unseen: boolean,
-  activeToolName?: string
-) {
+export type SessionRuntimePhase = 'idle' | 'running' | 'awaiting-input' | 'error';
+
+export type SessionRuntimeOptions = {
+  phase: SessionRuntimePhase;
+  activeToolName?: string;
+  unread?: boolean;
+  needsAttention?: boolean;
+  resident?: boolean;
+  lastActivity?: number;
+};
+
+export function sessionRuntimePayload(sessionId: string, options: SessionRuntimeOptions) {
+  const {
+    phase,
+    activeToolName,
+    unread = false,
+    needsAttention = false,
+    resident = true,
+    lastActivity = Date.now(),
+  } = options;
   return {
-    type: 'session_runtime',
+    type: 'session_runtime' as const,
     sessionId,
-    isRunning,
+    phase,
+    isRunning: phase === 'running',
     ...(activeToolName ? { activeToolName } : {}),
-    unseen,
-    lastActivity: Date.now(),
+    lastActivity,
+    unread,
+    needsAttention,
+    resident,
   };
 }
 

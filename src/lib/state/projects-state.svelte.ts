@@ -186,6 +186,14 @@ class ProjectsState {
     }
     return null;
   });
+  /** Number of sessions that completed while no socket was focused on them. */
+  unreadCount = $derived.by<number>(() => {
+    let count = 0;
+    for (const status of this.runtime.values()) {
+      if (status.unread) count++;
+    }
+    return count;
+  });
 
   /** Sidebar search text. */
   filter = $state('');
@@ -350,11 +358,17 @@ class ProjectsState {
     return null;
   }
 
-  /** Remove runtime snapshots for sessions deleted from the authoritative list. */
-  private pruneRuntimeState(): void {
+  /** Remove runtime snapshots for sessions that disappeared from the authoritative list. */
+  private pruneRuntimeState(previousSessionIds: Set<string>): void {
     const knownIds = new Set(this.allSessions.map((session) => session.id));
     for (const id of this.runtime.keys()) {
-      if (!knownIds.has(id)) this.runtime.delete(id);
+      // A runtime frame can beat the first all_sessions_list response. Keep
+      // that status until its row arrives, but discard statuses for sessions
+      // that were present in the previous authoritative list and have since
+      // been removed.
+      if (!knownIds.has(id) && previousSessionIds.has(id)) {
+        this.runtime.delete(id);
+      }
     }
   }
 
@@ -377,8 +391,9 @@ class ProjectsState {
   applyState(payload: { projects?: ProjectInfo[]; sessions?: SessionSummary[] }): void {
     if (payload.projects !== undefined) this.projects = payload.projects;
     if (payload.sessions !== undefined) {
+      const previousSessionIds = new Set(this.allSessions.map((session) => session.id));
       this.allSessions = payload.sessions;
-      this.pruneRuntimeState();
+      this.pruneRuntimeState(previousSessionIds);
     }
   }
 
