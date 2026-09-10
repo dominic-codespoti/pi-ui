@@ -10,6 +10,14 @@
 
 const PORT = Number(process.env.FAKE_LLM_PORT || 8787);
 
+/** A user message starting with this string streams in SLOW_STREAM_CHUNKS
+ *  chunks paced SLOW_STREAM_CHUNK_DELAY_MS apart instead of the (unpaced)
+ *  default, so a spec can hold a turn open long enough to navigate away
+ *  from and back to the streaming session before it completes. */
+const SLOW_STREAM_MARKER = 'SLOW_STREAM:';
+const SLOW_STREAM_CHUNKS = 24;
+const SLOW_STREAM_CHUNK_DELAY_MS = 350;
+
 const encoder = new TextEncoder();
 
 function sse(payload: unknown): Uint8Array {
@@ -51,7 +59,14 @@ const server = Bun.serve({
     };
     const messages = body.messages ?? [];
     const userText = lastUserText(messages).slice(0, 2000);
-    const reply = `FAKE-LLM REPLY: ${userText}`;
+    // Opt-in pacing so a live spec can hold a turn open long enough to
+    // exercise session navigation mid-stream — every other request streams
+    // at full speed, unaffected.
+    const isSlow = userText.startsWith(SLOW_STREAM_MARKER);
+    const replyBody = isSlow
+      ? Array.from({ length: SLOW_STREAM_CHUNKS }, (_, i) => `chunk${i}`).join(' ')
+      : userText;
+    const reply = `FAKE-LLM REPLY: ${replyBody}`;
     const model = body.model ?? 'e2e-fake-model';
     const created = Math.floor(Date.now() / 1000);
     const id = `chatcmpl-e2e-${created}`;
@@ -76,7 +91,7 @@ const server = Bun.serve({
     // Stream the reply in small chunks so the client exercises real deltas.
     const chunks = reply.match(/.{1,12}/gs) ?? [];
     const stream = new ReadableStream<Uint8Array>({
-      start(controller) {
+      async start(controller) {
         controller.enqueue(
           sse({
             id,
@@ -87,6 +102,7 @@ const server = Bun.serve({
           })
         );
         for (const c of chunks) {
+          if (isSlow) await Bun.sleep(SLOW_STREAM_CHUNK_DELAY_MS);
           controller.enqueue(
             sse({
               id,
