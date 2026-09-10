@@ -2212,7 +2212,13 @@
     if (typeof payload.sessionId === 'string') {
       const nextSessionId = payload.sessionId;
       if (nextSessionId !== prevSessionId) {
-        const draftWhileSwitching = !projectsState.pendingNewSession ? sessionSwitchDraft : null;
+        // A connected/session_loaded snapshot can race a draft typed while
+        // the socket is still completing its handshake. Preserve that draft
+        // when no explicit switch is in flight; otherwise a late snapshot
+        // replaces it with an empty composer and leaves Send disabled.
+        const draftWhileSwitching = !projectsState.pendingNewSession
+          ? (sessionSwitchDraft ?? (!projectsState.sessionLoading ? input : null))
+          : null;
         const sharedDraft = shareTargetDraft;
         if (
           prevSessionId &&
