@@ -4461,19 +4461,6 @@ try {
               await withSessionMutationLock(async () => {
                 try {
                   const resolvedPath = resolve(cwd, expandTilde(msg.path));
-                  // Security: only open known session files — never raw client paths.
-                  // hasFile parses the exact target and preserves that guarantee
-                  // without forcing a cold scan of every project directory.
-                  if (!(await sessionCatalog.hasFile(resolvedPath))) {
-                    ws.send(
-                      JSON.stringify({
-                        type: 'sessions_error',
-                        requestId,
-                        message: 'Session not found.',
-                      })
-                    );
-                    return;
-                  }
                   const current = activeSessionOrNullEntry();
                   if (current?.path === resolvedPath) {
                     current.unread = false;
@@ -4483,6 +4470,13 @@ try {
                     broadcastSessionLoaded(current.session, requestId, ws);
                     return;
                   }
+                  // A resident session is already validated in memory — its
+                  // .jsonl may not exist on disk yet (the SDK persists the
+                  // first turn only on completion), so checking residency
+                  // before the disk guard lets navigating back to a session
+                  // that is still streaming its first turn succeed instead
+                  // of spuriously failing "Session not found" and leaving
+                  // this socket's focus stuck on whatever it switched from.
                   const existing = residentFor(resolvedPath);
                   if (existing) {
                     existing.unread = false;
@@ -4493,6 +4487,19 @@ try {
                       requestId,
                       true,
                       ws
+                    );
+                    return;
+                  }
+                  // Security: only open known session files — never raw client paths.
+                  // hasFile parses the exact target and preserves that guarantee
+                  // without forcing a cold scan of every project directory.
+                  if (!(await sessionCatalog.hasFile(resolvedPath))) {
+                    ws.send(
+                      JSON.stringify({
+                        type: 'sessions_error',
+                        requestId,
+                        message: 'Session not found.',
+                      })
                     );
                     return;
                   }
