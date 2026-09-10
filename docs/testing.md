@@ -2,28 +2,29 @@
 
 ## Layer 1 — Unit Tests (Vitest)
 
-| Aspect              | Value                                                                                           |
-| ------------------- | ----------------------------------------------------------------------------------------------- |
-| Framework           | Vitest v4.1.11 (`@vitest/coverage-v8` v4.1.11)                                                  |
-| Environment         | jsdom                                                                                           |
-| Setup               | `@testing-library/jest-dom/vitest` (auto-imported)                                              |
-| Test locations      | `src/**/*.test.ts` (33 test files across `lib/`, `server/`, `state/`, `components/`, `routes/`) |
-| Coverage            | v8 provider, 60% stmts/funcs/lines, 50% branches                                                |
-| Coverage exclusions | `src/lib/components/ui/**`, test files, service-worker                                          |
-| Mocking             | `vi.mock()` module mocking, `vi.mocked()` typed mocks, `vi.resetModules()` for fresh imports    |
+| Aspect              | Value                                                                                                       |
+| ------------------- | ----------------------------------------------------------------------------------------------------------- |
+| Framework           | Vitest v4.1.11 (`@vitest/coverage-v8` v4.1.11)                                                              |
+| Environment         | jsdom                                                                                                       |
+| Setup               | `@testing-library/jest-dom/vitest` (auto-imported)                                                          |
+| Test locations      | `src/**/*.test.ts` (34 test files / 451 tests across `lib/`, `server/`, `state/`, `components/`, `routes/`) |
+| Coverage            | v8 provider, 60% stmts/funcs/lines, 50% branches                                                            |
+| Coverage exclusions | `src/lib/components/ui/**`, test files, service-worker                                                      |
+| Mocking             | `vi.mock()` module mocking, `vi.mocked()` typed mocks, `vi.resetModules()` for fresh imports                |
 
-### Test Files by Area (33 Files)
+### Test Files by Area (34 Files / 451 Tests)
 
 #### Client Core & Protocol Helpers (`src/lib/__tests__/`, `src/lib/`)
 
 - `src/lib/__tests__/client-messages.test.ts` — uid, extractTextContent, formatToolInput, agentMsgToUI, thinking levels, reconnectDelay, rawMessagesToUI
 - `src/lib/__tests__/diff-parser.test.ts` — unified diff parser and hunk formatting
+- `src/lib/__tests__/adapter-bun.test.ts` — vendored svelte-adapter-bun distribution files and package exports
 - `src/lib/__tests__/extension-modals.test.ts` — extension modal / confirm / input state transformations
 - `src/lib/__tests__/markdown.test.ts` — renderMarkdown, LaTeX math block rendering, memoization cache, highlightCode
 - `src/lib/__tests__/notification-prefs.test.ts` — web push notification preferences & storage serialization
 - `src/lib/__tests__/session-identity.test.ts` — device-scoped last-session identity persistence and resume priority
 - `src/lib/__tests__/session-snapshot.test.ts` — session snapshot hydration and message projection
-- `src/lib/__tests__/session-view-cache.test.ts` — session view cache invalidation & hydration
+- `src/lib/__tests__/session-view-cache.test.ts` — bounded per-session client view cache: retention cap, LRU eviction order, base64/attachment stripping on save, restore equivalence
 - `src/lib/__tests__/thinking-levels.test.ts` — reasoning / thinking level definitions and cycle transitions
 - `src/lib/__tests__/tui-stubs.test.ts` — stripAnsi, StubTui, parseComponentTree, callFactoryAndParse, editor / isEditor stubs
 - `src/lib/__tests__/utils.test.ts` — cn, formatRelativeDate, type helpers
@@ -54,6 +55,7 @@
 - `src/lib/server/__tests__/session-scan.test.ts` — JSONL session log scanning, header extraction, metadata parsing
 - `src/lib/server/__tests__/session-watcher.test.ts` — inotify / file watcher events on `.pi` session logs
 - `src/lib/server/__tests__/terminal-input.test.ts` — raw terminal mode keystroke and input handling
+- `src/lib/server/__tests__/ui-settings.test.ts` — durable UI settings and last-session pointer persistence
 - `src/lib/server/__tests__/wire-messages.test.ts` — server wire serialization, protocol framing, message encoding
 - `src/lib/server/__tests__/ws-helpers.test.ts` — path utilities, serialization, semver, formatting
 
@@ -83,7 +85,7 @@
 | Aspect           | Value                                                                                                                                                                                                                                                                              |
 | ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Framework        | Playwright v1.62+                                                                                                                                                                                                                                                                  |
-| Test dir         | `e2e/*.spec.ts` (23 spec files)                                                                                                                                                                                                                                                    |
+| Test dir         | `e2e/*.spec.ts` (24 spec files)                                                                                                                                                                                                                                                    |
 | Browsers         | Chromium (`Desktop Chrome`) + Mobile (`Pixel 5`)                                                                                                                                                                                                                                   |
 | Parallelism      | `fullyParallel: false`, `workers: process.env.CI ? 2 : 4` (mock suite)                                                                                                                                                                                                             |
 | CI retries       | 2                                                                                                                                                                                                                                                                                  |
@@ -112,7 +114,7 @@
 - **`loginViaCookie(page)`**: Directly generates a session token signed with `PI_UI_JWT_SECRET` and attaches the auth cookie to the browser context, bypassing the login form submission.
 - **`CONNECTED_PAYLOAD` Factory (`e2e/mocks/payloads.ts`)**: Generates pre-populated connected states, mock session headers, and helper factories (`extensionSetWidgetPayload`, `extensionConfirmPayload`, `extensionInputPayload`, `extensionNotifyPayload`, `textDeltaPayload`, `thinkingDeltaPayload`).
 
-### Test Files (23 Specs)
+### Test Files (24 Specs)
 
 - `auth.spec.ts` — login form redirection, wrong password error banner, valid login, persisted auth cookie
 - `auth-expiry.spec.ts` — WS close code 4001 session expiry banner and reconnect flows
@@ -125,13 +127,14 @@
 - `horizontal-scroll.spec.ts` — wide markdown tables horizontal panning, wide code block scrolling, page-level overflow containment
 - `live-agent.spec.ts` — live end-to-end turn against real pi SDK and fake LLM stub
 - `live-widget.spec.ts` — live above-editor extension widget loading and rendering
+- `multi-session.spec.ts` — background running/tool orbs, unread and clear-on-switch with outbound `session_focus`, needs-attention affordance, and background streaming isolation
 - `notifications.spec.ts` — browser notification permission requests, web push registration, sound toggle preferences
-- `projects.spec.ts` — sidebar project groups, project search filter, session switching without reload, runtime indicator orbs (8+ tests)
+- `projects.spec.ts` — sidebar project groups, project search filter, session switching without reload (8+ tests)
 - `providers.spec.ts` — provider list, API key input, OAuth modal triggers, custom model configs (4+ tests)
 - `resume.spec.ts` — resuming existing session from persisted JSONL snapshot vs live connection takeover
 - `server-smoke.spec.ts` — real HTTP tests against server: `/login` 200, 404 handler, `/ws` 401 without cookie, login HTML structure
 - `session-identity.spec.ts` — device identity resume priority (URL param vs. persisted vs. server default) and self-heal on a stale/deleted identity
-- `session-orbs.spec.ts` — background session streaming activity indicators and active session selection
+- `session-orbs.spec.ts` — restored background-session orbs and per-session orb selection
 - `share-target.spec.ts` — PWA Web Share Target API handling for files and incoming text
 - `sidebar-nesting.spec.ts` — hierarchical sub-session nesting under parent roots in sidebar
 - `sidebar-order.spec.ts` — chronological and pinned session sorting order
@@ -147,6 +150,13 @@
 | Blank Screenshot                      | Captured before DOM or assets finished rendering      | Add `await page.waitForTimeout(1000)` or wait on a specific locator (`locator('textarea')`) after `goto` |
 | `text=password` strict mode violation | Multiple elements match (label + hint span)           | Use `getByText('password', { exact: true })` instead of `locator('text=password')`                       |
 | Duplicate inline login                | Re-logging in when fixture already set cookie         | Avoid repeating `login(page)` in test bodies if `login` was already invoked in `beforeEach`              |
+
+#### Harness Lessons
+
+- A service worker may be terminated and respawned at any time: re-resolve the worker handle before each `evaluate` and never rely on worker-local state.
+- A drawer's bounding box remains non-zero during its close transition, so read whether it is open from the authoritative `aria-hidden`/animation state.
+- Drive frames around assertions rather than using fixed timers; fixed delays can race when running with `workers: 4`.
+- Exact URLs are brittle when the app legitimately appends `?session=`; assert `url.pathname` instead.
 
 ---
 

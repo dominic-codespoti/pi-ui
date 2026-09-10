@@ -67,7 +67,7 @@ bun run dev:full          # Both Vite (5173) + WS server (5174) in parallel via 
 
 # Build
 bun run build             # SvelteKit frontend (adapter: svelte-adapter-bun)
-bun run build:server      # Bundles server.ts → server.bundle.js (~165 KB, minified)
+bun run build:server      # Bundles server.ts → server.bundle.js (~253 KB, minified)
 
 # Production
 PI_PASSWORD=secret bun run start          # CLI entry (prefers server.bundle.js)
