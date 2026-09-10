@@ -772,11 +772,30 @@ class ProjectsState {
   visibleSessions(g: ProjectGroup): SessionRow[] {
     let rows = g.sessions;
     if (!this.filter && !this.expandedGroups.has(g.cwd)) {
+      // The active session and its ancestor path always stay visible, even
+      // when ranked past the preview limit — otherwise the sidebar shows no
+      // selection for the session currently in view.
+      const keep = new SvelteSet<number>();
+      if (this.activeSessionId) {
+        const activeIndex = g.sessions.findIndex((row) => row.session.id === this.activeSessionId);
+        if (activeIndex >= 0) {
+          keep.add(activeIndex);
+          let targetDepth = g.sessions[activeIndex].depth;
+          for (let i = activeIndex - 1; i >= 0; i--) {
+            if (g.sessions[i].depth < targetDepth) {
+              keep.add(i);
+              targetDepth = g.sessions[i].depth;
+            }
+          }
+        }
+      }
       rows = [];
       let roots = 0;
-      for (const row of g.sessions) {
-        if (row.depth === 0 && ++roots > SESSION_PREVIEW_LIMIT) break;
-        rows.push(row);
+      let skipping = false;
+      for (let i = 0; i < g.sessions.length; i++) {
+        const row = g.sessions[i];
+        if (row.depth === 0) skipping = ++roots > SESSION_PREVIEW_LIMIT && !keep.has(i);
+        if (!skipping || keep.has(i)) rows.push(row);
       }
     }
     if (this.filter) return rows;

@@ -237,6 +237,50 @@ test.describe('Projects sidebar', () => {
     await expect(page.getByText('Session B only')).toBeVisible();
   });
 
+  test('switching to an unnamed session clears the previous title', async ({ page }) => {
+    const s1Path = '/home/user/project-a/s1.jsonl';
+    const s2Path = '/home/user/project-a/s2.jsonl';
+    const header = page.getByRole('button', { name: 'Open model and provider panel' });
+
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.onMessage((data) => {
+        const msg = JSON.parse(String(data));
+        if (msg.type === 'get_projects') ws.send(JSON.stringify(PROJECTS_LIST_PAYLOAD));
+        if (msg.type === 'get_all_sessions') ws.send(JSON.stringify(ALL_SESSIONS_LIST_PAYLOAD));
+        if (msg.type === 'switch_session') {
+          ws.send(
+            JSON.stringify({
+              ...SESSION_LOADED_PAYLOAD,
+              sessionId: 's2',
+              sessionPath: s2Path,
+              messages: [],
+              // The real server sends `sessionName: undefined` for unnamed
+              // sessions, which JSON.stringify drops — the client must clear
+              // the previous title instead of keeping it stale.
+              sessionName: undefined,
+              requestId: msg.requestId,
+            })
+          );
+        }
+      });
+      ws.send(
+        JSON.stringify({
+          ...CONNECTED_PAYLOAD,
+          sessionId: 's1',
+          sessionPath: s1Path,
+          sessionName: 'Bug fix',
+          messages: [],
+        })
+      );
+    });
+
+    await expect(header).toContainText('Bug fix', { timeout: 3000 });
+    await openProjectsSidebar(page);
+    await page.getByRole('button', { name: 'Add tests' }).click();
+
+    await expect(header).not.toContainText('Bug fix', { timeout: 3000 });
+  });
+
   test('search filters projects', async ({ page }) => {
     await page.routeWebSocket('/ws', (ws) => {
       ws.onMessage((data) => {
@@ -456,6 +500,9 @@ test.describe('Projects sidebar', () => {
         new KeyboardEvent('keydown', { key: 'a', bubbles: true, cancelable: true })
       );
     });
+    // Session rows lock while the switch is in flight instead of silently
+    // swallowing further clicks (the reply is still delayed by 1s here).
+    await expect(switchButton).toBeDisabled();
     await expect.poll(() => terminalInputCount).toBe(0);
 
     await expect(composer).toBeEnabled();

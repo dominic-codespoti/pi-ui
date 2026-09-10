@@ -2295,6 +2295,11 @@
     }
     if ('sessionName' in payload) {
       sessionName = typeof payload.sessionName === 'string' ? payload.sessionName : undefined;
+    } else if (isFullSessionPayload) {
+      // Full snapshots are authoritative: an unnamed session serializes with
+      // the key dropped (JSON omits undefined), so absence must clear the
+      // previous session's name instead of leaving it stale in the header.
+      sessionName = undefined;
     }
     if ('messages' in payload) {
       const raw = (payload.messages as unknown[]) ?? [];

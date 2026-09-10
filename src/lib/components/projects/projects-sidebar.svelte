@@ -349,7 +349,8 @@
                 {/if}
                 <button
                   onclick={() => ps.switchSession(s.path)}
-                  class="flex-1 text-left px-3 py-2 min-w-0"
+                  disabled={ps.sessionLoading || ps.pendingNewSession}
+                  class="flex-1 text-left px-3 py-2 min-w-0 disabled:cursor-wait"
                   aria-current={isActiveSession ? 'true' : undefined}
                   tabindex={open ? 0 : -1}
                 >

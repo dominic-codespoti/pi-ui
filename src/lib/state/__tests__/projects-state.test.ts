@@ -963,5 +963,36 @@ describe('ProjectsState', () => {
         'grandchild',
       ]);
     });
+    it('visibleSessions keeps a top-level active session past the preview limit visible', () => {
+      const group = {
+        cwd: '/p',
+        sessions: buildSessionRows(
+          Array.from({ length: 5 }, (_, i) => mkSession(`s${i}`, { modified: 100 - i }))
+        ),
+      } as ProjectGroup;
+      projectsState.activeSessionId = 's4';
+
+      expect(projectsState.visibleSessions(group).map((r) => r.session.id)).toEqual([
+        's0',
+        's1',
+        's2',
+        's4',
+      ]);
+    });
+    it('visibleSessions keeps the preview limit exact when the active session is in preview', () => {
+      const group = {
+        cwd: '/p',
+        sessions: buildSessionRows(
+          Array.from({ length: 5 }, (_, i) => mkSession(`s${i}`, { modified: 100 - i }))
+        ),
+      } as ProjectGroup;
+      projectsState.activeSessionId = 's1';
+
+      expect(projectsState.visibleSessions(group).map((r) => r.session.id)).toEqual([
+        's0',
+        's1',
+        's2',
+      ]);
+    });
   });
 });
