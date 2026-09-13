@@ -384,6 +384,7 @@ export type SessionPhase = 'idle' | 'running' | 'awaiting-input' | 'error';
  *
  *   { type: "slash_result",            command: string, message: string, level?: "info" | "warning" | "error" }
  *   { type: "file_content",            path: string, content: string, error?: string }
+ *   { type: "file_staged",             name: string, path: string, error?: string }
  *   { type: "older_messages",          messages: unknown[], totalMessageCount: number, messagesTruncated: boolean }
  *
  * SDK events the browser must handle:
@@ -568,6 +569,7 @@ export type ServerCustomEvent =
     }
   | { type: 'file_content'; path: string; content: string; error?: string }
   | { type: 'file_saved'; path: string; error?: string }
+  | { type: 'file_staged'; name: string; path: string; error?: string }
   | {
       type: 'older_messages';
       messages: unknown[];
@@ -800,6 +802,8 @@ export type ClientMessage =
   | { type: 'read_file'; path: string }
   /** Write file content from the file viewer modal's edit mode. */
   | { type: 'write_file'; path: string; content: string }
+  /** Stage an uploaded binary file in the active workspace. */
+  | { type: 'upload_file'; name: string; data: string }
   /** Request older messages before the current window. Server replies with older_messages. */
   | { type: 'load_messages'; sessionId?: string; count: number; alreadyHasCount: number }
   /** Request argument completions for an extension slash command. Server replies with command_completions. */

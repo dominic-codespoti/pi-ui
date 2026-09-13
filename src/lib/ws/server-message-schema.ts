@@ -512,6 +512,13 @@ export const FileSavedSchema = v.looseObject({
   error: v.optional(v.string()),
 });
 
+export const FileStagedSchema = v.looseObject({
+  type: v.literal('file_staged'),
+  name: v.string(),
+  path: v.string(),
+  error: v.optional(v.string()),
+});
+
 export const SlashResultSchema = v.looseObject({
   type: v.literal('slash_result'),
   command: v.string(),
@@ -829,6 +836,7 @@ export const customEventSchemas = {
   extension_terminal_input_result: ExtensionTerminalInputResultSchema,
   file_content: FileContentSchema,
   file_saved: FileSavedSchema,
+  file_staged: FileStagedSchema,
   slash_result: SlashResultSchema,
   settings: SettingsSchema,
   notification_webhook_url: NotificationWebhookUrlSchema,

@@ -51,7 +51,10 @@
   import { saveIdentity, loadIdentity, clearIdentity } from '#lib/session-identity.js';
   import {
     TEXT_FILE_EXTENSIONS,
+    SPREADSHEET_EXTENSIONS,
+    fileToBase64,
     fileToText,
+    xlsxToText,
     prepareImage,
     MAX_IMAGE_PAYLOAD,
   } from '#lib/attachments.js';
@@ -585,6 +588,9 @@
   );
   /** Text files staged for the next prompt (content read as text). */
   let attachedFiles = $state<Array<{ name: string; content: string; size: number }>>([]);
+  /** Original files awaiting their server staging response, keyed by name. */
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity -- response correlation map
+  const pendingUploads = new Map<string, File>();
   let fileInputEl = $state<HTMLInputElement | undefined>(undefined);
 
   // ── Extension UI state ───────────────────────────────────────────────────────
@@ -1786,6 +1792,7 @@
     // Belt-and-braces: connect() nulls the old socket's onclose before
     // closing it, so its close event may never reach flushPendingTerminalInputs.
     flushPendingTerminalInputs();
+    pendingUploads.clear();
     if (ws) {
       try {
         ws.onclose = null;
@@ -1850,6 +1857,7 @@
       // down by the resume force-close) must not clobber the current
       // connection's state or schedule spurious reconnects.
       if (ws !== socket) return;
+      pendingUploads.clear();
       olderMessagesLoading = false;
       modelRefreshLoading = false;
       flushPendingTerminalInputs();
@@ -4075,6 +4083,30 @@
         break;
       }
 
+      case 'file_staged': {
+        const staged = msg as {
+          type: 'file_staged';
+          name: string;
+          path: string;
+          error?: string;
+        };
+        pendingUploads.delete(staged.name);
+        if (staged.error) {
+          showChatNotice(`Failed to stage ${staged.name}: ${staged.error}`, 'error');
+        } else {
+          input = input + `@${staged.path} `;
+          showChatNotice(
+            `Staged ${staged.name} as @${staged.path} — the agent can open it`,
+            'info'
+          );
+          void tick().then(() => {
+            autoResizeTextarea();
+            inputEl?.focus();
+          });
+        }
+        break;
+      }
+
       case 'file_saved': {
         const fs = msg as { type: 'file_saved'; path: string; error?: string };
         fileSaving = false;
@@ -4785,21 +4817,54 @@
           name: file.name || 'clipboard image',
           src: `data:${prepared.mimeType};base64,${prepared.data}`,
         });
-      } else {
-        const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
-        if (!TEXT_FILE_EXTENSIONS.has(ext)) {
-          showChatNotice(
-            `Unsupported file type: ${file.name} (only text files and images are supported)`,
-            'warning'
-          );
+        continue;
+      }
+
+      const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
+      if (SPREADSHEET_EXTENSIONS.has(ext)) {
+        if (file.size > 10 * 1024 * 1024) {
+          showChatNotice(`File too large: ${file.name} (max 10 MB workbook)`, 'warning');
           continue;
         }
+        try {
+          const content = xlsxToText(await file.arrayBuffer());
+          attachedFiles.push({ name: file.name, content, size: file.size });
+        } catch {
+          showChatNotice(`Could not read spreadsheet: ${file.name}`, 'warning');
+        }
+        continue;
+      }
+
+      if (TEXT_FILE_EXTENSIONS.has(ext)) {
         if (file.size > 1024 * 1024) {
           showChatNotice(`File too large: ${file.name} (max 1MB)`, 'warning');
           continue;
         }
         const content = await fileToText(file);
         attachedFiles.push({ name: file.name, content, size: file.size });
+        continue;
+      }
+
+      // Anything else stages as a binary for the agent to open via its `@` path.
+      // Bounded by the 4 MB WS frame: base64 inflates ~33%, so ~3 MB of file.
+      if (file.size > 4 * 1024 * 1024) {
+        showChatNotice(`File too large: ${file.name} (max ~3MB staged)`, 'warning');
+        continue;
+      }
+      pendingUploads.set(file.name, file);
+      showChatNotice(`Uploading ${file.name}…`, 'info');
+      try {
+        const data = await fileToBase64(file);
+        if (data.length > 4190000) {
+          pendingUploads.delete(file.name);
+          showChatNotice(`File too large: ${file.name} (max ~3MB staged)`, 'warning');
+        } else if (!send({ type: 'upload_file', name: file.name, data })) {
+          pendingUploads.delete(file.name);
+          showChatNotice(`Failed to upload ${file.name}: not connected`, 'error');
+        }
+      } catch {
+        pendingUploads.delete(file.name);
+        showChatNotice(`Failed to upload ${file.name}`, 'error');
       }
     }
   }

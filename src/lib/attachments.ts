@@ -1,3 +1,5 @@
+import * as XLSX from 'xlsx';
+
 /**
  * Client-side attachment processing: file readers, text-extension allowlist,
  * and in-browser image downscaling. Keeps prompt payloads under the WS frame
@@ -54,7 +56,26 @@ export const TEXT_FILE_EXTENSIONS = new Set([
   'editorconfig',
   'prettierrc',
   'eslintrc',
+  'csv',
 ]);
+
+/** Spreadsheet formats parsed into text in the browser. */
+export const SPREADSHEET_EXTENSIONS = new Set(['xlsx', 'xls']);
+
+const MAX_SPREADSHEET_TEXT = 256 * 1024;
+
+/**
+ * Extract all worksheets as CSV text while retaining sheet boundaries.
+ * Keep the result bounded so a large workbook cannot inflate a prompt.
+ */
+export function xlsxToText(buf: ArrayBuffer): string {
+  const workbook = XLSX.read(buf, { type: 'array' });
+  const sheets = workbook.SheetNames.map((name) => {
+    const sheet = workbook.Sheets[name];
+    return `=== Sheet: ${name} ===\n${XLSX.utils.sheet_to_csv(sheet)}`;
+  });
+  return sheets.join('\n\n').slice(0, MAX_SPREADSHEET_TEXT);
+}
 
 /** Max base64 image payload per attachment (keeps prompt messages under the
  *  4 MB WS frame cap even with a couple of images attached). */

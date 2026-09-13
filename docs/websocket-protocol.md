@@ -140,6 +140,7 @@ When `parentSession` is present, clients organize sessions into hierarchical tre
 - `file_completions` — `{ query: string, entries: string[] }`; workspace file completion matches for composer `@` references
 - `file_content` — `{ path: string, content: string, error?: string }`; file read response
 - `file_saved` — `{ path: string, error?: string }`; file write response
+- `file_staged` — `{ name: string, path: string, error?: string }`; binary upload staged under `.pi-ui-uploads/` (workspace-relative `path`) for `@` references
 - `extension_terminal_input_active` — `{ active: boolean, sessionId?: string }`; emitted when a session's `onTerminalInput` handler set appears/disappears (register, unregister, extension reload, session dispose)
 - `extension_terminal_input_result` — `{ id: string, consumed: boolean, data?: string, sessionId?: string }`; verdict for a client's `extension_terminal_input` round trip (`consumed: true` swallows the key; `data` replaces it)
 - `extension_ui_state` — `{ sessionId: string, ui: ExtensionUiStatePayload }`; full extension UI snapshot
@@ -211,18 +212,19 @@ Session-scoped client messages accept an optional target field, `sessionId?: str
 
 #### Project & Filesystem
 
-| Type             | Payload             | Purpose                                                                                     |
-| ---------------- | ------------------- | ------------------------------------------------------------------------------------------- |
-| `get_projects`   | —                   | Request project list (replies with `projects_list`)                                         |
-| `add_project`    | `{ path }`          | Register a project directory                                                                |
-| `remove_project` | `{ cwd }`           | Unregister a project from registry (sessions untouched)                                     |
-| `delete_project` | `{ cwd }`           | Permanently delete a project and all its sessions (cannot delete active project)            |
-| `pin_project`    | `{ cwd, pinned }`   | Pin or unpin a project (pinned projects sort to top)                                        |
-| `rename_project` | `{ cwd, name }`     | Set project custom display name                                                             |
-| `dir_complete`   | `{ prefix }`        | Directory path autocomplete (replies with `dir_completions`)                                |
-| `file_complete`  | `{ query }`         | Workspace file autocomplete for `@` mentions (replies with `file_completions`)              |
-| `read_file`      | `{ path }`          | Read file contents with workspace guard + null-byte rejection (replies with `file_content`) |
-| `write_file`     | `{ path, content }` | Write file contents with workspace guard + null-byte rejection (replies with `file_saved`)  |
+| Type             | Payload             | Purpose                                                                                                                                                                         |
+| ---------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `get_projects`   | —                   | Request project list (replies with `projects_list`)                                                                                                                             |
+| `add_project`    | `{ path }`          | Register a project directory                                                                                                                                                    |
+| `remove_project` | `{ cwd }`           | Unregister a project from registry (sessions untouched)                                                                                                                         |
+| `delete_project` | `{ cwd }`           | Permanently delete a project and all its sessions (cannot delete active project)                                                                                                |
+| `pin_project`    | `{ cwd, pinned }`   | Pin or unpin a project (pinned projects sort to top)                                                                                                                            |
+| `rename_project` | `{ cwd, name }`     | Set project custom display name                                                                                                                                                 |
+| `dir_complete`   | `{ prefix }`        | Directory path autocomplete (replies with `dir_completions`)                                                                                                                    |
+| `file_complete`  | `{ query }`         | Workspace file autocomplete for `@` mentions (replies with `file_completions`)                                                                                                  |
+| `read_file`      | `{ path }`          | Read file contents with workspace guard + null-byte rejection (replies with `file_content`)                                                                                     |
+| `write_file`     | `{ path, content }` | Write file contents with workspace guard + null-byte rejection (replies with `file_saved`)                                                                                      |
+| `upload_file`    | `{ name, data }`    | Stage a binary upload (base64 `data`) under `.pi-ui-uploads/` with sanitized unique name (bounded by the 4 MB WS frame — ~3 MB file; replies requester-only with `file_staged`) |
 
 #### Extension UI
 
@@ -286,9 +288,8 @@ Residency is bounded by count (`PI_UI_MAX_RESIDENT_SESSIONS`, default 4) and est
 ## Error Handling
 
 - `agent_error` events contain a human-readable error string from the SDK or server.
-- `sessions_error` events contain `{ message: string, requestId?: string }`; `requestId` is an optional vestigial compatibility echo, not a client correlation mechanism.
+- File operations (`read_file` / `write_file` / `upload_file`) enforce workspace boundary guards (`isInsideWorkspace`) and reject null-byte path injections (`\0`), returning explicit `error` fields in `file_content` / `file_saved` / `file_staged`.
 - Server logs errors to console with `[pifrontier]` prefix.
-- File operations (`read_file` / `write_file`) enforce workspace boundary guards (`isInsideWorkspace`) and reject null-byte path injections (`\0`), returning explicit `error` fields in `file_content` / `file_saved`.
 - Client displays errors in the UI and allows retry.
 
 ## Session Expiry

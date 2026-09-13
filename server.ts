@@ -6541,6 +6541,104 @@ try {
               break;
             }
 
+            case 'upload_file': {
+              const upload = msg as { type: 'upload_file'; name: string; data: string };
+              const originalName = upload.name;
+              try {
+                if (originalName.includes('\0')) {
+                  throw new Error('Invalid filename');
+                }
+
+                const sanitizedName = basename(originalName.replaceAll('\\', '/')).replace(
+                  /[^A-Za-z0-9._-]/g,
+                  '_'
+                );
+                const extensionIndex = sanitizedName.lastIndexOf('.');
+                const extension =
+                  extensionIndex > 0
+                    ? sanitizedName.slice(extensionIndex, extensionIndex + 100)
+                    : '';
+                const stem =
+                  extensionIndex > 0 ? sanitizedName.slice(0, extensionIndex) : sanitizedName;
+                const safeName = `${stem.slice(0, 100 - extension.length)}${extension}`;
+                const uniqueName = `${Date.now()}-${crypto
+                  .randomUUID()
+                  .replaceAll('-', '')
+                  .slice(0, 6)}-${safeName}`;
+                const workspaceRoot = activeCwd();
+                const stagingDir = resolve(workspaceRoot, '.pi-ui-uploads');
+                const resolved = resolve(stagingDir, uniqueName);
+                const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+                const MAX_STAGED_FILES = 20;
+
+                if (!isInsideWorkspace(resolved)) {
+                  throw new Error('Path escapes workspace root');
+                }
+                if ((upload.data.length * 3) / 4 > MAX_UPLOAD_BYTES) {
+                  throw new Error('File too large (maximum 10 MB)');
+                }
+
+                const bytes = Buffer.from(upload.data, 'base64');
+                if (bytes.byteLength > MAX_UPLOAD_BYTES) {
+                  throw new Error('File too large (maximum 10 MB)');
+                }
+
+                await mkdir(stagingDir, { recursive: true });
+                if (!isInsideWorkspace(resolved)) {
+                  throw new Error('Path escapes workspace root');
+                }
+                await Bun.write(resolved, bytes);
+                // Bound staging growth: oldest-first prune, never the file just written.
+                try {
+                  const names = await readdir(stagingDir);
+                  if (names.length > MAX_STAGED_FILES) {
+                    const candidates = names
+                      .filter((n) => n !== uniqueName)
+                      .map((n) => {
+                        try {
+                          return { n, mtime: statSync(join(stagingDir, n)).mtimeMs };
+                        } catch {
+                          return null;
+                        }
+                      })
+                      .filter((c): c is { n: string; mtime: number } => c !== null)
+                      .sort((a, b) => a.mtime - b.mtime);
+                    let total = names.length;
+                    for (const c of candidates) {
+                      if (total <= MAX_STAGED_FILES) break;
+                      try {
+                        await rm(join(stagingDir, c.n));
+                        total -= 1;
+                      } catch {
+                        /* best effort */
+                      }
+                    }
+                  }
+                } catch {
+                  /* prune is best effort; the staged reply stands */
+                }
+                const stagedPath = relative(workspaceRoot, resolved).split(sep).join('/');
+                ws.send(
+                  JSON.stringify({
+                    type: 'file_staged',
+                    name: originalName,
+                    path: stagedPath,
+                  })
+                );
+              } catch (err) {
+                log.error('[pifrontier] upload_file error:', err);
+                ws.send(
+                  JSON.stringify({
+                    type: 'file_staged',
+                    name: originalName,
+                    path: originalName,
+                    error: String(err),
+                  })
+                );
+              }
+              break;
+            }
+
             case 'get_update_status': {
               try {
                 const status = await getUpdateStatus();
