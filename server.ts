@@ -2358,6 +2358,8 @@ interface ManagedSession {
   lastActivity: number;
   /** Pending coalesced session_runtime broadcast timer (null when none scheduled). */
   runtimeBroadcastTimer: Timer | null;
+  /** Deferred reload check timer (undefined when none scheduled). */
+  pendingReloadTimer: Timer | undefined;
   /** Last serialized runtime payload that was broadcast. */
   runtimeStatusJson: string | null;
   /** Diagnostics from service/session creation. */
@@ -2366,6 +2368,10 @@ interface ManagedSession {
   hostBound: boolean;
   /** True while asynchronous extension binding is in flight. */
   bindingPending: boolean;
+  /** Whether an extension/resource reload is waiting for the session to go idle. */
+  pendingReload: boolean;
+  /** Resident generation; incremented when the SDK runner/session is replaced. */
+  generation: number;
   /** Cached first user/assistant text for O(1) session-list updates. */
   firstMessage: string;
   /** Whether a completed turn has reported an error. */
@@ -2428,6 +2434,13 @@ function activeSessionId(): string | null {
 }
 function managedSessionFor(sid: string): ManagedSession | undefined {
   return resident.get(sid);
+}
+function isCurrentEntry(entry: ManagedSession, sess: AgentSession, gen: number): boolean {
+  return (
+    managedSessionFor(entry.session.sessionId) === entry &&
+    entry.session === sess &&
+    entry.generation === gen
+  );
 }
 function activeSessionOrNullEntry(): ManagedSession | null {
   return selectedSessionId ? (resident.get(selectedSessionId) ?? null) : null;
@@ -2527,12 +2540,15 @@ function sessionPhaseFor(
 }
 
 function isPinned(entry: ManagedSession): boolean {
+  const sid = entry.session.sessionId;
   return (
     entry.isRunning ||
-    runReservations.has(entry.session.sessionId) ||
+    runReservations.has(sid) ||
+    _promptsInFlight.has(sid) ||
+    hasQueuedRuns(sid) ||
     entry.activeToolName !== undefined ||
     entry.activeToolCalls.size > 0 ||
-    hasPendingExtensionDialog(entry.session.sessionId)
+    hasPendingExtensionDialog(sid)
   );
 }
 
@@ -2574,6 +2590,9 @@ function evictResidents(): void {
 function disposeSession(sid: string, reason: string): void {
   const entry = resident.get(sid);
   if (!entry) return;
+  entry.pendingReload = false;
+  clearTimeout(entry.pendingReloadTimer);
+  entry.pendingReloadTimer = undefined;
   resident.delete(sid);
   queuedRuns.delete(sid);
   runReservations.delete(sid);
@@ -2595,6 +2614,7 @@ function disposeSession(sid: string, reason: string): void {
   } catch (err) {
     log.error(`[pifrontier] Error unsubscribing runtime events for ${sid}:`, err);
   }
+  entry.generation++;
   try {
     entry.session.dispose();
   } catch (err) {
@@ -2675,8 +2695,17 @@ async function invokeRun(
 
 function startQueuedRun(entry: ManagedSession, run: QueuedRun): void {
   const sid = entry.session.sessionId;
+  const session = entry.session;
+  const generation = entry.generation;
   void withPerSessionMutationLock(sid, async () => {
-    if (managedSessionFor(sid) !== entry || !runReservations.has(sid)) return;
+    if (
+      managedSessionFor(sid) !== entry ||
+      !isCurrentEntry(entry, session, generation) ||
+      !runReservations.has(sid)
+    ) {
+      if (managedSessionFor(sid) === entry) runReservations.delete(sid);
+      return;
+    }
     if (entry.session.isStreaming || _promptsInFlight.has(sid)) {
       runReservations.delete(sid);
       const queue = queuedRuns.get(sid) ?? [];
@@ -2731,8 +2760,11 @@ function drainQueuedRuns(): void {
       }
     }
     if (!candidateEntry || !candidateRun) return;
+    const candidateSession = candidateEntry.session;
+    const candidateGeneration = candidateEntry.generation;
     const queue = queuedRuns.get(candidateEntry.session.sessionId);
-    if (!queue || queue.shift() !== candidateRun) return;
+    if (!queue || queue.shift() !== candidateRun) continue;
+    if (!isCurrentEntry(candidateEntry, candidateSession, candidateGeneration)) continue;
     if (queue.length === 0) queuedRuns.delete(candidateEntry.session.sessionId);
     if (!reserveRunSlot(candidateEntry)) {
       queue.unshift(candidateRun);
@@ -2940,9 +2972,13 @@ function requestExtensionShutdown(sid: string): void {
   if (!entry || entry.shutdownRequested) return;
   entry.shutdownRequested = true;
   const finish = () => {
-    if (managedSessionFor(sid)?.session !== entry.session) return;
-    broadcast({ type: 'shutdown_requested', sessionId: sid });
-    void _shutdown();
+    try {
+      if (managedSessionFor(sid)?.session !== entry.session) return;
+      broadcast({ type: 'shutdown_requested', sessionId: sid });
+      void _shutdown();
+    } catch (err) {
+      log.error(`[pifrontier] extension shutdown failed for session ${sid}:`, err);
+    }
   };
   if (entry.session.isIdle) finish();
   else void entry.session.waitForIdle().then(finish, finish);
@@ -3021,7 +3057,10 @@ function commandContextActionsFor(
         return { cancelled: false };
       }),
     reload: async () => {
-      await reloadSessionHost(sid, session);
+      const reloadResult = await reloadSessionHost(sid, session);
+      if (reloadResult === 'deferred') {
+        uiContext.notify('Reload requested; change applies when idle.', 'info', sid);
+      }
     },
   };
 }
@@ -3086,25 +3125,44 @@ function startHostBinding(sid: string, session: AgentSession): void {
     });
 }
 
-async function reloadSessionHost(sid: string, session: AgentSession): Promise<void> {
+async function reloadSessionHost(
+  sid: string,
+  session: AgentSession
+): Promise<'applied' | 'deferred'> {
+  const entry = managedSessionFor(sid);
+  if (!entry || entry.session !== session) return 'applied';
+  if (
+    session.isStreaming ||
+    session.isCompacting ||
+    entry.activeToolCalls.size > 0 ||
+    hasQueuedRuns(sid) ||
+    _promptsInFlight.has(sid)
+  ) {
+    entry.pendingReload = true;
+    return 'deferred';
+  }
+  entry.pendingReload = false;
+  clearTimeout(entry.pendingReloadTimer);
+  entry.pendingReloadTimer = undefined;
   terminalInputRegistry.clear(sid);
   clearAutocompleteProviders(sid);
   broadcast({ type: 'extension_terminal_input_active', active: false, ...stampOwner(sid) });
   await session.reload();
-  const entry = managedSessionFor(sid);
-  if (!entry || entry.session !== session) return;
-  entry.diagnostics = session.resourceLoader.getExtensions().errors.map((error) => ({
+  const current = managedSessionFor(sid);
+  if (!current || current.session !== session) return 'applied';
+  current.generation++;
+  current.diagnostics = session.resourceLoader.getExtensions().errors.map((error) => ({
     type: 'error',
     message: `${error.path}: ${error.error}`,
   }));
-  entry.bindingPending = false;
-  entry.hostBound = true;
+  current.bindingPending = false;
+  current.hostBound = true;
   // Reload can yield while another session is selected. Its rebuilt host
   // state remains valid, and its stamped snapshots are useful to all clients.
   broadcastSessionLoaded(session);
   broadcast({
     type: 'runtime_diagnostics',
-    diagnostics: entry.diagnostics,
+    diagnostics: current.diagnostics,
     ...stampOwner(sid),
   });
   broadcast({
@@ -3123,6 +3181,7 @@ async function reloadSessionHost(sid: string, session: AgentSession): Promise<vo
     activeToolNames: session.getActiveToolNames(),
     ...stampOwner(sid),
   });
+  return 'applied';
 }
 function packageManagerFor(session: AgentSession): {
   manager: PackageManagerWithUpdates;
@@ -3273,81 +3332,87 @@ function makeEventForwarder(
 ): (event: PiSDKNS.AgentSessionEvent) => void {
   const pendingToolArgs = new Map<string, unknown>();
   return (event) => {
-    // Normal completion/turn-end events must release argument payloads even
-    // when no browser is connected.
-    if (event.type === 'agent_end') pendingToolArgs.clear();
-    if (connectedClients === 0) {
-      if (event.type === 'tool_execution_end') pendingToolArgs.delete(event.toolCallId);
-      return;
-    }
-    if (event.type === 'message_update') {
-      broadcast({ ...event, sessionId: sid, message: { role: event.message.role } });
-    } else if (event.type === 'message_end') {
-      const wireMessage = boundMessagesForWire([event.message])[0];
-      try {
+    // The SDK dispatches listeners synchronously without a guard — a throw
+    // here would propagate into the agent loop. Never let the wire path fail.
+    try {
+      // Normal completion/turn-end events must release argument payloads even
+      // when no browser is connected.
+      if (event.type === 'agent_end') pendingToolArgs.clear();
+      if (connectedClients === 0) {
+        if (event.type === 'tool_execution_end') pendingToolArgs.delete(event.toolCallId);
+        return;
+      }
+      if (event.type === 'message_update') {
+        broadcast({ ...event, sessionId: sid, message: { role: event.message.role } });
+      } else if (event.type === 'message_end') {
+        const wireMessage = boundMessagesForWire([event.message])[0];
+        try {
+          broadcast({
+            ...event,
+            message: wireMessage,
+            sessionId: sid,
+            contextUsage: sess.getContextUsage(),
+          });
+        } catch {
+          broadcast({ ...event, message: wireMessage, sessionId: sid });
+        }
+      } else if (event.type === 'tool_execution_start') {
+        pendingToolArgs.set(event.toolCallId, event.args);
+        const renderedCallHtml = renderToolCallHtml(
+          sess,
+          event.toolName,
+          event.args,
+          event.toolCallId
+        );
+        broadcast({ ...event, sessionId: sid, ...(renderedCallHtml ? { renderedCallHtml } : {}) });
+      } else if (event.type === 'tool_execution_update') {
+        const args = pendingToolArgs.get(event.toolCallId);
+        const renderedResultHtml = renderToolResultHtml(
+          sess,
+          event.toolName,
+          event.partialResult,
+          args,
+          event.toolCallId,
+          true
+        );
+        const wirePartialResult = boundMessagesForWire([event.partialResult])[0];
         broadcast({
           ...event,
-          message: wireMessage,
+          partialResult: wirePartialResult,
           sessionId: sid,
-          contextUsage: sess.getContextUsage(),
+          ...(renderedResultHtml ? { renderedResultHtml } : {}),
         });
-      } catch {
-        broadcast({ ...event, message: wireMessage, sessionId: sid });
+      } else if (event.type === 'tool_execution_end') {
+        const args = pendingToolArgs.get(event.toolCallId);
+        pendingToolArgs.delete(event.toolCallId);
+        const renderedResultHtml = renderToolResultHtml(
+          sess,
+          event.toolName,
+          event.result,
+          args,
+          event.toolCallId,
+          false
+        );
+        const wireResult = boundMessagesForWire([event.result])[0];
+        broadcast({
+          ...event,
+          result: wireResult,
+          sessionId: sid,
+          ...(renderedResultHtml ? { renderedResultHtml } : {}),
+        });
+      } else if (event.type === 'agent_end') {
+        const messages = Array.isArray(event.messages)
+          ? boundMessagesForWire(event.messages)
+          : event.messages;
+        broadcast({ ...event, messages, sessionId: sid });
+      } else if (event.type === 'queue_update') {
+        const state = queuedStateFor(sess);
+        broadcast({ ...event, ...state, sessionId: sid });
+      } else {
+        broadcast({ ...event, sessionId: sid });
       }
-    } else if (event.type === 'tool_execution_start') {
-      pendingToolArgs.set(event.toolCallId, event.args);
-      const renderedCallHtml = renderToolCallHtml(
-        sess,
-        event.toolName,
-        event.args,
-        event.toolCallId
-      );
-      broadcast({ ...event, sessionId: sid, ...(renderedCallHtml ? { renderedCallHtml } : {}) });
-    } else if (event.type === 'tool_execution_update') {
-      const args = pendingToolArgs.get(event.toolCallId);
-      const renderedResultHtml = renderToolResultHtml(
-        sess,
-        event.toolName,
-        event.partialResult,
-        args,
-        event.toolCallId,
-        true
-      );
-      const wirePartialResult = boundMessagesForWire([event.partialResult])[0];
-      broadcast({
-        ...event,
-        partialResult: wirePartialResult,
-        sessionId: sid,
-        ...(renderedResultHtml ? { renderedResultHtml } : {}),
-      });
-    } else if (event.type === 'tool_execution_end') {
-      const args = pendingToolArgs.get(event.toolCallId);
-      pendingToolArgs.delete(event.toolCallId);
-      const renderedResultHtml = renderToolResultHtml(
-        sess,
-        event.toolName,
-        event.result,
-        args,
-        event.toolCallId,
-        false
-      );
-      const wireResult = boundMessagesForWire([event.result])[0];
-      broadcast({
-        ...event,
-        result: wireResult,
-        sessionId: sid,
-        ...(renderedResultHtml ? { renderedResultHtml } : {}),
-      });
-    } else if (event.type === 'agent_end') {
-      const messages = Array.isArray(event.messages)
-        ? boundMessagesForWire(event.messages)
-        : event.messages;
-      broadcast({ ...event, messages, sessionId: sid });
-    } else if (event.type === 'queue_update') {
-      const state = queuedStateFor(sess);
-      broadcast({ ...event, ...state, sessionId: sid });
-    } else {
-      broadcast({ ...event, sessionId: sid });
+    } catch (err) {
+      log.warn(`[pifrontier] event forwarder failed for session ${sid}:`, err);
     }
   };
 }
@@ -3391,12 +3456,15 @@ function registerSession(
     createdAt: Date.now(),
     isRunning: sess.isStreaming,
     lastActivity: Date.now(),
+    pendingReloadTimer: undefined,
     runtimeBroadcastTimer: null,
     runtimeStatusJson: null,
     diagnostics: created?.diagnostics ?? [],
     sessionName: sess.sessionManager.getSessionName(),
     hostBound,
     bindingPending: false,
+    pendingReload: false,
+    generation: 0,
     firstMessage: firstMessageForSession(sess),
     lastTurnError: false,
     shutdownRequested: false,
@@ -3443,6 +3511,36 @@ function registerSession(
           ...(entry.path ? { sessionPath: entry.path } : {}),
         });
         if (!event.willRetry) scheduleQueuedRuns();
+        if (
+          !event.willRetry &&
+          entry.pendingReload &&
+          managedSessionFor(sid) === entry &&
+          entry.session === sess
+        ) {
+          const checkDeferredReload = () => {
+            entry.pendingReloadTimer = undefined;
+            const current = managedSessionFor(sid);
+            if (!current || current !== entry || current.session !== sess || !current.pendingReload)
+              return;
+            if (
+              sess.isStreaming ||
+              sess.isCompacting ||
+              current.activeToolCalls.size > 0 ||
+              hasQueuedRuns(sid) ||
+              _promptsInFlight.has(sid)
+            ) {
+              entry.pendingReloadTimer = setTimeout(checkDeferredReload, 2_000);
+              return;
+            }
+            current.pendingReload = false;
+            void reloadSessionHost(sid, sess).catch((err) => {
+              log.error(`[pifrontier] deferred reload for session ${sid} failed:`, err);
+            });
+          };
+          if (!entry.pendingReloadTimer) {
+            entry.pendingReloadTimer = setTimeout(checkDeferredReload, 0);
+          }
+        }
         break;
       }
       case 'tool_execution_start':
@@ -3491,10 +3589,16 @@ function registerSession(
         // A successful compaction rewrites the client's context. Defer the
         // snapshot until the SDK has cleared isCompacting.
         if (!ce.aborted && !ce.willRetry && !ce.errorMessage) {
+          const compactionGeneration = entry.generation;
           setTimeout(() => {
-            const current = managedSessionFor(sid)?.session;
-            if (!current) return;
-            broadcastSessionLoaded(current);
+            const current = managedSessionFor(sid);
+            if (
+              !current ||
+              current.session !== sess ||
+              !isCurrentEntry(entry, sess, compactionGeneration)
+            )
+              return;
+            broadcastSessionLoaded(current.session);
           }, 0);
         }
         // Compaction rewrote the session — refresh the resident summary while
@@ -4193,9 +4297,21 @@ try {
             case 'prompt': {
               const target = targetEntry(ws.data, msg, (data) => ws.send(data));
               if (!target) break;
-              await withPerSessionMutationLock(target.session.sessionId, async () => {
+              const targetSession = target.session;
+              const targetGeneration = target.generation;
+              await withPerSessionMutationLock(targetSession.sessionId, async () => {
                 try {
-                  const s = target.session;
+                  const s = targetSession;
+                  const generation = targetGeneration;
+                  if (!isCurrentEntry(target, s, generation)) {
+                    ws.send(
+                      JSON.stringify({
+                        type: 'agent_error',
+                        error: 'Session is no longer current.',
+                      })
+                    );
+                    return;
+                  }
                   const imageContent = msg.images?.length
                     ? msg.images.map((img) => ({
                         type: 'image' as const,
@@ -4250,9 +4366,21 @@ try {
             case 'steer': {
               const target = targetEntry(ws.data, msg, (data) => ws.send(data));
               if (!target) break;
-              await withPerSessionMutationLock(target.session.sessionId, async () => {
+              const targetSession = target.session;
+              const targetGeneration = target.generation;
+              await withPerSessionMutationLock(targetSession.sessionId, async () => {
                 try {
-                  const s = target.session;
+                  const s = targetSession;
+                  const generation = targetGeneration;
+                  if (!isCurrentEntry(target, s, generation)) {
+                    ws.send(
+                      JSON.stringify({
+                        type: 'agent_error',
+                        error: 'Session is no longer current.',
+                      })
+                    );
+                    return;
+                  }
                   const images = msg.images?.map((img) => ({
                     type: 'image' as const,
                     data: img.data,
@@ -4282,9 +4410,21 @@ try {
             case 'follow_up': {
               const target = targetEntry(ws.data, msg, (data) => ws.send(data));
               if (!target) break;
-              await withPerSessionMutationLock(target.session.sessionId, async () => {
+              const targetSession = target.session;
+              const targetGeneration = target.generation;
+              await withPerSessionMutationLock(targetSession.sessionId, async () => {
                 try {
-                  const s = target.session;
+                  const s = targetSession;
+                  const generation = targetGeneration;
+                  if (!isCurrentEntry(target, s, generation)) {
+                    ws.send(
+                      JSON.stringify({
+                        type: 'agent_error',
+                        error: 'Session is no longer current.',
+                      })
+                    );
+                    return;
+                  }
                   const images = msg.images?.map((img) => ({
                     type: 'image' as const,
                     data: img.data,
@@ -5298,7 +5438,7 @@ try {
               // concurrently with agent.prompt(). Read-only/independent commands
               // (session, export, share, changelog, name, tree, shell, extension
               // commands) are unaffected and stay allowed mid-stream.
-              if (['reload', 'clone', 'login', 'logout'].includes(command) && session.isStreaming) {
+              if (['clone', 'login', 'logout'].includes(command) && session.isStreaming) {
                 sendSlashResult(
                   ws,
                   command,
@@ -5310,25 +5450,16 @@ try {
               try {
                 switch (command) {
                   case 'reload': {
-                    // Extensions re-run their factories inside reload() and
-                    // register fresh onTerminalInput handlers. The old
-                    // factories' handlers are never unsubscribed (the SDK
-                    // provides no reload hook to us), so drop them now —
-                    // mirroring pi-tui, which clears its terminal listeners on
-                    // session shutdown before re-registering on session_start.
-                    // Keystrokes during the reload window fall back to native
-                    // composer behavior, and the re-registration broadcasts
-                    // active:true again.
-                    const reloadSid = session.sessionId;
-                    if (reloadSid && terminalInputRegistry.has(reloadSid)) {
-                      terminalInputRegistry.clear(reloadSid);
-                      broadcast({
-                        type: 'extension_terminal_input_active',
-                        active: false,
-                        ...stampOwner(reloadSid),
-                      });
+                    const reloadResult = await reloadSessionHost(session.sessionId, session);
+                    if (reloadResult === 'deferred') {
+                      sendSlashResult(
+                        ws,
+                        command,
+                        'Reload requested; change applies when idle.',
+                        'warning'
+                      );
+                      break;
                     }
-                    await session.reload();
                     sendSlashResult(
                       ws,
                       command,
@@ -5494,32 +5625,34 @@ try {
                     break;
                   }
                   case 'clone': {
-                    const leafId = session.sessionManager.getLeafId();
-                    if (!leafId) {
-                      sendSlashResult(ws, command, 'No session branch to clone yet.', 'warning');
-                      break;
-                    }
-                    const newPath = session.sessionManager.createBranchedSession(leafId);
-                    if (!newPath) {
-                      // Fallback — create a fresh persisted session
-                      const clonedSm = _sdk!.SessionManager.create(cwd);
+                    await withSessionMutationLock(async () => {
+                      const leafId = session.sessionManager.getLeafId();
+                      if (!leafId) {
+                        sendSlashResult(ws, command, 'No session branch to clone yet.', 'warning');
+                        return;
+                      }
+                      const newPath = session.sessionManager.createBranchedSession(leafId);
+                      if (!newPath) {
+                        // Fallback — create a fresh persisted session
+                        const clonedSm = _sdk!.SessionManager.create(cwd);
+                        const { session: clonedSession } = await _sdk!.createAgentSession({
+                          cwd,
+                          sessionManager: clonedSm,
+                          model: session.model,
+                        });
+                        await setActiveSession(clonedSession);
+                        sendSlashResult(ws, command, 'Cloned to a fresh session.');
+                        return;
+                      }
+                      const clonedSm = _sdk!.SessionManager.open(newPath);
                       const { session: clonedSession } = await _sdk!.createAgentSession({
-                        cwd,
+                        cwd: clonedSm.getCwd() || cwd,
                         sessionManager: clonedSm,
                         model: session.model,
                       });
                       await setActiveSession(clonedSession);
-                      sendSlashResult(ws, command, 'Cloned to a fresh session.');
-                      break;
-                    }
-                    const clonedSm = _sdk!.SessionManager.open(newPath);
-                    const { session: clonedSession } = await _sdk!.createAgentSession({
-                      cwd: clonedSm.getCwd() || cwd,
-                      sessionManager: clonedSm,
-                      model: session.model,
+                      sendSlashResult(ws, command, `Cloned current branch to ${newPath}.`);
                     });
-                    await setActiveSession(clonedSession);
-                    sendSlashResult(ws, command, `Cloned current branch to ${newPath}.`);
                     break;
                   }
                   case 'tree': {
@@ -5658,7 +5791,14 @@ try {
                     // Use prompt() even during streaming (SDK handles extension commands during streaming)
                     try {
                       await withPerSessionMutationLock(session.sessionId, async () => {
-                        await session.prompt(args);
+                        const sid = session.sessionId;
+                        _promptsInFlight.add(sid);
+                        try {
+                          await session.prompt(args);
+                        } finally {
+                          _promptsInFlight.delete(sid);
+                          scheduleQueuedRuns();
+                        }
                       });
                     } catch (e) {
                       sendSlashResult(ws, command, String(e), 'error');
@@ -5940,17 +6080,21 @@ try {
                   );
                 }
                 const sess = target.session;
+                let reloadResult: 'applied' | 'deferred' = 'applied';
                 if (resolve(sess.sessionManager.getCwd() || cwd) === targetCwd) {
                   sess.settingsManager.setProjectTrusted(
                     request.decision === 'trusted' || request.decision === 'session'
                   );
-                  await reloadSessionHost(sess.sessionId, sess);
+                  reloadResult = await reloadSessionHost(sess.sessionId, sess);
                 }
                 broadcast({
                   type: 'project_trust',
                   trust: projectTrustInfoFor(targetCwd),
                   sessionId: ownerSessionId ?? undefined,
-                });
+                  ...(reloadResult === 'deferred'
+                    ? { message: 'Project trust update applies when idle.' }
+                    : {}),
+                } as ServerMessage);
               } catch (err) {
                 log.error('[pifrontier] set_project_trust error:', err);
                 ws.send(
@@ -6125,12 +6269,15 @@ try {
                 } else {
                   await manager.update(msg.source);
                 }
-                await reloadSessionHost(sess.sessionId, sess);
+                const reloadResult = await reloadSessionHost(sess.sessionId, sess);
                 ws.send(
                   JSON.stringify({
                     type: 'package_result',
                     success: true,
-                    message: 'Package operation completed.',
+                    message:
+                      reloadResult === 'deferred'
+                        ? 'Package operation completed; change applies when idle.'
+                        : 'Package operation completed.',
                     sessionId: sess.sessionId,
                   })
                 );
@@ -6193,12 +6340,15 @@ try {
                 );
                 if (projectScope) settings.setProjectPackages(updated);
                 else settings.setPackages(updated);
-                await reloadSessionHost(sess.sessionId, sess);
+                const reloadResult = await reloadSessionHost(sess.sessionId, sess);
                 ws.send(
                   JSON.stringify({
                     type: 'package_result',
                     success: true,
-                    message: 'Package filter updated.',
+                    message:
+                      reloadResult === 'deferred'
+                        ? 'Package filter updated; change applies when idle.'
+                        : 'Package filter updated.',
                     sessionId: sess.sessionId,
                   })
                 );
@@ -6230,7 +6380,7 @@ try {
                 }
                 sess.extensionRunner.setFlagValue(msg.name, msg.value);
                 persistExtensionFlag(msg.name, msg.value);
-                await reloadSessionHost(sess.sessionId, sess);
+                const reloadResult = await reloadSessionHost(sess.sessionId, sess);
                 ws.send(
                   JSON.stringify({
                     type: 'extension_flag_result',
@@ -6238,6 +6388,9 @@ try {
                     value: msg.value,
                     success: true,
                     sessionId: sess.sessionId,
+                    ...(reloadResult === 'deferred'
+                      ? { message: 'Extension flag update applies when idle.' }
+                      : {}),
                   })
                 );
               } catch (err) {
@@ -6252,10 +6405,17 @@ try {
               if (!target) break;
               try {
                 const sess = target.session;
+                const generation = target.generation;
                 const shortcuts = sess.extensionRunner.getShortcuts({});
                 const shortcut = [...shortcuts.values()].find(
                   (entry) => String(entry.shortcut) === msg.shortcut
                 );
+                if (!isCurrentEntry(target, sess, generation)) {
+                  ws.send(
+                    JSON.stringify({ type: 'agent_error', error: 'Session is no longer current.' })
+                  );
+                  return;
+                }
                 if (!shortcut) throw new Error(`Shortcut not found: ${msg.shortcut}`);
                 await shortcut.handler(sess.extensionRunner.createContext());
               } catch (err) {
@@ -6344,13 +6504,20 @@ try {
                 await mkdir(destDir, { recursive: true });
                 const destPath = join(destDir, safeFileName);
                 await writeFile(destPath, content, 'utf8');
-                await reloadSessionHost(sess.sessionId, sess);
+                const reloadResult = await reloadSessionHost(sess.sessionId, sess);
                 const nameMatch = content.match(/^---[\s\S]*?^name:\s*(.+)$/m);
                 const skillName = nameMatch
                   ? nameMatch[1].trim()
                   : safeFileName.replace(/\.md$/, '');
                 ws.send(
-                  JSON.stringify({ type: 'skill_install_result', success: true, name: skillName })
+                  JSON.stringify({
+                    type: 'skill_install_result',
+                    success: true,
+                    name: skillName,
+                    ...(reloadResult === 'deferred'
+                      ? { message: 'Skill installation applies when idle.' }
+                      : {}),
+                  })
                 );
               } catch (err) {
                 log.error('[pifrontier] install_skill error:', err);
@@ -6399,9 +6566,21 @@ try {
             case 'edit_message': {
               const target = targetEntry(ws.data, msg, (data) => ws.send(data));
               if (!target) break;
-              await withPerSessionMutationLock(target.session.sessionId, async () => {
+              const targetSession = target.session;
+              const targetGeneration = target.generation;
+              await withPerSessionMutationLock(targetSession.sessionId, async () => {
                 try {
-                  const s = target.session;
+                  const s = targetSession;
+                  const generation = targetGeneration;
+                  if (!isCurrentEntry(target, s, generation)) {
+                    ws.send(
+                      JSON.stringify({
+                        type: 'agent_error',
+                        error: 'Session is no longer current.',
+                      })
+                    );
+                    return;
+                  }
                   if (s.isStreaming) {
                     ws.send(
                       JSON.stringify({
@@ -6422,9 +6601,43 @@ try {
                   // Find the last matching entry (most recent occurrence of the original text)
                   const match = [...userMsgs].reverse().find((m) => m.text === originalMessage);
                   if (!match) throw new Error('Could not find the original message to edit');
+                  if (!isCurrentEntry(target, s, generation)) {
+                    ws.send(
+                      JSON.stringify({
+                        type: 'agent_error',
+                        error: 'Session is no longer current.',
+                      })
+                    );
+                    return;
+                  }
                   await s.navigateTree(match.entryId);
+                  if (!isCurrentEntry(target, s, generation)) {
+                    ws.send(
+                      JSON.stringify({
+                        type: 'agent_error',
+                        error: 'Session is no longer current.',
+                      })
+                    );
+                    return;
+                  }
                   refreshSessionSummary(s);
-                  await s.prompt(newMessage);
+                  if (!isCurrentEntry(target, s, generation)) {
+                    ws.send(
+                      JSON.stringify({
+                        type: 'agent_error',
+                        error: 'Session is no longer current.',
+                      })
+                    );
+                    return;
+                  }
+                  const sid = s.sessionId;
+                  _promptsInFlight.add(sid);
+                  try {
+                    await s.prompt(newMessage);
+                  } finally {
+                    _promptsInFlight.delete(sid);
+                    scheduleQueuedRuns();
+                  }
                 } catch (err) {
                   log.error('[pifrontier] edit_message error:', err);
                   ws.send(JSON.stringify({ type: 'agent_error', error: String(err) }));
@@ -6922,9 +7135,28 @@ process.on('SIGINT', () => _shutdown());
 // one bad SDK event or WS send loops the service under systemd Restart=.
 // Log loudly (journald picks up the <3> priority), tell connected clients,
 // and keep serving; the live session remains valid.
+// Crash-broadcast dedupe: a looping rejection (e.g. a stale extension ctx
+// reused by extension-owned background work) must not spray every client on
+// each iteration. The server log keeps full fidelity; clients get one
+// broadcast per distinct message per window.
+const _crashDedupe = new Map<string, number>();
+const CRASH_DEDUPE_MS = 30_000;
+const CRASH_DEDUPE_MAX = 20;
+
 function reportCrash(kind: string, err: unknown): void {
   log.error(`${kind}:`, err instanceof Error ? err : new Error(String(err)));
   try {
+    const key = `${kind}:${err instanceof Error ? err.message : String(err)}`;
+    const now = Date.now();
+    const lastAt = _crashDedupe.get(key);
+    if (lastAt !== undefined && now - lastAt < CRASH_DEDUPE_MS) return;
+    _crashDedupe.delete(key);
+    _crashDedupe.set(key, now);
+    while (_crashDedupe.size > CRASH_DEDUPE_MAX) {
+      const oldestKey = _crashDedupe.keys().next().value;
+      if (oldestKey === undefined) break;
+      _crashDedupe.delete(oldestKey);
+    }
     broadcast({
       type: 'agent_error',
       error: `Internal server error (${kind}): ${err instanceof Error ? err.message : String(err)}`,
