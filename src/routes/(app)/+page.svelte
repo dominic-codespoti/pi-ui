@@ -15,7 +15,6 @@
     PromptSummary,
     ExtensionSummary,
     WidgetContent,
-    WidgetPayload,
     ExtensionUiStatePayload,
     TreeNode,
     UpdateStatus,
@@ -67,6 +66,7 @@
   } from '#lib/notification-prefs.js';
   import { clampThinkingLevelForModel, getSupportedThinkingLevels } from '#lib/thinking-levels.js';
   import { encodeTerminalKey, wrapBracketedPaste } from '#lib/terminal-key-encoder.js';
+  import { ComposerTerminalBridge } from '#lib/composer-terminal-bridge.js';
   import * as Tooltip from '#lib/components/ui/tooltip/index.js';
   import { Switch } from '#lib/components/ui/switch/index.js';
   import * as Dialog from '#lib/components/ui/dialog/index.js';
@@ -81,7 +81,6 @@
   import RightPanel from '#lib/components/panels/lazy-right-panel.svelte';
   import ExtensionComponent from '#lib/components/ui/extension-component.svelte';
   import ConfirmDialog from '#lib/components/dialogs/confirm-dialog.svelte';
-
   import ChevronRight from '@lucide/svelte/icons/chevron-right';
   import X from '@lucide/svelte/icons/x';
   import Keyboard from '@lucide/svelte/icons/keyboard';
@@ -580,8 +579,13 @@
   const toolMessagesById = new Map<string, UIMessage>();
   /** Inactive session transcripts and UI-only state, bounded by the cache's LRU cap. */
   const sessionViewCache = new SessionViewCache();
-
   let input = $state('');
+  /** Non-empty trimmed composer — one derived instead of input.trim() per template read. */
+  const hasComposerText = $derived(input.trim().length > 0);
+  /** Extension commands grouped by source — precomputed on commands_list, not per keystroke. */
+  let extCommandsBySource = $state<Record<string, { name: string; description?: string }[]>>({});
+  /** Lowercase extension command names — O(1) arg-mode lookup instead of .find per keystroke. */
+  let extCommandNames = $state<Set<string>>(new Set());
   /** Images staged for the next prompt (base64 data + display src). */
   let attachedImages = $state<Array<{ data: string; mimeType: string; name: string; src: string }>>(
     []
@@ -649,8 +653,7 @@
     const commandEnd = trimmed.search(/\s/);
     if (commandEnd < 0) return null;
     const cmdName = trimmed.slice(0, commandEnd).toLowerCase();
-    const extCmd = extensionCommands.find((c) => c.name.toLowerCase() === cmdName);
-    if (!extCmd) return null;
+    if (!extCommandNames.has(cmdName)) return null;
     return { command: cmdName, prefix: trimmed.slice(commandEnd).trim() };
   });
   const filteredSlashCommands = $derived.by<ComposerShortcut[]>(() => {
@@ -690,16 +693,12 @@
         description: c.description,
         insert: `/${c.name} `,
       }));
-      // Group extension commands by source (file/package name)
-      const extBySource = Object.groupBy(
-        extensionCommands.filter((c) => typeof c.name === 'string' && (!q || c.name.startsWith(q))),
-        (c) => c.source
-      );
+      // Grouped on commands_list receipt (extCommandsBySource) — no per-keystroke groupBy.
       const extCmds: ComposerShortcut[] = [];
-      for (const [source, cmds] of Object.entries(extBySource).filter(
-        (e): e is [string, typeof extensionCommands] => !!e[1]
-      )) {
-        for (const c of cmds.slice(0, 6)) {
+      for (const [source, cmds] of Object.entries(extCommandsBySource)) {
+        if (!cmds) continue;
+        const matching = q ? cmds.filter((c) => c.name.startsWith(q)) : cmds;
+        for (const c of matching.slice(0, 6)) {
           extCmds.push({
             trigger: '/' as const,
             label: `/${c.name}`,
@@ -937,7 +936,7 @@
         _optimisticViewSavedSessionId = sessionId;
       }
       sessionSwitchDraft = null;
-      discardPendingTerminalInputs();
+      composerBridge.discard();
       _optimisticPrevMessages = messages.slice();
       _optimisticPrevInput = input;
       messages = [];
@@ -1131,7 +1130,18 @@
   let activeToolNames = $state<string[]>([]);
   /** Registered slash commands from extensions */
   let extensionCommands = $state<{ name: string; description?: string; source: string }[]>([]);
-
+  /** Replace the extension command catalog + its precomputed per-keystroke indexes. */
+  function applyExtensionCommands(
+    commands: { name: string; description?: string; source: string }[]
+  ): void {
+    extensionCommands = commands;
+    // Precompute once here — the per-keystroke slash-menu derived only reads it.
+    extCommandsBySource = Object.groupBy(
+      extensionCommands.filter((c) => typeof c.name === 'string'),
+      (c) => c.source
+    ) as Record<string, { name: string; description?: string }[]>;
+    extCommandNames = new Set(extensionCommands.map((c) => c.name.toLowerCase()));
+  }
   /** PWA install prompt (beforeinstallprompt event). Non-reactive — event fires once. */
   let deferredInstallPrompt: Event | null = null;
   let installReady = $state(false);
@@ -1790,8 +1800,8 @@
   function connect() {
     if (document.hidden) return;
     // Belt-and-braces: connect() nulls the old socket's onclose before
-    // closing it, so its close event may never reach flushPendingTerminalInputs.
-    flushPendingTerminalInputs();
+    // closing it, so its close event may never reach the bridge flush.
+    composerBridge.flush();
     pendingUploads.clear();
     if (ws) {
       try {
@@ -1860,9 +1870,8 @@
       pendingUploads.clear();
       olderMessagesLoading = false;
       modelRefreshLoading = false;
-      flushPendingTerminalInputs();
+      composerBridge.flush();
       stopHeartbeat();
-      if (_intentionalClose) return;
       // 4001 = the server closed the socket because the session token expired
       // (or was revoked). Reconnecting can never succeed — go to /login.
       if (event.code === 4001) {
@@ -2080,8 +2089,7 @@
     // Stop any awaited key verdicts before the active session identity can
     // change. The store flips sessionLoading synchronously, but the local
     // mirror is an effect and can lag one turn behind a click.
-    discardPendingTerminalInputs();
-    sessionSwitchDraft = null;
+    composerBridge.discard();
   };
   extensionUiState.send = send;
 
@@ -2262,8 +2270,7 @@
         // A key round-trip for the previous session must never be applied to
         // or routed toward the new one (its late verdict would insert text or
         // even submit into the wrong composer).
-        discardPendingTerminalInputs();
-        sessionSwitchDraft = null;
+        composerBridge.discard();
       }
     }
     const isFullSessionPayload = payload.type === 'connected' || payload.type === 'session_loaded';
@@ -2294,6 +2301,12 @@
     }
     if (payload.activeToolNames !== undefined) {
       activeToolNames = (payload.activeToolNames as string[] | undefined) ?? [];
+    }
+    if (payload.commands !== undefined) {
+      applyExtensionCommands(
+        (payload.commands as
+          { name: string; description?: string; source: string }[] | undefined) ?? []
+      );
     }
     if (payload.cwd) cwd = payload.cwd as string;
     if ('sessionPath' in payload) {
@@ -2332,26 +2345,13 @@
     }
     if (payload.extensionUiState && typeof payload.extensionUiState === 'object') {
       extensionUiState.applySnapshot(payload.extensionUiState as ExtensionUiStatePayload);
-    } else if ('widgets' in payload) {
-      // Legacy snapshots carry widgets as a top-level array. Treat the
-      // snapshot as a full session-scoped replacement, including title and
-      // other extension channels, before replaying the widgets.
-      extensionUiState.reset();
-      for (const w of (payload.widgets as WidgetPayload[]) ?? []) {
-        extensionUiState.applyWidget(w as unknown as Record<string, unknown>);
-      }
     } else if ('sessionId' in payload && (payload.sessionId as string) !== prevSessionId) {
       // Defensive: a session change without a snapshot must never keep the
-      // previous session's extension UI behind (legacy/partial payloads).
+      // previous session's extension UI behind (partial payloads).
       extensionUiState.reset();
+      // ...including its document title — fall back to the session name.
+      if (typeof payload.sessionName === 'string') extensionUiState.setTitle(payload.sessionName);
     }
-    // Legacy full snapshots do not carry the newer extensionUiState title.
-    // Once the session changes, fall back to its name rather than retaining
-    // the previous session's extension-injected document title.
-    if (isFullSessionPayload && payload.extensionUiState === undefined) {
-      extensionUiState.setTitle(sessionName);
-    }
-    // Sync the shared projects store with the active session.
     projectsState.cwd = cwd;
     if ('sessionId' in payload && typeof payload.sessionId === 'string') {
       projectsState.reconcileActiveRuntime(payload.sessionId, isStreaming, activeToolName);
@@ -2942,17 +2942,14 @@
         // stale and must not clobber the newer visible session.
         if (requestId && projectsState.isRetiredRequest(requestId)) break;
         const pendingRequestId = projectsState.pendingRequestId;
-        const pendingSwitchPath = projectsState.pendingSwitchPath;
         const previousPath = _lastVisibleSessionPath;
         const previousSessionId = _lastVisibleSessionId;
         const loadedPath = typeof sl.sessionPath === 'string' ? sl.sessionPath : undefined;
         const loadedSessionId = typeof sl.sessionId === 'string' ? sl.sessionId : undefined;
-        const ownResponse =
-          pendingRequestId !== null
-            ? requestId !== undefined
-              ? requestId === pendingRequestId
-              : pendingSwitchPath === null || pendingSwitchPath === loadedPath
-            : false;
+        // The server always stamps the requester's snapshot. Unstamped
+        // snapshots are foreign-switch broadcasts from other tabs — applied
+        // as foreign below, never as this tab's own response.
+        const ownResponse = pendingRequestId !== null && requestId === pendingRequestId;
         // A requestId is authoritative when present. A stamped snapshot for
         // another operation belongs to another tab (or an abandoned request),
         // never this tab, even when its session path differs.
@@ -2972,8 +2969,7 @@
         _resyncInFlight = false;
         applySessionState(sl);
         if (sessionId ?? loadedSessionId) sendSessionFocus(sessionId ?? loadedSessionId ?? null);
-        _lastVisibleSessionPath =
-          loadedPath ?? (ownResponse ? pendingSwitchPath : sessionPath) ?? undefined;
+        _lastVisibleSessionPath = loadedPath ?? sessionPath ?? undefined;
         _lastVisibleSessionId = sessionId ?? loadedSessionId;
         resetSessionPanelState();
         projectTrust = (sl.projectTrust as ProjectTrustInfo | undefined) ?? null;
@@ -2983,12 +2979,8 @@
         if (sl.piVersion) piVersion = sl.piVersion as string;
         if (sl.uiVersion) uiVersion = sl.uiVersion as string;
         if (sl.sessionMode) sessionMode = sl.sessionMode as string;
-        const authoritativePath =
-          loadedPath ?? (ownResponse ? pendingSwitchPath : sessionPath) ?? undefined;
-        const settled = projectsState.onSessionLoaded(
-          ownResponse ? requestId : undefined,
-          loadedPath
-        );
+        const authoritativePath = loadedPath ?? sessionPath ?? undefined;
+        const settled = projectsState.onSessionLoaded(ownResponse ? requestId : undefined);
         sessionLoading = projectsState.sessionLoading;
         if (settled) showSessionPanel = false;
         projectPickerOpen = false;
@@ -3008,7 +3000,6 @@
           } else {
             clearIdentity();
           }
-          projectsState.pendingSwitchPath = null;
         } else if (!foreignSnapshot) {
           // A same-session resync is still authoritative for this device.
           if (authoritativePath) {
@@ -3246,6 +3237,12 @@
         activeStreamMsg = null;
         releaseWakeLock();
         const errMsg = (msg as { error?: string }).error ?? 'Unknown error';
+        // Crash-containment broadcasts (reportCrash) loop by nature — the same
+        // unhandled rejection refires while its owner (stale ctx timer, wedged
+        // extension) lives. Collapse repeats so one looping fault renders one
+        // notice instead of a stack; legitimately distinct errors still show.
+        const last = [...messages].reverse().find((m) => m.role === 'notice');
+        const sameAsLast = last?.role === 'notice' && last.content === `Agent error: ${errMsg}`;
         if (_optimisticPrevMessages || projectsState.pendingNewSession) {
           if (_optimisticPrevMessages) {
             messages = _optimisticPrevMessages;
@@ -3262,7 +3259,7 @@
           // no request token. Resync so the authoritative server history wins.
           send({ type: 'resync_session' });
         }
-        showChatNotice(`Agent error: ${errMsg}`, 'error');
+        if (!sameAsLast) showChatNotice(`Agent error: ${errMsg}`, 'error');
         break;
       }
 
@@ -3272,8 +3269,7 @@
           const a = activeStreamMsg;
           if (a) {
             a.content += event.delta;
-            scheduleContentRender(a);
-            scrollBottom();
+            scheduleContentRender(a, true);
           }
         } else if (event?.type === 'thinking_delta' && typeof event.delta === 'string') {
           const a = activeStreamMsg;
@@ -3636,19 +3632,20 @@
           sessionId?: string;
         };
         if (res.sessionId !== undefined && res.sessionId !== sessionId) break;
-        const settle = pendingTerminalInputs.get(res.id);
-        if (settle)
-          settle({
-            consumed: Boolean(res.consumed),
-            ...(res.data !== undefined ? { data: res.data } : {}),
-          });
+        composerBridge.settleVerdict(res.id, {
+          consumed: Boolean(res.consumed),
+          ...(res.data !== undefined ? { data: res.data } : {}),
+        });
         break;
       }
 
       case 'queue_update': {
-        queuedSteering = (msg.steering as string[] | undefined) ?? [];
-        queuedFollowUp = (msg.followUp as string[] | undefined) ?? [];
-
+        const steering = (msg.steering as string[] | undefined) ?? [];
+        const followUp = (msg.followUp as string[] | undefined) ?? [];
+        // Authoritative echo of our optimistic chip — Set-dedupe keeps the
+        // render stable whether the optimistic or server copy lands first.
+        queuedSteering = [...new Set(steering)];
+        queuedFollowUp = [...new Set(followUp)];
         break;
       }
 
@@ -3876,13 +3873,12 @@
         break;
 
       case 'commands_list': {
-        extensionCommands =
+        applyExtensionCommands(
           (msg.commands as { name: string; description?: string; source: string }[] | undefined) ??
-          [];
-
+            []
+        );
         break;
       }
-
       case 'skill_install_result': {
         skillInstalling = false;
         if (msg.success) {
@@ -4437,11 +4433,11 @@
       if (messages[i].role === role && messages[i].streaming) return messages[i];
     }
   }
-
-  // ── Throttled markdown rendering during streaming ─────────────────────────
   // eslint-disable-next-line svelte/prefer-svelte-reactivity -- internal throttle buffer, never read reactively
   let _pendingRenderSet = new Set<UIMessage>();
   let _renderScheduled = false;
+  /** A text delta asked for bottom-stick this frame — consumed by the render rAF. */
+  let _scrollPending = false;
 
   /**
    * Fence languages still loading when a message was last rendered, keyed by
@@ -4470,17 +4466,19 @@
     }
   }
 
-  function scheduleContentRender(msg: UIMessage) {
+  function scheduleContentRender(msg: UIMessage, scroll = false) {
     _pendingRenderSet.add(msg);
+    if (scroll) _scrollPending = true;
     if (_renderScheduled) return;
     _renderScheduled = true;
-    requestAnimationFrame(() => {
+    requestAnimationFrame(async () => {
       for (const m of _pendingRenderSet) {
         if (!messages.includes(m)) continue; // stale — evicted or replaced
         if (m.streaming) {
           // Escaped plain-text preview — full markdown parse per delta is the
           // streaming hot spot (100k chars ≈ 24 ms parse, 60×/s); the
           // message_end / sealStreaming finalize paths render real markdown.
+          // Large buffers skip the per-char LaTeX scan (see markdown.ts).
           if (m.content) m.renderedContent = renderStreamingPreview(m.content);
           if (m.thinking) m.renderedThinking = renderStreamingPreview(m.thinking);
         } else {
@@ -4496,6 +4494,15 @@
       }
       _pendingRenderSet.clear();
       _renderScheduled = false;
+      // Fold the per-delta scroll into this same frame — deltas previously
+      // scheduled a second rAF + tick per token on top of the render rAF.
+      if (_scrollPending) {
+        _scrollPending = false;
+        if (isAtBottom && scrollEl) {
+          await tick();
+          if (isAtBottom && scrollEl) scrollEl.scrollTop = scrollEl.scrollHeight;
+        }
+      }
     });
   }
 
@@ -4944,6 +4951,10 @@
     }
     // Keep the draft when the socket closes between the guard and send().
     if (!send({ type: 'steer', message: text })) return;
+    // Optimistic queue chip — the server rebroadcasts authoritative
+    // queue_update (deduped below); the send path above already showed the
+    // text left the composer instantly.
+    if (!queuedSteering.includes(text)) queuedSteering = [...queuedSteering, text];
     input = '';
     resetTextareaHeight();
   }
@@ -5026,7 +5037,7 @@
       wsState === 'open' &&
       !sessionLoading &&
       !isStreaming &&
-      input.trim().length > 0 &&
+      hasComposerText &&
       attachedImages.length === 0 &&
       attachedFiles.length === 0
     );
@@ -5233,6 +5244,16 @@
         if (!selected?.disabled) selectSlashCommand(selected);
         return true;
       }
+      // Tab completes the highlighted entry, falling back to the top entry —
+      // typing a space then Tab accepts the first subcommand without arrows.
+      if (e.key === 'Tab') {
+        const index = slashMenuIndex >= 0 ? slashMenuIndex : 0;
+        const selected = filteredSlashCommands[index];
+        if (!selected || selected.disabled) return true;
+        e.preventDefault();
+        selectSlashCommand(selected);
+        return true;
+      }
     }
     // Keep Enter available as a newline while the session is opening. The
     // eventual session_loaded path enables submission without losing the draft.
@@ -5245,56 +5266,32 @@
     return false;
   }
 
-  type ComposerSnapshot = {
-    value: string;
-    start: number;
-    end: number;
-    seq: number;
-    /** composerForeignEditSeq at snapshot time — any bump before the verdict
-     *  arrives means something OTHER than this key's own expected native
-     *  action changed the text (paste, IME, programmatic, another verdict). */
-    foreignSeq: number;
-    menuOpen: boolean;
-    /** Native delete was prevented (keys were pending) — replayed at verdict time. */
-    deferredDelete?: 'backward' | 'forward';
-  };
-
-  let terminalInputChain: Promise<void> = Promise.resolve();
-  /** Bumped when pending inputs are flushed/discarded — stale queued executors
-   *  and late verdicts check it before sending/applying anything. */
-  let terminalInputGeneration = 0;
-  /** Bumped ONLY by a session-switch discard (never by a flush). A queued
-   *  entry captured before a discard epoch bump must always be dropped even
-   *  if a LATER, unrelated flush also invalidates its generation — otherwise
-   *  a stale entry from session A could resurrect and apply after session
-   *  B's socket closes. Comparing epochs (not a single mutable "discarding"
-   *  flag) makes each entry's own capture point authoritative. */
-  let terminalInputDiscardEpoch = 0;
-  // eslint-disable-next-line svelte/prefer-svelte-reactivity -- non-reactive dispatch table, never rendered
-  const pendingTerminalInputs = new Map<
-    string,
-    (verdict: { consumed: boolean; data?: string }, discard?: boolean) => void
-  >();
-  let composerEditSeq = 0;
-  /** Bumped by any composer input event NOT attributable to the immediately
-   *  preceding optimistic keydown's own native action (see expectingNativeEdit
-   *  below) — paste, IME commit, programmatic replace, or a verdict's own
-   *  insert/delete/restore. Lets a pending verdict tell "my key's expected
-   *  native change" apart from "something else changed the text". */
-  let composerForeignEditSeq = 0;
-  /** True for the one input event expected to follow an optimistic keydown's
-   *  own native default action (if it produces one at all — arrows/Home/End
-   *  don't). Consumed by that event without bumping composerForeignEditSeq;
-   *  cleared on a microtask so a key with NO native input event (e.g. a bare
-   *  arrow) never misattributes a LATER, unrelated edit to itself. */
-  let expectingNativeEdit = false;
+  // ── Composer terminal-input bridge (extracted module) ─────────────────────
+  // Engages whenever the session has terminal-input handlers; otherwise the
+  // composer is a plain textarea (no per-keystroke WS sends, no snapshots,
+  // no verdict bookkeeping). The overlay's own hidden input always forwards
+  // via overlayKeydown regardless of this gate.
+  const composerBridgeActive = $derived(extensionUiState.terminalInputActive);
+  const composerBridge = new ComposerTerminalBridge({
+    get inputEl() {
+      return inputEl;
+    },
+    getInput: () => input,
+    setInput: (v) => (input = v),
+    isMenuOpen: () => showSlashMenu,
+    handleKey: (e) => handleComposerKey(e),
+    handleGlobalKey: (e) => handleGlobalKeydown(e),
+    resize: () => autoResizeTextarea(),
+    sendTerminalInput: (id, data, sid) => {
+      send({ type: 'extension_terminal_input', id, data, sessionId: sid });
+    },
+    getSessionId: () => sessionId,
+  });
 
   function handleComposerInput() {
-    if (expectingNativeEdit) {
-      expectingNativeEdit = false;
-    } else {
-      composerForeignEditSeq++;
-    }
+    // The bridge only tracks native-edit seqs while engaged; otherwise this
+    // is a plain input event (draft save + resize).
+    if (composerBridgeActive) composerBridge.noteInput();
     if ((sessionLoading || projectsState.sessionLoading) && !projectsState.pendingNewSession) {
       sessionSwitchDraft = input;
     }
@@ -5302,305 +5299,51 @@
   }
 
   function handleComposerKeydown(e: KeyboardEvent) {
-    // During session creation or the reconnect handshake, sessionId and
-    // terminalInputActive still describe the previous session. Keep typing
-    // local and never route keys to that session's extension handlers.
+    // Session/handshake guards stay local — never route keys for a stale session.
     if (
       sessionLoading ||
       projectsState.sessionLoading ||
       projectsState.pendingNewSession ||
       !_wsHandshakeComplete ||
-      !extensionUiState.terminalInputActive ||
       e.isComposing
     ) {
       handleComposerKey(e);
       return;
     }
-    const data = encodeTerminalKey(e);
-    if (!data) {
-      handleComposerKey(e);
-      return;
-    }
-    const optimistic = isOptimisticTerminalKey(e);
-    const snapshot: ComposerSnapshot = {
-      value: inputEl?.value ?? input,
-      start: inputEl?.selectionStart ?? input.length,
-      end: inputEl?.selectionEnd ?? input.length,
-      seq: ++composerEditSeq,
-      foreignSeq: composerForeignEditSeq,
-      menuOpen: showSlashMenu,
-    };
-    if (optimistic) {
-      // Native default action applies the key; app-level handling runs now.
-      // Backspace/Delete with earlier keys still in flight would delete
-      // against pre-verdict text (terminal order breaks: "a" then ⌫ must
-      // delete the "a"). Defer those until the pending verdicts land.
-      if ((e.key === 'Backspace' || e.key === 'Delete') && pendingTerminalInputs.size > 0) {
-        e.preventDefault();
-        e.stopPropagation();
-        snapshot.deferredDelete = e.key === 'Backspace' ? 'backward' : 'forward';
-      } else {
-        expectingNativeEdit = true;
-        handleComposerKey(e);
-        queueMicrotask(() => {
-          expectingNativeEdit = false;
-        });
-      }
-    } else {
-      e.preventDefault();
-      e.stopPropagation();
-    }
-    enqueueTerminalInput(e, data, optimistic, snapshot);
+    // Bridge disengaged (normal typing): plain local handling, zero WS traffic.
+    if (!composerBridge.handleKeydown(e, composerBridgeActive)) handleComposerKey(e);
   }
-
-  /**
-   * Keys whose native textarea behavior is complex (caret/selection/line
-   * movement, clipboard, focus) are applied natively and the verdict arrives
-   * in the background; consumed keys are reverted best-effort. All other keys
-   * (printable chars, Enter, Escape) await the verdict before applying.
-   */
-  function isOptimisticTerminalKey(e: KeyboardEvent): boolean {
-    // Ctrl/Alt-modified keys are optimistic EXCEPT Enter — a consumed
-    // Ctrl+Enter/Alt+Enter verdict must be able to veto the submit.
-    if (e.ctrlKey || e.altKey) return e.key !== 'Enter';
-    switch (e.key) {
-      case 'ArrowUp':
-      case 'ArrowDown':
-      case 'ArrowLeft':
-      case 'ArrowRight':
-      case 'Home':
-      case 'End':
-      case 'PageUp':
-      case 'PageDown':
-      case 'Backspace':
-      case 'Delete':
-      case 'Tab':
-      case 'Insert':
-        return true;
-      default:
-        return false;
-    }
-  }
-
-  function enqueueTerminalInput(
-    e: KeyboardEvent,
-    data: string,
-    optimistic: boolean,
-    snapshot: ComposerSnapshot
-  ) {
-    const id = crypto.randomUUID();
-    const gen = terminalInputGeneration;
-    const discardEpoch = terminalInputDiscardEpoch;
-    terminalInputChain = terminalInputChain
-      .then(
-        () =>
-          new Promise<void>((resolve) => {
-            // Flushed/discarded (socket close, session switch) while queued —
-            // this key must neither be sent nor applied.
-            if (gen !== terminalInputGeneration) {
-              if (discardEpoch === terminalInputDiscardEpoch) {
-                // Only flush(es) — never a discard — happened since capture,
-                // so this key still belongs to the current session and must
-                // not vanish.
-                applyTerminalInputResult(e, { consumed: false }, snapshot, optimistic);
-              }
-              resolve();
-              return;
-            }
-            const entry = {
-              applied: false,
-              timeout: setTimeout(() => settle({ consumed: false }), 2000),
-            };
-            function settle(verdict: { consumed: boolean; data?: string }, discard = false) {
-              if (entry.applied) return;
-              entry.applied = true;
-              clearTimeout(entry.timeout);
-              pendingTerminalInputs.delete(id);
-              resolve();
-              if (!discard) applyTerminalInputResult(e, verdict, snapshot, optimistic);
-            }
-            pendingTerminalInputs.set(id, settle);
-            send({ type: 'extension_terminal_input', id, data, sessionId: sessionId ?? '' });
-          })
-      )
-      .catch(() => {
-        pendingTerminalInputs.delete(id);
-        if (gen === terminalInputGeneration || discardEpoch === terminalInputDiscardEpoch) {
-          applyTerminalInputResult(e, { consumed: false }, snapshot, optimistic);
-        }
-      });
-  }
-
-  function applyTerminalInputResult(
-    e: KeyboardEvent,
-    verdict: { consumed: boolean; data?: string },
-    snapshot: ComposerSnapshot,
-    optimistic: boolean
-  ) {
-    if (verdict.consumed) {
-      // Best-effort revert: only when no later keydown intervened AND the
-      // text wasn't changed by a non-keydown edit (paste/IME/programmatic)
-      // while the verdict was in flight.
-      if (snapshot.seq === composerEditSeq && snapshot.foreignSeq === composerForeignEditSeq) {
-        restoreComposer(snapshot);
-      }
-      return;
-    }
-    if (verdict.data !== undefined) {
-      // pi-tui replaces the key with the rewritten data. For optimistic keys
-      // the native default action already ran, so undo it first (guarded).
-      if (
-        optimistic &&
-        snapshot.seq === composerEditSeq &&
-        snapshot.foreignSeq === composerForeignEditSeq
-      )
-        restoreComposer(snapshot);
-      applyRewrittenData(verdict.data, e);
-      return;
-    }
-    if (optimistic) {
-      if (snapshot.deferredDelete) {
-        // Earlier verdicts have landed by now (chain order) — delete against
-        // the live text so terminal order is preserved.
-        deleteComposerText(snapshot.deferredDelete === 'backward');
-      } else if (!snapshot.menuOpen && showSlashMenu) {
-        // The key's app-level handling may have run before an earlier awaited
-        // key's verdict opened the slash menu (fast typing: "/" then ArrowDown).
-        // Replay the menu interaction now that the menu exists.
-        handleComposerKey(e);
-      }
-      return;
-    }
-    if (handleComposerKey(e)) return;
-
-    if (e.key === 'Enter') insertComposerText('\n');
-    else // Shift+Enter newline
-    if (e.key.length === 1) insertComposerText(e.key);
-    else if (e.key === 'Escape') {
-      // The awaited tier preventDefault+stopPropagation'd this key, so the
-      // window handler (close panels, dismiss modal) never saw it — replay it.
-      handleGlobalKeydown(e);
-    }
-    // Other unmapped keys: nothing to apply.
-  }
-
-  /**
-   * Applies handler-rewritten data. In pi-tui the rewritten bytes are
-   * processed as a key, not inserted literally — map the single-byte
-   * sequences with real composer actions; anything else is inserted as text
-   * (the only current consumer never rewrites).
-   */
-  function applyRewrittenData(data: string, sourceEvent: KeyboardEvent) {
-    if (data === '\r') {
-      // Rewritten to Enter — replay the composer's Enter handling with the
-      // original event's modifiers (shift state decides submit vs newline).
-      // A real KeyboardEvent is required: handleComposerKey calls
-      // preventDefault(), which throws Illegal invocation on event fakes.
-      handleComposerKey(
-        new KeyboardEvent('keydown', {
-          key: 'Enter',
-          bubbles: true,
-          cancelable: true,
-          shiftKey: sourceEvent.shiftKey,
-        })
-      );
-      return;
-    }
-    if (data === '\x1b') {
-      // Rewritten to Escape — replay global Escape handling (close panels)
-      // with the key transformed, since handleGlobalKeydown reads e.key.
-      handleGlobalKeydown(
-        new KeyboardEvent('keydown', {
-          key: 'Escape',
-          bubbles: true,
-          cancelable: true,
-          ctrlKey: sourceEvent.ctrlKey,
-          metaKey: sourceEvent.metaKey,
-          shiftKey: sourceEvent.shiftKey,
-          altKey: sourceEvent.altKey,
-        })
-      );
-      return;
-    }
-    insertComposerText(data);
-  }
-
-  function insertComposerText(text: string) {
-    if (!inputEl) {
-      input += text;
-      return;
-    }
-    const start = inputEl.selectionStart ?? input.length;
-    const end = inputEl.selectionEnd ?? input.length;
-    inputEl.setRangeText(text, start, end, 'end');
-    inputEl.dispatchEvent(
-      new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text })
-    );
-    autoResizeTextarea();
-  }
-
-  /** Native-equivalent Backspace/Delete against the live composer text. */
-  function deleteComposerText(backward: boolean) {
-    if (!inputEl) {
-      input = backward ? input.slice(0, Math.max(0, input.length - 1)) : input.slice(1);
-      return;
-    }
-    const start = inputEl.selectionStart ?? input.length;
-    const end = inputEl.selectionEnd ?? input.length;
-    const delStart = backward ? Math.max(0, start - (start === end ? 1 : 0)) : start;
-    const delEnd = backward ? end : Math.min(inputEl.value.length, end + (start === end ? 1 : 0));
-    inputEl.setRangeText('', delStart, delEnd, 'end');
-    inputEl.dispatchEvent(
-      new InputEvent('input', {
-        bubbles: true,
-        inputType: backward ? 'deleteContentBackward' : 'deleteContentForward',
-      })
-    );
-    autoResizeTextarea();
-  }
-
-  function restoreComposer(s: ComposerSnapshot) {
-    if (!inputEl) {
-      input = s.value;
-      return;
-    }
-    inputEl.value = s.value;
-    inputEl.setSelectionRange(s.start, s.end);
-    inputEl.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertFromDrop' }));
-    autoResizeTextarea();
-  }
-
-  function flushPendingTerminalInputs() {
-    // No discardEpoch bump — queued entries invalidated by this flush alone
-    // still apply as unconsumed (see enqueueTerminalInput).
-    terminalInputGeneration++;
-    for (const settle of [...pendingTerminalInputs.values()]) settle({ consumed: false });
-    pendingTerminalInputs.clear();
-    terminalInputChain = Promise.resolve();
-  }
-
-  /** Session switch — keys sent for the previous session must neither be
-   *  applied to the new session's composer nor routed to it. */
-  function discardPendingTerminalInputs() {
-    terminalInputDiscardEpoch++;
-    terminalInputGeneration++;
-    for (const settle of [...pendingTerminalInputs.values()]) settle({ consumed: false }, true);
-    pendingTerminalInputs.clear();
-    terminalInputChain = Promise.resolve();
-  }
-
+  /** One pending resize per frame — input events fire per keystroke, but the
+   *  height write forces layout, so coalesce bursts into a single rAF. */
+  let _resizeRaf: number | null = null;
   function autoResizeTextarea() {
-    if (!inputEl) return;
-    inputEl.style.height = 'auto';
-    inputEl.style.height = `${Math.min(inputEl.scrollHeight, 192)}px`;
+    if (!inputEl || _resizeRaf !== null) return;
+    _resizeRaf = requestAnimationFrame(() => {
+      _resizeRaf = null;
+      if (!inputEl) return;
+      inputEl.style.height = 'auto';
+      inputEl.style.height = `${Math.min(inputEl.scrollHeight, 192)}px`;
+    });
   }
 
   function resetTextareaHeight() {
+    if (_resizeRaf !== null) {
+      cancelAnimationFrame(_resizeRaf);
+      _resizeRaf = null;
+    }
     if (inputEl) inputEl.style.height = '';
   }
 
   function abortGeneration() {
     haptic();
+    // Freeze the UI instantly — the server ack (agent_end) can lag behind a
+    // wedged provider stream or a queued mutation lock. agent_end/agent_error
+    // reconcile afterwards (idempotent: sealStreaming, isStreaming=false).
+    isStreaming = false;
+    projectsState.isStreaming = false;
+    sealStreaming();
+    activeStreamMsg = null;
+    releaseWakeLock();
     send({ type: 'abort' });
   }
 
@@ -6781,7 +6524,7 @@
                               : 'prompt shortcuts'}
                     </span>
                     <span class="hidden sm:inline text-[10px] text-base-content/25"
-                      >↑↓ select · Enter insert</span
+                      >↑↓ select · Tab/Enter insert</span
                     >
                   </div>
                   <div class="max-h-[min(18rem,45dvh)] overflow-y-auto p-1.5">
@@ -6919,7 +6662,7 @@
 
               {#if isStreaming}
                 <div class="flex items-center justify-end gap-1">
-                  {#if input.trim()}
+                  {#if hasComposerText}
                     <Tooltip.Root>
                       <Tooltip.Trigger>
                         {#snippet child({ props })}
@@ -7142,12 +6885,12 @@
                           onpointerleave={cancelSendHold}
                           onpointercancel={cancelSendHold}
                           oncontextmenu={(e) => e.preventDefault()}
-                          disabled={(!input.trim() &&
+                          disabled={(!hasComposerText &&
                             attachedImages.length === 0 &&
                             attachedFiles.length === 0) ||
                             wsState !== 'open' ||
                             sessionLoading}
-                          class="relative w-10 h-10 sm:w-8 sm:h-8 flex items-center justify-center rounded-full transition-all duration-200 shrink-0 {(input.trim() ||
+                          class="relative w-10 h-10 sm:w-8 sm:h-8 flex items-center justify-center rounded-full transition-all duration-200 shrink-0 {(hasComposerText ||
                             attachedImages.length > 0 ||
                             attachedFiles.length > 0) &&
                           wsState === 'open' &&

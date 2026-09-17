@@ -444,16 +444,13 @@ class ProjectsState {
         return true;
       case 'sessions_error': {
         const requestId = typeof msg.requestId === 'string' ? msg.requestId : undefined;
-        // Only a correlated in-flight operation (or a legacy unstamped
-        // response while one is pending) may settle the current operation.
-        // Retired responses are late duplicates; an unstamped error with no
-        // operation has no safe owner.
+        // Only a correlated in-flight operation may settle the current
+        // operation. Retired responses are late duplicates; an unstamped error
+        // with no operation has no safe owner.
         if (
           (requestId !== undefined && this.isRetiredRequest(requestId)) ||
           (requestId === undefined && !this.pendingNewSession && !this.sessionLoading) ||
-          (this.pendingRequestId !== null &&
-            requestId !== undefined &&
-            requestId !== this.pendingRequestId)
+          (this.pendingRequestId !== null && requestId !== this.pendingRequestId)
         ) {
           return false;
         }
@@ -574,19 +571,14 @@ class ProjectsState {
    * Returns true when an operation was settled so callers can close
    * operation-specific UI such as the session drawer.
    *
-   * Newer servers stamp the requester's snapshot with `requestId`, but older
-   * servers (and the E2E protocol mocks) do not. In that case a switch can be
-   * correlated by its requested path; a new-session response has no path to
-   * compare and is therefore accepted as the current authoritative snapshot.
-   */
-  onSessionLoaded(requestId?: string, sessionPath?: string): boolean {
+  * The server always stamps the requester's snapshot with `requestId`.
+  * Unstamped snapshots are foreign-switch broadcasts from other tabs and
+  * never settle a pending operation.
+  */
+  onSessionLoaded(requestId?: string): boolean {
     const hadPendingOperation = this.pendingNewSession || this.sessionLoading;
     if (this.pendingRequestId !== null) {
-      const requestMatches = requestId !== undefined && requestId === this.pendingRequestId;
-      const legacyMatches =
-        requestId === undefined &&
-        (this.pendingSwitchPath === null || this.pendingSwitchPath === sessionPath);
-      if (!requestMatches && !legacyMatches) return false;
+      if (requestId === undefined || requestId !== this.pendingRequestId) return false;
     }
     this.clearOpTimeout();
     this.pendingNewSession = false;

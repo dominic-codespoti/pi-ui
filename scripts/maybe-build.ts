@@ -32,14 +32,25 @@ async function newestMtimeUnder(paths: readonly string[]): Promise<number> {
 
 const outSt = await stat(OUT).catch(() => null);
 if (outSt) {
-  const [outNewest, inNewest] = await Promise.all([
-    newestMtimeUnder([OUT]),
-    newestMtimeUnder(INPUTS),
-  ]);
-  if (inNewest <= outNewest) {
-    console.log('[maybe-build] build/ is fresh — skipping rebuild');
-    process.exit(0);
+  // Untracked src files are invisible to mtime freshness when build/ is newer
+  // (git-ignored build dir vs new module) — a new module imported by an edited
+  // page would silently not ship. Force rebuild when untracked src exists.
+  const untrackedOut = await $`git status --porcelain`.quiet();
+  const untrackedText = untrackedOut.text();
+  const hasUntrackedSrc = untrackedText
+    .split('\n')
+    .some((line) => line.startsWith('?? ') && line.slice(3).startsWith('src/'));
+  if (!hasUntrackedSrc) {
+    const [outNewest, inNewest] = await Promise.all([
+      newestMtimeUnder([OUT]),
+      newestMtimeUnder(INPUTS),
+    ]);
+    if (inNewest <= outNewest) {
+      console.log('[maybe-build] build/ is fresh — skipping rebuild');
+      process.exit(0);
+    }
+  } else {
+    console.log('[maybe-build] untracked src files — rebuilding');
   }
-  console.log('[maybe-build] inputs changed since last build — rebuilding');
 }
 await $`bun run build`;

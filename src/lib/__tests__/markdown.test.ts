@@ -126,6 +126,14 @@ describe('renderStreamingPreview', () => {
     expect(result).toContain('whitespace-pre-wrap');
     expect(result).toContain('**bold**'); // raw markdown visible during stream
   });
+
+  it('skips the LaTeX scan for large buffers to bound per-frame cost', () => {
+    const body = `a$b_${'x'.repeat(9000)}`;
+    const result = renderStreamingPreview(body);
+    expect(result.startsWith('<pre class="whitespace-pre-wrap break-words">')).toBe(true);
+    expect(result).toContain('a$b_');
+    expect(result).toContain('x'.repeat(100));
+  });
 });
 
 describe('renderMarkdown unresolved-lang hook', () => {

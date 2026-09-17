@@ -359,8 +359,16 @@ export const ConnectedMessageSchema = v.looseObject({
     )
   ),
   activeToolNames: v.optional(v.array(v.string())),
+  commands: v.optional(
+    v.array(
+      v.looseObject({
+        name: v.string(),
+        description: v.optional(v.string()),
+        source: v.string(),
+      })
+    )
+  ),
 });
-// ── Custom Server Event Schemas ──────────────────────────────────────────────
 
 export const BashExecutionUpdateSchema = v.looseObject({
   type: v.literal('bash_execution_update'),
@@ -432,8 +440,16 @@ export const SessionLoadedSchema = v.looseObject({
     )
   ),
   activeToolNames: v.optional(v.array(v.string())),
+  commands: v.optional(
+    v.array(
+      v.looseObject({
+        name: v.string(),
+        description: v.optional(v.string()),
+        source: v.string(),
+      })
+    )
+  ),
 });
-
 export const SessionsErrorSchema = v.looseObject({
   type: v.literal('sessions_error'),
   message: v.string(),
@@ -443,7 +459,6 @@ export const SessionsErrorSchema = v.looseObject({
 export const ModelChangedSchema = v.looseObject({
   type: v.literal('model_changed'),
   model: v.nullable(ModelInfoSchema),
-  thinkingLevel: v.optional(v.string()),
   sessionId: v.optional(v.string()),
 });
 
@@ -747,6 +762,7 @@ export const AgentErrorSchema = v.looseObject({
   type: v.literal('agent_error'),
   error: v.string(),
   sessionId: v.optional(v.string()),
+  dedupeKey: v.optional(v.string()),
 });
 
 export const QueueRestoredSchema = v.looseObject({

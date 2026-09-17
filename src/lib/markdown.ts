@@ -630,8 +630,12 @@ export function memoizedRenderMarkdown(content: string): string {
  * the full accumulated markdown on every token delta (the streaming hot spot)
  * stalls the main thread on long responses; this only resolves complete math
  * expressions before escaping, leaving the rest as plain text until final render.
+ * Above 8k chars the per-char LaTeX scan itself becomes the hot spot, so
+ * large buffers skip it and escape directly (final render still resolves math).
  */
 export function renderStreamingPreview(src: string): string {
+  if (src.length > 8000)
+    return `<pre class="whitespace-pre-wrap break-words">${escHtml(src)}</pre>`;
   return `<pre class="whitespace-pre-wrap break-words">${escHtml(renderCompleteLatex(src))}</pre>`;
 }
 

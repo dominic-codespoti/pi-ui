@@ -688,12 +688,7 @@ describe('ProjectsState', () => {
       expect(send).toHaveBeenCalledWith({ type: 'dir_complete', prefix: '~/projects/' });
     });
 
-    it('onSessionLoaded settles a pending operation and reports whether one was pending', () => {
-      projectsState.pendingNewSession = true;
-      projectsState.sessionLoading = true;
-      expect(projectsState.onSessionLoaded()).toBe(true);
-      expect(projectsState.pendingNewSession).toBe(false);
-      expect(projectsState.sessionLoading).toBe(false);
+    it('onSessionLoaded without a pending operation is a no-op success', () => {
       expect(projectsState.onSessionLoaded()).toBe(false);
     });
     it('a session_loaded snapshot without a token does not settle a pending switch', () => {
@@ -766,11 +761,16 @@ describe('ProjectsState', () => {
 
     it('sessions_error cancels the watchdog', () => {
       vi.useFakeTimers();
-      projectsState.send = vi.fn().mockReturnValue(true);
+      const send = vi.fn().mockReturnValue(true);
+      projectsState.send = send;
       projectsState.newSession();
-      projectsState.handleMessage({ type: 'sessions_error', message: 'oops' } as {
-        type: string;
-      } & Record<string, unknown>);
+      const requestId = projectsState.pendingRequestId;
+      expect(requestId).toEqual(expect.any(String));
+      projectsState.handleMessage({
+        type: 'sessions_error',
+        message: 'oops',
+        requestId,
+      } as { type: string } & Record<string, unknown>);
       vi.advanceTimersByTime(SESSION_OP_TIMEOUT_MS + 1);
       expect(projectsState.error).toBe('oops'); // untouched by the watchdog
       expect(projectsState.pendingNewSession).toBe(false);

@@ -322,7 +322,6 @@ export interface ConnectedMessage {
   webhookUrl?: string;
   /** Full session-owned extension UI snapshot; replaces stale panels on connect/switch. */
   extensionUiState?: ExtensionUiStatePayload;
-  /** Legacy widget-only snapshot accepted from older servers. */
   /** Project trust state used when loading project-scoped resources. */
   projectTrust?: ProjectTrustInfo;
   /** Runtime diagnostics collected during session/service creation. */
@@ -333,6 +332,8 @@ export interface ConnectedMessage {
   tools?: Array<{ name: string; description: string; isBuiltin: boolean; origin?: string }>;
   /** Names of active/enabled tools. */
   activeToolNames?: string[];
+  /** Extension slash commands available in this session (snapshot-embedded catalog). */
+  commands?: Array<{ name: string; description?: string; source: string }>;
 }
 export type SessionPhase = 'idle' | 'running' | 'awaiting-input' | 'error';
 
@@ -354,7 +355,7 @@ export type SessionPhase = 'idle' | 'running' | 'awaiting-input' | 'error';
  * sessions held in memory.
  *
  * Custom server events (not from the SDK):
- *   { type: "model_changed",           model: ModelInfo | null; thinkingLevel?: string; sessionId?: string }
+ *   { type: "model_changed",           model: ModelInfo | null; sessionId?: string }
  *   { type: "session_loaded",          sessionId, isStreaming, activeToolName?, thinkingLevel, model, availableModels, messages, contextUsage }
  *   { type: "sessions_list",           sessions: SessionSummary[] }
  *   { type: "all_sessions_list",       sessions: SessionSummary[] }
@@ -466,7 +467,7 @@ export type PiEvent = { type: string } & Record<string, unknown>;
 /** Custom server-authored events (not from the SDK). Typed so payload drift —
  *  a missing or renamed field — fails at compile time on the broadcast site. */
 export type ServerCustomEvent =
-  | { type: 'model_changed'; model: ModelInfo | null; thinkingLevel?: string; sessionId?: string }
+  | { type: 'model_changed'; model: ModelInfo | null; sessionId?: string }
   | {
       type: 'session_loaded';
       /** Correlation token for the initiating client; accept a snapshot only when it matches an in-flight switch_session/new_session request, and treat unstamped global broadcasts as foreign switches. */
@@ -497,6 +498,7 @@ export type ServerCustomEvent =
       contextUsage?: ContextUsage | null;
       tools?: Array<{ name: string; description: string; isBuiltin: boolean; origin?: string }>;
       activeToolNames?: string[];
+      commands?: Array<{ name: string; description?: string; source: string }>;
     }
   /** Full tool output fetched for an expanded history row. */
   | {
@@ -588,7 +590,7 @@ export type ServerCustomEvent =
   | { type: 'extension_completions'; trigger: string; query: string; items: unknown[] }
   | { type: 'settings'; settings: Record<string, unknown> }
   | { type: 'pong' }
-  | { type: 'agent_error'; error: string; sessionId?: string }
+  | { type: 'agent_error'; error: string; sessionId?: string; dedupeKey?: string }
   | { type: 'queue_restored'; text: string }
   | {
       type: 'session_runtime';
@@ -776,11 +778,9 @@ export type ClientMessage =
   | { type: 'update_packages'; source?: string }
   | { type: 'check_package_updates' }
   | { type: 'set_package_filter'; source: string; filter: Record<string, unknown> }
-  | { type: 'get_commands' }
   /**
    * Fetch a skill markdown file from a URL (GitHub blob / raw / direct) and
    * write it to either the project or user skills directory.
-   * Server replies with skill_install_result.
    */
   | { type: 'install_skill'; url: string; scope: 'project' | 'user' }
   /** Check current and latest available pi-ui / pi SDK versions. */

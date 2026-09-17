@@ -245,7 +245,6 @@ Session-scoped client messages accept an optional target field, `sessionId?: str
 | `set_active_tools`  | `{ sessionId?, toolNames }` | Set the active tool subset for a session                            |
 | `get_resources`     | —                           | Request skills/prompts (replies with `resources_list`)              |
 | `get_extensions`    | —                           | Request extension list (replies with `extensions_list`)             |
-| `get_commands`      | —                           | Request slash commands (replies with `commands_list`)               |
 | `install_skill`     | `{ url, scope }`            | Install a skill from URL (replies with `skill_install_result`)      |
 | `get_update_status` | —                           | Check for updates (replies with `update_status`)                    |
 | `run_update`        | `{ target }`                | Execute update (`ui` or `sdk`)                                      |

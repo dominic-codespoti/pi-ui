@@ -416,6 +416,7 @@ test.describe('Projects sidebar', () => {
                 sessionId: 'new-session',
                 messages: [],
                 sessionName: undefined,
+                requestId: msg.requestId,
               })
             );
           }, 1000);

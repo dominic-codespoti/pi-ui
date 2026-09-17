@@ -36,10 +36,8 @@
   } = $props();
 
   const translateClosed = $derived(side === 'left' ? '-100%' : '100%');
-  const borderClass = $derived('');
   const fixedSideClass = $derived(side === 'left' ? 'left-0' : 'right-0');
   const resizeSideClass = $derived(side === 'left' ? 'right-0' : 'left-0');
-  const resizeCursorClass = $derived(side === 'left' ? 'cursor-col-resize' : 'cursor-col-resize');
   const panelStyle = $derived(
     isMobile
       ? `width: min(${width}px, calc(100vw - 1rem)); transform: translateX(${open ? '0' : translateClosed}); transition: transform ${open ? '300ms cubic-bezier(0.34,1.56,0.64,1)' : '220ms cubic-bezier(0.33,1,0.68,1)'}; padding-top: env(safe-area-inset-top, 0px); padding-bottom: env(safe-area-inset-bottom, 0px);`
@@ -72,9 +70,7 @@
   aria-hidden={!open}
 >
   <div
-    class="w-full h-full {surfaceClass} {borderClass} {isMobile
-      ? mobileRoundClass
-      : ''} flex flex-col overflow-hidden"
+    class="w-full h-full {surfaceClass} {isMobile ? mobileRoundClass : ''} flex flex-col overflow-hidden"
   >
     {#if header}
       {@render header()}
@@ -107,9 +103,7 @@
 
   {#if !isMobile && onResizeStart && onResizeMove && onResizeStop}
     <div
-      class="absolute top-0 {resizeSideClass} bottom-0 w-1.5 z-10 {resizeCursorClass} hover:bg-primary/25 active:bg-primary/40 transition-colors"
-      onpointerdown={onResizeStart}
-      onpointermove={onResizeMove}
+      class="absolute top-0 {resizeSideClass} bottom-0 w-1.5 z-10 cursor-col-resize hover:bg-primary/25 active:bg-primary/40 transition-colors"
       onpointerup={onResizeStop}
       onpointercancel={onResizeStop}
       aria-hidden="true"

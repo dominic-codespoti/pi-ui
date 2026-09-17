@@ -90,6 +90,7 @@ test.describe('PWA notifications', () => {
               cwd: String(msg.path),
               sessionName: undefined,
               isCompacting: false,
+              requestId: String(msg.requestId),
             })
           );
         }

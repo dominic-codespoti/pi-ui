@@ -401,7 +401,7 @@ const CONNECTED_S1 = {
   sessionMode: 'persisted',
 };
 
-function sessionLoadedFor(path: string, widgets: unknown[] = []) {
+function sessionLoadedFor(path: string) {
   const isProjectB = path.includes('project-b');
   return {
     type: 'session_loaded',
@@ -416,7 +416,6 @@ function sessionLoadedFor(path: string, widgets: unknown[] = []) {
     sessionPath: path,
     sessionMode: 'persisted',
     contextUsage: null,
-    widgets,
   };
 }
 
@@ -615,7 +614,7 @@ test.describe('Extension component widgets', () => {
         if (msg.type === 'get_projects') ws.send(JSON.stringify(PROJECTS_LIST_PAYLOAD));
         if (msg.type === 'get_all_sessions') ws.send(JSON.stringify(ALL_SESSIONS_LIST_PAYLOAD));
         if (msg.type === 'switch_session') {
-          ws.send(JSON.stringify(sessionLoadedFor(msg.path)));
+          ws.send(JSON.stringify({ ...sessionLoadedFor(msg.path), requestId: msg.requestId }));
         }
       });
       ws.send(JSON.stringify(CONNECTED_S1));
@@ -647,7 +646,11 @@ test.describe('Extension component widgets', () => {
         if (msg.type === 'get_all_sessions') ws.send(JSON.stringify(ALL_SESSIONS_LIST_PAYLOAD));
         if (msg.type === 'switch_session') {
           ws.send(
-            JSON.stringify({ ...sessionLoadedFor(msg.path), sessionName: 'Current session' })
+            JSON.stringify({
+              ...sessionLoadedFor(msg.path),
+              sessionName: 'Current session',
+              requestId: msg.requestId,
+            })
           );
         }
       });
@@ -679,18 +682,20 @@ test.describe('Extension component widgets', () => {
           JSON.stringify({
             ...sessionLoadedFor('/home/user/project-a/mock-session-002.jsonl'),
             sessionId: 'mock-session-002',
-            widgets: [
-              {
-                widgetKey: 'subagents',
-                widgetType: 'component',
-                widgetComponent: {
-                  kind: 'text',
-                  label: '',
-                  content: 'Active subagents: 1',
+            extensionUiState: {
+              widgets: [
+                {
+                  widgetKey: 'subagents',
+                  widgetType: 'component',
+                  widgetComponent: {
+                    kind: 'text',
+                    label: '',
+                    content: 'Active subagents: 1',
+                  },
+                  widgetPlacement: 'belowEditor',
                 },
-                widgetPlacement: 'belowEditor',
-              },
-            ],
+              ],
+            },
           })
         );
       }, 500);

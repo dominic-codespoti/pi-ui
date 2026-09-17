@@ -101,7 +101,7 @@ test.describe('Session status orbs', () => {
           bgRunning = false;
           clearInterval(bgTimer);
           // Real server also re-broadcasts runtime snapshots after a switch.
-          ws.send(JSON.stringify(sessionLoadedFor(msg.path)));
+          ws.send(JSON.stringify({ ...sessionLoadedFor(msg.path), requestId: msg.requestId }));
           ws.send(JSON.stringify(sessionRuntimePayload('s1', { phase: 'idle' })));
           // Switch #2 is "back to s1" — s3's background run finished unread.
           ws.send(
@@ -173,7 +173,7 @@ test.describe('Session status orbs', () => {
         if (msg.type === 'switch_session') {
           running = false;
           clearInterval(timer);
-          ws.send(JSON.stringify(sessionLoadedFor(msg.path)));
+          ws.send(JSON.stringify({ ...sessionLoadedFor(msg.path), requestId: msg.requestId }));
           ws.send(JSON.stringify(sessionRuntimePayload('s1', { phase: 'idle' })));
           ws.send(JSON.stringify(sessionRuntimePayload('s3', { phase: 'idle' })));
         }
@@ -216,7 +216,7 @@ test.describe('Session status orbs', () => {
         if (msg.type === 'switch_session') {
           bgRunning = false;
           clearInterval(bgTimer);
-          ws.send(JSON.stringify(sessionLoadedFor(msg.path)));
+          ws.send(JSON.stringify({ ...sessionLoadedFor(msg.path), requestId: msg.requestId }));
         }
       });
       ws.send(JSON.stringify(CONNECTED_S1));

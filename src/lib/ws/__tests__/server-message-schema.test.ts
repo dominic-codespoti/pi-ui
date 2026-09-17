@@ -197,7 +197,6 @@ describe('server-message-schema', () => {
         name: 'Claude 3.7 Sonnet',
         reasoning: true,
       },
-      thinkingLevel: 'high',
     });
     expect(modelChanged.ok).toBe(true);
 

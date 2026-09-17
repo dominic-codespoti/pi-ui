@@ -3165,22 +3165,8 @@ async function reloadSessionHost(
     diagnostics: current.diagnostics,
     ...stampOwner(sid),
   });
-  broadcast({
-    type: 'commands_list',
-    commands: extensionCommandsFor(session),
-    ...stampOwner(sid),
-  });
-  broadcast({
-    type: 'tools_list',
-    tools: session.getAllTools().map((tool) => ({
-      name: tool.name,
-      description: tool.description,
-      isBuiltin: tool.sourceInfo.source === 'builtin',
-      origin: tool.sourceInfo.source,
-    })),
-    activeToolNames: session.getActiveToolNames(),
-    ...stampOwner(sid),
-  });
+  // NOTE: session_loaded already embeds tools+commands via toolsPayloadFor —
+  // no standalone resends here (were duplicate traffic per reload).
   return 'applied';
 }
 function packageManagerFor(session: AgentSession): {
@@ -3736,6 +3722,7 @@ function snapshotModels(sess: AgentSession): ModelInfo[] {
 function toolsPayloadFor(sess: AgentSession): {
   tools: Array<{ name: string; description: string; isBuiltin: boolean; origin?: string }>;
   activeToolNames: string[];
+  commands: WireExtensionCommand[];
 } {
   return {
     tools: sess.getAllTools().map((tool) => ({
@@ -3745,6 +3732,7 @@ function toolsPayloadFor(sess: AgentSession): {
       origin: tool.sourceInfo.source,
     })),
     activeToolNames: sess.getActiveToolNames(),
+    commands: extensionCommandsFor(sess),
   };
 }
 
@@ -3788,7 +3776,6 @@ function broadcastSessionLoaded(
     diagnostics: entry?.diagnostics ?? [],
     modelFallbackMessage: entry?.modelFallbackMessage,
     extensionUiState: extensionUiStateForSession(sess.sessionId),
-    widgets: widgetsForSession(sess.sessionId),
     ...toolsPayloadFor(sess),
   };
   // session_loaded is normally a global authoritative snapshot. A request
@@ -3925,13 +3912,8 @@ async function setActiveSession(
   }
 
   broadcastSessionLoaded(session, requestId, requester);
-  if (entry.hostBound) {
-    broadcast({
-      type: 'commands_list',
-      commands: extensionCommandsFor(session),
-      ...stampOwner(targetId),
-    });
-  }
+  // NOTE: session_loaded already embeds commands via toolsPayloadFor — no
+  // standalone commands_list resend here (was duplicate traffic per switch).
   projectCatalog.apply({ kind: 'touch', path: session.sessionManager.getCwd() || cwd });
   scheduleSessionListRefresh();
 }
@@ -4162,7 +4144,6 @@ try {
                 modelFallbackMessage: managedSessionFor(sess.sessionId)?.modelFallbackMessage,
                 webhookUrl: getWebhookUrl() || undefined,
                 extensionUiState: extensionUiStateForSession(sess.sessionId),
-                widgets: widgetsForSession(sess.sessionId),
                 ...toolsPayloadFor(sess),
               })
             );
@@ -4183,21 +4164,9 @@ try {
               return;
             }
           }
-          // Extensions may still be binding in the background. The binding
-          // completion publishes the authoritative commands/tools snapshot.
-          try {
-            if (managedSessionFor(sess.sessionId)?.hostBound) {
-              ws.send(
-                JSON.stringify({
-                  type: 'commands_list',
-                  commands: extensionCommandsFor(sess),
-                  ...stampOwner(sess.sessionId),
-                })
-              );
-            }
-          } catch (err) {
-            log.error('[pifrontier] Failed to send extension commands:', err);
-          }
+          // NOTE: connected already embeds commands via toolsPayloadFor, and
+          // background bind completion publishes its own snapshot — no
+          // standalone resend here (was duplicate traffic per connect).
 
           // Replay only ownerless requests and requests for the active
           // session. Replaying other session dialogs would leak stale UI into
@@ -4387,6 +4356,15 @@ try {
                     mimeType: img.mimeType,
                   }));
                   if (s.isStreaming || _promptsInFlight.has(s.sessionId)) {
+                    // Ack first so the client renders the queued chip instantly
+                    // — s.steer() only emits queue_update after extension input
+                    // hooks resolve, which can take seconds mid-turn.
+                    broadcast({
+                      type: 'queue_update',
+                      steering: [...s.getSteeringMessages(), msg.message],
+                      followUp: [...s.getFollowUpMessages()],
+                      sessionId: s.sessionId,
+                    });
                     await s.steer(msg.message, images);
                   } else {
                     if (hasQueuedRuns(s.sessionId) || !reserveRunSlot(target)) {
@@ -4453,17 +4431,25 @@ try {
             case 'abort': {
               const target = targetEntry(ws.data, msg, (data) => ws.send(data));
               if (!target) break;
-              await withPerSessionMutationLock(target.session.sessionId, async () => {
-                // Clear queued steering/follow-up messages before abort so they
-                // don't continue processing after the abort takes effect.
-                const s = target.session;
+              // Abort must not wait behind the per-session mutation lock — a
+              // long prompt/steer/edit handler holds that lock while streaming,
+              // so a locked abort would only fire after the run finished.
+              // Read the entry directly (no generation check: an abort is valid
+              // whenever the session exists) and signal synchronously.
+              const entry = managedSessionFor(target.session.sessionId);
+              const s = entry?.session ?? target.session;
+              try {
                 const cleared = s.clearQueue();
                 const deferred = queuedRuns.get(s.sessionId) ?? [];
                 queuedRuns.delete(s.sessionId);
                 runReservations.delete(s.sessionId);
-                broadcastQueueState(target);
+                if (entry) broadcastQueueState(entry);
                 s.abortBash();
-                await s.abort();
+                // Signal first so streaming stops promptly; waitForIdle (which
+                // needs the lock-holder to finish) happens in the background.
+                void s.abort().catch((err) => {
+                  log.error('[pifrontier] abort error:', err);
+                });
                 // Restore any queued text to the requesting tab's composer so the
                 // user can re-submit it.
                 const allQueued = [
@@ -4479,7 +4465,10 @@ try {
                     })
                   );
                 }
-              });
+              } catch (err) {
+                log.error('[pifrontier] abort error:', err);
+                ws.send(JSON.stringify({ type: 'agent_error', error: String(err) }));
+              }
               break;
             }
 
@@ -4749,13 +4738,17 @@ try {
               if (!target) break;
               const owner = target.session.sessionId;
               const verdict = terminalInputRegistry.dispatch(owner, data);
-              broadcast({
-                type: 'extension_terminal_input_result',
-                id: inputId,
-                consumed: verdict.consumed,
-                ...(verdict.data !== undefined ? { data: verdict.data } : {}),
-                ...stampOwner(owner),
-              });
+              // Requester-only reply — a broadcast fans every keystroke's
+              // verdict to all tabs and queues it behind streaming deltas.
+              ws.send(
+                JSON.stringify({
+                  type: 'extension_terminal_input_result',
+                  id: inputId,
+                  consumed: verdict.consumed,
+                  ...(verdict.data !== undefined ? { data: verdict.data } : {}),
+                  ...stampOwner(owner),
+                })
+              );
               break;
             }
             case 'extension_editor_text_change': {
@@ -6157,7 +6150,6 @@ try {
                   ...sess.resourceLoader.getSkills().diagnostics,
                   ...sess.resourceLoader.getPrompts().diagnostics,
                 ];
-                const shortcuts = runner.getShortcuts({}) as Map<string, PiSDKNS.ExtensionShortcut>;
                 const summaries: ExtensionSummary[] = extensions.map((extension) => ({
                   source: extension.sourceInfo.source,
                   path: extension.sourceInfo.path,
@@ -6202,7 +6194,6 @@ try {
                     sessionId: sess.sessionId,
                   })
                 );
-                void shortcuts;
               } catch (err) {
                 log.error('[pifrontier] get_extensions error:', err);
                 ws.send(
@@ -6425,29 +6416,6 @@ try {
               break;
             }
 
-            case 'get_commands': {
-              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
-              if (!target) break;
-              try {
-                ws.send(
-                  JSON.stringify({
-                    type: 'commands_list',
-                    commands: extensionCommandsFor(target.session),
-                    ...stampOwner(target.session.sessionId),
-                  })
-                );
-              } catch (err) {
-                log.error('[pifrontier] get_commands error:', err);
-                ws.send(
-                  JSON.stringify({
-                    type: 'commands_list',
-                    commands: [],
-                    ...stampOwner(target.session.sessionId),
-                  })
-                );
-              }
-              break;
-            }
 
             case 'install_skill': {
               const target = targetEntry(ws.data, msg, (data) => ws.send(data));
@@ -7144,9 +7112,12 @@ const CRASH_DEDUPE_MS = 30_000;
 const CRASH_DEDUPE_MAX = 20;
 
 function reportCrash(kind: string, err: unknown): void {
-  log.error(`${kind}:`, err instanceof Error ? err : new Error(String(err)));
+  const error = err instanceof Error ? err : new Error(String(err));
+  // The broadcast message is lossy by design (message only) — log the stack
+  // here so the passive-crash source is identifiable from server output.
+  log.error(`${kind}:`, error, error.stack ? `\n${error.stack}` : '');
   try {
-    const key = `${kind}:${err instanceof Error ? err.message : String(err)}`;
+    const key = `${kind}:${error.message}`;
     const now = Date.now();
     const lastAt = _crashDedupe.get(key);
     if (lastAt !== undefined && now - lastAt < CRASH_DEDUPE_MS) return;
@@ -7160,6 +7131,10 @@ function reportCrash(kind: string, err: unknown): void {
     broadcast({
       type: 'agent_error',
       error: `Internal server error (${kind}): ${err instanceof Error ? err.message : String(err)}`,
+      // Lets clients collapse a looping fault into one notice — the dedupe
+      // window above already rate-limits, but a tab that reconnects mid-loop
+      // would otherwise stack a fresh notice per rebroadcast.
+      dedupeKey: `crash:${key}`,
     });
   } catch {
     /* broadcast unavailable during startup/shutdown */
