@@ -22,29 +22,20 @@ test.describe('Server smoke', () => {
     expect(response).not.toBeNull();
   });
 
-  test('/ws returns 401 without cookie', async ({ page }) => {
-    // Playwright's routeWebSocket intercepts at the browser level; to test the
-    // real server endpoint we need to go through a real WS connection attempt.
-    // We use page.exposeFunction and a raw WebSocket to verify the 401.
-    const status = await page.evaluate(async () => {
-      try {
-        const ws = new WebSocket(`ws://${location.host}/ws`);
-        await new Promise((resolve, reject) => {
-          ws.onopen = () => {
-            ws.close();
-            resolve('opened');
-          };
-          ws.onerror = () => resolve('error');
-          ws.onclose = (e) => resolve(`closed:${e.code}`);
-        });
-        return 'no-error';
-      } catch {
-        return 'exception';
-      }
+  test('/ws returns 401 without cookie', async ({ request }) => {
+    // Chromium does not expose the HTTP response status for a failed
+    // WebSocket handshake. In this case it also leaves the browser-level
+    // error/close events pending, so a raw WebSocket promise can hang.
+    // Exercise the real upgrade request instead and assert its HTTP status.
+    const response = await request.get('/ws', {
+      headers: {
+        Connection: 'Upgrade',
+        Upgrade: 'websocket',
+        'Sec-WebSocket-Version': '13',
+        'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==',
+      },
     });
-    // Without auth, the server should reject the WS upgrade (401)
-    // which typically manifests as an error/close event rather than open.
-    expect(status).not.toBe('opened');
+    expect(response.status()).toBe(401);
   });
 
   test('login page has correct HTML structure', async ({ page }) => {

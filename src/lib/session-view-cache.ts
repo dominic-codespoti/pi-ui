@@ -5,10 +5,7 @@ import type { ContextUsage } from '#lib/ws/protocol.js';
 export const MAX_RETAINED_SESSION_VIEWS = 3;
 
 /** UI state kept while a session is resident but not currently visible. */
-export type SessionView = {
-  messages: UIMessage[];
-  activeStreamMsg: UIMessage | null;
-  toolsById: Map<string, UIMessage>;
+export type SessionViewUiState = {
   expandedUserMsgs: Set<string>;
   truncatedUserMsgs: Set<string>;
   draft: string;
@@ -16,6 +13,13 @@ export type SessionView = {
   queuedSteering: string[];
   queuedFollowUp: string[];
   scrollAtBottom: boolean;
+};
+
+/** UI state and the retained transcript for an inactive resident session. */
+export type SessionView = SessionViewUiState & {
+  messages: UIMessage[];
+  activeStreamMsg: UIMessage | null;
+  toolsById: Map<string, UIMessage>;
 };
 
 const IMAGE_DATA_URL_RE = /data:image\/[^;]+;base64,[A-Za-z0-9+/_=-]+/gi;
@@ -70,6 +74,18 @@ function cloneMessage(message: UIMessage): UIMessage {
   };
 }
 
+function cloneUiState(view: SessionViewUiState): SessionViewUiState {
+  return {
+    expandedUserMsgs: new Set(view.expandedUserMsgs),
+    truncatedUserMsgs: new Set(view.truncatedUserMsgs),
+    draft: view.draft,
+    contextUsage: view.contextUsage ? { ...view.contextUsage } : null,
+    queuedSteering: view.queuedSteering.slice(),
+    queuedFollowUp: view.queuedFollowUp.slice(),
+    scrollAtBottom: view.scrollAtBottom,
+  };
+}
+
 function cloneView(view: SessionView): SessionView {
   const messages = view.messages.map(cloneMessage);
   const byId = new Map(messages.map((message) => [message.id, message]));
@@ -84,13 +100,7 @@ function cloneView(view: SessionView): SessionView {
       ? (byId.get(view.activeStreamMsg.id) ?? cloneMessage(view.activeStreamMsg))
       : null,
     toolsById,
-    expandedUserMsgs: new Set(view.expandedUserMsgs),
-    truncatedUserMsgs: new Set(view.truncatedUserMsgs),
-    draft: view.draft,
-    contextUsage: view.contextUsage ? { ...view.contextUsage } : null,
-    queuedSteering: view.queuedSteering.slice(),
-    queuedFollowUp: view.queuedFollowUp.slice(),
-    scrollAtBottom: view.scrollAtBottom,
+    ...cloneUiState(view),
   };
 }
 
@@ -112,6 +122,19 @@ export class SessionViewCache {
       if (typeof oldest !== 'string') break;
       this.views.delete(oldest);
     }
+  }
+
+  /**
+   * Restore only the inexpensive UI state for a retained resident. The
+   * transcript stays in the cache for background event updates and is not
+   * copied into the visible session before its authoritative snapshot arrives.
+   */
+  restoreUiState(sessionId: string): SessionViewUiState | null {
+    const view = this.views.get(sessionId);
+    if (!view) return null;
+    this.views.delete(sessionId);
+    this.views.set(sessionId, view);
+    return cloneUiState(view);
   }
 
   /** Restore a retained view and mark it as most recently used. */

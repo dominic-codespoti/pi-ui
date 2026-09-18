@@ -2,9 +2,9 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import {
   mkdirSync,
   rmSync,
+  utimesSync,
   writeFileSync,
   appendFileSync,
-  utimesSync,
   existsSync,
   readFileSync,
 } from 'node:fs';
@@ -217,9 +217,9 @@ describe('session-scan', () => {
     await flushSessionScanCache();
     expect(existsSync(cacheFile)).toBe(true);
 
-    // Simulate a restart: wipe in-memory state, rewrite the session file with
-    // identical size + mtime but different content. If the persisted cache is
-    // honoured, the OLD summary comes back without the file being re-read.
+    // Simulate a restart: rewrite the session file with identical size + mtime
+    // but the same inode. Stat metadata cannot detect an in-place rewrite, so
+    // the persisted cache remains authoritative.
     const original = readFileSync(path, 'utf8');
     writeFileSync(path, original.replace('Original name', 'Tampered name'));
     utimesSync(path, pinned, pinned);
@@ -228,7 +228,6 @@ describe('session-scan', () => {
     initSessionScanCache(cacheFile);
     const second = await scanAllSessions(ROOT);
     expect(second[0].name).toBe('Original name');
-    expect(second[0].id).toBe('s1');
     expect(second[0].messageCount).toBe(1);
     expect(second[0].modified.getTime()).toBe(first[0].modified.getTime());
   });

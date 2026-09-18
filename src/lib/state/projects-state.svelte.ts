@@ -161,10 +161,85 @@ class ProjectsState {
   /** Optional callback invoked before switching to a new session. */
   onBeforeSwitch?: (targetPath: string) => void;
 
+  /** Project metadata normalized by cwd; public access remains array-shaped. */
+  private projectByCwd = new SvelteMap<string, ProjectInfo>();
+  /** Session summaries normalized by stable session id. */
+  private sessionById = new SvelteMap<string, SessionSummary>();
+  /** Stable session ids grouped by cwd, preserving server/list insertion order. */
+  private sessionIdsByCwd = new SvelteMap<string, SvelteSet<string>>();
+  /** Materialized groups; only groups touched by a state delta are rebuilt. */
+  private groupByCwd = new SvelteMap<string, ProjectGroup>();
+  /** Invalidates derived public collections after batched map updates. */
+  private groupRevision = $state(0);
+
   /** Merged project list from the server (registry + session dirs). */
-  projects = $state<ProjectInfo[]>([]);
-  /** All sessions across all projects. */
-  allSessions = $state<SessionSummary[]>([]);
+  get projects(): ProjectInfo[] {
+    return [...this.projectByCwd.values()];
+  }
+  set projects(value: ProjectInfo[]) {
+    const previous = new SvelteMap(this.projectByCwd);
+    const next = new SvelteMap<string, ProjectInfo>();
+    for (const project of value) next.set(project.cwd, project);
+
+    const affected = new SvelteSet<string>();
+    for (const [cwd, project] of previous) {
+      const replacement = next.get(cwd);
+      if (
+        !replacement ||
+        replacement.name !== project.name ||
+        replacement.pinned !== project.pinned ||
+        replacement.exists !== project.exists ||
+        replacement.registered !== project.registered ||
+        replacement.sessionCount !== project.sessionCount ||
+        replacement.lastActivity !== project.lastActivity
+      ) {
+        affected.add(cwd);
+      }
+    }
+    for (const cwd of next.keys()) {
+      if (!previous.has(cwd)) affected.add(cwd);
+    }
+
+    this.projectByCwd.clear();
+    for (const [cwd, project] of next) this.projectByCwd.set(cwd, project);
+    for (const cwd of affected) this.rebuildProjectGroup(cwd);
+    this.groupRevision++;
+  }
+
+  /** All sessions across all projects, exposed as the historical array API. */
+  get allSessions(): SessionSummary[] {
+    return [...this.sessionById.values()];
+  }
+  set allSessions(value: SessionSummary[]) {
+    const affected = new SvelteSet<string>();
+    for (const session of this.sessionById.values()) {
+      const cwd = session.cwd ?? '';
+      if (cwd) affected.add(cwd);
+    }
+
+    // Map normalization makes pooled/in-memory sessions with the same path
+    // independent and ensures every later delta addresses one stable id.
+    const normalized = new SvelteMap<string, SessionSummary>();
+    for (const session of value) normalized.set(session.id, session);
+
+    this.sessionById.clear();
+    this.sessionIdsByCwd.clear();
+    for (const session of normalized.values()) {
+      this.sessionById.set(session.id, session);
+      const cwd = session.cwd ?? '';
+      if (!cwd) continue;
+      let ids = this.sessionIdsByCwd.get(cwd);
+      if (!ids) {
+        ids = new SvelteSet<string>();
+        this.sessionIdsByCwd.set(cwd, ids);
+      }
+      ids.add(session.id);
+      affected.add(cwd);
+    }
+    for (const cwd of affected) this.rebuildProjectGroup(cwd);
+    this.groupRevision++;
+  }
+
   /** Active session's working directory (synced from connected/session_loaded). */
   cwd = $state('');
   /** Active session id (synced from the page). */
@@ -220,7 +295,7 @@ class ProjectsState {
   /** Watchdog for in-flight new_session/switch_session — see SESSION_OP_TIMEOUT_MS. */
   private opTimeout: ReturnType<typeof setTimeout> | null = null;
   /** Request ids whose responses can no longer change the visible session. */
-  private retiredRequestIds = new Set<string>();
+  private retiredRequestIds = new SvelteSet<string>();
   private requestSequence = 0;
   collapsed = new SvelteSet<string>(loadCollapsed());
   /** Projects whose full session list is expanded past the preview limit. */
@@ -237,41 +312,23 @@ class ProjectsState {
 
   /** Projects merged with their sessions. Pinned first, then recent. */
   groups = $derived.by<ProjectGroup[]>(() => {
-    const byCwd = new SvelteMap<string, SessionSummary[]>();
-    for (const s of this.allSessions) {
-      const key = s.cwd ?? '';
-      if (!key) continue;
-      const list = byCwd.get(key);
-      if (list) list.push(s);
-      else byCwd.set(key, [s]);
+    // No state delta has populated the indexes yet; reading the revision also
+    // keeps this derived value invalidated when the batched indexes change.
+    if (this.groupRevision === 0) return [];
+    const out: ProjectGroup[] = [];
+    const known = new SvelteSet<string>();
+    for (const cwd of this.projectByCwd.keys()) {
+      const group = this.groupByCwd.get(cwd);
+      if (group) {
+        out.push(group);
+        known.add(cwd);
+      }
     }
-
-    // Subtree-recency order within a project (parents sit at the position of
-    // their liveliest descendant, children nested under them). The server
-    // sorts full lists by recency, but live session_updated deltas upsert in
-    // place — without this re-derivation a session that just ran would keep
-    // its old row position until the next full list.
-    const out: ProjectGroup[] = this.projects.map((p) => ({
-      ...p,
-      sessions: buildSessionRows(byCwd.get(p.cwd) ?? []),
-    }));
-
     // Sessions in directories the server list doesn't know yet (e.g. before
-    // the first projects_list arrives) still need a group.
-    for (const [dir, sessions] of byCwd) {
-      if (out.some((g) => g.cwd === dir)) continue;
-      out.push({
-        cwd: dir,
-        name: pathBasename(dir),
-        pinned: false,
-        exists: true,
-        registered: false,
-        sessionCount: sessions.length,
-        lastActivity: Math.max(0, ...sessions.map((s) => s.modified)),
-        sessions: buildSessionRows(sessions),
-      });
+    // the first projects_list arrives) are materialized as fallback groups.
+    for (const [cwd, group] of this.groupByCwd) {
+      if (!known.has(cwd)) out.push(group);
     }
-
     return out.sort((a, b) =>
       a.pinned !== b.pinned ? (a.pinned ? -1 : 1) : b.lastActivity - a.lastActivity
     );
@@ -358,9 +415,81 @@ class ProjectsState {
     return null;
   }
 
+  /** Rebuild one project group from its normalized session bucket. */
+  private rebuildProjectGroup(cwd: string): void {
+    const project = this.projectByCwd.get(cwd);
+    const ids = this.sessionIdsByCwd.get(cwd);
+    if (!project && (!ids || ids.size === 0)) {
+      this.groupByCwd.delete(cwd);
+      return;
+    }
+
+    const sessions: SessionSummary[] = [];
+    let lastActivity = 0;
+    if (ids) {
+      for (const id of ids) {
+        const session = this.sessionById.get(id);
+        if (!session) continue;
+        sessions.push(session);
+        if (session.modified > lastActivity) lastActivity = session.modified;
+      }
+    }
+
+    this.groupByCwd.set(
+      cwd,
+      project
+        ? { ...project, sessions: buildSessionRows(sessions) }
+        : {
+            cwd,
+            name: pathBasename(cwd),
+            pinned: false,
+            exists: true,
+            registered: false,
+            sessionCount: sessions.length,
+            lastActivity,
+            sessions: buildSessionRows(sessions),
+          }
+    );
+  }
+
+  /** Upsert one session and rebuild only its previous/current project groups. */
+  private upsertSession(session: SessionSummary): void {
+    const previous = this.sessionById.get(session.id);
+    const previousCwd = previous?.cwd ?? '';
+    const nextCwd = session.cwd ?? '';
+    this.sessionById.set(session.id, session);
+
+    if (previousCwd !== nextCwd) {
+      if (previousCwd) {
+        const oldIds = this.sessionIdsByCwd.get(previousCwd);
+        oldIds?.delete(session.id);
+        if (oldIds && oldIds.size === 0) this.sessionIdsByCwd.delete(previousCwd);
+      }
+      if (nextCwd) {
+        let nextIds = this.sessionIdsByCwd.get(nextCwd);
+        if (!nextIds) {
+          nextIds = new SvelteSet<string>();
+          this.sessionIdsByCwd.set(nextCwd, nextIds);
+        }
+        nextIds.add(session.id);
+      }
+    } else if (!previous && nextCwd) {
+      let ids = this.sessionIdsByCwd.get(nextCwd);
+      if (!ids) {
+        ids = new SvelteSet<string>();
+        this.sessionIdsByCwd.set(nextCwd, ids);
+      }
+      ids.add(session.id);
+    }
+
+    if (previousCwd) this.rebuildProjectGroup(previousCwd);
+    if (nextCwd && nextCwd !== previousCwd) this.rebuildProjectGroup(nextCwd);
+    this.groupRevision++;
+  }
+
   /** Remove runtime snapshots for sessions that disappeared from the authoritative list. */
-  private pruneRuntimeState(previousSessionIds: Set<string>): void {
-    const knownIds = new Set(this.allSessions.map((session) => session.id));
+  private pruneRuntimeState(previousSessionIds: ReadonlySet<string>): void {
+    const knownIds = new SvelteSet(this.sessionById.keys());
     for (const id of this.runtime.keys()) {
       // A runtime frame can beat the first all_sessions_list response. Keep
       // that status until its row arrives, but discard statuses for sessions
@@ -384,14 +513,13 @@ class ProjectsState {
   // ── Server message intake ────────────────────────────────────────────────
   /**
    * Apply a partial state update atomically.
-   * `groups` is derived from both `projects` and `allSessions` — updating them
-   * through this single method makes the relationship explicit and ensures any
-   * future cross-field invariants are enforced in one place.
+   * The normalized session/project indexes and materialized groups are updated
+   * through this single method so cross-field invariants stay synchronized.
    */
   applyState(payload: { projects?: ProjectInfo[]; sessions?: SessionSummary[] }): void {
     if (payload.projects !== undefined) this.projects = payload.projects;
     if (payload.sessions !== undefined) {
-      const previousSessionIds = new Set(this.allSessions.map((session) => session.id));
+      const previousSessionIds = new SvelteSet(this.sessionById.keys());
       this.allSessions = payload.sessions;
       this.pruneRuntimeState(previousSessionIds);
     }
@@ -423,19 +551,8 @@ class ProjectsState {
         this.lastFullListAt = Date.now();
         return true;
       case 'session_updated': {
-        // Disk-derived sidebar deltas upsert by id — the derived groups re-sort
-        // by recency automatically.
-        const s = msg.session as SessionSummary | undefined;
-        if (s && typeof s.id === 'string') {
-          const idx = this.allSessions.findIndex((x) => x.id === s.id);
-          if (idx === -1) {
-            this.allSessions = [...this.allSessions, s];
-          } else if (this.allSessions[idx] !== s) {
-            const next = this.allSessions.slice();
-            next[idx] = s;
-            this.allSessions = next;
-          }
-        }
+        const session = msg.session as SessionSummary | undefined;
+        if (session && typeof session.id === 'string') this.upsertSession(session);
         return true;
       }
       case 'sessions_list':
@@ -571,10 +688,10 @@ class ProjectsState {
    * Returns true when an operation was settled so callers can close
    * operation-specific UI such as the session drawer.
    *
-  * The server always stamps the requester's snapshot with `requestId`.
-  * Unstamped snapshots are foreign-switch broadcasts from other tabs and
-  * never settle a pending operation.
-  */
+   * The server always stamps the requester's snapshot with `requestId`.
+   * Unstamped snapshots are foreign-switch broadcasts from other tabs and
+   * never settle a pending operation.
+   */
   onSessionLoaded(requestId?: string): boolean {
     const hadPendingOperation = this.pendingNewSession || this.sessionLoading;
     if (this.pendingRequestId !== null) {
@@ -719,12 +836,12 @@ class ProjectsState {
     this.send({ type: 'rename_project', cwd, name });
   }
 
-  renameSession(path: string, name: string): void {
-    this.send({ type: 'rename_session', path, name });
+  renameSession(sessionId: string, name: string): void {
+    this.send({ type: 'rename_session', sessionId, name });
   }
 
-  deleteSession(path: string): void {
-    this.send({ type: 'delete_session', path });
+  deleteSession(sessionId: string): void {
+    this.send({ type: 'delete_session', sessionId });
   }
 
   requestDirCompletions(prefix: string): void {

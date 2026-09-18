@@ -19,6 +19,8 @@ import { encodeTerminalKey } from '#lib/terminal-key-encoder.js';
 
 export type TerminalVerdict = { consumed: boolean; data?: string };
 
+const TERMINAL_VERDICT_TIMEOUT_MS = 2000;
+
 type ComposerSnapshot = {
   value: string;
   start: number;
@@ -100,8 +102,11 @@ export class ComposerTerminalBridge {
   private pending = new Map<
     string,
     {
-      settle: (verdict: TerminalVerdict) => void;
-      discard: () => void;
+      event: KeyboardEvent;
+      optimistic: boolean;
+      snapshot: ComposerSnapshot;
+      deadline: number;
+      applied: boolean;
     }
   >();
   /** In-flight keys whose paint awaits the server verdict (Enter/Escape). */
@@ -111,6 +116,9 @@ export class ComposerTerminalBridge {
   private lastNativeEditSeq = -1;
   private expectingNativeEdit = false;
   private expectedNativeSeq = -1;
+  private nextId = 0;
+  private deadlineTimer: Timer | undefined;
+  private deadlineAt = 0;
 
   constructor(private readonly host: ComposerBridgeHost) {}
 
@@ -188,20 +196,23 @@ export class ComposerTerminalBridge {
   settleVerdict(id: string, verdict: TerminalVerdict): boolean {
     const entry = this.pending.get(id);
     if (!entry) return false;
-    entry.settle(verdict);
+    this.settleEntry(id, entry, verdict);
     return true;
   }
 
   /** Socket close/reconnect: queued verdicts never arrive — settle as unconsumed. */
   flush(): void {
-    for (const entry of [...this.pending.values()]) entry.settle({ consumed: false });
+    this.clearDeadlineTimer();
+    for (const [id, entry] of this.pending) this.settleEntry(id, entry, { consumed: false });
     this.pending.clear();
     this.pendingAwaitedCount = 0;
+    this.clearDeadlineTimer();
   }
 
   /** Session switch — keys for the previous session must never apply. */
   discard(): void {
-    for (const entry of [...this.pending.values()]) entry.discard();
+    this.clearDeadlineTimer();
+    for (const entry of this.pending.values()) entry.applied = true;
     this.pending.clear();
     this.pendingAwaitedCount = 0;
   }
@@ -212,28 +223,63 @@ export class ComposerTerminalBridge {
     optimistic: boolean,
     snapshot: ComposerSnapshot
   ): void {
-    const id = crypto.randomUUID();
+    const id = `k${(++this.nextId).toString(36)}`;
     // Fire-and-forget: typing must never wait on an earlier key's verdict.
     const entry = {
+      event: e,
+      optimistic,
+      snapshot,
+      deadline: Date.now() + TERMINAL_VERDICT_TIMEOUT_MS,
       applied: false,
-      timeout: setTimeout(() => this.pending.get(id)?.settle({ consumed: false }), 2000),
     };
-    this.pending.set(id, {
-      settle: (verdict: TerminalVerdict) => {
-        if (entry.applied) return;
-        entry.applied = true;
-        clearTimeout(entry.timeout);
-        this.pending.delete(id);
-        if (!optimistic) this.pendingAwaitedCount = Math.max(0, this.pendingAwaitedCount - 1);
-        this.applyResult(e, verdict, snapshot, optimistic);
-      },
-      discard: () => {
-        entry.applied = true;
-        clearTimeout(entry.timeout);
-      },
-    });
+    this.pending.set(id, entry);
+    this.scheduleDeadline(entry.deadline);
     if (!optimistic) this.pendingAwaitedCount++;
     this.host.sendTerminalInput(id, data, this.host.getSessionId() ?? '');
+  }
+
+  private settleEntry(
+    id: string,
+    entry: {
+      event: KeyboardEvent;
+      optimistic: boolean;
+      snapshot: ComposerSnapshot;
+      deadline: number;
+      applied: boolean;
+    },
+    verdict: TerminalVerdict
+  ): void {
+    if (entry.applied) return;
+    entry.applied = true;
+    this.pending.delete(id);
+    if (!entry.optimistic) this.pendingAwaitedCount = Math.max(0, this.pendingAwaitedCount - 1);
+    this.applyResult(entry.event, verdict, entry.snapshot, entry.optimistic);
+  }
+
+  private scheduleDeadline(deadline: number): void {
+    if (this.deadlineTimer !== undefined && this.deadlineAt <= deadline) return;
+    if (this.deadlineTimer !== undefined) clearTimeout(this.deadlineTimer);
+    this.deadlineAt = deadline;
+    this.deadlineTimer = setTimeout(() => this.expirePending(), Math.max(0, deadline - Date.now()));
+  }
+
+  private expirePending(): void {
+    this.deadlineTimer = undefined;
+    this.deadlineAt = 0;
+    const now = Date.now();
+    let nextDeadline = Infinity;
+    for (const [id, entry] of this.pending) {
+      if (entry.deadline <= now) this.settleEntry(id, entry, { consumed: false });
+      else if (entry.deadline < nextDeadline) nextDeadline = entry.deadline;
+    }
+    if (nextDeadline !== Infinity) this.scheduleDeadline(nextDeadline);
+  }
+
+  private clearDeadlineTimer(): void {
+    if (this.deadlineTimer === undefined) return;
+    clearTimeout(this.deadlineTimer);
+    this.deadlineTimer = undefined;
+    this.deadlineAt = 0;
   }
 
   private applyResult(

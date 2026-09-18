@@ -117,7 +117,7 @@ describe('session-catalog', () => {
     expect(cat.lastPatch).toBeNull();
     cat.apply({ kind: 'upsert', session: makeInfo({ id: 'mem-1' }) });
     expect(cat.lastPatch).toBe('upsert');
-    cat.apply({ kind: 'rename', path: '/x.jsonl', name: 'new' });
+    cat.apply({ kind: 'rename', id: 'missing', name: 'new' });
     expect(cat.lastPatch).toBe('rename');
     cat.apply({ kind: 'release', id: 'mem-1' });
     expect(cat.lastPatch).toBe('release');
@@ -163,7 +163,7 @@ describe('session-catalog', () => {
 
     // Pooled → overlay patched in place.
     cat.apply({ kind: 'upsert', session: makeInfo({ id: 's1', messageCount: 1 }) });
-    cat.apply({ kind: 'rename', path: '/tmp/whatever.jsonl', name: 'Pooled rename' });
+    cat.apply({ kind: 'rename', id: 's1', name: 'Pooled rename' });
     expect((await cat.list())[0].name).toBe('Pooled rename');
 
     // Non-pooled → scan re-parses the file (session_info line appended,
@@ -173,7 +173,7 @@ describe('session-catalog', () => {
       join(DIR, 'a.jsonl'),
       JSON.stringify({ type: 'session_info', id: 'i1', name: 'Disk rename' }) + '\n'
     );
-    cat.apply({ kind: 'rename', path: join(DIR, 'a.jsonl'), name: 'Disk rename' });
+    cat.apply({ kind: 'rename', id: 's1', name: 'Disk rename' });
     const infos = await cat.list();
     expect(infos[0].name).toBe('Disk rename');
   });
@@ -185,8 +185,31 @@ describe('session-catalog', () => {
     expect(await cat.list()).toHaveLength(1);
 
     rmSync(path);
-    cat.apply({ kind: 'remove', path: '/tmp/whatever.jsonl' });
+    cat.apply({ kind: 'remove', id: 's1' });
     expect(await cat.list()).toHaveLength(0);
+  });
+
+  it('renames and removes exactly one pooled session when paths are shared', async () => {
+    const cat = newCatalog();
+    const sharedPath = '(in-memory)';
+    cat.apply({
+      kind: 'upsert',
+      session: makeInfo({ id: 'mem-1', path: sharedPath, name: 'First' }),
+    });
+    cat.apply({
+      kind: 'upsert',
+      session: makeInfo({ id: 'mem-2', path: sharedPath, name: 'Second' }),
+    });
+
+    cat.apply({ kind: 'rename', id: 'mem-2', name: 'Second renamed' });
+    const renamed = await cat.list();
+    expect(renamed.find((session) => session.id === 'mem-1')).toMatchObject({ name: 'First' });
+    expect(renamed.find((session) => session.id === 'mem-2')).toMatchObject({
+      name: 'Second renamed',
+    });
+
+    cat.apply({ kind: 'remove', id: 'mem-1' });
+    expect((await cat.list()).map((session) => session.id)).toEqual(['mem-2']);
   });
 
   it('listForCwd filters the merged list', async () => {
@@ -221,13 +244,15 @@ describe('session-catalog', () => {
     expect((await cat.list({ fresh: true }))[0].messageCount).toBe(2); // re-scan
   });
 
-  it('onChange fires per apply and unsubscribe works', () => {
+  it('onChange fires per apply, passes the patch, and unsubscribe works', () => {
     const cat = newCatalog();
     const cb = vi.fn();
     const off = cat.onChange(cb);
-    cat.apply({ kind: 'upsert', session: makeInfo({ id: 'mem-1' }) });
+    const upsert = { kind: 'upsert' as const, session: makeInfo({ id: 'mem-1' }) };
+    cat.apply(upsert);
     cat.apply({ kind: 'release', id: 'mem-1' });
     expect(cb).toHaveBeenCalledTimes(2);
+    expect(cb.mock.calls[0][0]).toBe(upsert);
     off();
     cat.apply({ kind: 'upsert', session: makeInfo({ id: 'mem-1' }) });
     expect(cb).toHaveBeenCalledTimes(2);

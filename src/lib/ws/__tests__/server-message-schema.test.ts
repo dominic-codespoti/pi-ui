@@ -296,6 +296,59 @@ describe('server-message-schema', () => {
     }
   });
 
+  it('parses correlated extension completions and preserves unknown fields', () => {
+    const parsed = parseServerMessage({
+      type: 'extension_completions',
+      sessionId: 'sess-completions',
+      requestId: 'req-completions',
+      trigger: '@',
+      query: 'foo',
+      items: [
+        {
+          value: 'fresh',
+          label: 'latest',
+          description: 'A fresh completion',
+          providerMetadata: { source: 'extension' },
+        },
+      ],
+      serverMetadata: { revision: 2 },
+    });
+
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) {
+      expect(parsed.kind).toBe('custom');
+      expect(parsed.value.sessionId).toBe('sess-completions');
+      expect(parsed.value.requestId).toBe('req-completions');
+      expect(parsed.value.items).toEqual([
+        {
+          value: 'fresh',
+          label: 'latest',
+          description: 'A fresh completion',
+          providerMetadata: { source: 'extension' },
+        },
+      ]);
+      expect(parsed.value.serverMetadata).toEqual({ revision: 2 });
+    }
+  });
+
+  it('rejects extension completions with malformed item entries', () => {
+    const frame = {
+      type: 'extension_completions',
+      sessionId: 'sess-completions',
+      requestId: 'req-completions',
+      trigger: '@',
+      query: 'foo',
+    };
+
+    for (const item of [
+      { label: 'missing value' },
+      { value: 'missing label' },
+      { value: 'wrong description', label: 'item', description: 42 },
+    ]) {
+      expect(parseServerMessage({ ...frame, items: [item] }).ok).toBe(false);
+    }
+  });
+
   describe('exported schemas direct use', () => {
     it('ConnectedMessageSchema validates a handshake payload', () => {
       const res = v.safeParse(ConnectedMessageSchema, {

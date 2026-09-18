@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { SessionViewCache, type SessionView } from '../session-view-cache';
+import { SessionViewCache, type SessionView, type SessionViewUiState } from '../session-view-cache';
 import type { UIMessage } from '../client-messages';
 
 function message(overrides: Partial<UIMessage> = {}): UIMessage {
@@ -87,5 +87,26 @@ describe('SessionViewCache', () => {
     expect(restored?.messages).not.toBe(original.messages);
     expect(restored?.expandedUserMsgs).not.toBe(original.expandedUserMsgs);
     expect(restored?.queuedSteering).not.toBe(original.queuedSteering);
+  });
+  it('restores UI state without exposing the retained transcript', () => {
+    const cache = new SessionViewCache();
+    const retained = view('resident');
+    cache.save('resident', retained);
+
+    const ui = cache.restoreUiState('resident');
+    const expected: SessionViewUiState = {
+      expandedUserMsgs: new Set(['expanded']),
+      truncatedUserMsgs: new Set(['truncated']),
+      draft: 'draft-resident',
+      contextUsage: { tokens: 12, contextWindow: 100, percent: 12 },
+      queuedSteering: ['steer-resident'],
+      queuedFollowUp: ['follow-resident'],
+      scrollAtBottom: false,
+    };
+    expect(ui).toEqual(expected);
+    ui?.expandedUserMsgs.add('local');
+    ui?.queuedSteering.push('local');
+    expect(cache.restoreUiState('resident')).toEqual(expected);
+    expect(cache.restore('resident')?.messages).toEqual(retained.messages);
   });
 });

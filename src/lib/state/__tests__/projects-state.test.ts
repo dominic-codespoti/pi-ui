@@ -502,6 +502,53 @@ describe('ProjectsState', () => {
       expect(projectsState.allSessions).toHaveLength(1);
       expect(projectsState.allSessions[0]).toMatchObject({ name: 'renamed', messageCount: 12 });
     });
+    it('updates one normalized session without rebuilding untouched project groups', () => {
+      const project = (cwd: string, lastActivity = 0) => ({
+        cwd,
+        name: cwd.slice(1).toUpperCase(),
+        pinned: false,
+        exists: true,
+        registered: true,
+        sessionCount: 2,
+        lastActivity,
+      });
+      projectsState.projects = [project('/a'), project('/b')];
+      const untouched = mkSession('b1', { cwd: '/b', path: '/shared.jsonl' });
+      const affected = mkSession('a1', { cwd: '/a', path: '/shared.jsonl', modified: 1 });
+      projectsState.allSessions = [affected, untouched];
+
+      const untouchedGroup = projectsState.groups.find((group) => group.cwd === '/b');
+      const affectedGroup = projectsState.groups.find((group) => group.cwd === '/a');
+      expect(untouchedGroup).toBeDefined();
+      expect(affectedGroup).toBeDefined();
+
+      projectsState.handleMessage({
+        type: 'session_updated',
+        session: { ...affected, name: 'updated', modified: 20 },
+      } as { type: string } & Record<string, unknown>);
+
+      expect(projectsState.allSessions.find((session) => session.id === 'b1')).toBe(untouched);
+      expect(projectsState.groups.find((group) => group.cwd === '/b')).toBe(untouchedGroup);
+      expect(projectsState.groups.find((group) => group.cwd === '/a')).not.toBe(affectedGroup);
+    });
+
+    it('keeps duplicate paths distinct when a delta targets one stable id', () => {
+      const first = mkSession('mem-1', { path: '(in-memory)', name: 'first' });
+      const second = mkSession('mem-2', { path: '(in-memory)', name: 'second' });
+      projectsState.allSessions = [first, second];
+
+      projectsState.handleMessage({
+        type: 'session_updated',
+        session: { ...second, name: 'renamed second' },
+      } as { type: string } & Record<string, unknown>);
+
+      expect(projectsState.allSessions).toHaveLength(2);
+      expect(projectsState.allSessions.find((session) => session.id === 'mem-1')).toBe(first);
+      expect(projectsState.allSessions.find((session) => session.id === 'mem-2')).toMatchObject({
+        name: 'renamed second',
+        path: '(in-memory)',
+      });
+    });
 
     it('re-sorts sessions within a project when a delta bumps recency', () => {
       projectsState.projects = [
@@ -663,22 +710,48 @@ describe('ProjectsState', () => {
       expect(send).toHaveBeenCalledWith({ type: 'pin_project', cwd: '/p', pinned: true });
     });
 
-    it('renameSession sends message', () => {
+    it('renameSession sends the session ID', () => {
       const send = vi.fn().mockReturnValue(true);
       projectsState.send = send;
-      projectsState.renameSession('/path', 'New Name');
+      projectsState.renameSession('session-2', 'New Name');
       expect(send).toHaveBeenCalledWith({
         type: 'rename_session',
-        path: '/path',
+        sessionId: 'session-2',
         name: 'New Name',
       });
     });
 
-    it('deleteSession sends message', () => {
+    it('deleteSession sends the session ID', () => {
       const send = vi.fn().mockReturnValue(true);
       projectsState.send = send;
-      projectsState.deleteSession('/path');
-      expect(send).toHaveBeenCalledWith({ type: 'delete_session', path: '/path' });
+      projectsState.deleteSession('session-2');
+      expect(send).toHaveBeenCalledWith({ type: 'delete_session', sessionId: 'session-2' });
+    });
+
+    it('uses distinct IDs for pooled sessions that share a path', () => {
+      const pooledSessions = [
+        mkSession('mem-1', { path: '(in-memory)' }),
+        mkSession('mem-2', { path: '(in-memory)' }),
+      ];
+      expect(buildSessionRows(pooledSessions).map((row) => row.session.id)).toEqual([
+        'mem-1',
+        'mem-2',
+      ]);
+
+      const send = vi.fn().mockReturnValue(true);
+      projectsState.send = send;
+      projectsState.renameSession(pooledSessions[1].id, 'Only second');
+      projectsState.deleteSession(pooledSessions[0].id);
+
+      expect(send).toHaveBeenNthCalledWith(1, {
+        type: 'rename_session',
+        sessionId: 'mem-2',
+        name: 'Only second',
+      });
+      expect(send).toHaveBeenNthCalledWith(2, {
+        type: 'delete_session',
+        sessionId: 'mem-1',
+      });
     });
 
     it('requestDirCompletions sends message', () => {

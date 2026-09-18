@@ -1,5 +1,3 @@
-import * as XLSX from 'xlsx';
-
 /**
  * Client-side attachment processing: file readers, text-extension allowlist,
  * and in-browser image downscaling. Keeps prompt payloads under the WS frame
@@ -68,7 +66,9 @@ const MAX_SPREADSHEET_TEXT = 256 * 1024;
  * Extract all worksheets as CSV text while retaining sheet boundaries.
  * Keep the result bounded so a large workbook cannot inflate a prompt.
  */
-export function xlsxToText(buf: ArrayBuffer): string {
+export async function xlsxToText(buf: ArrayBuffer): Promise<string> {
+  // Keep SheetJS out of the initial client graph; spreadsheets are optional attachments.
+  const XLSX = await import('xlsx');
   const workbook = XLSX.read(buf, { type: 'array' });
   const sheets = workbook.SheetNames.map((name) => {
     const sheet = workbook.Sheets[name];

@@ -81,15 +81,36 @@ export function initSessionScanCache(filePath: string): void {
     )
       return;
     for (const raw of parsed.entries) {
-      if (!Array.isArray(raw) || raw.length !== 4) continue;
-      const [path, mtimeMs, size, info] = raw as [unknown, unknown, unknown, unknown];
+      if (!Array.isArray(raw)) continue;
+      let path: unknown;
+      let mtimeMs: unknown;
+      let size: unknown;
+      let dev: unknown;
+      let ino: unknown;
+      let info: unknown;
+      if (raw.length === 4) {
+        [path, mtimeMs, size, info] = raw;
+      } else if (raw.length === 6) {
+        [path, mtimeMs, size, dev, ino, info] = raw;
+      } else {
+        continue;
+      }
       if (typeof path !== 'string' || typeof mtimeMs !== 'number' || typeof size !== 'number')
         continue;
       const revived = reviveInfo(info);
       // `modified` is derived from the file's stat mtime (single clock with
       // the pooled-session overlay) — the persisted value is never authoritative.
-      if (revived) revived.modified = new Date(mtimeMs);
-      fileInfoCache.set(path, { mtimeMs, size, info: revived });
+      if (revived) {
+        revived.path = resolve(path);
+        revived.modified = new Date(mtimeMs);
+      }
+      fileInfoCache.set(resolve(path), {
+        mtimeMs,
+        size,
+        info: revived,
+        dev: typeof dev === 'number' ? dev : undefined,
+        ino: typeof ino === 'number' ? ino : undefined,
+      });
     }
   } catch (err) {
     log.warn('[pifrontier] session-scan cache: failed to load, starting empty:', err);
@@ -120,6 +141,7 @@ function reviveInfo(raw: unknown): SessionFileInfo | null {
 let persistTimer: Timer | null = null;
 let cacheWritePromise: Promise<void> | null = null;
 let cacheGeneration = 0;
+let cacheInvalidationGeneration = 0;
 
 /**
  * Mark the cache dirty and schedule an atomic write. Debounced so a burst of
@@ -153,6 +175,8 @@ async function persistCache(): Promise<void> {
           path,
           c.mtimeMs,
           c.size,
+          c.dev,
+          c.ino,
           c.info
             ? { ...c.info, created: c.info.created.getTime(), modified: c.info.modified.getTime() }
             : null,
@@ -376,16 +400,26 @@ async function parseSessionFile(
  *  file, shrink, identity change, or a failed extension attempt) does a
  *  full re-parse. */
 async function fileInfo(filePath: string): Promise<SessionFileInfo | null> {
+  const canonicalPath = resolve(filePath);
+  const operationGeneration = cacheInvalidationGeneration;
   let stats: { dev: number; ino: number; mtimeMs: number; size: number };
   try {
-    const s = await stat(filePath);
+    const s = await stat(canonicalPath);
     stats = { dev: s.dev, ino: s.ino, mtimeMs: s.mtimeMs, size: s.size };
   } catch {
-    if (fileInfoCache.delete(filePath)) schedulePersist();
+    // A transient stat failure must not discard a previously valid entry.
     return null;
   }
-  const cached = fileInfoCache.get(filePath);
-  if (cached && cached.mtimeMs === stats.mtimeMs && cached.size === stats.size) return cached.info;
+  const cached = fileInfoCache.get(canonicalPath);
+  if (
+    cached &&
+    cached.mtimeMs === stats.mtimeMs &&
+    cached.size === stats.size &&
+    cached.dev === stats.dev &&
+    cached.ino === stats.ino
+  ) {
+    return cached.info;
+  }
 
   if (
     cached?.fold &&
@@ -398,34 +432,35 @@ async function fileInfo(filePath: string): Promise<SessionFileInfo | null> {
       dev: number;
       ino: number;
     };
-    const extended = await tryExtendFold(filePath, cachedWithFold, stats);
+    const extended = await tryExtendFold(canonicalPath, cachedWithFold, stats);
     if (extended) {
-      fileInfoCache.set(filePath, extended);
-      schedulePersist();
+      if (cacheInvalidationGeneration === operationGeneration) {
+        fileInfoCache.set(canonicalPath, extended);
+        schedulePersist();
+      }
       return extended.info;
     }
   }
 
-  let info: SessionFileInfo | null;
-  let fold: SessionScanFold | undefined;
+  let result: { info: SessionFileInfo | null; fold: SessionScanFold };
   try {
-    const result = await parseSessionFile(filePath, stats.mtimeMs);
-    info = result.info;
-    fold = result.fold;
+    result = await parseSessionFile(canonicalPath, stats.mtimeMs);
   } catch {
-    info = null;
-    fold = undefined;
+    // Do not poison a good cache entry with a transient read/parse failure.
+    return null;
   }
-  fileInfoCache.set(filePath, {
-    mtimeMs: stats.mtimeMs,
-    size: stats.size,
-    info,
-    dev: stats.dev,
-    ino: stats.ino,
-    fold,
-  });
-  schedulePersist();
-  return info;
+  if (cacheInvalidationGeneration === operationGeneration) {
+    fileInfoCache.set(canonicalPath, {
+      mtimeMs: stats.mtimeMs,
+      size: stats.size,
+      info: result.info,
+      dev: stats.dev,
+      ino: stats.ino,
+      fold: result.fold,
+    });
+    schedulePersist();
+  }
+  return result.info;
 }
 /**
  * Attempt to extend a cached fold with only the bytes appended since
@@ -480,6 +515,20 @@ async function tryExtendFold(
  */
 export async function sessionFileInfo(filePath: string): Promise<SessionFileInfo | null> {
   return fileInfo(filePath);
+}
+
+/**
+ * Invalidate cached per-file summaries. A generation fence prevents an
+ * in-flight parse from repopulating an entry after its path was invalidated.
+ */
+export function invalidateSessionScanCache(paths?: readonly string[]): void {
+  cacheInvalidationGeneration++;
+  if (!paths) {
+    fileInfoCache.clear();
+  } else {
+    for (const path of paths) fileInfoCache.delete(resolve(path));
+  }
+  schedulePersist();
 }
 
 async function collectInfos(files: string[]): Promise<SessionFileInfo[]> {
@@ -570,13 +619,14 @@ export async function scanAllSessions(
   const dirFileLists = await Promise.all(dirs.map((dir) => jsonlFilesIn(dir)));
   for (const list of dirFileLists) files.push(...list);
   const skipPaths = opts?.skipPaths;
-  if (skipPaths?.size) files = files.filter((f) => !skipPaths.has(f));
+  const canonicalSkipPaths = skipPaths && new Set([...skipPaths].map((path) => resolve(path)));
+  if (canonicalSkipPaths?.size) files = files.filter((f) => !canonicalSkipPaths.has(resolve(f)));
   // Drop cache entries for files that vanished so the cache can't grow
   // unbounded. Skipped (pooled) files still exist on disk — keep their
   // entries so a release falls back to a stat-only check.
-  const live = new Set(files);
-  if (skipPaths) {
-    for (const p of skipPaths) live.add(p);
+  const live = new Set(files.map((file) => resolve(file)));
+  if (canonicalSkipPaths) {
+    for (const p of canonicalSkipPaths) live.add(p);
   }
   for (const cachedPath of fileInfoCache.keys()) {
     if (!live.has(cachedPath)) {
@@ -586,9 +636,10 @@ export async function scanAllSessions(
   }
   return collectInfos(files);
 }
-
-/** Test hook — clears the per-file stat cache and disables persistence. */
 export function clearSessionScanCache(): void {
+  cacheInvalidationGeneration++;
+  if (persistTimer) clearTimeout(persistTimer);
+  persistTimer = null;
   fileInfoCache.clear();
   cacheFilePath = null;
   cacheDirty = false;

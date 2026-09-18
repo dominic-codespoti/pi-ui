@@ -25,8 +25,8 @@ import type {
 } from '@earendil-works/pi-coding-agent';
 import type { AutocompleteProvider } from '@earendil-works/pi-tui';
 import type { AuthEvent, AuthInteraction, AuthPrompt } from '@earendil-works/pi-ai';
-import { rm, mkdir, writeFile, readdir } from 'node:fs/promises';
-import { join, resolve, basename, sep, dirname, relative } from 'node:path';
+import { rm, mkdir, writeFile } from 'node:fs/promises';
+import { join, resolve, basename, sep, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import {
@@ -34,7 +34,6 @@ import {
   isValidSessionCookie,
   extractTokenExp,
   extractJti,
-  isJtiRevoked,
   getTokenFromCookies,
 } from './src/lib/auth/password.ts';
 import {
@@ -43,10 +42,10 @@ import {
   sendWebhookNotification,
 } from './src/lib/server/notification-webhook.ts';
 import {
-  addPushSubscription,
   ensureVapidKeys,
-  removePushSubscription,
   sendPushNotification,
+  addPushSubscription,
+  removePushSubscription,
 } from './src/lib/server/push-notifications.ts';
 import { persistProviderApiKey } from './src/lib/server/provider-auth.ts';
 import {
@@ -56,7 +55,6 @@ import {
   formatCommand,
   ephemeralUpdateHint,
   ALLOWED_SKILL_HOSTS,
-  SKIP_DIRS,
 } from './src/lib/server/ws-helpers.ts';
 import { ProjectCatalog } from './src/lib/server/project-catalog.ts';
 import {
@@ -69,7 +67,39 @@ import { log } from './src/lib/server/logger.ts';
 import { terminalInputRegistry } from './src/lib/server/terminal-input.ts';
 import { boundMessagesForWire } from './src/lib/server/wire-messages.ts';
 import { createCompactionWatchdog } from './src/lib/server/compaction-watchdog.ts';
+import {
+  createToolUpdateCoalescer,
+  type ToolUpdateCoalescer,
+} from './src/lib/server/tool-update-coalescer.ts';
 import { getCommandArgumentCompletions } from './src/lib/server/extension-completions.ts';
+import { ResidentStore, type ResidentEntry } from './src/lib/server/runtime/resident-sessions.ts';
+import {
+  createWebSocketTransport,
+  type WSData,
+} from './src/lib/server/runtime/websocket-transport.ts';
+import {
+  dispatchSystemMessage,
+  type SystemHandlerDependencies,
+} from './src/lib/server/handlers/system-handlers.ts';
+import {
+  dispatchFilesystemMessage,
+  type FilesystemHandlerDependencies,
+} from './src/lib/server/handlers/filesystem-handlers.ts';
+import {
+  dispatchProjectMessage,
+  type ProjectHandlerDependencies,
+} from './src/lib/server/handlers/project-handlers.ts';
+import {
+  dispatchExtensionUiMessage,
+  type ExtensionUiHandlerDependencies,
+} from './src/lib/server/handlers/extension-ui-handlers.ts';
+import {
+  ExtensionRuntime,
+  type AutocompleteProviderFactory,
+  type SessionUiState,
+  type WidgetFactoryState,
+  type WidgetStoreEntry,
+} from './src/lib/server/runtime/extension-runtime.ts';
 import {
   flushSessionScanCache,
   initSessionScanCache,
@@ -80,7 +110,6 @@ import { SessionCatalog } from './src/lib/server/session-catalog.ts';
 import { startSessionWatch } from './src/lib/server/session-watcher.ts';
 import {
   EXTENSION_UI_SCHEMA_VERSION,
-  type ClientMessage,
   type ServerMessage,
   type ModelInfo,
   type ProviderInfo,
@@ -110,8 +139,8 @@ import {
   parseComponentTree,
   shouldUseInteractiveCustom,
   StubTui,
-  stubKeybindings,
   stubTui,
+  stubKeybindings,
   stubTheme,
   stripAnsi,
   renderTerminalLines,
@@ -179,13 +208,9 @@ const MAX_INITIAL_MESSAGES = 100;
  * typing/backspacing; a depth-3 walk per keystroke is wasted I/O on large
  * repos. 5 s TTL bounds staleness; the map is capped and evicts oldest-first.
  */
-const FILE_COMPLETE_TTL_MS = 5_000;
-const FILE_COMPLETE_CACHE_MAX = 50;
 const fileCompleteCache = new Map<string, { at: number; entries: string[] }>();
 /** Per-directory completion cache — completion requests repeat while a path is
  *  being typed. Short TTL keeps newly-created directories discoverable. */
-const DIR_COMPLETE_TTL_MS = 2_000;
-const DIR_COMPLETE_CACHE_MAX = 50;
 const dirCompleteCache = new Map<string, { at: number; entries: string[] }>();
 
 /** Transform and bound messages for the initial/history wire payload. */
@@ -495,7 +520,7 @@ async function mutateProviderAuth(
     if (
       !ownerSessionId ||
       activeSessionId() !== ownerSessionId ||
-      managedSessionFor(ownerSessionId)?.session.modelRuntime !== runtime
+      residentStore.get(ownerSessionId)?.session.modelRuntime !== runtime
     ) {
       throw new Error('Session changed before provider auth operation could start');
     }
@@ -906,12 +931,15 @@ function liveSummary(sess: AgentSession, entry: ManagedSession): SessionFileInfo
 
 /** Refresh the live session summary after a tree rewrite or compaction. */
 function refreshSessionSummary(sess: AgentSession): void {
-  const entry = managedSessionFor(sess.sessionId);
+  const entry = residentStore.get(sess.sessionId);
   if (!entry || entry.session !== sess) return;
   entry.firstMessage = firstMessageForSession(sess);
   entry.sessionName = sess.sessionManager.getSessionName();
+  entry.sessionSummaryDirty = true;
+  refreshResidentHistory(entry);
   sessionCatalog.apply({ kind: 'upsert', session: liveSummary(sess, entry) });
 }
+
 type WireExtensionCommand = { name: string; description?: string; source: string };
 
 /** Read the already-bound session command catalog without reloading resources. */
@@ -949,230 +977,8 @@ const _promptsInFlight = new Set<string>();
 // dialogs) have no owning session and use `ownerlessUiState` — unstamped,
 // global, never replayed.
 
-type PendingRequest = {
-  requestPayload: Record<string, unknown>;
-  resolve: (response: Record<string, unknown>) => void;
-  /** Dialog timeout handle — cleared when the request resolves early. */
-  timeoutId?: Timer;
-};
-
-/**
- * Live component tree for an open custom() dialog, keyed by dialog id.
- * `nodeMap` maps a path (e.g. "0.2") to the LIVE pi-tui component instance at
- * that position, so `extension_component_event` can invoke the extension's
- * real callback (onSelect/onClick/onToggle/...) instead of just returning a
- * value — and `pollId` re-parses + diffs the tree so loaders/progress/live
- * state changes reach the browser without the extension re-prompting.
- */
-interface ActiveCustomDialog {
-  root: Record<string, unknown>;
-  nodeMap: Map<string, Record<string, unknown>>;
-  lastParsedJson: string;
-  pollId: Timer;
-}
-
-/** All extension UI state + live resources owned by one session. */
-interface SessionUiState {
-  statuses: Map<string, string>;
-  workingMessage?: string;
-  workingVisible: boolean;
-  workingIndicatorFrames: string[];
-  workingIndicatorMs: number;
-  hiddenThinkingLabel: string;
-  header: string;
-  footer: string;
-  editorComponent?: ParsedComponent;
-  title: string;
-  editorText: string;
-  widgets: Map<string, WidgetStoreEntry>;
-  pendingDialogs: Map<string, PendingRequest>;
-  /** Live pi-tui instance for an interactive custom() dialog, keyed by dialog id. */
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  interactiveCustomComponents: Map<string, any>;
-  /** Render-polling intervals for interactive custom() dialogs (keyed by dialog id). */
-  interactiveRenderIntervals: Map<string, Timer>;
-  /** Last broadcast clean-line snapshot for interactive custom() dialogs. */
-  interactiveLastRender: Map<string, string>;
-  activeCustomDialogs: Map<string, ActiveCustomDialog>;
-}
-
-function createSessionUiState(): SessionUiState {
-  return {
-    statuses: new Map(),
-    workingVisible: true,
-    workingIndicatorFrames: [],
-    workingIndicatorMs: 80,
-    hiddenThinkingLabel: 'thinking',
-    header: '',
-    footer: '',
-    title: 'pi UI',
-    editorText: '',
-    widgets: new Map(),
-    pendingDialogs: new Map(),
-    interactiveCustomComponents: new Map(),
-    interactiveRenderIntervals: new Map(),
-    interactiveLastRender: new Map(),
-    activeCustomDialogs: new Map(),
-  };
-}
-
-/** Per-session UI buckets — created lazily on the first UI call from a session. */
-const uiStateBuckets = new Map<string, SessionUiState>();
-/** Bucket for server-internal (ownerless) UI calls — unstamped, global, never replayed. */
-const ownerlessUiState = createSessionUiState();
-/** Request id → owning session id (or null) — routes response messages to the right bucket. */
-const pendingRequestOwners = new Map<string, string | null>();
-
-/** Bucket for an owner, created on demand. `null` → the ownerless bucket. */
-function uiStateFor(owner: string | null): SessionUiState {
-  if (owner == null) return ownerlessUiState;
-  let ui = uiStateBuckets.get(owner);
-  if (!ui) {
-    ui = createSessionUiState();
-    uiStateBuckets.set(owner, ui);
-  }
-  return ui;
-}
-
-/** Bucket for an owner if it exists — never creates one (used by cleanup paths). */
-function existingUiStateFor(owner: string | null): SessionUiState | undefined {
-  return owner == null ? ownerlessUiState : uiStateBuckets.get(owner);
-}
-
-/** Session stamp for a session-owned broadcast — omitted for ownerless calls. */
-function stampOwner(owner: string | null): Record<string, string> {
-  return owner ? { sessionId: owner } : {};
-}
-
-/** Find the bucket owning a widget key — prefers the active session's bucket,
- *  since the client dismisses what it currently sees. Returns undefined when
- *  the key is unknown. */
-function widgetOwnerFor(key: string): string | null | undefined {
-  const sid = activeSessionId();
-  if (sid && uiStateBuckets.get(sid)?.widgets.has(key)) {
-    return sid;
-  }
-  for (const [sid, ui] of uiStateBuckets) {
-    if (ui.widgets.has(key)) return sid;
-  }
-  return ownerlessUiState.widgets.has(key) ? null : undefined;
-}
-
-/** Releases everything tracked for a resolved/dismissed extension UI request. */
-function cleanupCustomDialog(id: string): void {
-  const owner = pendingRequestOwners.get(id) ?? null;
-  const ui = existingUiStateFor(owner);
-  if (!ui) return;
-  const dlg = ui.activeCustomDialogs.get(id);
-  if (dlg) {
-    clearInterval(dlg.pollId);
-    try {
-      if (typeof dlg.root.dispose === 'function') dlg.root.dispose();
-    } catch {
-      /* ignore */
-    }
-    ui.activeCustomDialogs.delete(id);
-  }
-  ui.interactiveCustomComponents.delete(id);
-  const pollId = ui.interactiveRenderIntervals.get(id);
-  if (pollId) {
-    clearInterval(pollId);
-    ui.interactiveRenderIntervals.delete(id);
-  }
-  ui.interactiveLastRender.delete(id);
-}
-/** Render, deduplicate, and broadcast an interactive custom() snapshot. */
-function flushInteractiveRender(id: string): void {
-  const owner = pendingRequestOwners.get(id) ?? null;
-  const ui = existingUiStateFor(owner);
-  if (!ui) return;
-  const tui = ui.interactiveCustomComponents.get(id);
-  if (!tui) return;
-  const rendered = renderTerminalLines(tui);
-  if (!rendered) return;
-  const json = JSON.stringify(rendered.cleanLines);
-  if (json === ui.interactiveLastRender.get(id)) return;
-  ui.interactiveLastRender.set(id, json);
-  broadcast({
-    type: 'custom_render',
-    id,
-    lines: rendered.cleanLines,
-    htmlLines: rendered.htmlLines,
-    ...stampOwner(owner),
-  });
-  const pending = ui.pendingDialogs.get(id);
-  if (pending) {
-    pending.requestPayload.lines = rendered.cleanLines;
-    pending.requestPayload.htmlLines = rendered.htmlLines;
-  }
-}
-
-/**
- * Single choke point for "this extension UI request is over, for any
- * reason" — user responded, the extension self-resolved via done(), it
- * timed out, or all clients disconnected. Closes the dialog in EVERY
- * connected tab, not just the one that answered.
- */
-function finalizeExtensionResponse(id: string): void {
-  const owner = pendingRequestOwners.get(id) ?? null;
-  cleanupCustomDialog(id);
-  broadcast({ type: 'extension_ui_dismiss', id, ...stampOwner(owner) });
-}
-
-// broadcast is a thin wrapper; reassigned once the Bun server is live.
-let broadcast: (payload: ServerMessage) => void = () => {};
-
-function createDialogPromise<T>(
-  id: string,
-  requestPayload: Record<string, unknown>,
-  parseResponse: (r: Record<string, unknown>) => T,
-  ownerSessionId: string | null = null
-): Promise<T> {
-  return new Promise<T>((resolve) => {
-    const ui = uiStateFor(ownerSessionId);
-    const entry: PendingRequest = {
-      requestPayload,
-      resolve: (response) => {
-        if (entry.timeoutId) clearTimeout(entry.timeoutId);
-        ui.pendingDialogs.delete(id);
-        if (ownerSessionId) scheduleSessionRuntimeBroadcast(ownerSessionId);
-        finalizeExtensionResponse(id);
-        pendingRequestOwners.delete(id);
-        resolve(parseResponse(response));
-      },
-    };
-    ui.pendingDialogs.set(id, entry);
-    pendingRequestOwners.set(id, ownerSessionId);
-    if (ownerSessionId) scheduleSessionRuntimeBroadcast(ownerSessionId);
-    broadcast({
-      type: 'extension_ui_request',
-      id,
-      ...requestPayload,
-      ...stampOwner(ownerSessionId),
-    });
-    // Timeout — prevents the agent from hanging forever if the browser
-    // never responds (e.g. tab was closed without notifying the server).
-    // The orphan grace timer (close handler) may cancel it earlier.
-    entry.timeoutId = setTimeout(() => {
-      const pending = ui.pendingDialogs.get(id);
-      if (pending) pending.resolve({ cancelled: true });
-    }, EXTENSION_DIALOG_TIMEOUT_MS);
-  });
-}
-
-/** Number of currently-connected WS clients (browser tabs). */
-let connectedClients = 0;
-/** Number of connected sockets currently focused on each resident session. */
-const focusedSessionCounts = new Map<string, number>();
-function hasFocusedSocket(sid: string): boolean {
-  return (focusedSessionCounts.get(sid) ?? 0) > 0;
-}
-/** Timer that fires when the grace period for pending extension UI requests expires. */
-let _pendingRequestsTimeout: Timer | null = null;
 /** Cancel orphaned extension UI requests after all clients disconnect. */
 const EXTENSION_DIALOG_ORPHAN_GRACE_MS = 30_000;
-/** Max time a blocking extension dialog can wait for a browser response. */
-const EXTENSION_DIALOG_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 
 /**
  * Max wall-clock time a compaction may run before it is considered stuck.
@@ -1182,71 +988,8 @@ const EXTENSION_DIALOG_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
  */
 const COMPACTION_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 
-/**
- * Dispose one bucket's live resources and pending requests. The dialog
- * resolve wrappers broadcast extension_ui_dismiss and clean up their own live
- * resources; widget factories and editor-text requests are cleaned here
- * (editor-text resolves are raw, so their owner-index entries are dropped
- * explicitly). No widget teardown broadcasts fire — a disposed session is
- * never the active session, so no client displays its UI.
- */
-function disposeUiState(ui: SessionUiState): void {
-  for (const entry of ui.pendingDialogs.values()) {
-    entry.resolve({ cancelled: true });
-  }
-  // Clean up interactive custom components
-  for (const component of ui.interactiveCustomComponents.values()) {
-    try {
-      component.dispose?.();
-    } catch {
-      /* ignore */
-    }
-  }
-  for (const interval of ui.interactiveRenderIntervals.values()) {
-    clearInterval(interval);
-  }
-  for (const dlg of ui.activeCustomDialogs.values()) {
-    clearInterval(dlg.pollId);
-    try {
-      if (typeof dlg.root.dispose === 'function') dlg.root.dispose();
-    } catch {
-      /* ignore */
-    }
-  }
-  // Clean up widget refresh intervals and component instances
-  for (const entry of ui.widgets.values()) {
-    if (entry.factory) disposeWidgetFactory(entry.factory);
-  }
-}
-
-function cancelAllPendingExtensionRequests() {
-  if (_pendingRequestsTimeout) {
-    clearTimeout(_pendingRequestsTimeout);
-    _pendingRequestsTimeout = null;
-  }
-  for (const ui of [...uiStateBuckets.values(), ownerlessUiState]) {
-    disposeUiState(ui);
-  }
-  uiStateBuckets.clear();
-  pendingRequestOwners.clear();
-}
-
 // Server-side state for extension UI context
 let toolsExpanded = false;
-
-interface WidgetFactoryState {
-  fn: (tui: unknown, theme: unknown) => { render(w: number): unknown; dispose?(): void } | string[];
-  intervalId?: Timer;
-  lastPayloadJson?: string;
-  lastResult?: { dispose?(): void };
-}
-
-/** One widget's store entry — the owning session is the bucket it lives in. */
-interface WidgetStoreEntry {
-  payload: WidgetPayload;
-  factory?: WidgetFactoryState;
-  failures: number;
-}
 
 /**
  * Flatten a parsed component tree to plain text for footer/header display
@@ -1263,7 +1006,42 @@ function flattenParsedText(parsed: ParsedComponent | null): string {
   }
   return '';
 }
-type AutocompleteProviderFactory = (current: AutocompleteProvider) => AutocompleteProvider;
+
+// Broadcast is supplied by the live Bun server after startup; extension runtime
+// state remains independent of the server transport.
+let broadcast: (payload: ServerMessage) => void = () => {};
+const extensionRuntime = new ExtensionRuntime({
+  broadcast: (payload) => broadcast(payload),
+  scheduleSessionRuntimeBroadcast: (sid) => scheduleSessionRuntimeBroadcast(sid),
+  activeSessionId: () => activeSessionId(),
+  terminalInput: terminalInputRegistry,
+  schemaVersion: EXTENSION_UI_SCHEMA_VERSION,
+  log,
+});
+
+function createDialogPromise<T>(
+  id: string,
+  requestPayload: Record<string, unknown>,
+  parseResponse: (response: Record<string, unknown>) => T,
+  ownerSessionId: string | null = null
+): Promise<T> {
+  return extensionRuntime.createDialogPromise(id, requestPayload, parseResponse, ownerSessionId);
+}
+function uiStateFor(owner: string | null): SessionUiState {
+  return extensionRuntime.uiStateFor(owner);
+}
+function existingUiStateFor(owner: string | null): SessionUiState | undefined {
+  return extensionRuntime.existingUiStateFor(owner);
+}
+function stampOwner(owner: string | null): Record<string, string> {
+  return extensionRuntime.stampOwner(owner);
+}
+function widgetOwnerFor(key: string): string | null | undefined {
+  return extensionRuntime.widgetOwnerFor(key);
+}
+function flushInteractiveRender(id: string): void {
+  extensionRuntime.flushInteractiveRender(id, (component) => renderTerminalLines(component));
+}
 
 type ServerExtensionUIContext = Omit<
   ExtensionUIContext,
@@ -1492,7 +1270,7 @@ const uiContext: ServerExtensionUIContext = {
           // Terminal wrappers can render meaningful text while hiding their real
           // input control in a closure, so structured parsing cannot drive them.
           if (shouldUseInteractiveCustom(component, parsed)) {
-            ui.interactiveCustomComponents.set(id, tui); // Store the TUI wrapper so we can route keys
+            extensionRuntime.registerInteractiveComponent(id, tui, owner);
             tui.onRequestRender = () => flushInteractiveRender(id);
             tui.terminal.start(
               () => {},
@@ -1502,61 +1280,39 @@ const uiContext: ServerExtensionUIContext = {
             // Poll render every 200ms as a safety net for updates that do not
             // trigger requestRender() or a terminal resize.
             const pollId = setInterval(() => flushInteractiveRender(id), 200);
-            ui.interactiveRenderIntervals.set(id, pollId);
+            extensionRuntime.setInteractiveRenderInterval(id, pollId, owner);
 
             const rawLines = tui.render();
             const lines = Array.isArray(rawLines) ? boundTerminalLines(rawLines) : [];
             const cleanLines = lines.map((line) => stripAnsi(line));
             const htmlLines = boundedAnsiToHtmlLines(lines);
 
-            return new Promise<string | undefined>((resolve) => {
-              const requestPayload = {
-                method: 'custom',
-                title,
-                lines: cleanLines,
-                htmlLines,
-                interactive: true,
-                ...(parsed ? { parsed } : {}),
-              };
-              const entry: PendingRequest = {
-                requestPayload,
-                resolve: (r) => {
-                  try {
-                    component.dispose?.();
-                  } catch {
-                    /* ignore */
-                  }
-                  ui.pendingDialogs.delete(id);
-                  if (owner) scheduleSessionRuntimeBroadcast(owner);
-                  finalizeExtensionResponse(id);
-                  pendingRequestOwners.delete(id);
-                  resolve(
-                    'cancelled' in r && r.cancelled
-                      ? undefined
-                      : 'value' in r
-                        ? (r.value as string)
-                        : undefined
-                  );
-                },
-              };
-              ui.pendingDialogs.set(id, entry);
-              pendingRequestOwners.set(id, owner);
-              if (owner) scheduleSessionRuntimeBroadcast(owner);
-              broadcast({
-                type: 'extension_ui_request',
-                id,
-                ...requestPayload,
-                ...stampOwner(owner),
-              });
-              ui.interactiveLastRender.set(id, JSON.stringify(cleanLines));
-              // Timeout parity with createDialogPromise — prevents the agent
-              // hanging forever if no browser ever responds (e.g. dialog was
-              // created while no client was connected and none reconnects).
-              entry.timeoutId = setTimeout(() => {
-                const pending = ui.pendingDialogs.get(id);
-                if (pending) pending.resolve({ cancelled: true });
-              }, EXTENSION_DIALOG_TIMEOUT_MS);
-            });
+            const requestPayload = {
+              method: 'custom',
+              title,
+              lines: cleanLines,
+              htmlLines,
+              interactive: true,
+              ...(parsed ? { parsed } : {}),
+            };
+            extensionRuntime.setInteractiveLastRender(id, JSON.stringify(cleanLines), owner);
+            return extensionRuntime.createDialogPromise<string | undefined>(
+              id,
+              requestPayload,
+              (r) => {
+                try {
+                  component.dispose?.();
+                } catch {
+                  /* ignore */
+                }
+                return 'cancelled' in r && r.cancelled
+                  ? undefined
+                  : 'value' in r
+                    ? (r.value as string)
+                    : undefined;
+              },
+              owner
+            );
           }
 
           // Component parsed into a meaningful, non-keyboard-driven tree —
@@ -1633,7 +1389,7 @@ const uiContext: ServerExtensionUIContext = {
     // When no browser tab is connected, fire the webhook instead of the
     // in-app notification (which would go nowhere). This avoids double
     // notifications when the PWA is open.
-    if (connectedClients === 0) {
+    if (wsTransport.connectedClients === 0) {
       sendWebhookNotification(type === 'error' ? 'pi Error' : 'pi', message);
     }
   },
@@ -1735,14 +1491,15 @@ const uiContext: ServerExtensionUIContext = {
     // Persist to the owning session so diagnostics do not cross-contaminate
     // session state.
     try {
-      const sess = owner ? managedSessionFor(owner)?.session : activeSessionOrNull();
-      sess?.sessionManager.appendCustomMessageEntry('pi-ui:diagnostic', message, true, {
+      const entry = owner ? residentStore.get(owner) : activeSessionOrNullEntry();
+      entry?.session.sessionManager.appendCustomMessageEntry('pi-ui:diagnostic', message, true, {
         level,
         details,
         source,
       });
+      if (entry) refreshResidentHistory(entry);
     } catch {
-      /* session may not be ready — still broadcast to live clients */
+      // Diagnostics must never break the extension call that emitted them.
     }
     broadcast({
       type: 'extension_ui_request',
@@ -1819,11 +1576,12 @@ const uiContext: ServerExtensionUIContext = {
 
   setFooter(factory, ownerSessionId) {
     const owner = ownerSessionId ?? activeSessionId() ?? null;
-    const ownerSession = owner ? managedSessionFor(owner)?.session : undefined;
+    const ownerSession = owner ? residentStore.get(owner)?.session : undefined;
     const ui = uiStateFor(owner);
     const ownsLiveState = () =>
       owner == null ||
-      (managedSessionFor(owner)?.session === ownerSession && uiStateBuckets.get(owner) === ui);
+      (residentStore.get(owner)?.session === ownerSession &&
+        extensionRuntime.stateForSession(owner) === ui);
     const apply = (content: string) => {
       if (!ownsLiveState()) return;
       ui.footer = content;
@@ -1847,11 +1605,12 @@ const uiContext: ServerExtensionUIContext = {
   },
   setHeader(factory, ownerSessionId) {
     const owner = ownerSessionId ?? activeSessionId() ?? null;
-    const ownerSession = owner ? managedSessionFor(owner)?.session : undefined;
+    const ownerSession = owner ? residentStore.get(owner)?.session : undefined;
     const ui = uiStateFor(owner);
     const ownsLiveState = () =>
       owner == null ||
-      (managedSessionFor(owner)?.session === ownerSession && uiStateBuckets.get(owner) === ui);
+      (residentStore.get(owner)?.session === ownerSession &&
+        extensionRuntime.stateForSession(owner) === ui);
     const apply = (content: string) => {
       if (!ownsLiveState()) return;
       ui.header = content;
@@ -1916,19 +1675,16 @@ const uiContext: ServerExtensionUIContext = {
   addAutocompleteProvider(factory, ownerSessionId) {
     if (!factory) return;
     const owner = ownerSessionId ?? activeSessionId();
-    if (!owner) return;
-    const providers = autocompleteProviderWrappers.get(owner) ?? [];
-    providers.push(factory);
-    autocompleteProviderWrappers.set(owner, providers);
-    chainAutocompleteProviders(owner);
+    extensionRuntime.addAutocompleteProvider(factory, owner);
   },
   setEditorComponent(factory, ownerSessionId) {
     const owner = ownerSessionId ?? activeSessionId() ?? null;
-    const ownerSession = owner ? managedSessionFor(owner)?.session : undefined;
+    const ownerSession = owner ? residentStore.get(owner)?.session : undefined;
     const ui = uiStateFor(owner);
     const ownsLiveState = () =>
       owner == null ||
-      (managedSessionFor(owner)?.session === ownerSession && uiStateBuckets.get(owner) === ui);
+      (residentStore.get(owner)?.session === ownerSession &&
+        extensionRuntime.stateForSession(owner) === ui);
     const apply = (parsed: ParsedComponent | null) => {
       if (!ownsLiveState()) return;
       ui.editorComponent = parsed ?? undefined;
@@ -2038,100 +1794,24 @@ function disposeWidgetResult(result: unknown): void {
   }
 }
 
-function disposeWidgetFactory(factory: WidgetFactoryState): void {
-  clearInterval(factory.intervalId);
-  factory.intervalId = undefined;
-  factory.lastResult?.dispose?.();
-  factory.lastResult = undefined;
-}
-
 function teardownWidget(key: string, owner: string | null): void {
-  const ui = existingUiStateFor(owner);
-  const entry = ui?.widgets.get(key);
-  if (entry?.factory) disposeWidgetFactory(entry.factory);
-  ui?.widgets.delete(key);
-  broadcast({
-    type: 'extension_ui_request',
-    id: crypto.randomUUID(),
-    method: 'setWidget',
-    widgetKey: key,
-    widgetType: 'text',
-    widgetLines: [],
-    ...stampOwner(owner),
-  });
+  extensionRuntime.teardownWidget(key, owner);
 }
 
 /**
  * Dispose every resource and pending request owned by a session. Silent — no
- * broadcasts: the caller emits any required lifecycle tombstone before
- * removing the resident entry.
+ * broadcasts: the caller emits any required lifecycle tombstone first.
  */
 function disposeUi(sid: string): void {
-  // Clear the terminal-input registry FIRST — a session whose extension only
-  // registered an onTerminalInput handler may never have created a UI bucket,
-  // and the early return below would otherwise leak its handlers.
-  terminalInputRegistry.clear(sid);
-  const ui = uiStateBuckets.get(sid);
-  if (!ui) return;
-  disposeUiState(ui);
-  uiStateBuckets.delete(sid);
-}
-
-function widgetsForSession(sid: string): WidgetPayload[] {
-  const ui = uiStateBuckets.get(sid);
-  if (!ui) return [];
-  const out: WidgetPayload[] = [];
-  for (const entry of ui.widgets.values()) out.push(entry.payload);
-  return out;
+  extensionRuntime.disposeSession(sid);
 }
 
 function extensionUiStateForSession(sid: string): ExtensionUiStatePayload {
-  const ui = uiStateBuckets.get(sid) ?? createSessionUiState();
-  return {
-    schemaVersion: EXTENSION_UI_SCHEMA_VERSION,
-    statuses: Object.fromEntries(ui.statuses),
-    terminalInputActive: terminalInputRegistry.has(sid),
-    ...(ui.workingMessage !== undefined ? { workingMessage: ui.workingMessage } : {}),
-    workingVisible: ui.workingVisible,
-    ...(ui.workingIndicatorFrames.length > 0 || ui.workingIndicatorMs !== 80
-      ? {
-          workingIndicator: {
-            frames: ui.workingIndicatorFrames,
-            intervalMs: ui.workingIndicatorMs,
-          },
-        }
-      : {}),
-    hiddenThinkingLabel: ui.hiddenThinkingLabel,
-    ...(ui.header ? { header: ui.header } : {}),
-    ...(ui.footer ? { footer: ui.footer } : {}),
-    ...(ui.editorComponent ? { editorComponent: ui.editorComponent } : {}),
-    ...(ui.title !== 'pi UI' ? { title: ui.title } : {}),
-    widgets: widgetsForSession(sid),
-    pendingDialogs: Array.from(ui.pendingDialogs, ([id, pending]) => ({
-      id,
-      ...pending.requestPayload,
-    })),
-  };
+  return extensionRuntime.extensionUiStateForSession(sid);
 }
 
 function syncWidgetFactories(activeSid: string | null): void {
-  for (const [sid, ui] of uiStateBuckets) {
-    for (const [key, entry] of ui.widgets) {
-      const factory = entry.factory;
-      if (!factory) continue;
-      if (sid === activeSid) {
-        if (!factory.intervalId) {
-          tickWidgetFactory(key, sid);
-          const current = ui.widgets.get(key);
-          if (current !== entry || current.factory !== factory) continue;
-          factory.intervalId = setInterval(() => tickWidgetFactory(key, sid), 250);
-        }
-      } else if (factory.intervalId) {
-        clearInterval(factory.intervalId);
-        factory.intervalId = undefined;
-      }
-    }
-  }
+  extensionRuntime.syncWidgetFactories(activeSid, tickWidgetFactory);
 }
 
 function isWidgetComponent(
@@ -2243,38 +1923,6 @@ let _stopSessionWatch: (() => void) | undefined;
 
 // ── Autocomplete provider wrappers (extension-registered) ─────────────────
 // Providers belong to the session that registered them. This prevents a
-// background session from replacing the active session's completion chain.
-const autocompleteProviderWrappers = new Map<string, AutocompleteProviderFactory[]>();
-const chainedAutocompleteProviders = new Map<string, AutocompleteProvider>();
-
-function chainAutocompleteProviders(sid: string) {
-  const provider: AutocompleteProvider = {
-    async getSuggestions() {
-      return null;
-    },
-    applyCompletion(lines, cursorLine, cursorCol) {
-      return { lines, cursorLine, cursorCol };
-    },
-  };
-  let chained: AutocompleteProvider = provider;
-  for (const wrap of autocompleteProviderWrappers.get(sid) ?? []) {
-    try {
-      chained = wrap(chained);
-    } catch (err) {
-      log.warn(`[pifrontier] autocomplete provider failed for ${sid}:`, err);
-    }
-  }
-  chainedAutocompleteProviders.set(sid, chained);
-}
-
-function autocompleteProviderFor(sid: string): AutocompleteProvider | null {
-  return chainedAutocompleteProviders.get(sid) ?? null;
-}
-
-function clearAutocompleteProviders(sid: string): void {
-  autocompleteProviderWrappers.delete(sid);
-  chainedAutocompleteProviders.delete(sid);
-}
 
 let _sdkPromise: Promise<typeof PiSDKNS> | null = null;
 
@@ -2309,10 +1957,7 @@ async function getSDK(): Promise<typeof PiSDKNS> {
       // Not critical — version display stays 'unknown'
     }
     // Start watching the session root exactly once, now that the SDK's agent
-    // dir (and therefore sessionsRoot()) is resolvable. External appends
-    // (subagents, a concurrent pi CLI process) invalidate the cached scan and
-    // trigger a coalesced sidebar/projects refresh instead of staying hidden
-    // until an unrelated structural change forces a rescan.
+    // dir (and therefore sessionsRoot()) is resolvable.
     _stopSessionWatch = startSessionWatch(
       sessionsRoot,
       () => {
@@ -2321,7 +1966,7 @@ async function getSDK(): Promise<typeof PiSDKNS> {
         scheduleProjectsRefresh();
       },
       (absolutePath) => {
-        for (const entry of resident.values()) {
+        for (const entry of residentStore.values()) {
           if (entry.path === absolutePath) return true;
         }
         return false;
@@ -2336,17 +1981,25 @@ async function getSDK(): Promise<typeof PiSDKNS> {
     if (_sdkPromise === init) _sdkPromise = null;
   }
 }
+function autocompleteProviderFor(sid: string): AutocompleteProvider | null {
+  return extensionRuntime.autocompleteProviderFor(sid);
+}
 
-interface ManagedSession {
+function clearAutocompleteProviders(sid: string): void {
+  extensionRuntime.clearAutocompleteProviders(sid);
+}
+interface ManagedSession extends ResidentEntry {
+  id: string;
   session: AgentSession;
   /** Unsubscribe from per-session event forwarding (null when inactive). */
   forwardingUnsub: (() => void) | null;
+  /** Dispose the event forwarder and its coalesced partial timer. */
+  disposeForwarder: () => void;
   /** Unsubscribe from the runtime-status subscription (always active). */
   runtimeUnsub: (() => void) | null;
+  /** Coalesced tool partials owned by this resident's event forwarder. */
+  toolPartialCoalescer: ToolUpdateCoalescer<ToolUpdateEvent>;
   cwd: string;
-  path: string | null;
-  /** Estimated parsed history retained by this resident. */
-  historyBytes: number;
   createdAt: number;
   /** True while the agent is generating (agent_start … agent_end). */
   isRunning: boolean;
@@ -2362,6 +2015,10 @@ interface ManagedSession {
   pendingReloadTimer: Timer | undefined;
   /** Last serialized runtime payload that was broadcast. */
   runtimeStatusJson: string | null;
+  /** Last serialized session summary sent in a session_updated payload. */
+  sessionSummaryJson: string | null;
+  /** True when a runtime event may have changed the visible session summary. */
+  sessionSummaryDirty: boolean;
   /** Diagnostics from service/session creation. */
   diagnostics: RuntimeDiagnostic[];
   /** Whether the host contract has completed for this session. */
@@ -2370,8 +2027,6 @@ interface ManagedSession {
   bindingPending: boolean;
   /** Whether an extension/resource reload is waiting for the session to go idle. */
   pendingReload: boolean;
-  /** Resident generation; incremented when the SDK runner/session is replaced. */
-  generation: number;
   /** Cached first user/assistant text for O(1) session-list updates. */
   firstMessage: string;
   /** Whether a completed turn has reported an error. */
@@ -2424,35 +2079,14 @@ type QueuedRun = {
 /** Runs waiting for a concurrency slot, grouped by resident session. */
 const queuedRuns = new Map<string, QueuedRun[]>();
 let nextQueuedRunSequence = 0;
-/** Reservations close the race between dispatching prompt() and agent_start. */
-const runReservations = new Set<string>();
-const resident = new Map<string, ManagedSession>();
+const residentStore = new ResidentStore<ManagedSession>();
 let selectedSessionId: string | null = null;
 
 function activeSessionId(): string | null {
   return selectedSessionId;
 }
-function managedSessionFor(sid: string): ManagedSession | undefined {
-  return resident.get(sid);
-}
-function isCurrentEntry(entry: ManagedSession, sess: AgentSession, gen: number): boolean {
-  return (
-    managedSessionFor(entry.session.sessionId) === entry &&
-    entry.session === sess &&
-    entry.generation === gen
-  );
-}
 function activeSessionOrNullEntry(): ManagedSession | null {
-  return selectedSessionId ? (resident.get(selectedSessionId) ?? null) : null;
-}
-function residentFor(path: string): ManagedSession | undefined {
-  for (const entry of resident.values()) {
-    if (entry.path === path) return entry;
-  }
-  return undefined;
-}
-function residentEntries(): IterableIterator<ManagedSession> {
-  return resident.values();
+  return selectedSessionId ? (residentStore.get(selectedSessionId) ?? null) : null;
 }
 
 function queuedStateFor(sess: AgentSession): { steering: string[]; followUp: string[] } {
@@ -2491,19 +2125,9 @@ function queueRun(entry: ManagedSession, run: Omit<QueuedRun, 'sequence'>): void
   broadcastQueueState(entry);
 }
 
-function concurrentRunCount(): number {
-  let count = 0;
-  for (const entry of resident.values()) {
-    const sid = entry.session.sessionId;
-    // Reservations cover the short interval before the SDK emits agent_start.
-    if (sessionPhaseFor(sid, entry) === 'running' || runReservations.has(sid)) count += 1;
-  }
-  return count;
-}
-
 function residentCwdPeerCount(entry: ManagedSession): number {
   let peers = 0;
-  for (const other of resident.values()) {
+  for (const other of residentStore.values()) {
     if (other !== entry && other.cwd === entry.cwd) peers += 1;
   }
   return peers;
@@ -2519,14 +2143,31 @@ function historyBytesForPath(path: string | null): number {
   }
 }
 
-function residentHistoryBytes(): number {
-  let total = 0;
-  for (const entry of resident.values()) total += entry.historyBytes;
-  return total;
+/** Refresh the admission estimate after a persisted history boundary. */
+function refreshResidentHistory(entry: ManagedSession): void {
+  try {
+    // The stat must be captured before eviction considers this entry's size.
+    residentStore.setHistoryBytes(entry, historyBytesForPath(entry.path));
+    evictResidents();
+  } catch (err) {
+    // History accounting is advisory and must never break SDK event delivery.
+    log.warn(
+      `[pifrontier] Failed to refresh resident history ${entry.path ?? '(in-memory)'}:`,
+      err
+    );
+  }
+}
+
+/** Defer history accounting until the SDK has persisted the message event. */
+function scheduleResidentHistoryRefresh(entry: ManagedSession): void {
+  queueMicrotask(() => {
+    if (residentStore.get(entry.id) !== entry) return;
+    refreshResidentHistory(entry);
+  });
 }
 
 function hasPendingExtensionDialog(sid: string): boolean {
-  return (uiStateBuckets.get(sid)?.pendingDialogs.size ?? 0) > 0;
+  return (extensionRuntime.stateForSession(sid)?.pendingDialogs.size ?? 0) > 0;
 }
 
 function sessionPhaseFor(
@@ -2542,8 +2183,7 @@ function sessionPhaseFor(
 function isPinned(entry: ManagedSession): boolean {
   const sid = entry.session.sessionId;
   return (
-    entry.isRunning ||
-    runReservations.has(sid) ||
+    residentStore.isPinned(entry) ||
     _promptsInFlight.has(sid) ||
     hasQueuedRuns(sid) ||
     entry.activeToolName !== undefined ||
@@ -2554,12 +2194,12 @@ function isPinned(entry: ManagedSession): boolean {
 
 function evictResidents(): void {
   while (
-    resident.size > MAX_RESIDENT_SESSIONS ||
-    residentHistoryBytes() > MAX_RESIDENT_HISTORY_BYTES
+    residentStore.size > MAX_RESIDENT_SESSIONS ||
+    residentStore.totalHistoryBytes() > MAX_RESIDENT_HISTORY_BYTES
   ) {
     let candidate: ManagedSession | undefined;
     let candidatePeers = Infinity;
-    for (const entry of resident.values()) {
+    for (const entry of residentStore.values()) {
       if (entry.session.sessionId === selectedSessionId || isPinned(entry)) continue;
       const cwdPeers = residentCwdPeerCount(entry);
       // Prefer removing a project outlier to avoid repeatedly invalidating the
@@ -2575,8 +2215,8 @@ function evictResidents(): void {
     }
     if (!candidate) {
       log.warn(
-        `[pifrontier] Resident policy exceeded (count ${resident.size}/${MAX_RESIDENT_SESSIONS}, ` +
-          `history ${(residentHistoryBytes() / 1024 / 1024).toFixed(1)}/${MAX_RESIDENT_HISTORY_MB} MB); ` +
+        `[pifrontier] Resident policy exceeded (count ${residentStore.size}/${MAX_RESIDENT_SESSIONS}, ` +
+          `history ${(residentStore.totalHistoryBytes() / 1024 / 1024).toFixed(1)}/${MAX_RESIDENT_HISTORY_MB} MB); ` +
           'all entries are pinned or selected.'
       );
       return;
@@ -2588,15 +2228,16 @@ function evictResidents(): void {
 /** Mechanical teardown of one resident entry: unsubscribe, dispose the SDK
  * session, drop UI state, and release its catalog overlay. */
 function disposeSession(sid: string, reason: string): void {
-  const entry = resident.get(sid);
+  const entry = residentStore.get(sid);
   if (!entry) return;
   entry.pendingReload = false;
   clearTimeout(entry.pendingReloadTimer);
+  // Stop pending coalesced partials before unsubscribing/disposal so no timer
+  // can render or broadcast after this resident is gone.
+  entry.disposeForwarder();
   entry.pendingReloadTimer = undefined;
-  resident.delete(sid);
+  residentStore.remove(sid);
   queuedRuns.delete(sid);
-  runReservations.delete(sid);
-  sessionMutationQueues.delete(sid);
   if (selectedSessionId === sid) selectedSessionId = null;
   if (entry.runtimeBroadcastTimer) {
     clearTimeout(entry.runtimeBroadcastTimer);
@@ -2614,7 +2255,6 @@ function disposeSession(sid: string, reason: string): void {
   } catch (err) {
     log.error(`[pifrontier] Error unsubscribing runtime events for ${sid}:`, err);
   }
-  entry.generation++;
   try {
     entry.session.dispose();
   } catch (err) {
@@ -2642,40 +2282,6 @@ function disposeSession(sid: string, reason: string): void {
 
 // Promise lock — prevents concurrent first-connection races from creating duplicate sessions.
 let _sessionInitPromise: Promise<AgentSession> | null = null;
-/** Serializes session-creating/switching operations (new_session,
- * switch_session, fork_session, and the matching extension command
- * actions) so concurrent requests cannot race to create duplicate SDK
- * sessions or interleave live-session updates. A rejected operation
- * does not jam the queue for the next one. */
-let _sessionMutationQueue: Promise<unknown> = Promise.resolve();
-const sessionMutationQueues = new Map<string, Promise<unknown>>();
-function withSessionMutationLock<T>(operation: () => Promise<T>): Promise<T> {
-  const run = _sessionMutationQueue.then(operation, operation);
-  _sessionMutationQueue = run.then(
-    () => undefined,
-    () => undefined
-  );
-  return run;
-}
-function withPerSessionMutationLock<T>(sid: string, operation: () => Promise<T>): Promise<T> {
-  const previous = sessionMutationQueues.get(sid) ?? Promise.resolve();
-  const run = previous.then(operation, operation);
-  sessionMutationQueues.set(
-    sid,
-    run.then(
-      () => undefined,
-      () => undefined
-    )
-  );
-  return run;
-}
-function reserveRunSlot(entry: ManagedSession): boolean {
-  const sid = entry.session.sessionId;
-  if (entry.isRunning || runReservations.has(sid)) return false;
-  if (concurrentRunCount() >= MAX_CONCURRENT_RUNS) return false;
-  runReservations.add(sid);
-  return true;
-}
 
 async function invokeRun(
   entry: ManagedSession,
@@ -2688,7 +2294,7 @@ async function invokeRun(
     await entry.session.prompt(message, images ? { images } : undefined);
   } finally {
     _promptsInFlight.delete(sid);
-    runReservations.delete(sid);
+    residentStore.releaseRunSlot(sid);
     scheduleQueuedRuns();
   }
 }
@@ -2697,33 +2303,35 @@ function startQueuedRun(entry: ManagedSession, run: QueuedRun): void {
   const sid = entry.session.sessionId;
   const session = entry.session;
   const generation = entry.generation;
-  void withPerSessionMutationLock(sid, async () => {
-    if (
-      managedSessionFor(sid) !== entry ||
-      !isCurrentEntry(entry, session, generation) ||
-      !runReservations.has(sid)
-    ) {
-      if (managedSessionFor(sid) === entry) runReservations.delete(sid);
-      return;
-    }
-    if (entry.session.isStreaming || _promptsInFlight.has(sid)) {
-      runReservations.delete(sid);
-      const queue = queuedRuns.get(sid) ?? [];
-      queue.unshift(run);
-      queuedRuns.set(sid, queue);
-      broadcastQueueState(entry);
-      scheduleQueuedRuns();
-      return;
-    }
-    try {
-      await invokeRun(entry, run.message, run.images);
-    } catch (err) {
-      log.error(`[pifrontier] queued ${run.mode} error for session ${sid}:`, err);
-      broadcast({ type: 'agent_error', error: String(err), sessionId: sid });
-    }
-  }).catch((err) => {
-    log.error(`[pifrontier] queued run dispatch error for session ${sid}:`, err);
-  });
+  void residentStore
+    .withSessionLock(sid, async () => {
+      if (
+        residentStore.get(sid) !== entry ||
+        !(residentStore.isCurrent(entry, generation) && entry.session === session) ||
+        !residentStore.hasRunReservation(sid)
+      ) {
+        if (residentStore.get(sid) === entry) residentStore.releaseRunSlot(sid);
+        return;
+      }
+      if (entry.session.isStreaming || _promptsInFlight.has(sid)) {
+        residentStore.releaseRunSlot(sid);
+        const queue = queuedRuns.get(sid) ?? [];
+        queue.unshift(run);
+        queuedRuns.set(sid, queue);
+        broadcastQueueState(entry);
+        scheduleQueuedRuns();
+        return;
+      }
+      try {
+        await invokeRun(entry, run.message, run.images);
+      } catch (err) {
+        log.error(`[pifrontier] queued ${run.mode} error for session ${sid}:`, err);
+        broadcast({ type: 'agent_error', error: String(err), sessionId: sid });
+      }
+    })
+    .catch((err) => {
+      log.error(`[pifrontier] queued run dispatch error for session ${sid}:`, err);
+    });
 }
 
 let queuedRunScheduler: Promise<void> = Promise.resolve();
@@ -2736,7 +2344,11 @@ function scheduleQueuedRuns(): void {
 }
 
 function drainQueuedRuns(): void {
-  while (concurrentRunCount() < MAX_CONCURRENT_RUNS) {
+  while (
+    residentStore.concurrentRunCount(
+      (entry) => sessionPhaseFor(entry.session.sessionId, entry) === 'running'
+    ) < MAX_CONCURRENT_RUNS
+  ) {
     let candidateEntry: ManagedSession | undefined;
     let candidateRun: QueuedRun | undefined;
     for (const [sid, queue] of queuedRuns) {
@@ -2744,12 +2356,12 @@ function drainQueuedRuns(): void {
         queuedRuns.delete(sid);
         continue;
       }
-      const entry = managedSessionFor(sid);
+      const entry = residentStore.get(sid);
       if (
         !entry ||
         entry.session.isStreaming ||
         _promptsInFlight.has(sid) ||
-        runReservations.has(sid)
+        residentStore.hasRunReservation(sid)
       ) {
         continue;
       }
@@ -2764,13 +2376,24 @@ function drainQueuedRuns(): void {
     const candidateGeneration = candidateEntry.generation;
     const queue = queuedRuns.get(candidateEntry.session.sessionId);
     if (!queue || queue.shift() !== candidateRun) continue;
-    if (!isCurrentEntry(candidateEntry, candidateSession, candidateGeneration)) continue;
-    if (queue.length === 0) queuedRuns.delete(candidateEntry.session.sessionId);
-    if (!reserveRunSlot(candidateEntry)) {
+    if (!(
+      residentStore.isCurrent(candidateEntry, candidateGeneration) &&
+      candidateEntry.session === candidateSession
+    ))
+      continue;
+    if (
+      !residentStore.reserveRunSlot(
+        candidateEntry,
+        MAX_CONCURRENT_RUNS,
+        (entry) => entry.isRunning,
+        (entry) => sessionPhaseFor(entry.session.sessionId, entry) === 'running'
+      )
+    ) {
       queue.unshift(candidateRun);
       queuedRuns.set(candidateEntry.session.sessionId, queue);
       return;
     }
+    if (queue.length === 0) queuedRuns.delete(candidateEntry.session.sessionId);
     broadcastQueueState(candidateEntry);
     startQueuedRun(candidateEntry, candidateRun);
   }
@@ -2968,12 +2591,12 @@ function replacementContextFor(session: AgentSession): HostReplacementContext {
 }
 
 function requestExtensionShutdown(sid: string): void {
-  const entry = managedSessionFor(sid);
+  const entry = residentStore.get(sid);
   if (!entry || entry.shutdownRequested) return;
   entry.shutdownRequested = true;
   const finish = () => {
     try {
-      if (managedSessionFor(sid)?.session !== entry.session) return;
+      if (residentStore.get(sid)?.session !== entry.session) return;
       broadcast({ type: 'shutdown_requested', sessionId: sid });
       void _shutdown();
     } catch (err) {
@@ -2984,6 +2607,28 @@ function requestExtensionShutdown(sid: string): void {
   else void entry.session.waitForIdle().then(finish, finish);
 }
 
+async function activateResidentSession(
+  entry: ManagedSession,
+  requestId?: string,
+  requester?: {
+    send(data: string): unknown;
+    publish(topic: string, data: string): unknown;
+  },
+  onActivated?: (session: AgentSession) => Promise<void> | void
+): Promise<boolean> {
+  const sid = entry.session.sessionId;
+  return residentStore.withActivationPin(sid, () =>
+    residentStore.withSessionLock(sid, async () => {
+      if (residentStore.get(sid) !== entry) return false;
+      entry.unread = false;
+      broadcastSessionRuntime(sid, entry);
+      await setActiveSession(entry.session, entry.cwd, undefined, requestId, true, requester);
+      await onActivated?.(entry.session);
+      return true;
+    })
+  );
+}
+
 function commandContextActionsFor(
   sid: string,
   session: AgentSession
@@ -2991,7 +2636,7 @@ function commandContextActionsFor(
   return {
     waitForIdle: () => session.waitForIdle(),
     newSession: (options) =>
-      withSessionMutationLock(async () => {
+      residentStore.withGlobalLock(async () => {
         const sdk = await getSDK();
         const previousSessionFile = session.sessionFile;
         const targetCwd = session.sessionManager.getCwd() || cwd;
@@ -3004,7 +2649,7 @@ function commandContextActionsFor(
         return { cancelled: false };
       }),
     fork: (entryId, options) =>
-      withSessionMutationLock(async () => {
+      residentStore.withGlobalLock(async () => {
         const sessionFile = session.sessionFile;
         if (!sessionFile) throw new Error('Cannot fork an in-memory session');
         const forkPath = session.sessionManager.createBranchedSession(entryId);
@@ -3026,8 +2671,18 @@ function commandContextActionsFor(
       refreshSessionSummary(session);
       return result;
     },
-    switchSession: (sessionPath, options) =>
-      withSessionMutationLock(async () => {
+    switchSession: async (sessionPath, options) => {
+      const directResident = residentStore.getByPath(sessionPath);
+      if (directResident) {
+        const activated = await activateResidentSession(
+          directResident,
+          undefined,
+          undefined,
+          (active) => options?.withSession?.(replacementContextFor(active))
+        );
+        if (activated) return { cancelled: false };
+      }
+      return residentStore.withGlobalLock(async () => {
         const known = await sessionCatalog.list();
         const resolvedPath = resolve(sessionPath);
         if (
@@ -3036,7 +2691,7 @@ function commandContextActionsFor(
         ) {
           throw new Error('Session not found');
         }
-        const existing = residentFor(resolvedPath);
+        const existing = residentStore.getByPath(resolvedPath);
         if (existing) {
           selectedSessionId = existing.session.sessionId;
           rememberActiveSession(existing.session);
@@ -3055,7 +2710,8 @@ function commandContextActionsFor(
         await setActiveSession(created.session, manager.getCwd(), created, undefined, true);
         await options?.withSession?.(replacementContextFor(created.session));
         return { cancelled: false };
-      }),
+      });
+    },
     reload: async () => {
       const reloadResult = await reloadSessionHost(sid, session);
       if (reloadResult === 'deferred') {
@@ -3094,17 +2750,17 @@ async function bindRpcHost(session: AgentSession): Promise<void> {
 }
 /** Start extension binding without making session creation wait. */
 function startHostBinding(sid: string, session: AgentSession): void {
-  const entry = managedSessionFor(sid);
+  const entry = residentStore.get(sid);
   if (!entry || entry.hostBound || entry.bindingPending) return;
   entry.bindingPending = true;
   const startedAt = Date.now();
   void bindRpcHost(session)
     .then(() => {
-      if (managedSessionFor(sid)?.session !== session) return;
+      if (residentStore.get(sid)?.session !== session) return;
       entry.bindingPending = false;
       entry.hostBound = true;
       log.info(`[pifrontier] bindRpcHost ${sid} done in ${Date.now() - startedAt}ms`);
-      if (connectedClients === 0) {
+      if (wsTransport.connectedClients === 0) {
         return;
       }
       broadcast({ type: 'tools_list', ...toolsPayloadFor(session), ...stampOwner(sid) });
@@ -3120,7 +2776,7 @@ function startHostBinding(sid: string, session: AgentSession): void {
       });
     })
     .catch((err) => {
-      if (managedSessionFor(sid)?.session === session) entry.bindingPending = false;
+      if (residentStore.get(sid)?.session === session) entry.bindingPending = false;
       log.error(`[pifrontier] bindRpcHost for ${sid} failed:`, err);
     });
 }
@@ -3129,7 +2785,7 @@ async function reloadSessionHost(
   sid: string,
   session: AgentSession
 ): Promise<'applied' | 'deferred'> {
-  const entry = managedSessionFor(sid);
+  const entry = residentStore.get(sid);
   if (!entry || entry.session !== session) return 'applied';
   if (
     session.isStreaming ||
@@ -3148,14 +2804,13 @@ async function reloadSessionHost(
   clearAutocompleteProviders(sid);
   broadcast({ type: 'extension_terminal_input_active', active: false, ...stampOwner(sid) });
   await session.reload();
-  const current = managedSessionFor(sid);
+  const current = residentStore.get(sid);
   if (!current || current.session !== session) return 'applied';
-  current.generation++;
+  residentStore.bumpGeneration(current);
   current.diagnostics = session.resourceLoader.getExtensions().errors.map((error) => ({
     type: 'error',
     message: `${error.path}: ${error.error}`,
   }));
-  current.bindingPending = false;
   current.hostBound = true;
   // Reload can yield while another session is selected. Its rebuilt host
   // state remains valid, and its stamped snapshots are useful to all clients.
@@ -3216,7 +2871,7 @@ async function ensureSession(): Promise<AgentSession> {
   const selected = activeSessionOrNull();
   if (selected) return selected;
   if (!_sessionInitPromise) {
-    const init = withSessionMutationLock(async () => {
+    const init = residentStore.withGlobalLock(async () => {
       const start = Date.now();
       const sdk = await getSDK();
       log.info(`[pifrontier] Starting pi session in ${cwd} …`);
@@ -3312,19 +2967,66 @@ async function ensureSession(): Promise<AgentSession> {
  *   reduced to its role.
  * - `message_end`: enriched with live context usage.
  */
-function makeEventForwarder(
-  sid: string,
-  sess: AgentSession
-): (event: PiSDKNS.AgentSessionEvent) => void {
+type ToolUpdateEvent = Extract<PiSDKNS.AgentSessionEvent, { type: 'tool_execution_update' }>;
+
+interface EventForwarder {
+  handle: (event: PiSDKNS.AgentSessionEvent) => void;
+  toolPartialCoalescer: ToolUpdateCoalescer<ToolUpdateEvent>;
+  dispose: () => void;
+}
+
+function makeEventForwarder(sid: string, sess: AgentSession): EventForwarder {
   const pendingToolArgs = new Map<string, unknown>();
-  return (event) => {
+  let disposed = false;
+  const toolPartialCoalescer = createToolUpdateCoalescer<ToolUpdateEvent>(
+    (toolCallId, event) => {
+      if (disposed) return;
+      try {
+        const args = pendingToolArgs.get(toolCallId);
+        const renderedResultHtml = renderToolResultHtml(
+          sess,
+          event.toolName,
+          event.partialResult,
+          args,
+          toolCallId,
+          true
+        );
+        const wirePartialResult = boundMessagesForWire([event.partialResult])[0];
+        broadcast({
+          ...event,
+          partialResult: wirePartialResult,
+          sessionId: sid,
+          ...(renderedResultHtml ? { renderedResultHtml } : {}),
+        });
+      } catch (err) {
+        // A renderer failure must not prevent the matching final event from
+        // reaching clients after an explicit lifecycle flush.
+        log.warn(`[pifrontier] tool update forwarder failed for session ${sid}:`, err);
+      }
+    },
+    { cadenceMs: 50, maxPending: 128 }
+  );
+
+  const handle = (event: PiSDKNS.AgentSessionEvent): void => {
+    if (disposed) return;
     // The SDK dispatches listeners synchronously without a guard — a throw
     // here would propagate into the agent loop. Never let the wire path fail.
     try {
+      // Lifecycle events are ordered after their partials. Flush while the
+      // argument map is still populated so the latest cumulative partial is
+      // rendered before its final/end event.
+      if (event.type === 'tool_execution_end') {
+        if (wsTransport.connectedClients === 0) toolPartialCoalescer.cancel(event.toolCallId);
+        else toolPartialCoalescer.flush(event.toolCallId);
+      } else if (event.type === 'agent_end') {
+        if (wsTransport.connectedClients === 0) toolPartialCoalescer.cancel();
+        else toolPartialCoalescer.flushAll();
+      }
+
       // Normal completion/turn-end events must release argument payloads even
       // when no browser is connected.
       if (event.type === 'agent_end') pendingToolArgs.clear();
-      if (connectedClients === 0) {
+      if (wsTransport.connectedClients === 0) {
         if (event.type === 'tool_execution_end') pendingToolArgs.delete(event.toolCallId);
         return;
       }
@@ -3352,22 +3054,7 @@ function makeEventForwarder(
         );
         broadcast({ ...event, sessionId: sid, ...(renderedCallHtml ? { renderedCallHtml } : {}) });
       } else if (event.type === 'tool_execution_update') {
-        const args = pendingToolArgs.get(event.toolCallId);
-        const renderedResultHtml = renderToolResultHtml(
-          sess,
-          event.toolName,
-          event.partialResult,
-          args,
-          event.toolCallId,
-          true
-        );
-        const wirePartialResult = boundMessagesForWire([event.partialResult])[0];
-        broadcast({
-          ...event,
-          partialResult: wirePartialResult,
-          sessionId: sid,
-          ...(renderedResultHtml ? { renderedResultHtml } : {}),
-        });
+        toolPartialCoalescer.enqueue(event.toolCallId, event);
       } else if (event.type === 'tool_execution_end') {
         const args = pendingToolArgs.get(event.toolCallId);
         pendingToolArgs.delete(event.toolCallId);
@@ -3401,6 +3088,15 @@ function makeEventForwarder(
       log.warn(`[pifrontier] event forwarder failed for session ${sid}:`, err);
     }
   };
+
+  const dispose = (): void => {
+    if (disposed) return;
+    disposed = true;
+    pendingToolArgs.clear();
+    toolPartialCoalescer.dispose();
+  };
+
+  return { handle, toolPartialCoalescer, dispose };
 }
 /** Register a resident session before (or after) its RPC host binding. */
 function registerSession(
@@ -3411,7 +3107,7 @@ function registerSession(
   created?: CreatedSdkSession
 ): ManagedSession {
   const path = sess.sessionManager.getSessionFile() ?? null;
-  const existing = path ? residentFor(path) : undefined;
+  const existing = residentStore.get(sid) ?? (path ? residentStore.getByPath(path) : undefined);
   if (existing) {
     if (existing.session !== sess) {
       try {
@@ -3422,8 +3118,10 @@ function registerSession(
     }
     return existing;
   }
+  const eventForwarder = makeEventForwarder(sid, sess);
   const historyBytes = historyBytesForPath(path);
-  const crossingCwd = [...resident.values()].some((existing) => existing.cwd !== cwdV);
+  const now = residentStore.now();
+  const crossingCwd = [...residentStore.values()].some((existing) => existing.cwd !== cwdV);
   if (crossingCwd) {
     log.debug(
       `[pifrontier] Registering session ${sid} in cwd ${cwdV} alongside residents from other cwds; ` +
@@ -3431,20 +3129,25 @@ function registerSession(
     );
   }
   const entry: ManagedSession = {
+    id: sid,
     session: sess,
     forwardingUnsub: null,
+    disposeForwarder: eventForwarder.dispose,
     runtimeUnsub: null,
-    activeToolName: undefined,
-    activeToolCalls: new Map(),
+    toolPartialCoalescer: eventForwarder.toolPartialCoalescer,
     cwd: cwdV,
     path,
     historyBytes,
-    createdAt: Date.now(),
+    createdAt: now,
+    activeToolName: undefined,
+    activeToolCalls: new Map(),
     isRunning: sess.isStreaming,
-    lastActivity: Date.now(),
-    pendingReloadTimer: undefined,
+    lastActivity: now,
     runtimeBroadcastTimer: null,
+    pendingReloadTimer: undefined,
     runtimeStatusJson: null,
+    sessionSummaryJson: null,
+    sessionSummaryDirty: false,
     diagnostics: created?.diagnostics ?? [],
     sessionName: sess.sessionManager.getSessionName(),
     hostBound,
@@ -3459,14 +3162,15 @@ function registerSession(
       ? { modelFallbackMessage: created.modelFallbackMessage }
       : {}),
   };
-  resident.set(sid, entry);
+  entry.sessionSummaryJson = JSON.stringify(serializeSession(liveSummary(sess, entry)));
+  residentStore.register(entry);
   sessionCatalog.apply({ kind: 'upsert', session: liveSummary(sess, entry) });
   evictResidents();
 
   entry.runtimeUnsub = sess.subscribe((event) => {
     switch (event.type) {
       case 'agent_start':
-        runReservations.delete(sid);
+        residentStore.releaseRunSlot(sid);
         entry.activeToolCalls.clear();
         entry.activeToolName = undefined;
         entry.isRunning = true;
@@ -3477,12 +3181,13 @@ function registerSession(
         entry.activeToolName = undefined;
         entry.isRunning = false;
         entry.lastActivity = Date.now();
+        entry.sessionSummaryDirty = true;
         const finalMessage = event.messages.at(-1) as
           { role?: string; stopReason?: string } | undefined;
         if (!event.willRetry && finalMessage?.role === 'assistant') {
           entry.lastTurnError = finalMessage.stopReason === 'error';
         }
-        if (!event.willRetry && !hasFocusedSocket(sid)) entry.unread = true;
+        if (!event.willRetry && !wsTransport.hasFocusedSocket(sid)) entry.unread = true;
         // Closed-app notification (Web Push). The SW suppresses pushes when a
         // page is visible, and this tag matches the page's hidden-tab tag so one
         // completion cannot produce duplicate notifications. Include the
@@ -3500,12 +3205,12 @@ function registerSession(
         if (
           !event.willRetry &&
           entry.pendingReload &&
-          managedSessionFor(sid) === entry &&
+          residentStore.get(sid) === entry &&
           entry.session === sess
         ) {
           const checkDeferredReload = () => {
             entry.pendingReloadTimer = undefined;
-            const current = managedSessionFor(sid);
+            const current = residentStore.get(sid);
             if (!current || current !== entry || current.session !== sess || !current.pendingReload)
               return;
             if (
@@ -3542,7 +3247,9 @@ function registerSession(
       }
       case 'message_end':
         entry.lastActivity = Date.now();
+        entry.sessionSummaryDirty = true;
         if (!entry.firstMessage) entry.firstMessage = firstMessageForSession(sess);
+        scheduleResidentHistoryRefresh(entry);
         // Resident summary replaces the disk parse — the file is not re-read.
         sessionCatalog.apply({ kind: 'upsert', session: liveSummary(sess, entry) });
         break;
@@ -3550,6 +3257,7 @@ function registerSession(
         // Rename via any path (slash command, WS handler, SDK) — refresh the
         // live summary so the sidebar name is never stale.
         entry.sessionName = sess.sessionManager.getSessionName();
+        entry.sessionSummaryDirty = true;
         sessionCatalog.apply({ kind: 'upsert', session: liveSummary(sess, entry) });
         break;
       case 'compaction_start': {
@@ -3577,11 +3285,11 @@ function registerSession(
         if (!ce.aborted && !ce.willRetry && !ce.errorMessage) {
           const compactionGeneration = entry.generation;
           setTimeout(() => {
-            const current = managedSessionFor(sid);
+            const current = residentStore.get(sid);
             if (
               !current ||
               current.session !== sess ||
-              !isCurrentEntry(entry, sess, compactionGeneration)
+              !(residentStore.isCurrent(entry, compactionGeneration) && entry.session === sess)
             )
               return;
             broadcastSessionLoaded(current.session);
@@ -3590,6 +3298,7 @@ function registerSession(
         // Compaction rewrote the session — refresh the resident summary while
         // the SDK's compacted messages are authoritative.
         entry.lastActivity = Date.now();
+        entry.sessionSummaryDirty = true;
         refreshSessionSummary(sess);
         break;
       }
@@ -3597,7 +3306,7 @@ function registerSession(
     scheduleSessionRuntimeBroadcast(sid, entry);
   });
 
-  entry.forwardingUnsub = sess.subscribe(makeEventForwarder(sid, sess));
+  entry.forwardingUnsub = sess.subscribe(eventForwarder.handle);
   broadcastSessionRuntime(sid, entry);
   return entry;
 }
@@ -3630,15 +3339,21 @@ function sendSessionRuntime(
 }
 
 function scheduleSessionRuntimeBroadcast(sid: string, knownEntry?: ManagedSession): void {
-  const entry = knownEntry ?? managedSessionFor(sid);
+  const entry = knownEntry ?? residentStore.get(sid);
   if (!entry || entry.runtimeBroadcastTimer) return;
   entry.runtimeBroadcastTimer = setTimeout(() => {
     entry.runtimeBroadcastTimer = null;
-    if (managedSessionFor(sid) !== entry || connectedClients === 0) return;
+    if (residentStore.get(sid) !== entry || wsTransport.connectedClients === 0) return;
     broadcastSessionRuntime(sid, entry);
+    if (!entry.sessionSummaryDirty) return;
+    const summary = serializeSession(liveSummary(entry.session, entry));
+    const json = JSON.stringify(summary);
+    entry.sessionSummaryDirty = false;
+    if (json === entry.sessionSummaryJson) return;
+    entry.sessionSummaryJson = json;
     broadcast({
       type: 'session_updated',
-      session: serializeSession(liveSummary(entry.session, entry)),
+      session: summary,
       ...stampOwner(sid),
     });
   }, 300);
@@ -3661,7 +3376,7 @@ function broadcastSessionRuntime(sid: string, entry: ManagedSession): void {
  * the abort signal), the synthetic broadcast is the only way out.
  */
 function handleCompactionTimeout(sid: string): void {
-  const entry = managedSessionFor(sid);
+  const entry = residentStore.get(sid);
   if (!entry) return;
   log.error(
     `[pifrontier] Compaction for session ${sid} did not finish within ${COMPACTION_TIMEOUT_MS / 60_000} min — aborting.`
@@ -3704,7 +3419,7 @@ function snapshotModels(sess: AgentSession): ModelInfo[] {
   sess.modelRuntime
     .getAvailable() // coalesced by the runtime; never blocks
     .then(() => {
-      if (managedSessionFor(sessionId)?.session !== sess || connectedClients === 0) {
+      if (residentStore.get(sessionId)?.session !== sess || wsTransport.connectedClients === 0) {
         return;
       }
       const fresh = sess.modelRuntime
@@ -3747,7 +3462,7 @@ function broadcastSessionLoaded(
   },
   requesterOnly = false
 ): void {
-  const entry = managedSessionFor(sess.sessionId);
+  const entry = residentStore.get(sess.sessionId);
   const init = initialMessages(sess.messages, sess);
   const payload: ServerMessage = {
     type: 'session_loaded',
@@ -3816,7 +3531,7 @@ async function refreshSessionLists(): Promise<void> {
   // No browser attached — the scan + serialize + broadcast would be pure churn
   // (background sessions keep mutating the catalogs). The next connect replays
   // runtime snapshots and the client re-requests the lists itself.
-  if (connectedClients === 0) return;
+  if (wsTransport.connectedClients === 0) return;
   try {
     const all = await sessionCatalog.list();
     const payload: ServerMessage = {
@@ -3843,7 +3558,7 @@ function scheduleProjectsRefresh(): void {
     _projectsRefreshTimer = null;
     void (async () => {
       // Same idle guard as refreshSessionLists — no clients, no work.
-      if (connectedClients === 0) return;
+      if (wsTransport.connectedClients === 0) return;
       try {
         const projects = await projectCatalog.list();
         const payload: ServerMessage = { type: 'projects_list', projects };
@@ -3879,9 +3594,9 @@ async function setActiveSession(
 ): Promise<void> {
   const newId = newSession.sessionId;
   const path = newSession.sessionManager.getSessionFile() ?? null;
-  const existing = path ? residentFor(path) : undefined;
+  const existing = path ? residentStore.getByPath(path) : undefined;
   let session = newSession;
-  let entry = managedSessionFor(newId);
+  let entry = residentStore.get(newId);
   if (existing && existing.session !== newSession) {
     try {
       newSession.dispose();
@@ -3903,12 +3618,12 @@ async function setActiveSession(
   }
   const targetId = session.sessionId;
   selectedSessionId = targetId;
-  if (!entry) throw new Error('Failed to register session');
-  rememberActiveSession(session);
-  if (!entry.hostBound && !entry.bindingPending) startHostBinding(targetId, session);
   syncWidgetFactories(targetId);
   if (!entry.forwardingUnsub) {
-    entry.forwardingUnsub = session.subscribe(makeEventForwarder(targetId, session));
+    const eventForwarder = makeEventForwarder(targetId, session);
+    entry.toolPartialCoalescer = eventForwarder.toolPartialCoalescer;
+    entry.disposeForwarder = eventForwarder.dispose;
+    entry.forwardingUnsub = session.subscribe(eventForwarder.handle);
   }
 
   broadcastSessionLoaded(session, requestId, requester);
@@ -3971,21 +3686,65 @@ function securityHeaders(isTls: boolean): Headers {
   return headers;
 }
 
-/** Per-connection WebSocket data. */
-interface WSData {
-  connectedAt: number;
-  /** JWT expiry (seconds since epoch) — checked periodically to close expired sockets. */
-  tokenExp: number;
-  /** JTI of the session token — checked periodically and per message so a
-   *  revoked (logged-out) token cannot keep driving an established socket. */
-  jti?: string;
-  /** Periodic expiry-check interval (60s), cleared on close. */
-  _expTimer?: Timer;
-  /** True once the close handler ran — guards the async open() against installing timers on a dead socket. */
-  closed?: boolean;
-  /** Session currently visible in this socket's client. */
-  focusedSessionId?: string;
-}
+const wsTransport = createWebSocketTransport<WSData>({
+  topic: WS_TOPIC,
+  orphanGraceMs: EXTENSION_DIALOG_ORPHAN_GRACE_MS,
+  onCancelOrphanCleanup: () => extensionRuntime.cancelOrphanCleanup(),
+  onScheduleOrphanCleanup: (delayMs) => extensionRuntime.scheduleOrphanCleanup(delayMs),
+});
+
+const systemHandlerDependencies: SystemHandlerDependencies = {
+  broadcast: (payload) => broadcast(payload),
+  readSettings,
+  updateSettings,
+  addPushSubscription,
+  removePushSubscription,
+  getWebhookUrl,
+  setWebhookUrl,
+};
+const filesystemHandlerDependencies: FilesystemHandlerDependencies = {
+  activeCwd,
+  getResidentSession: (sessionId) => residentStore.get(sessionId),
+  autocompleteProviderFor,
+  getCommandCompletions: (target, command, prefix) =>
+    getCommandArgumentCompletions(target.session.extensionRunner, command, prefix),
+  isInsideWorkspace,
+  uploadStagingDir: (workspaceRoot) => resolve(workspaceRoot, '.pi-ui-uploads'),
+  readFile: (path) => Bun.file(path).text(),
+  writeFile: async (path, data) => {
+    await Bun.write(path, data);
+  },
+  maxUploadBytes: 10 * 1024 * 1024,
+  maxStagedFiles: 20,
+  completionCache: {
+    file: fileCompleteCache,
+    dir: dirCompleteCache,
+  },
+  logError: (...args) => log.error(...args),
+};
+
+const projectHandlerDependencies: ProjectHandlerDependencies = {
+  projectCatalog,
+  sessionCatalog,
+  residentStore: {
+    get: (sessionId) => residentStore.get(sessionId),
+    isPinned: (entry) => {
+      const resident = residentStore.get(entry.id);
+      return resident !== undefined && isPinned(resident);
+    },
+    withGlobalLock: (operation) => residentStore.withGlobalLock(operation),
+  },
+  activeCwd,
+  disposeSession,
+  broadcast: (payload) => broadcast(payload),
+  mkdir: async (path, options) => {
+    await mkdir(path, options);
+  },
+  removeFile: async (path) => {
+    await rm(path);
+  },
+  logError: (...args) => log.error(...args),
+};
 
 function targetEntry(
   wsData: WSData,
@@ -3994,7 +3753,7 @@ function targetEntry(
 ): ManagedSession | undefined {
   const fields = msg as { sessionId?: string; requestId?: string };
   const sid = fields.sessionId ?? wsData.focusedSessionId ?? selectedSessionId;
-  const entry = sid ? managedSessionFor(sid) : undefined;
+  const entry = sid ? residentStore.get(sid) : undefined;
   if (!entry) {
     send(
       JSON.stringify({
@@ -4006,6 +3765,22 @@ function targetEntry(
   }
   return entry;
 }
+const extensionUiHandlerDependencies: ExtensionUiHandlerDependencies = {
+  targetEntry: (socketData, message, send) => targetEntry(socketData as WSData, message, send),
+  uiStateFor,
+  existingUiStateFor,
+  pendingRequestOwner: (id) => extensionRuntime.pendingRequestOwner(id),
+  widgetOwnerFor,
+  teardownWidget,
+  flushInteractiveRender,
+  terminalInputDispatch: (owner, data) => terminalInputRegistry.dispatch(owner, data),
+  broadcast,
+  stampOwner,
+  parseComponentTree: (component, width, path, nodeMap) =>
+    parseComponentTree(component, width, path, nodeMap),
+  boundParsedComponentTree,
+  logError: (...args) => log.error(...args),
+};
 
 let server: Server<WSData>;
 try {
@@ -4089,14 +3864,7 @@ try {
 
     websocket: {
       async open(ws) {
-        ws.subscribe(WS_TOPIC);
-        connectedClients++;
-        // A client reconnected — cancel the pending-request grace timer so existing
-        // extension UI requests survive the disconnect.
-        if (_pendingRequestsTimeout) {
-          clearTimeout(_pendingRequestsTimeout);
-          _pendingRequestsTimeout = null;
-        }
+        wsTransport.onOpen(ws);
 
         try {
           const sess = await ensureSession();
@@ -4118,8 +3886,8 @@ try {
                 type: 'connected',
                 sessionId: sess.sessionId,
                 isStreaming: sess.isStreaming,
-                ...(managedSessionFor(sess.sessionId)?.activeToolName
-                  ? { activeToolName: managedSessionFor(sess.sessionId)?.activeToolName }
+                ...(residentStore.get(sess.sessionId)?.activeToolName
+                  ? { activeToolName: residentStore.get(sess.sessionId)?.activeToolName }
                   : {}),
                 thinkingLevel: sess.thinkingLevel,
                 model: serializeModel(sess.model),
@@ -4129,8 +3897,8 @@ try {
                 streamingMessage: streamingMessageForWire(sess),
                 totalMessageCount: init.total,
                 cwd: sess.sessionManager.getCwd() || cwd,
-                sessionPath: managedSessionFor(sess.sessionId)?.path ?? undefined,
-                sessionName: managedSessionFor(sess.sessionId)?.sessionName,
+                sessionPath: residentStore.get(sess.sessionId)?.path ?? undefined,
+                sessionName: residentStore.get(sess.sessionId)?.sessionName,
                 isCompacting: sess.isCompacting,
                 autoCompactionEnabled: sess.autoCompactionEnabled,
                 autoRetryEnabled: sess.autoRetryEnabled,
@@ -4140,8 +3908,8 @@ try {
                 piVersion: PI_SDK_VERSION,
                 contextUsage: sess.getContextUsage(),
                 projectTrust: projectTrustInfoFor(sess.sessionManager.getCwd() || cwd),
-                diagnostics: managedSessionFor(sess.sessionId)?.diagnostics ?? [],
-                modelFallbackMessage: managedSessionFor(sess.sessionId)?.modelFallbackMessage,
+                diagnostics: residentStore.get(sess.sessionId)?.diagnostics ?? [],
+                modelFallbackMessage: residentStore.get(sess.sessionId)?.modelFallbackMessage,
                 webhookUrl: getWebhookUrl() || undefined,
                 extensionUiState: extensionUiStateForSession(sess.sessionId),
                 ...toolsPayloadFor(sess),
@@ -4171,8 +3939,10 @@ try {
           // Replay only ownerless requests and requests for the active
           // session. Replaying other session dialogs would leak stale UI into
           // the newly connected tab and duplicate modal queues.
-          const replayBuckets: Array<[string | null, SessionUiState]> = [[null, ownerlessUiState]];
-          const activeUi = uiStateBuckets.get(sess.sessionId);
+          const replayBuckets: Array<[string | null, SessionUiState]> = [
+            [null, extensionRuntime.existingUiStateFor(null)!],
+          ];
+          const activeUi = extensionRuntime.stateForSession(sess.sessionId);
           if (activeUi) replayBuckets.push([sess.sessionId, activeUi]);
           for (const [owner, ui] of replayBuckets) {
             for (const [id, pending] of ui.pendingDialogs) {
@@ -4188,25 +3958,13 @@ try {
           }
 
           // Send runtime snapshots for every resident session to the reconnecting socket.
-          for (const entry of residentEntries()) {
+          for (const entry of residentStore.values()) {
             sendSessionRuntime(ws, entry.session.sessionId, entry);
           }
 
-          // Periodic token check (every 60s) — closes expired or revoked
-          // sockets even when the client is idle.
-          ws.data._expTimer = setInterval(() => {
-            if (
-              (ws.data.jti && isJtiRevoked(ws.data.jti)) ||
-              Date.now() / 1000 > ws.data.tokenExp
-            ) {
-              clearInterval(ws.data._expTimer!);
-              try {
-                ws.close(4001, 'Session expired');
-              } catch {
-                /* already closed */
-              }
-            }
-          }, 60_000);
+          // Install transport-owned auth revalidation only after the initial
+          // snapshot/replay work has completed successfully.
+          wsTransport.installExpiryTimer(ws);
         } catch (err) {
           log.error('[pifrontier] Failed to initialise session for new client:', err);
           try {
@@ -4218,49 +3976,26 @@ try {
       },
 
       async message(ws, raw) {
-        // Per-message auth revalidation — close sockets whose token expired or
-        // was revoked (logged out) so they cannot continue using the socket.
-        const wsData = ws.data as WSData;
-        if (
-          (wsData.jti && isJtiRevoked(wsData.jti)) ||
-          (wsData.tokenExp && Date.now() / 1000 > wsData.tokenExp)
-        ) {
-          try {
-            ws.close(4001, 'Session expired');
-          } catch {
-            /* already closed */
-          }
+        // Revalidate the authenticated upgrade identity before decoding or
+        // dispatching any client frame.
+        if (!wsTransport.isAuthValid(ws.data)) {
+          wsTransport.closeExpired(ws);
           return;
         }
 
-        let msg: ClientMessage;
-        try {
-          msg = JSON.parse(typeof raw === 'string' ? raw : new TextDecoder().decode(raw));
-        } catch {
-          return;
-        }
+        const msg = wsTransport.decodeFrame(raw);
+        if (!msg) return;
 
         try {
           switch (msg.type) {
             case 'session_focus': {
-              const previous = ws.data.focusedSessionId;
-              const next = msg.sessionId;
-              if (previous && previous !== next) {
-                const count = focusedSessionCounts.get(previous) ?? 0;
-                if (count <= 1) focusedSessionCounts.delete(previous);
-                else focusedSessionCounts.set(previous, count - 1);
-              }
-              if (next && previous !== next) {
-                focusedSessionCounts.set(next, (focusedSessionCounts.get(next) ?? 0) + 1);
-              }
-              ws.data.focusedSessionId = next ?? undefined;
-              if (next) {
-                const entry = managedSessionFor(next);
+              wsTransport.setFocusedSession(ws, msg.sessionId, (sessionId) => {
+                const entry = residentStore.get(sessionId);
                 if (entry) {
                   entry.unread = false;
-                  broadcastSessionRuntime(next, entry);
+                  broadcastSessionRuntime(sessionId, entry);
                 }
-              }
+              });
               break;
             }
             case 'prompt': {
@@ -4268,11 +4003,11 @@ try {
               if (!target) break;
               const targetSession = target.session;
               const targetGeneration = target.generation;
-              await withPerSessionMutationLock(targetSession.sessionId, async () => {
+              await residentStore.withSessionLock(targetSession.sessionId, async () => {
                 try {
                   const s = targetSession;
                   const generation = targetGeneration;
-                  if (!isCurrentEntry(target, s, generation)) {
+                  if (!(residentStore.isCurrent(target, generation) && target.session === s)) {
                     ws.send(
                       JSON.stringify({
                         type: 'agent_error',
@@ -4316,7 +4051,15 @@ try {
                     );
                     return;
                   }
-                  if (hasQueuedRuns(s.sessionId) || !reserveRunSlot(target)) {
+                  if (
+                    hasQueuedRuns(s.sessionId) ||
+                    !residentStore.reserveRunSlot(
+                      target,
+                      MAX_CONCURRENT_RUNS,
+                      (entry) => entry.isRunning,
+                      (entry) => sessionPhaseFor(entry.session.sessionId, entry) === 'running'
+                    )
+                  ) {
                     queueRun(target, {
                       mode: 'prompt',
                       message: msg.message,
@@ -4337,11 +4080,11 @@ try {
               if (!target) break;
               const targetSession = target.session;
               const targetGeneration = target.generation;
-              await withPerSessionMutationLock(targetSession.sessionId, async () => {
+              await residentStore.withSessionLock(targetSession.sessionId, async () => {
                 try {
                   const s = targetSession;
                   const generation = targetGeneration;
-                  if (!isCurrentEntry(target, s, generation)) {
+                  if (!(residentStore.isCurrent(target, generation) && target.session === s)) {
                     ws.send(
                       JSON.stringify({
                         type: 'agent_error',
@@ -4367,7 +4110,15 @@ try {
                     });
                     await s.steer(msg.message, images);
                   } else {
-                    if (hasQueuedRuns(s.sessionId) || !reserveRunSlot(target)) {
+                    if (
+                      hasQueuedRuns(s.sessionId) ||
+                      !residentStore.reserveRunSlot(
+                        target,
+                        MAX_CONCURRENT_RUNS,
+                        (entry) => entry.isRunning,
+                        (entry) => sessionPhaseFor(entry.session.sessionId, entry) === 'running'
+                      )
+                    ) {
                       queueRun(target, {
                         mode: 'steer',
                         message: msg.message,
@@ -4390,11 +4141,11 @@ try {
               if (!target) break;
               const targetSession = target.session;
               const targetGeneration = target.generation;
-              await withPerSessionMutationLock(targetSession.sessionId, async () => {
+              await residentStore.withSessionLock(targetSession.sessionId, async () => {
                 try {
                   const s = targetSession;
                   const generation = targetGeneration;
-                  if (!isCurrentEntry(target, s, generation)) {
+                  if (!(residentStore.isCurrent(target, generation) && target.session === s)) {
                     ws.send(
                       JSON.stringify({
                         type: 'agent_error',
@@ -4411,7 +4162,15 @@ try {
                   if (s.isStreaming) {
                     await s.followUp(msg.message, images);
                   } else {
-                    if (hasQueuedRuns(s.sessionId) || !reserveRunSlot(target)) {
+                    if (
+                      hasQueuedRuns(s.sessionId) ||
+                      !residentStore.reserveRunSlot(
+                        target,
+                        MAX_CONCURRENT_RUNS,
+                        (entry) => entry.isRunning,
+                        (entry) => sessionPhaseFor(entry.session.sessionId, entry) === 'running'
+                      )
+                    ) {
                       queueRun(target, {
                         mode: 'followUp',
                         message: msg.message,
@@ -4436,13 +4195,13 @@ try {
               // so a locked abort would only fire after the run finished.
               // Read the entry directly (no generation check: an abort is valid
               // whenever the session exists) and signal synchronously.
-              const entry = managedSessionFor(target.session.sessionId);
+              const entry = residentStore.get(target.session.sessionId);
               const s = entry?.session ?? target.session;
               try {
                 const cleared = s.clearQueue();
                 const deferred = queuedRuns.get(s.sessionId) ?? [];
                 queuedRuns.delete(s.sessionId);
-                runReservations.delete(s.sessionId);
+                residentStore.releaseRunSlot(s.sessionId);
                 if (entry) broadcastQueueState(entry);
                 s.abortBash();
                 // Signal first so streaming stops promptly; waitForIdle (which
@@ -4475,7 +4234,7 @@ try {
             case 'abort_compaction': {
               const target = targetEntry(ws.data, msg, (data) => ws.send(data));
               if (!target) break;
-              await withPerSessionMutationLock(target.session.sessionId, async () => {
+              await residentStore.withSessionLock(target.session.sessionId, async () => {
                 target.session.abortCompaction();
               });
               break;
@@ -4484,7 +4243,7 @@ try {
             case 'abort_retry': {
               const target = targetEntry(ws.data, msg, (data) => ws.send(data));
               if (!target) break;
-              await withPerSessionMutationLock(target.session.sessionId, async () => {
+              await residentStore.withSessionLock(target.session.sessionId, async () => {
                 await target.session.abort();
               });
               break;
@@ -4493,7 +4252,7 @@ try {
             case 'set_thinking_level': {
               const target = targetEntry(ws.data, msg, (data) => ws.send(data));
               if (!target) break;
-              await withPerSessionMutationLock(target.session.sessionId, async () => {
+              await residentStore.withSessionLock(target.session.sessionId, async () => {
                 target.session.setThinkingLevel(
                   msg.level as Parameters<AgentSession['setThinkingLevel']>[0]
                 );
@@ -4504,7 +4263,7 @@ try {
             case 'set_model': {
               const target = targetEntry(ws.data, msg, (data) => ws.send(data));
               if (!target) break;
-              await withPerSessionMutationLock(target.session.sessionId, async () => {
+              await residentStore.withSessionLock(target.session.sessionId, async () => {
                 const ownerSession = target.session;
                 const model = ownerSession.modelRuntime.getModel(msg.provider, msg.modelId);
                 if (!model) {
@@ -4515,7 +4274,7 @@ try {
                 }
                 try {
                   await ownerSession.setModel(model);
-                  if (managedSessionFor(ownerSession.sessionId)?.session !== ownerSession) return;
+                  if (residentStore.get(ownerSession.sessionId)?.session !== ownerSession) return;
                   broadcast({
                     type: 'model_changed',
                     model: serializeModel(model),
@@ -4560,7 +4319,7 @@ try {
 
             case 'new_session': {
               const requestId = msg.requestId;
-              await withSessionMutationLock(async () => {
+              await residentStore.withGlobalLock(async () => {
                 try {
                   const rawTargetCwd =
                     (msg as { type: 'new_session'; targetCwd?: string }).targetCwd ?? cwd;
@@ -4587,7 +4346,14 @@ try {
 
             case 'switch_session': {
               const requestId = msg.requestId;
-              await withSessionMutationLock(async () => {
+              const directResident = residentStore.getByPath(msg.path);
+              if (
+                directResident &&
+                (await activateResidentSession(directResident, requestId, ws))
+              ) {
+                break;
+              }
+              await residentStore.withGlobalLock(async () => {
                 try {
                   const resolvedPath = resolve(cwd, expandTilde(msg.path));
                   const current = activeSessionOrNullEntry();
@@ -4606,7 +4372,7 @@ try {
                   // that is still streaming its first turn succeed instead
                   // of spuriously failing "Session not found" and leaving
                   // this socket's focus stuck on whatever it switched from.
-                  const existing = residentFor(resolvedPath);
+                  const existing = residentStore.getByPath(resolvedPath);
                   if (existing) {
                     existing.unread = false;
                     await setActiveSession(
@@ -4656,206 +4422,6 @@ try {
               });
               break;
             }
-            case 'extension_ui_response': {
-              const owner = pendingRequestOwners.get(msg.id) ?? null;
-              const target = targetEntry(
-                ws.data,
-                owner ? { ...msg, sessionId: owner } : msg,
-                (data) => ws.send(data)
-              );
-              if (!target) break;
-              if (owner && owner !== target.session.sessionId) break;
-              const pending = existingUiStateFor(owner)?.pendingDialogs.get(msg.id);
-              if (pending) {
-                pending.resolve(msg as unknown as Record<string, unknown>);
-              }
-              break;
-            }
-
-            case 'dismiss_widget': {
-              const key = msg.key as string | undefined;
-              if (!key) break;
-              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
-              if (!target) break;
-              const owner = widgetOwnerFor(key);
-              if (owner === undefined || (owner && owner !== target.session.sessionId)) break;
-              teardownWidget(key, owner);
-              break;
-            }
-
-            case 'extension_custom_input': {
-              const customId = msg.id as string | undefined;
-              const data = msg.data as string | undefined;
-              if (!customId || data === undefined) break;
-              const owner = pendingRequestOwners.get(customId) ?? null;
-              const target = targetEntry(
-                ws.data,
-                owner ? { ...msg, sessionId: owner } : msg,
-                (data) => ws.send(data)
-              );
-              if (!target) break;
-              const resolvedOwner = owner ?? target.session.sessionId;
-              const ui = existingUiStateFor(resolvedOwner);
-              const component = ui?.interactiveCustomComponents.get(customId);
-              if (!component) break;
-              try {
-                // `data` is the raw terminal byte sequence the browser encoded for
-                // this keystroke/paste — pass it straight through, exactly as real
-                // stdin would deliver it.
-                if (typeof component.handleInput === 'function') component.handleInput(data);
-              } catch (err) {
-                log.error('[pifrontier] extension_custom_input error:', err);
-              } finally {
-                flushInteractiveRender(customId);
-              }
-              break;
-            }
-            case 'extension_custom_resize': {
-              const resizeId = msg.id as string | undefined;
-              if (!resizeId) break;
-              const owner = pendingRequestOwners.get(resizeId) ?? null;
-              const target = targetEntry(
-                ws.data,
-                owner ? { ...msg, sessionId: owner } : msg,
-                (data) => ws.send(data)
-              );
-              if (!target) break;
-              const resolvedOwner = owner ?? target.session.sessionId;
-              const tui =
-                existingUiStateFor(resolvedOwner)?.interactiveCustomComponents.get(resizeId);
-              if (!tui?.terminal?.setSize) break;
-              const columns = typeof msg.columns === 'number' ? msg.columns : 80;
-              const rows = typeof msg.rows === 'number' ? msg.rows : 24;
-              tui.terminal.setSize(columns, rows);
-              break;
-            }
-
-            case 'extension_terminal_input': {
-              const inputId = msg.id as string | undefined;
-              const data = msg.data as string | undefined;
-              if (!inputId || typeof data !== 'string') break;
-              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
-              if (!target) break;
-              const owner = target.session.sessionId;
-              const verdict = terminalInputRegistry.dispatch(owner, data);
-              // Requester-only reply — a broadcast fans every keystroke's
-              // verdict to all tabs and queues it behind streaming deltas.
-              ws.send(
-                JSON.stringify({
-                  type: 'extension_terminal_input_result',
-                  id: inputId,
-                  consumed: verdict.consumed,
-                  ...(verdict.data !== undefined ? { data: verdict.data } : {}),
-                  ...stampOwner(owner),
-                })
-              );
-              break;
-            }
-            case 'extension_editor_text_change': {
-              const text = msg.text as string | undefined;
-              if (typeof text !== 'string') break;
-              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
-              if (!target) break;
-              uiStateFor(target.session.sessionId).editorText = text;
-              break;
-            }
-
-            case 'extension_component_event': {
-              const dialogId = msg.id as string | undefined;
-              if (!dialogId) break;
-              const owner = pendingRequestOwners.get(dialogId) ?? null;
-              const target = targetEntry(
-                ws.data,
-                owner ? { ...msg, sessionId: owner } : msg,
-                (data) => ws.send(data)
-              );
-              if (!target) break;
-              const resolvedOwner = owner ?? target.session.sessionId;
-              const path = (msg.path as number[] | undefined) ?? [];
-              const event = msg.event as string;
-              const value = msg.value as string | undefined;
-              const dlg = existingUiStateFor(resolvedOwner)?.activeCustomDialogs.get(dialogId);
-              const node = dlg?.nodeMap.get(path.join('.'));
-              let handled = false;
-              try {
-                if (node) {
-                  if (
-                    event === 'select' &&
-                    Array.isArray(node.items) &&
-                    typeof node.onSelect === 'function'
-                  ) {
-                    const item = (node.items as Array<{ value: string }>).find(
-                      (i) => i.value === value
-                    );
-                    if (item) {
-                      (node.onSelect as (i: unknown) => void)(item);
-                      handled = true;
-                    }
-                  } else if (event === 'click' && typeof node.onClick === 'function') {
-                    (node.onClick as () => void)();
-                    handled = true;
-                  } else if (event === 'toggle' && typeof node.onToggle === 'function') {
-                    (node.onToggle as (v: boolean) => void)(!node.checked);
-                    handled = true;
-                  } else if (event === 'submit') {
-                    if (typeof node.setValue === 'function')
-                      (node.setValue as (v: string) => void)(value ?? '');
-                    if (typeof node.onSubmit === 'function') {
-                      (node.onSubmit as (v: string) => void)(value ?? '');
-                      handled = true;
-                    }
-                  } else if (event === 'setting' && typeof node.updateValue === 'function') {
-                    const sepIdx = (value ?? '').indexOf('::');
-                    if (sepIdx !== -1) {
-                      (node.updateValue as (settingId: string, v: string) => void)(
-                        (value as string).slice(0, sepIdx),
-                        (value as string).slice(sepIdx + 2)
-                      );
-                      handled = true;
-                    }
-                  }
-                }
-                if (handled && dlg) {
-                  // Re-parse and only broadcast if the tree actually changed —
-                  // avoids redundant traffic when the callback is a pure no-op.
-                  const reparsed = boundParsedComponentTree(
-                    parseComponentTree(dlg.root, 80, [], dlg.nodeMap)
-                  );
-                  const json = JSON.stringify(reparsed);
-                  if (json !== dlg.lastParsedJson) {
-                    dlg.lastParsedJson = json;
-                    broadcast({
-                      type: 'extension_ui_update',
-                      id: dialogId,
-                      parsed: reparsed,
-                      ...stampOwner(owner),
-                    });
-                    const ui = existingUiStateFor(pendingRequestOwners.get(dialogId) ?? null);
-                    const pending = ui?.pendingDialogs.get(dialogId);
-                    if (pending) pending.requestPayload.parsed = reparsed;
-                  }
-                } else if (!handled) {
-                  // No live callback on this node (static tree, or a component
-                  // the extension built without wiring a callback) — fall back
-                  // to resolving the dialog directly with the raw value, same
-                  // as before callback bridging existed.
-                  const ui = existingUiStateFor(pendingRequestOwners.get(dialogId) ?? null);
-                  const pending = ui?.pendingDialogs.get(dialogId);
-                  if (pending) pending.resolve({ value });
-                }
-              } catch (err) {
-                log.error('[pifrontier] extension_component_event error:', err);
-                // A throwing callback (onSelect/onClick/onSubmit/etc.) must
-                // still resolve the dialog — otherwise the extension's
-                // `await ui.confirm()`/`select()` call hangs forever with no
-                // way for the user to retry or dismiss it.
-                const ui = existingUiStateFor(pendingRequestOwners.get(dialogId) ?? null);
-                const pending = ui?.pendingDialogs.get(dialogId);
-                if (pending) pending.resolve({ value });
-              }
-              break;
-            }
-
             case 'get_providers': {
               const target = targetEntry(ws.data, msg, (data) => ws.send(data));
               if (!target) break;
@@ -4963,18 +4529,22 @@ try {
               break;
             }
             case 'rename_session': {
-              await withSessionMutationLock(async () => {
+              await residentStore.withGlobalLock(async () => {
+                const sessionId = msg.sessionId;
                 try {
-                  // Security: only accept paths of known sessions — never trust raw user paths.
-                  const known = await sessionCatalog.list();
-                  const target = known.find((s) => s.path === msg.path);
+                  // Resolve by stable ID from the merged catalog. The path is
+                  // catalog-owned data and is never accepted from the client.
+                  const target = (await sessionCatalog.list()).find((s) => s.id === sessionId);
                   if (!target) {
                     ws.send(
-                      JSON.stringify({ type: 'sessions_error', message: 'Session not found.' })
+                      JSON.stringify({
+                        type: 'sessions_error',
+                        message: 'Session not found.',
+                      })
                     );
                     return;
                   }
-                  const residentTarget = residentFor(target.path);
+                  const residentTarget = residentStore.get(sessionId);
                   if (!residentTarget) {
                     ws.send(
                       JSON.stringify({
@@ -4985,7 +4555,7 @@ try {
                     return;
                   }
                   residentTarget.session.setSessionName(msg.name);
-                  sessionCatalog.apply({ kind: 'rename', path: msg.path, name: msg.name });
+                  sessionCatalog.apply({ kind: 'rename', id: target.id, name: msg.name });
                   ws.send(JSON.stringify({ type: 'sessions_list', sessions: [] }));
                 } catch (err) {
                   log.error('[pifrontier] rename_session error:', err);
@@ -4996,14 +4566,24 @@ try {
             }
 
             case 'delete_session': {
-              await withSessionMutationLock(async () => {
+              await residentStore.withGlobalLock(async () => {
+                const sessionId = msg.sessionId;
                 try {
-                  // Validate the path is a known session file — never trust raw user paths.
-                  const list = await sessionCatalog.list();
-                  const target = list.find((s) => s.path === msg.path);
+                  // Resolve by stable ID from the merged catalog. The path is
+                  // catalog-owned data and is never accepted from the client.
+                  const target = (await sessionCatalog.list()).find((s) => s.id === sessionId);
                   if (!target) {
                     ws.send(
                       JSON.stringify({ type: 'sessions_error', message: 'Session not found.' })
+                    );
+                    return;
+                  }
+                  if (target.path === '(in-memory)') {
+                    ws.send(
+                      JSON.stringify({
+                        type: 'sessions_error',
+                        message: 'Cannot delete an in-memory session.',
+                      })
                     );
                     return;
                   }
@@ -5016,7 +4596,7 @@ try {
                     );
                     return;
                   }
-                  const residentEntry = managedSessionFor(target.id);
+                  const residentEntry = residentStore.get(sessionId);
                   if (residentEntry && isPinned(residentEntry)) {
                     ws.send(
                       JSON.stringify({
@@ -5026,11 +4606,13 @@ try {
                     );
                     return;
                   }
+                  // `target.path` was obtained from the validated catalog
+                  // entry above, never from request payload.
                   await rm(target.path);
                   if (residentEntry) {
                     broadcast({
                       type: 'session_runtime',
-                      sessionId: target.id,
+                      sessionId,
                       phase: 'idle',
                       isRunning: false,
                       lastActivity: Date.now(),
@@ -5038,9 +4620,9 @@ try {
                       needsAttention: false,
                       resident: false,
                     });
-                    disposeSession(target.id, 'deleted');
+                    disposeSession(sessionId, 'deleted');
                   }
-                  sessionCatalog.apply({ kind: 'remove', path: target.path });
+                  sessionCatalog.apply({ kind: 'remove', id: target.id });
                   ws.send(JSON.stringify({ type: 'sessions_list', sessions: [] }));
                 } catch (err) {
                   log.error('[pifrontier] delete_session error:', err);
@@ -5049,328 +4631,11 @@ try {
               });
               break;
             }
-            case 'get_all_sessions': {
-              try {
-                // The live session is in the overlay, so the merged list needs
-                // no manual prepend.
-                const all = await sessionCatalog.list();
-                const sessions = all.map(serializeSession);
-                ws.send(JSON.stringify({ type: 'all_sessions_list', sessions }));
-              } catch (err) {
-                log.error('[pifrontier] get_all_sessions error:', err);
-                ws.send(JSON.stringify({ type: 'all_sessions_list', sessions: [] }));
-              }
-              break;
-            }
-
-            case 'get_projects': {
-              ws.send(
-                JSON.stringify({ type: 'projects_list', projects: await projectCatalog.list() })
-              );
-              break;
-            }
-
-            case 'add_project': {
-              try {
-                const raw = (msg as { type: 'add_project'; path: string }).path ?? '';
-                if (!raw.trim() || raw.includes('\0')) {
-                  ws.send(
-                    JSON.stringify({ type: 'sessions_error', message: 'Invalid project path.' })
-                  );
-                  break;
-                }
-                const target = resolve(expandTilde(raw.trim()));
-                // Same trust level as new_session: create the folder if it's brand new.
-                await mkdir(target, { recursive: true });
-                projectCatalog.apply({ kind: 'touch', path: target });
-              } catch (err) {
-                log.error('[pifrontier] add_project error:', err);
-                ws.send(JSON.stringify({ type: 'sessions_error', message: String(err) }));
-              }
-              break;
-            }
-
-            case 'remove_project': {
-              const target = (msg as { type: 'remove_project'; cwd: string }).cwd ?? '';
-              if (target === (activeSessionOrNull()?.sessionManager.getCwd() || cwd)) {
-                ws.send(
-                  JSON.stringify({
-                    type: 'sessions_error',
-                    message: 'Cannot forget the active project.',
-                  })
-                );
-                break;
-              }
-              await withSessionMutationLock(async () => {
-                projectCatalog.apply({ kind: 'remove', path: target });
-              });
-              break;
-            }
-            case 'delete_project': {
-              await withSessionMutationLock(async () => {
-                try {
-                  const target = (msg as { type: 'delete_project'; cwd: string }).cwd ?? '';
-                  if (!target.trim()) {
-                    ws.send(
-                      JSON.stringify({ type: 'sessions_error', message: 'No project specified.' })
-                    );
-                    return;
-                  }
-                  if (target === (activeSessionOrNull()?.sessionManager.getCwd() || cwd)) {
-                    ws.send(
-                      JSON.stringify({
-                        type: 'sessions_error',
-                        message: 'Cannot delete the active project.',
-                      })
-                    );
-                    return;
-                  }
-                  // listForCwd already includes nested/subagent sessions.
-                  const sessions = await sessionCatalog.listForCwd(target);
-                  if (
-                    sessions.some((session) => {
-                      const residentEntry = managedSessionFor(session.id);
-                      return residentEntry !== undefined && isPinned(residentEntry);
-                    })
-                  ) {
-                    ws.send(
-                      JSON.stringify({
-                        type: 'sessions_error',
-                        message: 'Cannot delete a project with a running or busy resident session.',
-                      })
-                    );
-                    return;
-                  }
-                  for (const session of sessions) {
-                    try {
-                      await rm(session.path);
-                    } catch (err) {
-                      log.error(
-                        `[pifrontier] delete_project: failed to remove ${session.path}:`,
-                        err
-                      );
-                      continue;
-                    }
-                    const residentEntry = managedSessionFor(session.id);
-                    if (residentEntry) {
-                      broadcast({
-                        type: 'session_runtime',
-                        sessionId: session.id,
-                        phase: 'idle',
-                        isRunning: false,
-                        lastActivity: Date.now(),
-                        unread: false,
-                        needsAttention: false,
-                        resident: false,
-                      });
-                      disposeSession(session.id, 'deleted');
-                    }
-                  }
-                  projectCatalog.apply({ kind: 'remove', path: target });
-                  ws.send(JSON.stringify({ type: 'sessions_list', sessions: [] }));
-                } catch (err) {
-                  log.error('[pifrontier] delete_project error:', err);
-                  ws.send(JSON.stringify({ type: 'sessions_error', message: String(err) }));
-                }
-              });
-              break;
-            }
-
-            case 'pin_project': {
-              const { cwd: target, pinned } = msg as {
-                type: 'pin_project';
-                cwd: string;
-                pinned: boolean;
-              };
-              if (typeof target === 'string' && target.trim()) {
-                projectCatalog.apply({ kind: 'setPinned', path: target, pinned: Boolean(pinned) });
-              }
-              break;
-            }
-
-            case 'rename_project': {
-              const { cwd: target, name } = msg as {
-                type: 'rename_project';
-                cwd: string;
-                name: string;
-              };
-              if (typeof target === 'string' && target.trim()) {
-                projectCatalog.apply({
-                  kind: 'rename',
-                  path: target,
-                  name: typeof name === 'string' ? name : '',
-                });
-              }
-              break;
-            }
-
-            case 'dir_complete': {
-              try {
-                const prefix = expandTilde(
-                  (msg as { type: 'dir_complete'; prefix: string }).prefix
-                );
-                const isDir = prefix.endsWith('/');
-                const dir = isDir ? prefix : dirname(prefix);
-                const resolvedDir = resolve(dir);
-                const fragment = isDir ? '' : basename(prefix).toLowerCase();
-                const cacheKey = `${resolvedDir}\u0000${dir}\u0000${fragment}`;
-                const cachedHit = dirCompleteCache.get(cacheKey);
-                if (cachedHit && Date.now() - cachedHit.at < DIR_COMPLETE_TTL_MS) {
-                  ws.send(
-                    JSON.stringify({ type: 'dir_completions', prefix, entries: cachedHit.entries })
-                  );
-                  break;
-                }
-                let entries: string[] = [];
-                try {
-                  const dirents = await readdir(resolvedDir, { withFileTypes: true });
-                  entries = dirents
-                    .filter(
-                      (d) =>
-                        d.isDirectory() &&
-                        (fragment === '' || d.name.toLowerCase().startsWith(fragment))
-                    )
-                    .map((d) => join(dir, d.name) + '/')
-                    .slice(0, 20);
-                } catch {
-                  entries = [];
-                }
-                dirCompleteCache.set(cacheKey, { at: Date.now(), entries });
-                if (dirCompleteCache.size > DIR_COMPLETE_CACHE_MAX) {
-                  let oldestKey: string | null = null;
-                  let oldestAt = Infinity;
-                  for (const [key, value] of dirCompleteCache) {
-                    if (value.at < oldestAt) {
-                      oldestAt = value.at;
-                      oldestKey = key;
-                    }
-                  }
-                  if (oldestKey) dirCompleteCache.delete(oldestKey);
-                }
-                ws.send(JSON.stringify({ type: 'dir_completions', prefix, entries }));
-              } catch (err) {
-                log.error('[pifrontier] dir_complete error:', err);
-                ws.send(JSON.stringify({ type: 'dir_completions', prefix: '', entries: [] }));
-              }
-              break;
-            }
-
-            case 'file_complete': {
-              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
-              if (!target) break;
-              try {
-                const query = (
-                  (msg as { type: 'file_complete'; query: string }).query ?? ''
-                ).toLowerCase();
-                const root = target.session.sessionManager.getCwd() || cwd;
-                // Per-prefix cache — the client re-sends the same query while
-                // typing/backspacing, and a depth-3 walk per keystroke is
-                // wasted I/O on large repos. 5 s TTL keeps results fresh enough
-                // for completion; the cache is bounded and evicts oldest-first.
-                const cacheKey = `${root}\u0000${query}`;
-                const cachedHit = fileCompleteCache.get(cacheKey);
-                if (cachedHit && Date.now() - cachedHit.at < FILE_COMPLETE_TTL_MS) {
-                  ws.send(
-                    JSON.stringify({ type: 'file_completions', query, entries: cachedHit.entries })
-                  );
-                  break;
-                }
-                const entries: string[] = [];
-                const queue: Array<{ dir: string; depth: number }> = [{ dir: root, depth: 0 }];
-
-                while (queue.length > 0 && entries.length < 40) {
-                  const item = queue.shift()!;
-                  let dirents: Array<{ name: string; isFile(): boolean; isDirectory(): boolean }>;
-                  try {
-                    dirents = (await readdir(item.dir, { withFileTypes: true })) as typeof dirents;
-                  } catch {
-                    continue;
-                  }
-
-                  for (const dirent of dirents) {
-                    if (dirent.name.startsWith('.') && dirent.name !== '.env') continue;
-                    if (SKIP_DIRS.has(dirent.name)) continue;
-                    const abs = join(item.dir, dirent.name);
-                    const rel = relative(root, abs);
-                    if (dirent.isFile() && (!query || rel.toLowerCase().includes(query))) {
-                      entries.push(rel);
-                      if (entries.length >= 40) break;
-                    } else if (dirent.isDirectory() && item.depth < 3) {
-                      queue.push({ dir: abs, depth: item.depth + 1 });
-                    }
-                  }
-                }
-
-                // Store (bounded, oldest-evicted) so retypes hit the cache.
-                fileCompleteCache.set(cacheKey, { at: Date.now(), entries });
-                if (fileCompleteCache.size > FILE_COMPLETE_CACHE_MAX) {
-                  let oldestKey: string | null = null;
-                  let oldestAt = Infinity;
-                  for (const [k, v] of fileCompleteCache) {
-                    if (v.at < oldestAt) {
-                      oldestAt = v.at;
-                      oldestKey = k;
-                    }
-                  }
-                  if (oldestKey) fileCompleteCache.delete(oldestKey);
-                }
-                ws.send(JSON.stringify({ type: 'file_completions', query, entries }));
-              } catch (err) {
-                log.error('[pifrontier] file_complete error:', err);
-                ws.send(JSON.stringify({ type: 'file_completions', query: '', entries: [] }));
-              }
-              break;
-            }
-            case 'get_extension_autocomplete': {
-              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
-              if (!target) break;
-              let timeoutId: Timer | undefined;
-              try {
-                const { trigger, query } = msg as {
-                  type: 'get_extension_autocomplete';
-                  trigger: string;
-                  query: string;
-                };
-                const provider = autocompleteProviderFor(target.session.sessionId);
-                if (!provider) {
-                  ws.send(
-                    JSON.stringify({ type: 'extension_completions', trigger, query, items: [] })
-                  );
-                  break;
-                }
-                const inputText = `${trigger}${query ?? ''}`;
-                const controller = new AbortController();
-                timeoutId = setTimeout(() => controller.abort(), 2000);
-                const result = await provider.getSuggestions([inputText], 0, inputText.length, {
-                  signal: controller.signal,
-                });
-                ws.send(
-                  JSON.stringify({
-                    type: 'extension_completions',
-                    trigger,
-                    query,
-                    items: result?.items ?? [],
-                  })
-                );
-              } catch (err) {
-                log.error('[pifrontier] get_extension_autocomplete error:', err);
-                const { trigger = '', query = '' } = msg as {
-                  trigger?: string;
-                  query?: string;
-                };
-                ws.send(
-                  JSON.stringify({ type: 'extension_completions', trigger, query, items: [] })
-                );
-              } finally {
-                clearTimeout(timeoutId);
-              }
-              break;
-            }
 
             case 'compact': {
               const target = targetEntry(ws.data, msg, (data) => ws.send(data));
               if (!target) break;
-              await withPerSessionMutationLock(target.session.sessionId, async () => {
+              await residentStore.withSessionLock(target.session.sessionId, async () => {
                 const sess = target.session;
                 if (sess.isStreaming) {
                   sendSlashResult(
@@ -5618,7 +4883,7 @@ try {
                     break;
                   }
                   case 'clone': {
-                    await withSessionMutationLock(async () => {
+                    await residentStore.withGlobalLock(async () => {
                       const leafId = session.sessionManager.getLeafId();
                       if (!leafId) {
                         sendSlashResult(ws, command, 'No session branch to clone yet.', 'warning');
@@ -5783,7 +5048,7 @@ try {
                     // Extension commands — route through prompt() which handles them via _tryExecuteExtensionCommand
                     // Use prompt() even during streaming (SDK handles extension commands during streaming)
                     try {
-                      await withPerSessionMutationLock(session.sessionId, async () => {
+                      await residentStore.withSessionLock(session.sessionId, async () => {
                         const sid = session.sessionId;
                         _promptsInFlight.add(sid);
                         try {
@@ -5951,7 +5216,7 @@ try {
             case 'set_active_tools': {
               const target = targetEntry(ws.data, msg, (data) => ws.send(data));
               if (!target) break;
-              await withPerSessionMutationLock(target.session.sessionId, async () => {
+              await residentStore.withSessionLock(target.session.sessionId, async () => {
                 try {
                   target.session.setActiveToolsByName(msg.toolNames as string[]);
                 } catch (err) {
@@ -6100,43 +5365,6 @@ try {
               }
               break;
             }
-            case 'get_command_completions': {
-              const { command, prefix } = msg as {
-                type: 'get_command_completions';
-                command: string;
-                prefix: string;
-              };
-              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
-              if (!target) break;
-              try {
-                const items = await getCommandArgumentCompletions(
-                  target.session.extensionRunner,
-                  command,
-                  prefix
-                );
-                ws.send(
-                  JSON.stringify({
-                    type: 'command_completions',
-                    command,
-                    prefix,
-                    items,
-                    sessionId: target.session.sessionId,
-                  })
-                );
-              } catch (err) {
-                log.error('[pifrontier] get_command_completions error:', err);
-                ws.send(
-                  JSON.stringify({
-                    type: 'command_completions',
-                    command,
-                    prefix,
-                    items: [],
-                    sessionId: target.session.sessionId,
-                  })
-                );
-              }
-              break;
-            }
             case 'get_extensions': {
               const target = targetEntry(ws.data, msg, (data) => ws.send(data));
               if (!target) break;
@@ -6190,7 +5418,7 @@ try {
                 ws.send(
                   JSON.stringify({
                     type: 'runtime_diagnostics',
-                    diagnostics: managedSessionFor(sess.sessionId)?.diagnostics ?? [],
+                    diagnostics: residentStore.get(sess.sessionId)?.diagnostics ?? [],
                     sessionId: sess.sessionId,
                   })
                 );
@@ -6401,7 +5629,7 @@ try {
                 const shortcut = [...shortcuts.values()].find(
                   (entry) => String(entry.shortcut) === msg.shortcut
                 );
-                if (!isCurrentEntry(target, sess, generation)) {
+                if (!(residentStore.isCurrent(target, generation) && target.session === sess)) {
                   ws.send(
                     JSON.stringify({ type: 'agent_error', error: 'Session is no longer current.' })
                   );
@@ -6415,7 +5643,6 @@ try {
               }
               break;
             }
-
 
             case 'install_skill': {
               const target = targetEntry(ws.data, msg, (data) => ws.send(data));
@@ -6503,7 +5730,7 @@ try {
             case 'fork_session': {
               const target = targetEntry(ws.data, msg, (data) => ws.send(data));
               if (!target) break;
-              await withSessionMutationLock(async () => {
+              await residentStore.withGlobalLock(async () => {
                 try {
                   const source = target.session;
                   const entryId = (msg as { type: 'fork_session'; entryId: string }).entryId;
@@ -6536,11 +5763,11 @@ try {
               if (!target) break;
               const targetSession = target.session;
               const targetGeneration = target.generation;
-              await withPerSessionMutationLock(targetSession.sessionId, async () => {
+              await residentStore.withSessionLock(targetSession.sessionId, async () => {
                 try {
                   const s = targetSession;
                   const generation = targetGeneration;
-                  if (!isCurrentEntry(target, s, generation)) {
+                  if (!(residentStore.isCurrent(target, generation) && target.session === s)) {
                     ws.send(
                       JSON.stringify({
                         type: 'agent_error',
@@ -6563,13 +5790,11 @@ try {
                     originalMessage: string;
                     newMessage: string;
                   };
-                  if (!s.sessionManager.isPersisted())
-                    throw new Error('Cannot edit in an in-memory session');
                   const userMsgs = s.getUserMessagesForForking();
                   // Find the last matching entry (most recent occurrence of the original text)
                   const match = [...userMsgs].reverse().find((m) => m.text === originalMessage);
                   if (!match) throw new Error('Could not find the original message to edit');
-                  if (!isCurrentEntry(target, s, generation)) {
+                  if (!(residentStore.isCurrent(target, generation) && target.session === s)) {
                     ws.send(
                       JSON.stringify({
                         type: 'agent_error',
@@ -6579,7 +5804,7 @@ try {
                     return;
                   }
                   await s.navigateTree(match.entryId);
-                  if (!isCurrentEntry(target, s, generation)) {
+                  if (!(residentStore.isCurrent(target, generation) && target.session === s)) {
                     ws.send(
                       JSON.stringify({
                         type: 'agent_error',
@@ -6589,7 +5814,7 @@ try {
                     return;
                   }
                   refreshSessionSummary(s);
-                  if (!isCurrentEntry(target, s, generation)) {
+                  if (!(residentStore.isCurrent(target, generation) && target.session === s)) {
                     ws.send(
                       JSON.stringify({
                         type: 'agent_error',
@@ -6611,212 +5836,6 @@ try {
                   ws.send(JSON.stringify({ type: 'agent_error', error: String(err) }));
                 }
               });
-              break;
-            }
-
-            case 'read_file': {
-              try {
-                const filePath = (msg as { type: 'read_file'; path: string }).path;
-                // Security: reject null bytes (path traversal via null injection).
-                if (filePath.includes('\0')) {
-                  ws.send(
-                    JSON.stringify({
-                      type: 'file_content',
-                      path: filePath,
-                      content: '',
-                      error: 'Invalid path',
-                    })
-                  );
-                  break;
-                }
-                // Security: resolve relative to the active project root and ensure it doesn't escape
-                const resolved = resolve(activeCwd(), expandTilde(filePath));
-                if (!isInsideWorkspace(resolved)) {
-                  ws.send(
-                    JSON.stringify({
-                      type: 'file_content',
-                      path: filePath,
-                      content: '',
-                      error: 'Path escapes workspace root',
-                    })
-                  );
-                  break;
-                }
-                const file = Bun.file(resolved);
-                if (await file.exists()) {
-                  // Cap reads — loading huge logs/binaries into memory would hurt the Pi.
-                  const MAX_READ_BYTES = 2 * 1024 * 1024;
-                  if (file.size > MAX_READ_BYTES) {
-                    ws.send(
-                      JSON.stringify({
-                        type: 'file_content',
-                        path: filePath,
-                        content: '',
-                        error: `File too large to view (${(file.size / 1024 / 1024).toFixed(1)} MB > 2 MB)`,
-                      })
-                    );
-                    break;
-                  }
-                  const content = await file.text();
-                  ws.send(JSON.stringify({ type: 'file_content', path: filePath, content }));
-                } else {
-                  ws.send(
-                    JSON.stringify({
-                      type: 'file_content',
-                      path: filePath,
-                      content: '',
-                      error: 'File not found',
-                    })
-                  );
-                }
-              } catch (err) {
-                log.error('[pifrontier] read_file error:', err);
-                ws.send(
-                  JSON.stringify({
-                    type: 'file_content',
-                    path: (msg as { type: 'read_file'; path: string }).path,
-                    content: '',
-                    error: String(err),
-                  })
-                );
-              }
-              break;
-            }
-
-            case 'write_file': {
-              try {
-                const { path: filePath, content: fileContent } = msg as {
-                  type: 'write_file';
-                  path: string;
-                  content: string;
-                };
-                if (filePath.includes('\0')) {
-                  ws.send(
-                    JSON.stringify({ type: 'file_saved', path: filePath, error: 'Invalid path' })
-                  );
-                  break;
-                }
-                const resolved = resolve(activeCwd(), expandTilde(filePath));
-                if (!isInsideWorkspace(resolved)) {
-                  ws.send(
-                    JSON.stringify({
-                      type: 'file_saved',
-                      path: filePath,
-                      error: 'Path escapes workspace root',
-                    })
-                  );
-                  break;
-                }
-                await Bun.write(resolved, fileContent);
-                ws.send(JSON.stringify({ type: 'file_saved', path: filePath }));
-              } catch (err) {
-                log.error('[pifrontier] write_file error:', err);
-                ws.send(
-                  JSON.stringify({
-                    type: 'file_saved',
-                    path: (msg as { type: 'write_file'; path: string }).path,
-                    error: String(err),
-                  })
-                );
-              }
-              break;
-            }
-
-            case 'upload_file': {
-              const upload = msg as { type: 'upload_file'; name: string; data: string };
-              const originalName = upload.name;
-              try {
-                if (originalName.includes('\0')) {
-                  throw new Error('Invalid filename');
-                }
-
-                const sanitizedName = basename(originalName.replaceAll('\\', '/')).replace(
-                  /[^A-Za-z0-9._-]/g,
-                  '_'
-                );
-                const extensionIndex = sanitizedName.lastIndexOf('.');
-                const extension =
-                  extensionIndex > 0
-                    ? sanitizedName.slice(extensionIndex, extensionIndex + 100)
-                    : '';
-                const stem =
-                  extensionIndex > 0 ? sanitizedName.slice(0, extensionIndex) : sanitizedName;
-                const safeName = `${stem.slice(0, 100 - extension.length)}${extension}`;
-                const uniqueName = `${Date.now()}-${crypto
-                  .randomUUID()
-                  .replaceAll('-', '')
-                  .slice(0, 6)}-${safeName}`;
-                const workspaceRoot = activeCwd();
-                const stagingDir = resolve(workspaceRoot, '.pi-ui-uploads');
-                const resolved = resolve(stagingDir, uniqueName);
-                const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
-                const MAX_STAGED_FILES = 20;
-
-                if (!isInsideWorkspace(resolved)) {
-                  throw new Error('Path escapes workspace root');
-                }
-                if ((upload.data.length * 3) / 4 > MAX_UPLOAD_BYTES) {
-                  throw new Error('File too large (maximum 10 MB)');
-                }
-
-                const bytes = Buffer.from(upload.data, 'base64');
-                if (bytes.byteLength > MAX_UPLOAD_BYTES) {
-                  throw new Error('File too large (maximum 10 MB)');
-                }
-
-                await mkdir(stagingDir, { recursive: true });
-                if (!isInsideWorkspace(resolved)) {
-                  throw new Error('Path escapes workspace root');
-                }
-                await Bun.write(resolved, bytes);
-                // Bound staging growth: oldest-first prune, never the file just written.
-                try {
-                  const names = await readdir(stagingDir);
-                  if (names.length > MAX_STAGED_FILES) {
-                    const candidates = names
-                      .filter((n) => n !== uniqueName)
-                      .map((n) => {
-                        try {
-                          return { n, mtime: statSync(join(stagingDir, n)).mtimeMs };
-                        } catch {
-                          return null;
-                        }
-                      })
-                      .filter((c): c is { n: string; mtime: number } => c !== null)
-                      .sort((a, b) => a.mtime - b.mtime);
-                    let total = names.length;
-                    for (const c of candidates) {
-                      if (total <= MAX_STAGED_FILES) break;
-                      try {
-                        await rm(join(stagingDir, c.n));
-                        total -= 1;
-                      } catch {
-                        /* best effort */
-                      }
-                    }
-                  }
-                } catch {
-                  /* prune is best effort; the staged reply stands */
-                }
-                const stagedPath = relative(workspaceRoot, resolved).split(sep).join('/');
-                ws.send(
-                  JSON.stringify({
-                    type: 'file_staged',
-                    name: originalName,
-                    path: stagedPath,
-                  })
-                );
-              } catch (err) {
-                log.error('[pifrontier] upload_file error:', err);
-                ws.send(
-                  JSON.stringify({
-                    type: 'file_staged',
-                    name: originalName,
-                    path: originalName,
-                    error: String(err),
-                  })
-                );
-              }
               break;
             }
 
@@ -6925,48 +5944,18 @@ try {
               }, 400);
               break;
             }
-            case 'set_notification_webhook_url': {
-              setWebhookUrl(msg.url);
-              broadcast({ type: 'notification_webhook_url', url: getWebhookUrl() });
-              break;
-            }
-
-            case 'ping': {
-              // Client heartbeat — keeps the socket alive past idleTimeout and
-              // lets the client detect zombie (dead-but-open) connections.
-              ws.send('{"type":"pong"}');
-              break;
-            }
-            case 'get_settings': {
-              ws.send(JSON.stringify({ type: 'settings', settings: readSettings() }));
-              break;
-            }
-            case 'push_subscribe': {
-              const { endpoint, keys } = msg as {
-                type: 'push_subscribe';
-                endpoint: string;
-                keys: { p256dh: string; auth: string };
-                expirationTime?: number | null;
-              };
+            default: {
               if (
-                typeof endpoint === 'string' &&
-                endpoint.startsWith('https://') &&
-                keys &&
-                typeof keys.p256dh === 'string' &&
-                typeof keys.auth === 'string'
-              ) {
-                addPushSubscription({ endpoint, keys, expirationTime: msg.expirationTime ?? null });
-              }
-              break;
-            }
-            case 'push_unsubscribe': {
-              const { endpoint } = msg as { type: 'push_unsubscribe'; endpoint: string };
-              if (typeof endpoint === 'string') removePushSubscription(endpoint);
-              break;
-            }
-            case 'set_settings': {
-              const updated = updateSettings(msg.settings as Record<string, unknown>);
-              broadcast({ type: 'settings', settings: updated });
+                await dispatchExtensionUiMessage(
+                  msg,
+                  { data: ws.data, send: (data) => ws.send(data) },
+                  extensionUiHandlerDependencies
+                )
+              )
+                break;
+              if (await dispatchFilesystemMessage(msg, ws, filesystemHandlerDependencies)) break;
+              if (await dispatchProjectMessage(msg, ws, projectHandlerDependencies)) break;
+              dispatchSystemMessage(msg, ws, systemHandlerDependencies);
               break;
             }
           } // end switch
@@ -6981,34 +5970,7 @@ try {
       },
 
       close(ws) {
-        ws.data.closed = true;
-        ws.unsubscribe(WS_TOPIC);
-        const focused = ws.data.focusedSessionId;
-        if (focused) {
-          const count = focusedSessionCounts.get(focused) ?? 0;
-          if (count <= 1) focusedSessionCounts.delete(focused);
-          else focusedSessionCounts.set(focused, count - 1);
-        }
-        ws.data.focusedSessionId = undefined;
-        connectedClients = Math.max(0, connectedClients - 1);
-        // Clear the periodic token expiry check
-        if (ws.data._expTimer) {
-          clearInterval(ws.data._expTimer);
-          ws.data._expTimer = undefined;
-        }
-        // When the last client disconnects, cancel pending extension dialogs
-        // after a bounded orphan grace. This prevents transient PWA reconnects
-        // (tab hidden, mobile wake) from dropping active prompts while ensuring
-        // an orphaned request does not hold the SDK for the full timeout.
-        // We do not dispose the live session on client disconnect; pending agent work must
-        // continue running even when no browser client is connected.
-        if (connectedClients === 0) {
-          if (_pendingRequestsTimeout) clearTimeout(_pendingRequestsTimeout);
-          _pendingRequestsTimeout = setTimeout(() => {
-            _pendingRequestsTimeout = null;
-            cancelAllPendingExtensionRequests();
-          }, EXTENSION_DIALOG_ORPHAN_GRACE_MS);
-        }
+        wsTransport.onClose(ws);
       },
 
       idleTimeout: 120,
@@ -7035,7 +5997,7 @@ try {
 broadcast = (payload) => {
   // No subscribers — skip stringify/publish entirely. The open handler replays
   // full state snapshots to the next client that connects.
-  if (connectedClients === 0) return;
+  if (wsTransport.connectedClients === 0) return;
   server.publish(WS_TOPIC, JSON.stringify(payload));
 };
 // Hydrate session summaries from the previous run — sidebar loads become
@@ -7070,15 +6032,14 @@ const _shutdown = async () => {
   }
   _stopSessionWatch?.();
   // Abort and dispose every resident session so background agent work stops cleanly.
-  for (const entry of residentEntries()) {
-    if (!entry.session.isStreaming) continue;
+  for (const entry of residentStore.values()) {
     try {
       entry.session.abort();
     } catch {
       /* agent may already be done */
     }
   }
-  for (const sid of [...resident.keys()]) disposeSession(sid, 'shutdown');
+  for (const sid of residentStore.keys()) disposeSession(sid, 'shutdown');
   // Flush any debounced session-scan cache write so the next start is
   // stat-only for unchanged files.
   try {

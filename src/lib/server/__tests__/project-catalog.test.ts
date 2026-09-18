@@ -82,6 +82,36 @@ describe('project-catalog', () => {
     expect(projects.map((p) => p.cwd)).toEqual(['/proj/old', '/proj/new']);
   });
 
+  it('caches aggregates and updates a moved session incrementally', async () => {
+    const listSpy = vi.spyOn(sessions, 'list');
+    upsertSession('s1', '/proj/a', 1_700_000_100_000);
+    upsertSession('s2', '/proj/b', 1_700_000_200_000);
+
+    await catalog.list();
+    await catalog.list();
+    expect(listSpy).toHaveBeenCalledTimes(1);
+
+    upsertSession('s1', '/proj/b', 1_700_000_300_000);
+    const projects = await catalog.list();
+    expect(listSpy).toHaveBeenCalledTimes(1);
+    expect(projects.find((p) => p.cwd === '/proj/a')?.sessionCount).toBeUndefined();
+    expect(projects.find((p) => p.cwd === '/proj/b')).toMatchObject({
+      sessionCount: 2,
+      lastActivity: 1_700_000_300_000,
+    });
+  });
+
+  it('rebuilds aggregates once after releasing a resident session', async () => {
+    const listSpy = vi.spyOn(sessions, 'list');
+    upsertSession('s1', '/proj/a', 1_700_000_100_000);
+    expect(await catalog.list()).toHaveLength(1);
+
+    sessions.apply({ kind: 'release', id: 's1' });
+    expect(await catalog.list()).toHaveLength(0);
+    expect(await catalog.list()).toHaveLength(0);
+    expect(listSpy).toHaveBeenCalledTimes(2);
+  });
+
   it('setPinned upserts and toggles', async () => {
     catalog.apply({ kind: 'setPinned', path: '/proj/p', pinned: true });
     let projects = await catalog.list();

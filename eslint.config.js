@@ -34,6 +34,7 @@ export default [
       '.svelte-kit/',
       'node_modules/',
       'coverage/',
+      'test-results/',
       '.opencode/',
       '.pi/',
       '.playwright-mcp/',
@@ -50,9 +51,9 @@ export default [
   // state, routes app group) never reach into server-only modules, stores never
   // import components, and the server realm stays self-contained behind shared
   // + protocol. Routes stay permissive because the same directory mixes .svelte
-  // client code with legitimate .server.ts files. server.ts (root entry) is
-  // deliberately unclassified — element patterns are folder-based; its imports
-  // stay unconstrained.
+  // client code with legitimate .server.ts files. The root server.ts entry is
+  // classified separately as a server-entry file so it can depend only on
+  // protocol/shared/server runtime/handler elements.
   {
     plugins: { boundaries },
     settings: {
@@ -71,6 +72,9 @@ export default [
         { type: 'protocol', pattern: ['src/lib/ws/**'] },
         { type: 'state', pattern: ['src/lib/state/**'] },
         { type: 'components', pattern: ['src/lib/components/**'] },
+        { type: 'server-runtime', pattern: ['src/lib/server/runtime/**'] },
+        { type: 'server-handlers', pattern: ['src/lib/server/handlers/**'] },
+        { type: 'client-controllers', pattern: ['src/lib/controllers/**'] },
         {
           type: 'server',
           pattern: ['src/lib/server/**', 'src/lib/auth/**', 'bin/**', 'scripts/**'],
@@ -80,6 +84,7 @@ export default [
         // tui-stubs, …) is dual-use glue both realms may depend on.
         { type: 'shared', pattern: ['src/lib/**'] },
       ],
+      'boundaries/files': [{ category: 'server-entry', pattern: 'server.ts' }],
     },
     rules: {
       'boundaries/dependencies': [
@@ -124,13 +129,52 @@ export default [
               ],
             },
             {
+              from: { element: { type: 'client-controllers' } },
+              allow: [
+                { to: { element: { type: 'protocol' } } },
+                { to: { element: { type: 'shared' } } },
+                { to: { element: { type: 'state' } } },
+                { to: { element: { type: 'client-controllers' } } },
+              ],
+            },
+            {
               from: { element: { type: 'routes' } },
               allow: [
                 { to: { element: { type: 'protocol' } } },
                 { to: { element: { type: 'shared' } } },
                 { to: { element: { type: 'state' } } },
                 { to: { element: { type: 'components' } } },
+                { to: { element: { type: 'client-controllers' } } },
                 { to: { element: { type: 'server' } } },
+              ],
+            },
+            {
+              from: { element: { type: 'server-runtime' } },
+              allow: [
+                { to: { element: { type: 'protocol' } } },
+                { to: { element: { type: 'shared' } } },
+                { to: { element: { type: 'server' } } },
+                { to: { element: { type: 'server-runtime' } } },
+              ],
+            },
+            {
+              from: { element: { type: 'server-handlers' } },
+              allow: [
+                { to: { element: { type: 'protocol' } } },
+                { to: { element: { type: 'shared' } } },
+                { to: { element: { type: 'server' } } },
+                { to: { element: { type: 'server-runtime' } } },
+                { to: { element: { type: 'server-handlers' } } },
+              ],
+            },
+            {
+              from: { file: { categories: 'server-entry' } },
+              allow: [
+                { to: { element: { type: 'protocol' } } },
+                { to: { element: { type: 'shared' } } },
+                { to: { element: { type: 'server' } } },
+                { to: { element: { type: 'server-runtime' } } },
+                { to: { element: { type: 'server-handlers' } } },
               ],
             },
             {
@@ -139,6 +183,8 @@ export default [
                 { to: { element: { type: 'protocol' } } },
                 { to: { element: { type: 'shared' } } },
                 { to: { element: { type: 'server' } } },
+                { to: { element: { type: 'server-runtime' } } },
+                { to: { element: { type: 'server-handlers' } } },
               ],
             },
           ],

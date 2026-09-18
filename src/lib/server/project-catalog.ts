@@ -21,7 +21,7 @@ import { existsSync } from 'node:fs';
 import { basename } from 'node:path';
 import { loadProjectRecords, saveProjectRecords, type ProjectRecord } from './project-registry';
 import type { ProjectInfo } from '../ws/protocol';
-import type { SessionCatalog } from './session-catalog';
+import type { SessionCatalog, SessionCatalogPatch } from './session-catalog';
 
 export type ProjectCatalogPatch =
   | { kind: 'touch'; path: string }
@@ -33,16 +33,25 @@ export type ProjectCatalogPatch =
 const EXISTS_TTL_MS = 30_000;
 /** Debounce window for registry persistence (coalesces rapid touches). */
 const PERSIST_DEBOUNCE_MS = 500;
+type SessionAggregate = { count: number; lastModified: number };
+type SessionIdentity = { cwd: string; modified: number };
 
 export class ProjectCatalog {
   private readonly listeners = new Set<() => void>();
   private persistTimer: Timer | null = null;
   private readonly existsCache = new Map<string, { exists: boolean; at: number }>();
+  /** Cached session-derived values used by project list merges. */
+  private readonly sessionAggregates = new Map<string, SessionAggregate>();
+  /** Session identities let exact upsert/remove patches update only affected cwds. */
+  private readonly sessionById = new Map<string, SessionIdentity>();
+  private readonly sessionTimesByCwd = new Map<string, Map<string, number>>();
+  private aggregatesInitialized = false;
+  private aggregatesDirty = true;
+  private aggregateRevision = 0;
+  private aggregateRebuild: Promise<void> | null = null;
 
   constructor(private readonly sessions: SessionCatalog) {
-    // Session activity changes per-project counts and recency — re-derive
-    // and notify so the merged view stays fresh without server.ts wiring.
-    this.sessions.onChange(() => this.emit());
+    this.sessions.onChange((patch) => this.handleSessionChange(patch));
   }
 
   /** Single write chokepoint for all project-registry mutations. */
@@ -92,18 +101,7 @@ export class ProjectCatalog {
    * pinned-first then by most recent activity.
    */
   async list(): Promise<ProjectInfo[]> {
-    const sessions = await this.sessions.list();
-    const byCwd = new Map<string, { count: number; lastModified: number }>();
-    for (const s of sessions) {
-      if (!s.cwd) continue;
-      const agg = byCwd.get(s.cwd);
-      if (agg) {
-        agg.count += 1;
-        agg.lastModified = Math.max(agg.lastModified, s.modified.getTime());
-      } else {
-        byCwd.set(s.cwd, { count: 1, lastModified: s.modified.getTime() });
-      }
-    }
+    await this.ensureAggregates();
 
     const map = new Map<string, ProjectInfo>();
     for (const rec of loadProjectRecords()) {
@@ -117,7 +115,7 @@ export class ProjectCatalog {
         lastActivity: rec.lastOpened,
       });
     }
-    for (const [dir, agg] of byCwd) {
+    for (const [dir, agg] of this.sessionAggregates) {
       const entry = map.get(dir);
       if (entry) {
         entry.sessionCount = agg.count;
@@ -144,6 +142,90 @@ export class ProjectCatalog {
     return [...map.values()].sort((a, b) =>
       a.pinned !== b.pinned ? (a.pinned ? -1 : 1) : b.lastActivity - a.lastActivity
     );
+  }
+
+  private handleSessionChange(patch?: SessionCatalogPatch): void {
+    this.aggregateRevision++;
+    if (!patch || !this.aggregatesInitialized || this.aggregatesDirty || this.aggregateRebuild) {
+      this.aggregatesDirty = true;
+    } else if (patch.kind === 'upsert') {
+      this.applySessionUpsert(patch.session);
+    } else if (patch.kind === 'remove') {
+      const previous = this.sessionById.get(patch.id);
+      if (!previous) this.aggregatesDirty = true;
+      else {
+        this.removeSession(patch.id, previous);
+        this.sessionById.delete(patch.id);
+      }
+    } else {
+      // Rename and release change disk/overlay truth in ways that cannot be
+      // derived from the patch alone.
+      this.aggregatesDirty = true;
+    }
+    this.emit();
+  }
+
+  private applySessionUpsert(session: { id: string; cwd: string; modified: Date }): void {
+    const previous = this.sessionById.get(session.id);
+    if (previous) this.removeSession(session.id, previous);
+    const identity = { cwd: session.cwd, modified: session.modified.getTime() };
+    this.sessionById.set(session.id, identity);
+    if (!identity.cwd) return;
+    let times = this.sessionTimesByCwd.get(identity.cwd);
+    if (!times) {
+      times = new Map();
+      this.sessionTimesByCwd.set(identity.cwd, times);
+    }
+    times.set(session.id, identity.modified);
+    this.updateAggregate(identity.cwd, times);
+  }
+
+  private removeSession(id: string, identity: SessionIdentity): void {
+    if (!identity.cwd) return;
+    const times = this.sessionTimesByCwd.get(identity.cwd);
+    if (!times) return;
+    times.delete(id);
+    if (times.size === 0) {
+      this.sessionTimesByCwd.delete(identity.cwd);
+      this.sessionAggregates.delete(identity.cwd);
+      return;
+    }
+    this.updateAggregate(identity.cwd, times);
+  }
+
+  private updateAggregate(cwd: string, times: Map<string, number>): void {
+    let lastModified = -Infinity;
+    for (const modified of times.values()) lastModified = Math.max(lastModified, modified);
+    this.sessionAggregates.set(cwd, { count: times.size, lastModified });
+  }
+
+  private async ensureAggregates(): Promise<void> {
+    while (!this.aggregatesInitialized || this.aggregatesDirty) {
+      if (!this.aggregateRebuild) {
+        const revision = this.aggregateRevision;
+        const rebuild = (async () => {
+          const sessions = await this.sessions.list();
+          if (revision !== this.aggregateRevision) return;
+
+          this.sessionAggregates.clear();
+          this.sessionById.clear();
+          this.sessionTimesByCwd.clear();
+          for (const session of sessions) this.applySessionUpsert(session);
+          this.aggregatesInitialized = true;
+          this.aggregatesDirty = false;
+        })();
+        this.aggregateRebuild = rebuild;
+        void rebuild.then(
+          () => {
+            if (this.aggregateRebuild === rebuild) this.aggregateRebuild = null;
+          },
+          () => {
+            if (this.aggregateRebuild === rebuild) this.aggregateRebuild = null;
+          }
+        );
+      }
+      await this.aggregateRebuild;
+    }
   }
 
   /** Subscribe to list changes; returns an unsubscribe function. */

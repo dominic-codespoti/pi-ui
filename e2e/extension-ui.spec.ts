@@ -973,6 +973,9 @@ test.describe('Extension custom modal with parsed components', () => {
       wsInit(ws);
     });
 
+    // The prompt route is installed after login; wait for the connected composer
+    // rather than racing the initial session hydration.
+    await expect(page.locator('textarea')).toBeEditable({ timeout: 3000 });
     await submitPrompt(page, 'Pick model');
 
     await expect(page.getByText('Pick a model:')).toBeVisible({ timeout: 3000 });
@@ -2052,6 +2055,72 @@ test.describe('Extension terminal input', () => {
     await page.waitForTimeout(500);
 
     await expect(page.locator('textarea')).toHaveValue('xy');
+  });
+
+  test('rapid printable verdicts use compact monotonic ids and settle independently', async ({
+    page,
+  }) => {
+    const sent: Record<string, unknown>[] = [];
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.onMessage((data) => {
+        const msg = JSON.parse(String(data)) as Record<string, unknown>;
+        sent.push(msg);
+        if (msg.type === 'extension_terminal_input') {
+          setTimeout(() => {
+            ws.send(
+              JSON.stringify({
+                type: 'extension_terminal_input_result',
+                id: msg.id,
+                consumed: msg.data === 'b',
+                sessionId: 's1',
+              })
+            );
+          }, 50);
+        }
+      });
+      ws.send(
+        JSON.stringify({
+          ...CONNECTED_S1,
+          extensionUiState: { terminalInputActive: true },
+        })
+      );
+    });
+
+    await pressKey(page, 'a');
+    await pressKey(page, 'b');
+    await pressKey(page, 'c');
+
+    await expect(page.locator('textarea')).toHaveValue('ac');
+    const ids = sent
+      .filter((msg) => msg.type === 'extension_terminal_input')
+      .map((msg) => String(msg.id));
+    expect(ids).toHaveLength(3);
+    expect(new Set(ids).size).toBe(3);
+    expect(ids.every((id) => /^k[0-9a-z]+$/.test(id))).toBe(true);
+    expect(Number.parseInt(ids[1].slice(1), 36)).toBeGreaterThan(
+      Number.parseInt(ids[0].slice(1), 36)
+    );
+    expect(Number.parseInt(ids[2].slice(1), 36)).toBeGreaterThan(
+      Number.parseInt(ids[1].slice(1), 36)
+    );
+  });
+
+  test('unanswered printable verdict falls back after the shared deadline', async ({ page }) => {
+    const sent: Record<string, unknown>[] = [];
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.onMessage((data) => sent.push(JSON.parse(String(data)) as Record<string, unknown>));
+      ws.send(
+        JSON.stringify({
+          ...CONNECTED_S1,
+          extensionUiState: { terminalInputActive: true },
+        })
+      );
+    });
+
+    await pressKey(page, 't');
+
+    await expect(page.locator('textarea')).toHaveValue('t', { timeout: 3000 });
+    expect(sent.filter((msg) => msg.type === 'extension_terminal_input')).toHaveLength(1);
   });
 
   test('editor mirror resyncs after a same-session reconnect', async ({ page }) => {

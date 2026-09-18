@@ -16,12 +16,17 @@
  * own their own broadcast scheduling — the catalog is transport-agnostic.
  */
 
-import { scanAllSessions, sessionFileInfo, type SessionFileInfo } from './session-scan';
+import {
+  invalidateSessionScanCache,
+  scanAllSessions,
+  sessionFileInfo,
+  type SessionFileInfo,
+} from './session-scan';
 
 export type SessionCatalogPatch =
   | { kind: 'upsert'; session: SessionFileInfo }
-  | { kind: 'rename'; path: string; name: string }
-  | { kind: 'remove'; path: string }
+  | { kind: 'rename'; id: string; name: string }
+  | { kind: 'remove'; id: string }
   | { kind: 'release'; id: string };
 
 /** Marker for pooled sessions that have no file on disk (never persisted). */
@@ -36,9 +41,11 @@ export class SessionCatalog {
    * the first upsert), instead of drifting to "now" on every message.
    */
   private readonly createdById = new Map<string, Date>();
-  /** Promise-cached disk scan; dropped only on structural changes. */
+  /** Promise-cached disk scan and its invalidation generation. */
   private scanPromise: Promise<SessionFileInfo[]> | null = null;
-  private readonly listeners = new Set<() => void>();
+  private scanPromiseGeneration = 0;
+  private scanGeneration = 0;
+  private readonly listeners = new Set<(patch?: SessionCatalogPatch) => void>();
   /** Kind of the most recent patch — lets consumers distinguish live upserts
    *  (pooled-session churn) from structural changes (rename/remove/release)
    *  without re-reading the merged list. */
@@ -63,22 +70,17 @@ export class SessionCatalog {
         break;
       }
       case 'rename': {
-        for (const [id, s] of this.overlay) {
-          if (s.path === patch.path) this.overlay.set(id, { ...s, name: patch.name });
-        }
+        const session = this.overlay.get(patch.id);
+        if (session) this.overlay.set(patch.id, { ...session, name: patch.name });
         // Disk truth changed too (a session_info entry was appended) — the
         // next scan re-parses that one file via the per-file stat cache.
-        this.scanPromise = null;
+        this.dropScan();
         break;
       }
       case 'remove': {
-        for (const [id, s] of this.overlay) {
-          if (s.path === patch.path) {
-            this.overlay.delete(id);
-            this.createdById.delete(id);
-          }
-        }
-        this.scanPromise = null;
+        this.overlay.delete(patch.id);
+        this.createdById.delete(patch.id);
+        this.dropScan();
         break;
       }
       case 'release': {
@@ -88,11 +90,11 @@ export class SessionCatalog {
         // for unchanged files and re-parses just the released one.
         this.overlay.delete(patch.id);
         this.createdById.delete(patch.id);
-        this.scanPromise = null;
+        this.dropScan();
         break;
       }
     }
-    for (const cb of this.listeners) cb();
+    for (const cb of this.listeners) cb(patch);
   }
 
   /**
@@ -101,15 +103,23 @@ export class SessionCatalog {
    * accept stale disk truth (e.g. switch_session security validation).
    */
   async list(opts: { fresh?: boolean } = {}): Promise<SessionFileInfo[]> {
+    const generation = this.scanGeneration;
     if (!this.scanPromise || opts.fresh) {
       const promise = scanAllSessions(this.sessionsRoot(), { skipPaths: this.skipPaths() });
       this.scanPromise = promise;
+      this.scanPromiseGeneration = generation;
       // Never cache a failed scan.
       promise.catch(() => {
         if (this.scanPromise === promise) this.scanPromise = null;
       });
     }
-    const scanned = await this.scanPromise;
+    const promise = this.scanPromise;
+    const promiseGeneration = this.scanPromiseGeneration;
+    if (!promise) return this.list(opts);
+    const scanned = await promise;
+    if (this.scanGeneration !== promiseGeneration || this.scanPromise !== promise) {
+      return this.list(opts);
+    }
     for (const s of scanned) {
       if (!this.createdById.has(s.id)) this.createdById.set(s.id, s.created);
     }
@@ -140,7 +150,7 @@ export class SessionCatalog {
   }
 
   /** Subscribe to list changes; returns an unsubscribe function. */
-  onChange(cb: () => void): () => void {
+  onChange(cb: (patch?: SessionCatalogPatch) => void): () => void {
     this.listeners.add(cb);
     return () => this.listeners.delete(cb);
   }
@@ -149,11 +159,18 @@ export class SessionCatalog {
    * Drop the cached disk scan — external processes appended session files
    * (subagents, parallel CLI instances; see session-watcher.ts). The next
    * list() re-scans, and changed files re-parse via the per-file stat cache.
-   * Not an apply() patch: pooled state is untouched, and callers own the
-   * refresh scheduling.
+   * Not an apply() patch: pooled state is untouched, and callers own their
+   * own refresh scheduling.
    */
-  invalidateScan(): void {
+  invalidateScan(paths?: readonly string[]): void {
+    this.dropScan(paths);
+    for (const cb of this.listeners) cb();
+  }
+
+  private dropScan(paths?: readonly string[]): void {
+    this.scanGeneration++;
     this.scanPromise = null;
+    invalidateSessionScanCache(paths);
   }
 
   /** Files the disk scan must skip — pooled sessions are overlay-authoritative. */

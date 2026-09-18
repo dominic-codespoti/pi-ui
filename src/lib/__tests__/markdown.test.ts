@@ -134,6 +134,49 @@ describe('renderStreamingPreview', () => {
     expect(result).toContain('a$b_');
     expect(result).toContain('x'.repeat(100));
   });
+
+  it('reuses escaped output for large prefix appends without changing the result', () => {
+    const first = `prefix ${'x'.repeat(9000)} & <`;
+    const appended = `${first}dangerous <script>&`;
+
+    renderStreamingPreview('reset');
+    renderStreamingPreview(first);
+    const incremental = renderStreamingPreview(appended);
+
+    renderStreamingPreview('reset');
+    expect(incremental).toBe(renderStreamingPreview(appended));
+    expect(incremental).toContain('&lt;script&gt;');
+    expect(incremental).toContain('&amp;');
+    expect(incremental).not.toContain('<script>');
+  });
+
+  it('resets incremental state for interleaved streams and rewrites', () => {
+    const streamA = `stream A ${'a'.repeat(9000)}`;
+    const streamB = `stream B ${'b'.repeat(9000)}`;
+    const streamANext = `${streamA} <tag>`;
+
+    renderStreamingPreview(streamA);
+    renderStreamingPreview(streamB);
+    const interleaved = renderStreamingPreview(streamANext);
+
+    renderStreamingPreview('reset');
+    expect(interleaved).toBe(renderStreamingPreview(streamANext));
+
+    const rewritten = `replacement ${'r'.repeat(9000)}`;
+    const rewrittenResult = renderStreamingPreview(rewritten);
+    renderStreamingPreview('reset');
+    expect(rewrittenResult).toBe(renderStreamingPreview(rewritten));
+  });
+
+  it('keeps output correct when a stream exceeds the bounded preview cache', () => {
+    const overLimit = 'q'.repeat(150_001);
+    const appended = `${overLimit}<tag>`;
+
+    renderStreamingPreview(overLimit);
+    const result = renderStreamingPreview(appended);
+    renderStreamingPreview('reset');
+    expect(result).toBe(renderStreamingPreview(appended));
+  });
 });
 
 describe('renderMarkdown unresolved-lang hook', () => {

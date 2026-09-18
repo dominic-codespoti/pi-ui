@@ -492,10 +492,16 @@ marked.use({
 });
 
 /** Above this size, marked+hljs parsing stalls the main thread (seconds on
- *  mobile) and the throttled re-render during streaming compounds it — fall
- *  back to escaped plain text so a runaway reasoning/text block can't hang
- *  the tab. */
+ * mobile) and the throttled re-render during streaming compounds it — fall
+ * back to escaped plain text so a runaway reasoning/text block can't hang
+ * the tab. */
 export const MAX_MARKDOWN_CHARS = 150_000;
+
+/** Streaming previews skip the complete-LaTeX scan above this size. */
+const STREAMING_PREVIEW_LARGE_THRESHOLD_CHARS = 8_000;
+
+/** Keep incremental preview state bounded to a single ordinary large render. */
+const MAX_STREAMING_PREVIEW_CACHE_CHARS = MAX_MARKDOWN_CHARS;
 
 /** Minimum input size at which source-dump detection can bypass marked. */
 export const SOURCE_DUMP_MIN_CHARS = 16_000;
@@ -625,6 +631,24 @@ export function memoizedRenderMarkdown(content: string): string {
   return html;
 }
 
+type StreamingPreviewCache = {
+  source: string;
+  escaped: string;
+};
+
+let _streamingPreviewCache: StreamingPreviewCache | null = null;
+
+function cacheStreamingPreview(source: string, escaped: string): void {
+  if (
+    source.length <= MAX_STREAMING_PREVIEW_CACHE_CHARS &&
+    escaped.length <= MAX_STREAMING_PREVIEW_CACHE_CHARS
+  ) {
+    _streamingPreviewCache = { source, escaped };
+  } else {
+    _streamingPreviewCache = null;
+  }
+}
+
 /**
  * Streaming preview — escaped plain text with preserved whitespace. Parsing
  * the full accumulated markdown on every token delta (the streaming hot spot)
@@ -634,8 +658,21 @@ export function memoizedRenderMarkdown(content: string): string {
  * large buffers skip it and escape directly (final render still resolves math).
  */
 export function renderStreamingPreview(src: string): string {
-  if (src.length > 8000)
-    return `<pre class="whitespace-pre-wrap break-words">${escHtml(src)}</pre>`;
+  if (src.length > STREAMING_PREVIEW_LARGE_THRESHOLD_CHARS) {
+    const cached = _streamingPreviewCache;
+    let escaped: string;
+
+    if (cached && src.startsWith(cached.source)) {
+      escaped = cached.escaped + escHtml(src.slice(cached.source.length));
+    } else {
+      escaped = escHtml(src);
+    }
+
+    cacheStreamingPreview(src, escaped);
+    return `<pre class="whitespace-pre-wrap break-words">${escaped}</pre>`;
+  }
+
+  _streamingPreviewCache = null;
   return `<pre class="whitespace-pre-wrap break-words">${escHtml(renderCompleteLatex(src))}</pre>`;
 }
 

@@ -363,13 +363,17 @@ test.describe('Chat / prompt streaming', () => {
   test('shows extension subcommands with spaces and typed prefixes', async ({ page }) => {
     const longDescription =
       'Agent commands with a deliberately long description that should wrap instead of being clipped';
+    const commandPrefixes: string[] = [];
     await page.routeWebSocket('/ws', (ws) => {
       ws.onMessage((data) => {
         const msg = JSON.parse(String(data));
         if (msg.type === 'get_command_completions' && msg.command === 'ag') {
+          commandPrefixes.push(msg.prefix);
           ws.send(
             JSON.stringify({
               type: 'command_completions',
+              sessionId: msg.sessionId,
+              requestId: msg.requestId,
               command: 'ag',
               prefix: msg.prefix,
               items: [
@@ -410,11 +414,242 @@ test.describe('Chat / prompt streaming', () => {
     await page.fill('textarea', '/ag   ');
     await expect(page.getByText('/ag subcommands')).toBeVisible({ timeout: 3000 });
     await expect(page.getByText('Show agent status')).toBeVisible();
+    await expect.poll(() => commandPrefixes).toContain('');
 
     await page.fill('textarea', '/ag sta');
     await expect(page.getByText('Show agent status')).toBeVisible({ timeout: 3000 });
+    await expect.poll(() => commandPrefixes).toContain('sta');
     await page.getByRole('option', { name: /status Show agent status/ }).click();
     await expect(page.locator('textarea')).toHaveValue('/ag status ');
+  });
+  test('preserves parent arguments for nested command completions', async ({ page }) => {
+    const commandPrefixes: string[] = [];
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.onMessage((data) => {
+        const msg = JSON.parse(String(data));
+        if (msg.type !== 'get_command_completions') return;
+        commandPrefixes.push(msg.prefix);
+        ws.send(
+          JSON.stringify({
+            type: 'command_completions',
+            sessionId: msg.sessionId,
+            requestId: msg.requestId,
+            command: msg.command,
+            prefix: msg.prefix,
+            items: [
+              { value: 'child grand', label: 'grand', description: 'Grandchild command' },
+              { value: 'child graph', label: 'graph', description: 'Graph command' },
+            ],
+          })
+        );
+      });
+      ws.send(
+        JSON.stringify({
+          type: 'connected',
+          sessionId: 'nested-session',
+          isStreaming: false,
+          thinkingLevel: 'medium',
+          model: null,
+          availableModels: [],
+          messages: [],
+        })
+      );
+      ws.send(
+        JSON.stringify({
+          type: 'commands_list',
+          commands: [{ name: 'parent', description: 'Parent command', source: 'test' }],
+        })
+      );
+    });
+
+    await page.goto('/');
+    await page.fill('textarea', '/parent child gr');
+    await expect(page.getByRole('option', { name: /grand Grandchild command/ })).toBeVisible({
+      timeout: 3000,
+    });
+    await expect.poll(() => commandPrefixes).toContain('child gr');
+    await page.getByRole('option', { name: /grand Grandchild command/ }).click();
+    await expect(page.locator('textarea')).toHaveValue('/parent child grand ');
+  });
+
+  test('ignores out-of-order same-query completion responses', async ({ page }) => {
+    const requests: Array<{ sessionId: string; requestId: string; query: string }> = [];
+    let socket: { send(data: string): void } | null = null;
+    await page.routeWebSocket('/ws', (ws) => {
+      socket = ws;
+      ws.onMessage((data) => {
+        const msg = JSON.parse(String(data));
+        if (msg.type === 'get_extension_autocomplete' && msg.trigger === '@') {
+          requests.push(msg);
+        }
+      });
+      ws.send(
+        JSON.stringify({
+          type: 'connected',
+          sessionId: 'completion-session',
+          isStreaming: false,
+          thinkingLevel: 'medium',
+          model: null,
+          availableModels: [],
+          messages: [],
+        })
+      );
+    });
+
+    await page.goto('/');
+    await page.fill('textarea', '@foo');
+    await expect.poll(() => requests.length, { timeout: 3000 }).toBe(1);
+    await page.fill('textarea', '@bar');
+    await expect.poll(() => requests.length, { timeout: 3000 }).toBe(2);
+    await page.fill('textarea', '@foo');
+    await expect.poll(() => requests.length, { timeout: 3000 }).toBe(3);
+
+    const latest = requests[2];
+    const stale = requests[0];
+    socket!.send(
+      JSON.stringify({
+        type: 'extension_completions',
+        sessionId: latest.sessionId,
+        requestId: latest.requestId,
+        trigger: '@',
+        query: 'foo',
+        items: [{ value: 'fresh', label: 'fresh', description: 'latest' }],
+      })
+    );
+    await expect(page.getByRole('option', { name: /@fresh latest/ })).toBeVisible({
+      timeout: 3000,
+    });
+    socket!.send(
+      JSON.stringify({
+        type: 'extension_completions',
+        sessionId: stale.sessionId,
+        requestId: stale.requestId,
+        trigger: '@',
+        query: 'foo',
+        items: [{ value: 'stale', label: 'stale', description: 'old' }],
+      })
+    );
+    await expect(page.getByRole('option', { name: /@fresh latest/ })).toBeVisible();
+    await expect(page.getByRole('option', { name: /@stale old/ })).not.toBeVisible();
+  });
+
+  test('debounces file, extension, and command completion channels', async ({ page }) => {
+    const requests = {
+      file: [] as Array<{ query: string }>,
+      extension: [] as Array<{ query: string }>,
+      command: [] as Array<{ prefix: string }>,
+    };
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.onMessage((data) => {
+        const msg = JSON.parse(String(data));
+        if (msg.type === 'file_complete') requests.file.push(msg);
+        if (msg.type === 'get_extension_autocomplete' && msg.trigger === '@')
+          requests.extension.push(msg);
+        if (msg.type === 'get_command_completions') requests.command.push(msg);
+      });
+      ws.send(
+        JSON.stringify({
+          type: 'connected',
+          sessionId: 'completion-debounce-session',
+          isStreaming: false,
+          thinkingLevel: 'medium',
+          model: null,
+          availableModels: [],
+          messages: [],
+        })
+      );
+      ws.send(
+        JSON.stringify({
+          type: 'commands_list',
+          commands: [{ name: 'parent', description: 'Parent command', source: 'test' }],
+        })
+      );
+    });
+
+    await page.goto('/');
+    await page.fill('textarea', '@a');
+    await page.fill('textarea', '@ab');
+    await page.fill('textarea', '@abc');
+    await expect.poll(() => requests.file.length, { timeout: 3000 }).toBe(1);
+    await expect.poll(() => requests.extension.length, { timeout: 3000 }).toBe(1);
+    expect(requests.file[0].query).toBe('abc');
+    expect(requests.extension[0].query).toBe('abc');
+
+    await page.fill('textarea', '/parent a');
+    await page.fill('textarea', '/parent ab');
+    await page.fill('textarea', '/parent abc');
+    await expect.poll(() => requests.command.length, { timeout: 3000 }).toBe(1);
+    expect(requests.command[0].prefix).toBe('abc');
+  });
+
+  test('clears completion and context state when switching sessions', async ({ page }) => {
+    let firstRequest: { sessionId: string; requestId: string } | null = null;
+    let secondRequest: { sessionId: string; requestId: string } | null = null;
+    let socket: { send(data: string): void } | null = null;
+    await page.routeWebSocket('/ws', (ws) => {
+      socket = ws;
+      ws.onMessage((data) => {
+        const msg = JSON.parse(String(data));
+        if (msg.type === 'get_extension_autocomplete' && msg.trigger === '@') {
+          if (!firstRequest) firstRequest = msg;
+          else secondRequest = msg;
+        }
+      });
+      ws.send(
+        JSON.stringify({
+          type: 'connected',
+          sessionId: 'session-one',
+          isStreaming: false,
+          thinkingLevel: 'medium',
+          model: null,
+          availableModels: [],
+          messages: [],
+          contextUsage: { tokens: 90, contextWindow: 100 },
+        })
+      );
+    });
+
+    await page.goto('/');
+    await page.fill('textarea', '@foo');
+    await expect.poll(() => firstRequest !== null, { timeout: 3000 }).toBe(true);
+    socket!.send(
+      JSON.stringify({
+        type: 'extension_completions',
+        sessionId: firstRequest!.sessionId,
+        requestId: firstRequest!.requestId,
+        trigger: '@',
+        query: 'foo',
+        items: [{ value: 'old', label: 'old', description: 'old session' }],
+      })
+    );
+    await expect(page.getByRole('option', { name: /@old old session/ })).toBeVisible({
+      timeout: 3000,
+    });
+
+    socket!.send(
+      JSON.stringify({
+        type: 'session_loaded',
+        sessionId: 'session-two',
+        isStreaming: false,
+        thinkingLevel: 'medium',
+        model: null,
+        availableModels: [],
+        messages: [],
+      })
+    );
+    await expect.poll(() => secondRequest !== null, { timeout: 3000 }).toBe(true);
+    await expect(page.locator('body')).not.toContainText('90');
+    socket!.send(
+      JSON.stringify({
+        type: 'extension_completions',
+        sessionId: firstRequest!.sessionId,
+        requestId: firstRequest!.requestId,
+        trigger: '@',
+        query: 'foo',
+        items: [{ value: 'stale', label: 'stale', description: 'prior session' }],
+      })
+    );
+    await expect(page.getByRole('option', { name: /@stale prior session/ })).not.toBeVisible();
   });
   test('stages an image pasted from clipboard', async ({ page }) => {
     const wsMessages: string[] = [];

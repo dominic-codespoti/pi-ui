@@ -169,4 +169,34 @@ test.describe('Multi-session runtime and view routing', () => {
       )
       .toBe(true);
   });
+
+  test('keeps runtime status live while applying meaningful session summary changes', async ({
+    page,
+    login,
+    mockWs,
+  }) => {
+    const { emit } = await setupMockSession(page, mockWs);
+    await login(page, 'test-password');
+    await openProjectsSidebar(page);
+
+    const s2Row = page.getByRole('button', { name: /Add tests/ });
+    await expect(s2Row).toBeVisible({ timeout: 3000 });
+
+    emit(sessionRuntimePayload('s2', { phase: 'running' }));
+    await expect(s2Row.getByLabel('Running in background')).toBeVisible();
+
+    const s2 = SESSIONS.sessions.find((session) => session.id === 's2');
+    if (!s2) throw new Error('Missing s2 test session');
+    emit({
+      type: 'session_updated',
+      session: {
+        ...s2,
+        name: 'Renamed background task',
+        modified: Date.now(),
+        messageCount: s2.messageCount + 1,
+      },
+    });
+    await expect(page.getByText('Renamed background task')).toBeVisible();
+    await expect(page.getByRole('button', { name: /Renamed background task/ })).toHaveCount(1);
+  });
 });

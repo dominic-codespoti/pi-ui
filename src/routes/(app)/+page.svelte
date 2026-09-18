@@ -4,7 +4,7 @@
   import { goto } from '$app/navigation';
   import { page } from '$app/state';
   import { resolve } from '$app/paths';
-  import { SvelteMap, SvelteSet } from 'svelte/reactivity';
+  import { SvelteMap } from 'svelte/reactivity';
 
   import type {
     ServerMessage,
@@ -29,41 +29,41 @@
     ContextUsage,
   } from '#lib/ws/protocol.js';
   import type { PiEvent } from '#lib/ws/protocol.js';
-  import { parseServerMessage } from '#lib/ws/server-message-schema.js';
   import { renderMarkdown, renderStreamingPreview, onLangRegistered } from '#lib/markdown.js';
   import { providerColor, versionText, fmtTokens, fmtCost, fmtDuration } from '#lib/utils.js';
   import type { ParsedComponent } from '#lib/tui-stubs.js';
   import { projectsState } from '#lib/state/projects-state.svelte.js';
   import { extensionUiState } from '#lib/state/extension-ui-state.svelte.js';
-  import {
-    rawMessagesToUI,
-    uid,
-    formatToolInput,
-    extractTextContent,
-    reconnectDelay,
-    type UIMessage,
-    type CompactionNoticeDetails,
-  } from '#lib/client-messages.js';
+  import { rawMessagesToUI, uid, type UIMessage } from '#lib/client-messages.js';
   import { extensionOptionParts } from '#lib/extension-modals.js';
   import { saveSnapshot, loadSnapshot } from '#lib/session-snapshot.js';
-  import { SessionViewCache, type SessionView } from '#lib/session-view-cache.js';
+  import { SessionViewCache, type SessionViewUiState } from '#lib/session-view-cache.js';
+  import {
+    ClientWebSocketController,
+    type ClientWebSocketCloseInfo,
+    type ClientWebSocketErrorInfo,
+    type ClientWebSocketControllerState,
+  } from '#lib/controllers/client-websocket-controller.js';
+  import {
+    ComposerController,
+    type ComposerEffect,
+    type ComposerState,
+  } from '#lib/controllers/composer-controller.js';
+  import {
+    ComposerCompletionController,
+    type CompletionControllerState,
+  } from '#lib/controllers/composer-completion-controller.js';
+  import {
+    createSessionReducerState,
+    reduceSession,
+    type SessionEffect,
+    type SessionReducerState,
+  } from '#lib/controllers/session-reducer.js';
+  import { NotificationController } from '#lib/controllers/notification-controller.js';
+  import { ToolOutputController } from '#lib/controllers/tool-output-controller.js';
   import { saveIdentity, loadIdentity, clearIdentity } from '#lib/session-identity.js';
-  import {
-    TEXT_FILE_EXTENSIONS,
-    SPREADSHEET_EXTENSIONS,
-    fileToBase64,
-    fileToText,
-    xlsxToText,
-    prepareImage,
-    MAX_IMAGE_PAYLOAD,
-  } from '#lib/attachments.js';
-  import {
-    type NotificationPrefs,
-    NOTIF_NUDGE_SEEN_KEY,
-    loadNotificationPrefs,
-    saveNotificationPrefs,
-    urlBase64ToUint8Array,
-  } from '#lib/notification-prefs.js';
+  import { SPREADSHEET_EXTENSIONS, fileToBase64, xlsxToText } from '#lib/attachments.js';
+  import type { NotificationPrefs } from '#lib/notification-prefs.js';
   import { clampThinkingLevelForModel, getSupportedThinkingLevels } from '#lib/thinking-levels.js';
   import { encodeTerminalKey, wrapBracketedPaste } from '#lib/terminal-key-encoder.js';
   import { ComposerTerminalBridge } from '#lib/composer-terminal-bridge.js';
@@ -127,6 +127,39 @@
     /** Optional section header for grouping commands. */
     section?: string;
   };
+  type CommandArgMode = {
+    command: string;
+    /** Complete raw argument text after the command name, including boundaries. */
+    prefix: string;
+    /** Argument text before the token currently being completed. */
+    parentPrefix: string;
+    currentToken: string;
+  };
+
+  function completionWords(value: string): string[] {
+    return value.trim().split(/\s+/).filter(Boolean);
+  }
+
+  /** Return the token portion of either a token-only or full-argument result. */
+  function completionToken(value: string, mode: CommandArgMode): string {
+    const candidate = value.trim();
+    const parentWords = completionWords(mode.parentPrefix);
+    const candidateWords = completionWords(candidate);
+    if (
+      parentWords.length > 0 &&
+      candidateWords.length >= parentWords.length &&
+      parentWords.every((word, index) => candidateWords[index] === word)
+    ) {
+      return candidateWords.slice(parentWords.length).join(' ');
+    }
+    return candidate;
+  }
+
+  function commandCompletionInsert(mode: CommandArgMode, value: string): string {
+    const replacement = completionToken(value, mode);
+    const args = `${mode.parentPrefix}${replacement}`;
+    return `/${mode.command}${args ? ` ${args}` : ''} `;
+  }
 
   const SHELL_SHORTCUTS = [
     {
@@ -507,7 +540,7 @@
         // sidebar's cached list yet (or that has disappeared from it). The
         // server remains the authority on whether the path can be opened.
         if (!target || target.id !== projectsState.activeSessionId) {
-          if (ws?.readyState === WebSocket.OPEN && _wsHandshakeComplete) {
+          if (wsState === 'open' && _wsHandshakeComplete) {
             projectsState.switchSession(d.sessionPath);
           } else {
             // Keep the latest click until the next application-level handshake.
@@ -571,7 +604,7 @@
   /** Long runtime diagnostics (e.g. absolute-path dumps) collapse to a
    * preview by default in the settings panel — keyed by message text. */
   let expandedDiagnostics = $state<Record<string, boolean>>({});
-  /** Direct pointer to the currently-streaming assistant message — avoids O(n) lastStreaming() scans. */
+  /** Direct pointer to the currently-streaming assistant message — avoids O(n) transcript scans. */
   let activeStreamMsg = $state<UIMessage | null>(null);
   // Non-reactive index for high-frequency tool updates. Rebuilt when history
   // is replaced and updated incrementally for live tool events.
@@ -647,14 +680,27 @@
     return input.slice(1).trimStart().toLowerCase();
   });
   /** When query has a space, detect if it's an extension command with subcommand arg prefix. */
-  const commandArgMode = $derived.by<{ command: string; prefix: string } | null>(() => {
+  const commandArgMode = $derived.by<CommandArgMode | null>(() => {
     if (shortcutTrigger !== '/') return null;
-    const trimmed = input.slice(1).trimStart();
-    const commandEnd = trimmed.search(/\s/);
+    const commandText = input.slice(1).trimStart();
+    const commandEnd = commandText.search(/\s/);
     if (commandEnd < 0) return null;
-    const cmdName = trimmed.slice(0, commandEnd).toLowerCase();
+    const cmdName = commandText.slice(0, commandEnd).toLowerCase();
     if (!extCommandNames.has(cmdName)) return null;
-    return { command: cmdName, prefix: trimmed.slice(commandEnd).trim() };
+    // The separator belongs to the command name, not the raw argument prefix.
+    // Keep every subsequent character, including internal and trailing whitespace.
+    const prefix = commandText.slice(commandEnd).replace(/^\s+/, '');
+    let tokenEnd = prefix.length;
+    while (tokenEnd > 0 && /\s/.test(prefix[tokenEnd - 1] ?? '')) tokenEnd--;
+    let tokenStart = tokenEnd;
+    while (tokenStart > 0 && !/\s/.test(prefix[tokenStart - 1] ?? '')) tokenStart--;
+    const hasTrailingWhitespace = tokenEnd < prefix.length;
+    return {
+      command: cmdName,
+      prefix,
+      parentPrefix: hasTrailingWhitespace ? prefix : prefix.slice(0, tokenStart),
+      currentToken: hasTrailingWhitespace ? '' : prefix.slice(tokenStart, tokenEnd),
+    };
   });
   const filteredSlashCommands = $derived.by<ComposerShortcut[]>(() => {
     if (!shortcutTrigger) return [];
@@ -665,14 +711,18 @@
       // Show subcommand completions when typing past an extension command, e.g. "/ag ".
       if (commandArgMode) {
         const cmdName = commandArgMode.command;
-        const prefix = commandArgMode.prefix.toLowerCase();
+        const currentToken = commandArgMode.currentToken.toLowerCase();
         const filtered = commandArgCompletions
-          .filter((c) => !prefix || c.value.toLowerCase().startsWith(prefix))
+          .filter(
+            (c) =>
+              !currentToken ||
+              completionToken(c.value, commandArgMode).toLowerCase().startsWith(currentToken)
+          )
           .map((c) => ({
             trigger: '/' as const,
             label: c.label || c.value,
             description: c.description ?? `/${cmdName} subcommand`,
-            insert: `/${cmdName} ${c.value} `,
+            insert: commandCompletionInsert(commandArgMode, c.value),
           }))
           .slice(0, 14);
         if (filtered.length > 0) return filtered;
@@ -728,20 +778,17 @@
           insert: `/${p.name} `,
           muted: p.isBuiltin,
         }));
-      const extAuto = extensionCompletions
-        .filter((c) => !q || match(c.label) || match(c.description ?? ''))
-        .slice(0, 8)
-        .map((c) => ({
-          trigger: '/' as const,
-          label: `/${c.label}`,
-          description: c.description ?? 'extension',
-          insert: `/${c.value} `,
-        }));
+      const extAuto = extensionCompletions.slice(0, 8).map((c) => ({
+        trigger: '/' as const,
+        label: `/${c.label}`,
+        description: c.description ?? 'extension',
+        insert: `/${c.value} `,
+      }));
       return [...commands, ...extCmds, ...skills, ...prompts, ...extAuto].slice(0, 14);
     }
 
     if (shortcutTrigger === '@') {
-      const refs = [
+      const localRefs = [
         ...fileCompletions.map((path) => ({
           label: `@${path}`,
           description: 'workspace file',
@@ -760,28 +807,23 @@
           description: s.cwd,
           insert: `@${s.path} `,
         })),
-        ...extensionCompletions
-          .filter((c) => !q || match(c.label) || match(c.description ?? ''))
-          .map((c) => ({
-            label: `@${c.label}`,
-            description: c.description ?? 'extension',
-            insert: `@${c.value} `,
-          })),
       ];
-      return refs
-        .filter((r) => !q || match(r.label) || match(r.description))
+      const extRefs = extensionCompletions.map((c) => ({
+        label: `@${c.label}`,
+        description: c.description ?? 'extension',
+        insert: `@${c.value} `,
+      }));
+      return [...localRefs.filter((r) => !q || match(r.label) || match(r.description)), ...extRefs]
         .slice(0, 12)
         .map((r) => ({ trigger: '@' as const, ...r }));
     }
 
     if (shortcutTrigger === '!') {
-      const extAuto = extensionCompletions
-        .filter((c) => !q || match(c.label) || match(c.description ?? ''))
-        .map((c) => ({
-          label: c.label,
-          description: c.description ?? 'extension',
-          insert: `!${c.value} `,
-        }));
+      const extAuto = extensionCompletions.map((c) => ({
+        label: c.label,
+        description: c.description ?? 'extension',
+        insert: `!${c.value} `,
+      }));
       return [
         ...SHELL_SHORTCUTS.filter(
           (s) => !q || match(s.label) || match(s.description) || match(s.insert)
@@ -790,27 +832,28 @@
       ];
     }
 
-    const extAuto = extensionCompletions
-      .filter((c) => !q || match(c.label) || match(c.description ?? ''))
-      .map((c) => ({
+    if (shortcutTrigger === '#') {
+      const extAuto = extensionCompletions.map((c) => ({
         label: c.label,
         description: c.description ?? 'extension',
         insert: `#${c.value} `,
         muted: false,
       }));
-    return [
-      ...SNIPPET_SHORTCUTS,
-      ...resourcesPrompts.map((p) => ({
-        label: p.name,
-        description: p.description || p.argumentHint || `${p.scope} prompt`,
-        insert: `#${p.name} `,
-        muted: p.isBuiltin,
-      })),
-      ...extAuto,
-    ]
-      .filter((s) => !q || match(s.label) || match(s.description))
-      .slice(0, 12)
-      .map((s) => ({ trigger: '#' as const, ...s }));
+      const localSnippets = [
+        ...SNIPPET_SHORTCUTS,
+        ...resourcesPrompts.map((p) => ({
+          label: p.name,
+          description: p.description || p.argumentHint || `${p.scope} prompt`,
+          insert: `#${p.name} `,
+          muted: p.isBuiltin,
+        })),
+      ].filter((s) => !q || match(s.label) || match(s.description));
+      return [...localSnippets, ...extAuto]
+        .slice(0, 12)
+        .map((s) => ({ trigger: '#' as const, ...s }));
+    }
+
+    return [];
   });
   let isStreaming = $state(false);
   let activeToolName = $state<string | undefined>(undefined);
@@ -938,10 +981,10 @@
       sessionSwitchDraft = null;
       composerBridge.discard();
       _optimisticPrevMessages = messages.slice();
-      _optimisticPrevInput = input;
+      if (_optimisticPrevInput === null) _optimisticPrevInput = input;
       messages = [];
       toolMessagesById.clear();
-      input = '';
+      setComposerInput('');
       totalRawMessagesLoaded = 0;
       totalMessageCount = 0;
       messagesTruncated = false;
@@ -967,7 +1010,7 @@
     ) {
       messages = _optimisticPrevMessages;
       rebuildToolMessageIndex();
-      if (_optimisticPrevInput !== null) input = _optimisticPrevInput;
+      if (_optimisticPrevInput !== null) setComposerInput(_optimisticPrevInput);
       _optimisticPrevMessages = null;
       _optimisticPrevInput = null;
       _optimisticViewSavedSessionId = null;
@@ -1064,15 +1107,31 @@
 
   /** Whether the project picker dropdown is visible in the empty chat state. */
   let projectPickerOpen = $state(false);
-  /** Workspace file completions shown for composer @ references. */
+  /** Completion results are projected into runes; timers and correlation live in the controller. */
   let fileCompletions = $state<string[]>([]);
-  /** Extension-registered autocomplete items for the current trigger menu. */
   let extensionCompletions = $state<{ value: string; label: string; description?: string }[]>([]);
-  /** Last trigger we requested extension completions for. */
-  let lastExtensionTrigger = $state('');
-  let lastExtensionQuery = $state('');
-  let lastFileCompleteQuery = '';
-  let _fileCompleteTimer: ReturnType<typeof setTimeout> | null = null;
+  const completionController = new ComposerCompletionController(send);
+  completionController.subscribe((next: CompletionControllerState) => {
+    if (fileCompletions !== next.fileCompletions) fileCompletions = next.fileCompletions;
+    if (extensionCompletions !== next.extensionCompletions)
+      extensionCompletions = next.extensionCompletions;
+    if (commandArgCompletions !== next.commandArgCompletions)
+      commandArgCompletions = next.commandArgCompletions;
+    if (commandArgCommand !== next.commandArgCommand) commandArgCommand = next.commandArgCommand;
+    if (commandArgPrefix !== next.commandArgPrefix) commandArgPrefix = next.commandArgPrefix;
+    if (commandCompletionsPending !== next.commandCompletionsPending)
+      commandCompletionsPending = next.commandCompletionsPending;
+  });
+  function currentCompletionView() {
+    return {
+      websocketOpen: wsState === 'open',
+      loading: sessionLoading || projectsState.sessionLoading,
+      sessionId,
+      trigger: shortcutTrigger,
+      query: shortcutQuery,
+      commandArgMode,
+    };
+  }
   const SETTINGS_SECTIONS = [
     { id: 'session', label: 'Session', icon: SlidersHorizontal },
     { id: 'notifications', label: 'Notifications', icon: Bell },
@@ -1182,119 +1241,28 @@
       onConfirm,
     };
   }
-  let notificationPrefs = $state<NotificationPrefs>(loadNotificationPrefs());
-  $effect(() => {
-    saveNotificationPrefs(notificationPrefs);
+  let notificationController: NotificationController;
+  let toolOutputController: ToolOutputController;
+  notificationController = new NotificationController({
+    send,
+    isHidden: () => document.hidden,
+    getSessionSummary: (id) => {
+      const summary = projectsState.allSessions.find((item) => item.id === id);
+      return summary
+        ? { path: summary.path, name: summary.name, firstMessage: summary.firstMessage }
+        : undefined;
+    },
+    showNotice: (message, level) => showChatNotice(message, level),
+    onPreferencesChanged: (next) => {
+      notificationPrefs = next;
+    },
+    onNudgeVisibilityChanged: (visible) => {
+      showNotifNudge = visible;
+    },
   });
-
-  // ── Post-run permission nudge ─────────────────────────────────────────────
-  // Asking right after a completed turn (when the value is obvious) converts
-  // far better than the Settings toggle. Shown once; permission requests MUST
-  // come from a user gesture, so the banner's Enable button does the asking.
+  let notificationPrefs = $state<NotificationPrefs>(notificationController.preferences);
   let showNotifNudge = $state(false);
-  let notifNudgeSeen = $state(false);
-  try {
-    notifNudgeSeen = localStorage.getItem(NOTIF_NUDGE_SEEN_KEY) === '1';
-  } catch {
-    /* ignore */
-  }
-  function enableNotifications() {
-    showNotifNudge = false;
-    notifNudgeSeen = true;
-    try {
-      localStorage.setItem(NOTIF_NUDGE_SEEN_KEY, '1');
-    } catch {
-      /* ignore */
-    }
-    if ('Notification' in window && Notification.permission === 'default') {
-      void Notification.requestPermission()
-        .then((p) => {
-          if (p === 'granted' && connectedPushVapidKey && wsState === 'open') {
-            void syncPushSubscription();
-          }
-        })
-        .catch(() => {});
-    }
-  }
-  function dismissNotifNudge() {
-    showNotifNudge = false;
-    notifNudgeSeen = true;
-    try {
-      localStorage.setItem(NOTIF_NUDGE_SEEN_KEY, '1');
-    } catch {
-      /* ignore */
-    }
-  }
-
-  // ── Web Push subscription sync ────────────────────────────────────────────
-  // One subscription per browser, mirroring it to the server so closed-app
-  // notifications (agent_end pushes) can reach this device. Subscribe when
-  // notifications are enabled + permission granted; unsubscribe otherwise.
   let connectedPushVapidKey = $state<string | null>(null);
-  let _pushSyncInFlight = false;
-
-  async function syncPushSubscription() {
-    if (_pushSyncInFlight) return;
-    _pushSyncInFlight = true;
-    try {
-      const reg = await navigator.serviceWorker.ready;
-      const existing = await reg.pushManager.getSubscription();
-      if (existing) {
-        const json = existing.toJSON();
-        if (json.keys?.p256dh && json.keys.auth) {
-          send({
-            type: 'push_subscribe',
-            endpoint: existing.endpoint,
-            keys: { p256dh: json.keys.p256dh, auth: json.keys.auth },
-            expirationTime: existing.expirationTime ?? null,
-          });
-        }
-        return;
-      }
-      if (!connectedPushVapidKey) return;
-      const sub = await reg.pushManager.subscribe({
-        userVisibleOnly: true,
-        applicationServerKey: urlBase64ToUint8Array(connectedPushVapidKey),
-      });
-      const json = sub.toJSON();
-      send({
-        type: 'push_subscribe',
-        endpoint: sub.endpoint,
-        keys: { p256dh: json.keys?.p256dh ?? '', auth: json.keys?.auth ?? '' },
-        expirationTime: sub.expirationTime ?? null,
-      });
-    } catch (err) {
-      // Permission revoked, push unavailable, or a malformed VAPID key —
-      // notifications just stay page-only. Log for diagnosability.
-      console.warn('[pi-ui] push subscribe failed:', err);
-    } finally {
-      _pushSyncInFlight = false;
-    }
-  }
-
-  async function unsubscribePush() {
-    if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
-    try {
-      const reg = await navigator.serviceWorker.ready;
-      const sub = await reg.pushManager.getSubscription();
-      if (sub) {
-        send({ type: 'push_unsubscribe', endpoint: sub.endpoint });
-        await sub.unsubscribe();
-      }
-    } catch {
-      /* ignore */
-    }
-  }
-
-  $effect(() => {
-    if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
-    if (!connectedPushVapidKey || wsState !== 'open') return;
-    if (notificationPrefs.enabled && Notification.permission === 'granted') {
-      void syncPushSubscription();
-    } else {
-      void unsubscribePush();
-    }
-  });
 
   /** Webhook notification URL (ntfy.sh/Pushover/Gotify) — persisted server-side. */
   let notificationWebhookUrl = $state('');
@@ -1521,14 +1489,13 @@
 
   let scrollEl = $state<HTMLElement | undefined>(undefined);
   let inputEl = $state<HTMLTextAreaElement | undefined>(undefined);
-  let ws: WebSocket | null = null;
-  /** True after this socket receives its application-level `connected` message. */
+  let wsController: ClientWebSocketController;
+  let composerController: ComposerController;
+  /** True after the controller receives its application-level `connected` message. */
   let _wsHandshakeComplete = false;
+  let reconnectCountdown = $state(0);
   /** Latest notification deep-link waiting for a live, handshaken socket. */
   let pendingNotificationSessionPath: string | null = null;
-  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  let reconnectCountdown = $state(0);
-  let reconnectInterval: ReturnType<typeof setInterval> | null = null;
   /** Throttle recovery UI for malformed frames so repeated bad payloads do not flood the chat. */
   let _invalidFrameNoticeAt = 0;
   /** Resync requests are limited to one in flight and one attempt per five seconds. */
@@ -1663,128 +1630,8 @@
 
   // ── WebSocket ───────────────────────────────────────────────────────────────
 
-  let _intentionalClose = false;
-  let _reconnectAttempt = 0;
   /** Set to true when server_restarting is received — cleared and reloaded on next successful connect. */
   let _reloadPending = false;
-  /** When the page was last hidden (we stop reconnecting while hidden). */
-  let _pageHiddenAt = 0;
-  // ── Heartbeat — detects zombie sockets (dead-but-open, e.g. wifi drop or
-  // network switch while the page is visible) that never fire onclose, and
-  // keeps idle connections alive under the server's 120s idleTimeout.
-  let _heartbeatTimer: ReturnType<typeof setInterval> | null = null;
-  /** Timestamp of the last message received from the server (any type counts as liveness). */
-  let _lastMsgAt = 0;
-  /** Timestamp of the last ping we sent; 0 when no ping is outstanding. */
-  let _pingSentAt = 0;
-  const HEARTBEAT_INTERVAL_MS = 25_000;
-  const PONG_TIMEOUT_MS = 10_000;
-
-  function startHeartbeat() {
-    stopHeartbeat();
-    _lastMsgAt = Date.now();
-    _pingSentAt = 0;
-    _heartbeatTimer = setInterval(() => {
-      if (ws?.readyState !== WebSocket.OPEN) return;
-      const now = Date.now();
-      // A ping is outstanding, its timeout passed, and nothing arrived since —
-      // the socket is dead. Force-close so onclose fires and reconnection runs.
-      if (_pingSentAt && _lastMsgAt < _pingSentAt && now - _pingSentAt > PONG_TIMEOUT_MS) {
-        try {
-          ws.close();
-        } catch {
-          /* ignore */
-        }
-        return;
-      }
-      if (now - _lastMsgAt >= HEARTBEAT_INTERVAL_MS) {
-        _pingSentAt = now;
-        send({ type: 'ping' });
-      }
-    }, HEARTBEAT_INTERVAL_MS / 2);
-  }
-
-  function stopHeartbeat() {
-    if (_heartbeatTimer) {
-      clearInterval(_heartbeatTimer);
-      _heartbeatTimer = null;
-    }
-  }
-
-  function getReconnectDelay(): number {
-    return reconnectDelay(_reconnectAttempt);
-  }
-
-  function cancelReconnect() {
-    if (reconnectTimer) {
-      clearTimeout(reconnectTimer);
-      reconnectTimer = null;
-    }
-    if (reconnectInterval) {
-      clearInterval(reconnectInterval);
-      reconnectInterval = null;
-    }
-    reconnectCountdown = 0;
-  }
-
-  function scheduleReconnect() {
-    if (_intentionalClose) return;
-    if (document.hidden) {
-      _pageHiddenAt = Date.now();
-      return; // pause reconnection while page is hidden
-    }
-    if (!navigator.onLine) return; // wait for online event
-    cancelReconnect();
-    const delay = getReconnectDelay();
-    _reconnectAttempt++;
-    wsState = 'connecting';
-    reconnectCountdown = Math.ceil(delay / 1000);
-    reconnectInterval = setInterval(() => {
-      reconnectCountdown = Math.max(0, reconnectCountdown - 1);
-    }, 1000);
-    reconnectTimer = setTimeout(() => {
-      if (reconnectInterval) {
-        clearInterval(reconnectInterval);
-        reconnectInterval = null;
-      }
-      connect();
-    }, delay);
-  }
-
-  /** Navigate to /login, preserving the current URL so login can return here. */
-  function redirectToLogin() {
-    _intentionalClose = true;
-    cancelReconnect();
-    stopHeartbeat();
-    wsState = 'closed';
-    const current = location.pathname + location.search;
-    location.assign(`/login?redirect=${encodeURIComponent(current)}`);
-  }
-
-  let _authProbeInFlight = false;
-
-  /**
-   * Detect an expired/revoked session after a socket failure. A rejected WS
-   * upgrade (401) surfaces to the client as a generic abnormal close, so the
-   * only way to tell "server down" from "session expired" is an HTTP probe:
-   * hooks.server redirects every path but /login with a 302 when the JWT is
-   * missing or invalid. Network failures mean the server is unreachable and
-   * the normal reconnect loop applies.
-   */
-  async function probeSessionExpired(): Promise<void> {
-    if (_authProbeInFlight || document.hidden || !navigator.onLine) return;
-    _authProbeInFlight = true;
-    try {
-      const res = await fetch('/', { method: 'HEAD', redirect: 'manual', cache: 'no-store' });
-      if (res.type === 'opaqueredirect' || (res.status >= 300 && res.status < 400)) {
-        redirectToLogin();
-      }
-    } catch {
-      // Server unreachable — keep the reconnect loop.
-    } finally {
-      _authProbeInFlight = false;
-    }
-  }
 
   function recoverFromInvalidFrame() {
     const now = Date.now();
@@ -1797,111 +1644,133 @@
     if (send({ type: 'resync_session' })) _resyncInFlight = true;
   }
 
-  function connect() {
-    if (document.hidden) return;
-    // Belt-and-braces: connect() nulls the old socket's onclose before
-    // closing it, so its close event may never reach the bridge flush.
-    composerBridge.flush();
-    pendingUploads.clear();
-    if (ws) {
-      try {
-        ws.onclose = null;
-        ws.onerror = null;
-        ws.close();
-      } catch {
-        /* ignore */
-      }
-      ws = null;
-    }
-    cancelReconnect();
-
-    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    // In dev mode the Bun WS server runs on a separate port (5174);
-    // in production everything is served from a single port.
-    const wsPort = dev ? '5174' : location.port;
-    const socket = new WebSocket(`${proto}//${location.hostname}${wsPort ? ':' + wsPort : ''}/ws`);
-    ws = socket;
-    _wsHandshakeComplete = false;
-
-    socket.onopen = () => {
-      if (ws !== socket) return;
-      wsState = 'open';
-      cancelReconnect();
-      startHeartbeat();
-    };
-
-    socket.onmessage = ({ data }: MessageEvent<string>) => {
-      if (ws !== socket) return;
-      _lastMsgAt = Date.now();
-      let raw: unknown;
-      try {
-        raw = JSON.parse(data);
-      } catch (e) {
-        console.warn('[pi-ui] Failed to parse WS message:', e);
-        return;
-      }
-      const parsedResult = parseServerMessage(raw);
-      if (!parsedResult.ok) {
-        console.warn('[pi-ui] invalid WS payload', parsedResult.issues);
-        recoverFromInvalidFrame();
-        return;
-      }
-      const parsed = parsedResult.value as ServerMessage & Record<string, unknown>;
-      if (parsedResult.kind === 'connected' || parsed.type === 'connected') {
-        _wsHandshakeComplete = true;
-        overlayResizeConnection++;
-        _reconnectAttempt = 0;
-        if (reloadAfterRestart) {
-          reloadAfterRestart = false;
-          if (_reloadPending) {
-            _reloadPending = false;
-            location.reload();
-          }
+  function handleSocketMessage(message: ServerMessage): void {
+    const parsed = message as ServerMessage & Record<string, unknown>;
+    if (parsed.type === 'connected') {
+      _wsHandshakeComplete = true;
+      overlayResizeConnection++;
+      if (reloadAfterRestart) {
+        reloadAfterRestart = false;
+        if (_reloadPending) {
+          _reloadPending = false;
+          location.reload();
         }
       }
-      handleServer(parsed);
-    };
+    }
+    handleServer(parsed);
+  }
 
-    socket.onclose = (event) => {
-      // Stale-guard: a close event from a superseded socket (e.g. one torn
-      // down by the resume force-close) must not clobber the current
-      // connection's state or schedule spurious reconnects.
-      if (ws !== socket) return;
-      pendingUploads.clear();
-      olderMessagesLoading = false;
-      modelRefreshLoading = false;
-      composerBridge.flush();
-      stopHeartbeat();
-      // 4001 = the server closed the socket because the session token expired
-      // (or was revoked). Reconnecting can never succeed — go to /login.
-      if (event.code === 4001) {
-        redirectToLogin();
-        return;
-      }
-      if (!_wsHandshakeComplete && event.code === 1011) {
-        showChatNotice(`Server initialization failed: ${event.reason || 'unknown error'}`, 'error');
-      }
-      wsState = 'connecting';
-      // Seal any streaming notices (compaction, retry) that would otherwise
-      // stay stuck with streaming=true indefinitely after a disconnect
-      for (const m of messages) {
-        if (m.streaming) m.streaming = false;
-      }
-      activeStreamMsg = null;
-      scheduleReconnect();
-      // A rejected upgrade (expired cookie) looks like a dead server to the
-      // WS API — probe HTTP to distinguish the two.
-      probeSessionExpired();
-    };
+  function cleanupSocketLifecycle(): void {
+    pendingUploads.clear();
+    olderMessagesLoading = false;
+    modelRefreshLoading = false;
+    composerBridge.flush();
+    // Seal any streaming notices (compaction, retry) that would otherwise
+    // stay stuck with streaming=true indefinitely after a disconnect.
+    for (const m of messages) {
+      if (m.streaming) m.streaming = false;
+    }
+    activeStreamMsg = null;
+  }
 
-    socket.onerror = () => {
-      if (ws !== socket) return;
-      try {
-        socket.close();
-      } catch {
-        /* ignore */
-      }
-    };
+  function handleSocketClose(info: ClientWebSocketCloseInfo): void {
+    cleanupSocketLifecycle();
+    // 4001 is handled by the controller's auth redirect. Preserve the
+    // initialization failure notice with the handshake context from this socket.
+    if (!info.handshakeComplete && info.code === 1011) {
+      showChatNotice(`Server initialization failed: ${info.reason || 'unknown error'}`, 'error');
+    }
+  }
+
+  function handleSocketReplace(): void {
+    cleanupSocketLifecycle();
+  }
+
+  function handleSocketError(info: ClientWebSocketErrorInfo): void {
+    if (dev) console.warn('[pi-ui] WebSocket error:', info.error ?? info.event);
+  }
+
+  wsController = new ClientWebSocketController({
+    socketFactory: (url) => new WebSocket(url),
+    development: dev,
+    onMessage: handleSocketMessage,
+    onProtocolInvalid: (issues) => {
+      console.warn('[pi-ui] invalid WS payload', issues);
+      recoverFromInvalidFrame();
+    },
+    onClose: handleSocketClose,
+    onSocketReplace: handleSocketReplace,
+    onError: handleSocketError,
+    onAuthRedirect: (url) => {
+      location.assign(url);
+      return true;
+    },
+  });
+  wsController.subscribe((state: ClientWebSocketControllerState) => {
+    wsState = state.connectionState;
+    reconnectCountdown = state.reconnectCountdown;
+    _wsHandshakeComplete = state.handshakeComplete;
+  });
+  toolOutputController = new ToolOutputController({
+    send,
+    onError: (message) => showChatNotice(message, 'warning'),
+  });
+
+  composerController = new ComposerController({
+    send: (message) => wsController.send(message),
+    dispatchEffect: (effect) => dispatchComposerEffect(effect),
+    createId: uid,
+    now: () => Date.now(),
+  });
+  composerController.subscribe((state: ComposerState) => {
+    if (input !== state.input) input = state.input;
+    attachedImages = state.attachedImages;
+    attachedFiles = state.attachedFiles;
+  });
+
+  function setComposerInput(value: string): void {
+    composerController.setInput(value);
+  }
+  $effect(() => {
+    composerController.updateContext({
+      websocketOpen: wsState === 'open',
+      loading: sessionLoading || projectsState.sessionLoading,
+      pendingNewSession: projectsState.pendingNewSession,
+      streaming: isStreaming,
+      sessionId,
+      extensionCommands: extensionCommands.map((command) => command.name),
+      sessionError: projectsState.error,
+      newSessionTimedOut:
+        projectsState.error === 'New chat timed out — server did not respond in time',
+    });
+  });
+
+  function connect(): void {
+    composerBridge.flush();
+    pendingUploads.clear();
+    wsController.connect();
+  }
+
+  function send(msg: ClientMessage): boolean {
+    return wsController.send(msg);
+  }
+
+  /** Tell the server which session this socket currently has in view. */
+  function sendSessionFocus(focusedSessionId: string | null): void {
+    send({ type: 'session_focus', sessionId: focusedSessionId });
+  }
+
+  /** Apply the latest queued notification deep link after a live handshake. */
+  function flushPendingNotificationSession() {
+    const path = pendingNotificationSessionPath;
+    if (!path || wsState !== 'open' || !_wsHandshakeComplete) return;
+    pendingNotificationSessionPath = null;
+    const target = projectsState.allSessions.find((s) => s.path === path);
+    if (target && target.id === projectsState.activeSessionId) return;
+    if (projectsState.switchSession(path) !== 'ok') {
+      // Keep the intent if another session operation is still settling.
+      pendingNotificationSessionPath = path;
+    }
   }
 
   /** Read the persisted session path from URL params (?session=). */
@@ -1953,113 +1822,10 @@
     });
   }
 
-  /** Gracefully close the WS without reconnecting. */
-  function disconnect() {
-    _intentionalClose = true;
-    wsState = 'closed';
-    stopHeartbeat();
-    cancelReconnect();
-    try {
-      ws?.close();
-    } catch {
-      /* ignore */
-    }
-    ws = null;
-  }
-
-  function send(msg: ClientMessage): boolean {
-    if (ws?.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(msg));
-      return true;
-    }
-    return false;
-  }
-  /** Tell the server which session this socket currently has in view. */
-  function sendSessionFocus(focusedSessionId: string | null): void {
-    send({ type: 'session_focus', sessionId: focusedSessionId });
-  }
-  /** Apply the latest queued notification deep link after a live handshake. */
-  function flushPendingNotificationSession() {
-    const path = pendingNotificationSessionPath;
-    if (!path || ws?.readyState !== WebSocket.OPEN || !_wsHandshakeComplete) return;
-    pendingNotificationSessionPath = null;
-    const target = projectsState.allSessions.find((s) => s.path === path);
-    if (target && target.id === projectsState.activeSessionId) return;
-    if (projectsState.switchSession(path) !== 'ok') {
-      // Keep the intent if another session operation is still settling.
-      pendingNotificationSessionPath = path;
-    }
-  }
-
-  function notifyPiEvent(title: string, body: string, tag: string, data?: Record<string, unknown>) {
-    if (!notificationPrefs.enabled) return;
-    if (!('Notification' in window) || Notification.permission !== 'granted') return;
-    const msg = { type: 'show_notification' as const, title, body, tag, data };
-    if (navigator.serviceWorker?.controller) {
-      navigator.serviceWorker.controller.postMessage(msg);
-    } else {
-      try {
-        new Notification(title, { body, tag, icon: '/pwa-192x192.png' });
-      } catch {
-        /* fail silently */
-      }
-    }
-  }
-
-  /** Keep the PWA badge equal to the number of unread resident sessions. */
-  function updateAppBadge() {
-    if (!('setAppBadge' in navigator)) return;
-    const badge = navigator as Navigator & {
-      setAppBadge(count?: number): Promise<void>;
-      clearAppBadge(): Promise<void>;
-    };
-    if (projectsState.unreadCount > 0) {
-      badge.setAppBadge(projectsState.unreadCount).catch(() => {});
-    } else {
-      badge.clearAppBadge().catch(() => {});
-    }
-  }
-
   $effect(() => {
-    // Read the count so the effect re-runs when it changes; updateAppBadge
-    // reads it again to decide between setAppBadge and clearAppBadge.
     void projectsState.unreadCount;
-    updateAppBadge();
+    notificationController.updateBadge(projectsState.unreadCount);
   });
-
-  /** Deduplicate one completion alert per resident run (lastActivity is its run token). */
-  const _notifiedBackgroundCompletions = new SvelteSet<string>();
-  function notifyBackgroundCompletion(sessionRuntime: {
-    sessionId: string;
-    lastActivity: number;
-  }): void {
-    const key = `${sessionRuntime.sessionId}:${sessionRuntime.lastActivity}`;
-    if (_notifiedBackgroundCompletions.has(key)) return;
-    _notifiedBackgroundCompletions.add(key);
-    if (_notifiedBackgroundCompletions.size > 64) {
-      const oldest = _notifiedBackgroundCompletions.values().next().value;
-      if (typeof oldest === 'string') _notifiedBackgroundCompletions.delete(oldest);
-    }
-
-    const summary = projectsState.allSessions.find((item) => item.id === sessionRuntime.sessionId);
-    const name =
-      summary?.name?.trim() ||
-      summary?.firstMessage?.trim() ||
-      summary?.path.split('/').filter(Boolean).pop() ||
-      sessionRuntime.sessionId;
-    if (document.hidden) {
-      if (notificationPrefs.onComplete) {
-        notifyPiEvent(
-          'Response Complete',
-          `${name} finished responding.`,
-          `pi-agent-end-${sessionRuntime.sessionId}-${sessionRuntime.lastActivity}`,
-          { kind: 'response_complete', sessionId: sessionRuntime.sessionId }
-        );
-      }
-    } else {
-      showChatNotice(`${name} finished responding.`, 'info');
-    }
-  }
 
   /** Screen Wake Lock — keeps the display on during agent responses. */
   let wakeLock: WakeLockSentinel | null = null;
@@ -2186,112 +1952,140 @@
       scrollAtBottom: isAtBottom,
     });
   }
-
-  /** Bind a retained inactive view to the page's visible-session state. */
-  function restoreSessionView(view: SessionView): void {
-    const activeId = view.activeStreamMsg?.id;
-    messages = view.messages;
-    rebuildToolMessageIndex();
-    activeStreamMsg = activeId
-      ? (messages.find((message) => message.id === activeId) ?? null)
-      : null;
+  /** Apply retained UI-only state without replacing the authoritative transcript. */
+  function restoreSessionViewUiState(view: SessionViewUiState): void {
     expandedUserMsgs = Object.fromEntries([...view.expandedUserMsgs].map((id) => [id, true]));
     truncatedUserMsgs = Object.fromEntries([...view.truncatedUserMsgs].map((id) => [id, true]));
-    input = view.draft;
+    setComposerInput(view.draft);
     queuedSteering = view.queuedSteering.slice();
     queuedFollowUp = view.queuedFollowUp.slice();
     contextUsageTokens = view.contextUsage?.tokens ?? null;
     contextUsageWindow = view.contextUsage?.contextWindow ?? 0;
     isAtBottom = view.scrollAtBottom;
-
-    const streamingTool = messages.find((message) => message.role === 'tool' && message.streaming);
-    isStreaming = Boolean(activeStreamMsg?.streaming || streamingTool);
-    activeToolName = streamingTool?.toolName;
-    const compaction = [...messages]
-      .reverse()
-      .find((message) => message.noticeKind === 'compaction' && message.streaming);
-    isCompacting = Boolean(compaction);
-    compactionStartedAt = compaction?.compaction?.startedAt ?? null;
-    for (const message of messages) {
-      if (
-        (message.content && !message.renderedContent) ||
-        (message.thinking && !message.renderedThinking)
-      ) {
-        scheduleContentRender(message);
+  }
+  // ── Server event handling ────────────────────────────────────────────────────
+  function pageSessionReducerState(): SessionReducerState {
+    return createSessionReducerState({
+      sessionId,
+      isStreaming,
+      activeToolName,
+      model,
+      thinkingLevel,
+      availableModels,
+      cwd,
+      sessionPath,
+      sessionName,
+      messages,
+      activeStreamMsg,
+      toolsById: new Map(toolMessagesById),
+      contextUsage: currentContextUsage(),
+      queuedSteering,
+      queuedFollowUp,
+      isCompacting,
+      compactionStartedAt,
+      autoCompactionEnabled,
+      autoRetryEnabled,
+      totalRawMessagesLoaded,
+      totalMessageCount,
+      messagesTruncated,
+      toolsExpanded: toolsExpandedGlobal,
+    });
+  }
+  function applyPageSessionReducerState(next: SessionReducerState): void {
+    messages = next.messages;
+    activeStreamMsg = next.activeStreamMsg
+      ? (messages.find((message) => message.id === next.activeStreamMsg?.id) ?? null)
+      : null;
+    toolMessagesById.clear();
+    for (const [toolCallId, message] of next.toolsById) {
+      const reactive = messages.find((candidate) => candidate.id === message.id);
+      if (reactive) toolMessagesById.set(toolCallId, reactive);
+    }
+    sessionId = next.sessionId;
+    isStreaming = next.isStreaming;
+    activeToolName = next.activeToolName;
+    model = next.model;
+    thinkingLevel = next.thinkingLevel;
+    availableModels = next.availableModels;
+    cwd = next.cwd;
+    sessionPath = next.sessionPath;
+    sessionName = next.sessionName;
+    contextUsageTokens = next.contextUsage?.tokens ?? null;
+    contextUsageWindow = next.contextUsage?.contextWindow ?? 0;
+    queuedSteering = next.queuedSteering;
+    queuedFollowUp = next.queuedFollowUp;
+    isCompacting = next.isCompacting;
+    compactionStartedAt = next.compactionStartedAt;
+    autoCompactionEnabled = next.autoCompactionEnabled;
+    autoRetryEnabled = next.autoRetryEnabled;
+    totalRawMessagesLoaded = next.totalRawMessagesLoaded;
+    totalMessageCount = next.totalMessageCount;
+    messagesTruncated = next.messagesTruncated;
+  }
+  function executeSessionEffects(effects: SessionEffect[]): void {
+    for (const effect of effects) {
+      if (effect.type === 'scroll_bottom') {
+        scrollBottom();
+        continue;
       }
+      const message = messages.find((candidate) => candidate.id === effect.messageId);
+      if (message) scheduleContentRender(message, effect.scroll);
     }
   }
-
-  // ── Server event handling ────────────────────────────────────────────────────
+  function reduceActiveSessionEvent(message: ServerMessage | Record<string, unknown>): void {
+    const result = reduceSession(pageSessionReducerState(), { type: 'event', message });
+    applyPageSessionReducerState(result.state);
+    executeSessionEffects(result.effects);
+  }
   function applySessionState(payload: Record<string, unknown>) {
     const prevSessionId = sessionId;
-    if (typeof payload.sessionId === 'string') {
-      const nextSessionId = payload.sessionId;
-      if (nextSessionId !== prevSessionId) {
-        // A connected/session_loaded snapshot can race a draft typed while
-        // the socket is still completing its handshake. Preserve that draft
-        // when no explicit switch is in flight; otherwise a late snapshot
-        // replaces it with an empty composer and leaves Send disabled.
-        const draftWhileSwitching = !projectsState.pendingNewSession
-          ? (sessionSwitchDraft ?? (!projectsState.sessionLoading ? input : null))
-          : null;
-        const sharedDraft = shareTargetDraft;
-        if (
-          prevSessionId &&
-          _optimisticViewSavedSessionId !== prevSessionId &&
-          !projectsState.pendingNewSession
-        ) {
-          saveVisibleSessionView(prevSessionId);
-        }
-        const restored = !projectsState.pendingNewSession
-          ? sessionViewCache.restore(nextSessionId)
-          : null;
-        sessionId = nextSessionId;
-        attachedImages = [];
-        attachedFiles = [];
-        if (projectsState.pendingNewSession) {
-          // The composer stays live while the server creates the session.
-          // Keep that new draft instead of replacing it with another session's draft.
-          expandedUserMsgs = {};
-          truncatedUserMsgs = {};
-        } else if (restored) {
-          restoreSessionView(restored);
-          // A draft typed while the switch was in flight belongs to the new
-          // visible session and takes precedence over its cached draft.
-          if (sharedDraft !== null) input = sharedDraft;
-          else if (draftWhileSwitching !== null) input = draftWhileSwitching;
-        } else {
-          input = sharedDraft ?? draftWhileSwitching ?? '';
-          expandedUserMsgs = {};
-          truncatedUserMsgs = {};
-        }
-        shareTargetDraft = null;
-        _optimisticViewSavedSessionId = null;
-        // A key round-trip for the previous session must never be applied to
-        // or routed toward the new one (its late verdict would insert text or
-        // even submit into the wrong composer).
-        composerBridge.discard();
+    const sessionIdentityChanged =
+      typeof payload.sessionId === 'string' && payload.sessionId !== prevSessionId;
+    if (sessionIdentityChanged && typeof payload.sessionId === 'string') {
+      // Completion results are scoped to one resident; discard the previous
+      // request generation before accepting the new snapshot.
+      completionController.setSession(payload.sessionId);
+    }
+    if (sessionIdentityChanged) {
+      // Preserve drafts and cheap UI state around an authoritative identity
+      // transition; the reducer owns transcript/context replacement below.
+      const draftWhileSwitching = !projectsState.pendingNewSession
+        ? (sessionSwitchDraft ?? (!projectsState.sessionLoading ? input : null))
+        : null;
+      const sharedDraft = shareTargetDraft;
+      if (
+        prevSessionId &&
+        _optimisticViewSavedSessionId !== prevSessionId &&
+        !projectsState.pendingNewSession
+      ) {
+        saveVisibleSessionView(prevSessionId);
       }
+      const restoredUi = !projectsState.pendingNewSession
+        ? sessionViewCache.restoreUiState(payload.sessionId as string)
+        : null;
+      composerController.clearAttachments();
+      if (projectsState.pendingNewSession) {
+        expandedUserMsgs = {};
+        truncatedUserMsgs = {};
+      } else if (restoredUi) {
+        restoreSessionViewUiState(restoredUi);
+        if (sharedDraft !== null) setComposerInput(sharedDraft);
+        else if (draftWhileSwitching !== null) setComposerInput(draftWhileSwitching);
+      } else {
+        setComposerInput(sharedDraft ?? draftWhileSwitching ?? '');
+        expandedUserMsgs = {};
+        truncatedUserMsgs = {};
+      }
+      shareTargetDraft = null;
+      _optimisticViewSavedSessionId = null;
+      composerBridge.discard();
     }
-    const isFullSessionPayload = payload.type === 'connected' || payload.type === 'session_loaded';
-    if ('isStreaming' in payload) isStreaming = payload.isStreaming as boolean;
-    if ('activeToolName' in payload) {
-      const incomingTool = payload.activeToolName;
-      activeToolName =
-        typeof incomingTool === 'string' && incomingTool.length > 0 ? incomingTool : undefined;
-    } else if (
-      isFullSessionPayload ||
-      ('sessionId' in payload && payload.sessionId !== prevSessionId)
-    ) {
-      activeToolName = undefined;
-    }
-    const newModel = payload.model as ModelInfo | null | undefined;
-    if (newModel !== undefined) model = newModel;
-    if (typeof payload.thinkingLevel === 'string') {
-      thinkingLevel = clampThinkingLevelForModel(model, payload.thinkingLevel);
-    }
-    if (payload.availableModels !== undefined) {
-      availableModels = (payload.availableModels as ModelInfo[]) ?? [];
+
+    const result = reduceSession(pageSessionReducerState(), { type: 'snapshot', payload });
+    applyPageSessionReducerState(result.state);
+    if (result.transcriptReplaced) {
+      olderMessagesLoading = false;
+      pruneUnresolvedLangs();
     }
     if (payload.tools !== undefined) {
       toolsList =
@@ -2308,48 +2102,12 @@
           { name: string; description?: string; source: string }[] | undefined) ?? []
       );
     }
-    if (payload.cwd) cwd = payload.cwd as string;
-    if ('sessionPath' in payload) {
-      sessionPath = typeof payload.sessionPath === 'string' ? payload.sessionPath : undefined;
-    } else if (payload.sessionMode === 'in-memory') {
-      sessionPath = undefined;
-    }
-    if ('sessionName' in payload) {
-      sessionName = typeof payload.sessionName === 'string' ? payload.sessionName : undefined;
-    } else if (isFullSessionPayload) {
-      // Full snapshots are authoritative: an unnamed session serializes with
-      // the key dropped (JSON omits undefined), so absence must clear the
-      // previous session's name instead of leaving it stale in the header.
-      sessionName = undefined;
-    }
-    if ('messages' in payload) {
-      const raw = (payload.messages as unknown[]) ?? [];
-      const streamingMessage = payload.streamingMessage;
-      messages = rawMessagesToUI(streamingMessage === undefined ? raw : [...raw, streamingMessage]);
-      olderMessagesLoading = false;
-      rebuildToolMessageIndex();
-      pruneUnresolvedLangs();
-      activeStreamMsg = null;
-      if (streamingMessage !== undefined && isStreaming) {
-        for (let i = messages.length - 1; i >= 0; i--) {
-          if (messages[i].role === 'assistant') {
-            messages[i].streaming = true;
-            activeStreamMsg = messages[i];
-            break;
-          }
-        }
-      }
-      totalRawMessagesLoaded = raw.length;
-      if ('totalMessageCount' in payload) totalMessageCount = payload.totalMessageCount as number;
-      if ('messagesTruncated' in payload) messagesTruncated = Boolean(payload.messagesTruncated);
-    }
     if (payload.extensionUiState && typeof payload.extensionUiState === 'object') {
       extensionUiState.applySnapshot(payload.extensionUiState as ExtensionUiStatePayload);
-    } else if ('sessionId' in payload && (payload.sessionId as string) !== prevSessionId) {
+    } else if (sessionIdentityChanged) {
       // Defensive: a session change without a snapshot must never keep the
-      // previous session's extension UI behind (partial payloads).
+      // previous session's extension UI behind.
       extensionUiState.reset();
-      // ...including its document title — fall back to the session name.
       if (typeof payload.sessionName === 'string') extensionUiState.setTitle(payload.sessionName);
     }
     projectsState.cwd = cwd;
@@ -2359,44 +2117,7 @@
       projectsState.isStreaming = isStreaming;
       projectsState.activeToolName = activeToolName;
     }
-    // Restore queue state from payload (present on connected/session_loaded)
-    if ('queuedSteering' in payload || 'queuedFollowUp' in payload) {
-      queuedSteering = (payload.queuedSteering as string[]) ?? [];
-      queuedFollowUp = (payload.queuedFollowUp as string[]) ?? [];
-    } else if ('sessionId' in payload) {
-      // Full session reset — clear queues
-      queuedSteering = [];
-      queuedFollowUp = [];
-    }
-    // Context usage and window — keep in sync with model's contextWindow.
-    // Server may provide real-time contextUsage on connected / session_loaded / message_end.
-    // When only the model changes, fall back to the new model's contextWindow.
-    let newWindow: number | undefined;
-    if ('contextUsage' in payload) {
-      const cu = payload.contextUsage as
-        { tokens?: number | null; contextWindow?: number } | undefined;
-      if (cu) {
-        contextUsageTokens = cu.tokens ?? null;
-        if (cu.contextWindow) newWindow = cu.contextWindow;
-      }
-    }
-    if (newWindow == null) {
-      const m = newModel ?? model;
-      if (m?.contextWindow) newWindow = m.contextWindow;
-    }
-    if (newWindow != null) contextUsageWindow = newWindow;
-    // Session-level settings (optional — present on connected/session_loaded)
-    if ('isCompacting' in payload) {
-      const compacting = Boolean(payload.isCompacting);
-      isCompacting = compacting;
-      if (compacting) {
-        if (compactionStartedAt === null) compactionStartedAt = Date.now();
-      } else {
-        compactionStartedAt = null;
-      }
-    }
     if ('autoCompactionEnabled' in payload) {
-      autoCompactionEnabled = Boolean(payload.autoCompactionEnabled ?? true);
       try {
         localStorage.setItem(
           'pifrontier:autoCompactionEnabled',
@@ -2407,7 +2128,6 @@
       }
     }
     if ('autoRetryEnabled' in payload) {
-      autoRetryEnabled = Boolean(payload.autoRetryEnabled ?? true);
       try {
         localStorage.setItem('pifrontier:autoRetryEnabled', JSON.stringify(autoRetryEnabled));
       } catch {
@@ -2416,397 +2136,33 @@
     }
   }
 
-  function backgroundLastStreaming(
-    view: SessionView,
-    role: UIMessage['role']
-  ): UIMessage | undefined {
-    for (let i = view.messages.length - 1; i >= 0; i--) {
-      const message = view.messages[i];
-      if (message.role === role && message.streaming) return message;
-    }
-    return undefined;
-  }
-
-  function backgroundFindTool(view: SessionView, toolCallId: string): UIMessage | undefined {
-    const indexed = view.toolsById.get(toolCallId);
-    if (indexed) return indexed;
-    for (let i = view.messages.length - 1; i >= 0; i--) {
-      const message = view.messages[i];
-      if (message.role === 'tool' && message.toolCallId === toolCallId) {
-        view.toolsById.set(toolCallId, message);
-        return message;
-      }
-    }
-    return undefined;
-  }
-
-  function backgroundEnsureTool(
-    view: SessionView,
-    toolCallId: string | undefined,
-    toolName: string,
-    details?: Record<string, unknown>,
-    renderedCallHtml?: string[]
-  ): UIMessage | undefined {
-    if (!toolCallId) return undefined;
-    const existing = backgroundFindTool(view, toolCallId);
-    if (existing) return existing;
-    const created: UIMessage = {
-      id: uid(),
-      role: 'tool',
-      content: '',
-      toolName,
-      toolCallId,
-      toolInput: formatToolInput(toolName, details),
-      renderedCallHtml,
-      streaming: true,
-      expanded: toolsExpandedGlobal,
-      startMs: Date.now(),
-      createdAt: Date.now(),
-    };
-    view.messages.push(created);
-    view.toolsById.set(toolCallId, created);
-    return created;
-  }
-
-  function backgroundSeal(view: SessionView): void {
-    for (let i = view.messages.length - 1; i >= 0; i--) {
-      const message = view.messages[i];
-      if (
-        message.streaming &&
-        message.role === 'assistant' &&
-        !message.content &&
-        !message.thinking
-      ) {
-        view.messages.splice(i, 1);
-      } else if (message.streaming) {
-        message.streaming = false;
-        delete message.renderedContent;
-        delete message.renderedThinking;
-      }
-    }
-    view.activeStreamMsg = null;
-  }
-
-  /**
-   * Apply a session-scoped live event to an inactive resident view. This path
+  /** Apply a session-scoped live event to an inactive resident view. This path
    * intentionally never invokes markdown rendering, scroll handling, or any
-   * page-level reactive state; the view is rendered only after it is selected.
+   * page-level reactive state; it uses the same reducer as the active session.
    */
   function applyBackgroundFrame(msg: ServerMessage, sid: string): boolean {
     const view = sessionViewCache.restore(sid);
     if (!view) return false;
-    const frame = msg as unknown as Record<string, unknown>;
-    switch (frame.type) {
-      case 'agent_start':
-        return true;
-      case 'agent_error':
-        backgroundSeal(view);
-        return true;
-      case 'agent_end':
-        backgroundSeal(view);
-        return true;
-      case 'message_start': {
-        const message = frame.message as { role?: string } | undefined;
-        if (message?.role === 'assistant') {
-          const assistant = freshAssistant();
-          view.messages.push(assistant);
-          view.activeStreamMsg = assistant;
-        }
-        return true;
-      }
-      case 'message_update': {
-        const event = frame.assistantMessageEvent as { type?: string; delta?: string } | undefined;
-        const active = view.activeStreamMsg;
-        if (!active || typeof event?.delta !== 'string') return true;
-        if (event.type === 'text_delta') {
-          active.content += event.delta;
-          delete active.renderedContent;
-        } else if (event.type === 'thinking_delta') {
-          active.thinking = (active.thinking ?? '') + event.delta;
-          delete active.renderedThinking;
-        }
-        return true;
-      }
-      case 'message_end': {
-        const endMessage = frame.message as
-          | {
-              role?: string;
-              content?: { type: string; text?: string; thinking?: string }[];
-              usage?: {
-                input: number;
-                output: number;
-                totalTokens: number;
-                cost?: { total?: number };
-              };
-              stopReason?: string;
-            }
-          | undefined;
-        if (endMessage?.role === 'custom') {
-          const [custom] = rawMessagesToUI([endMessage]);
-          if (custom) {
-            custom.images = undefined;
-            view.messages.push(custom);
-          }
-        }
-        if (endMessage?.role === 'assistant') {
-          const active = view.activeStreamMsg;
-          if (active) {
-            active.endMs = Date.now();
-            active.streaming = false;
-            delete active.renderedContent;
-            delete active.renderedThinking;
-            if (endMessage.stopReason === 'aborted') {
-              active.aborted = true;
-              active.content = 'Operation aborted';
-            } else {
-              const content = endMessage.content ?? [];
-              const text = extractTextContent(content);
-              const thinking = content
-                .filter((block) => block.type === 'thinking')
-                .map((block) => block.thinking ?? block.text ?? '')
-                .join('');
-              if (text) active.content = text;
-              if (thinking) active.thinking = thinking;
-              if (endMessage.usage) {
-                active.usage = {
-                  input: endMessage.usage.input,
-                  output: endMessage.usage.output,
-                  totalTokens: endMessage.usage.totalTokens,
-                  cost: { total: endMessage.usage.cost?.total ?? 0 },
-                };
-              }
-            }
-          }
-        }
-        view.activeStreamMsg = null;
-        const context = frame.contextUsage as ContextUsage | undefined;
-        if (context) view.contextUsage = { ...context };
-        return true;
-      }
-      case 'tool_execution_start': {
-        const toolName = (frame.toolName as string | undefined) ?? 'tool';
-        const toolCallId = frame.toolCallId as string | undefined;
-        const details = (frame.args ?? frame.input ?? frame.details) as
-          Record<string, unknown> | undefined;
-        const tool = backgroundEnsureTool(
-          view,
-          toolCallId,
-          toolName,
-          details,
-          frame.renderedCallHtml as string[] | undefined
-        );
-        if (tool) {
-          tool.toolName = toolName;
-          tool.toolInput = formatToolInput(toolName, details);
-          tool.renderedCallHtml = frame.renderedCallHtml as string[] | undefined;
-          tool.streaming = true;
-          tool.isError = false;
-          tool.outputLoading = false;
-          tool.outputElided = false;
-          tool.endMs = undefined;
-        }
-        return true;
-      }
-      case 'tool_execution_update': {
-        const toolCallId = frame.toolCallId as string | undefined;
-        const details = (frame.args ?? frame.input ?? frame.details) as
-          Record<string, unknown> | undefined;
-        const tool = toolCallId
-          ? backgroundEnsureTool(
-              view,
-              toolCallId,
-              (frame.toolName as string | undefined) ?? 'tool',
-              details,
-              frame.renderedCallHtml as string[] | undefined
-            )
-          : backgroundLastStreaming(view, 'tool');
-        if (tool) {
-          const partial = frame.partialResult as
-            { content?: { type: string; text?: string }[] } | undefined;
-          if (partial?.content) {
-            tool.content = extractTextContent(partial.content);
-            delete tool.renderedResultHtml;
-          }
-          if (frame.renderedResultHtml)
-            tool.renderedResultHtml = frame.renderedResultHtml as string[];
-        }
-        return true;
-      }
-      case 'tool_execution_end': {
-        const toolCallId = frame.toolCallId as string | undefined;
-        const details = (frame.args ?? frame.input ?? frame.details) as
-          Record<string, unknown> | undefined;
-        const tool = toolCallId
-          ? backgroundEnsureTool(
-              view,
-              toolCallId,
-              (frame.toolName as string | undefined) ?? 'tool',
-              details,
-              frame.renderedCallHtml as string[] | undefined
-            )
-          : backgroundLastStreaming(view, 'tool');
-        if (tool) {
-          if (frame.renderedResultHtml)
-            tool.renderedResultHtml = frame.renderedResultHtml as string[];
-          tool.streaming = false;
-          tool.isError = (frame.isError as boolean | undefined) ?? false;
-          const result = frame.result as
-            | { content?: { type: string; text?: string }[]; details?: { diff?: string } }
-            | undefined;
-          if (result?.content) tool.content = extractTextContent(result.content);
-          const diff = result?.details?.diff;
-          if (diff) {
-            tool.diff = diff;
-            tool.lineCount = diff.split('\\n').length;
-            tool.expanded = true;
-          } else if (tool.content) {
-            tool.lineCount = tool.content.split('\\n').length;
-            if (tool.isError || (tool.lineCount <= 8 && tool.content.length <= 400)) {
-              tool.expanded = true;
-            }
-          }
-        }
-        return true;
-      }
-      case 'bash_execution_update': {
-        const bashId = frame.id as string | undefined;
-        const bash = bashId ? backgroundEnsureTool(view, bashId, 'bash') : undefined;
-        const delta = frame.delta as string | undefined;
-        if (bash && delta) {
-          bash.content += delta;
-          bash.streaming = true;
-          bash.lineCount = bash.content.split('\\n').length;
-          delete bash.renderedResultHtml;
-        }
-        return true;
-      }
-      case 'tool_output': {
-        const toolCallId = frame.toolCallId as string | undefined;
-        if (!toolCallId) return true;
-        const tool = backgroundFindTool(view, toolCallId);
-        if (!tool) return true;
-        if (frame.content !== undefined) tool.content = frame.content as string;
-        if (frame.details !== undefined) tool.details = frame.details as string;
-        if (frame.diff !== undefined) {
-          tool.diff = frame.diff as string;
-          tool.lineCount = tool.diff.split('\\n').length;
-        }
-        if (frame.renderedResultHtml !== undefined)
-          tool.renderedResultHtml = frame.renderedResultHtml as string[];
-        tool.outputElided = false;
-        return true;
-      }
-      case 'queue_update':
-        view.queuedSteering = (frame.steering as string[] | undefined) ?? [];
-        view.queuedFollowUp = (frame.followUp as string[] | undefined) ?? [];
-        return true;
-      case 'compaction_start': {
-        const startedAt = Date.now();
-        const reason = (frame.reason as string | undefined) ?? '';
-        const beforeTokens = view.contextUsage?.tokens ?? undefined;
-        view.messages.push({
-          id: uid(),
-          role: 'notice',
-          content:
-            reason === 'manual'
-              ? 'compacting context…'
-              : `auto-compacting context (${reason || 'automatic'})…`,
-          noticeKind: 'compaction',
-          compaction: {
-            reason: reason || 'automatic',
-            status: 'running',
-            startedAt,
-            ...(beforeTokens !== undefined ? { tokensBefore: beforeTokens } : {}),
-          },
-          streaming: true,
-          createdAt: startedAt,
-        });
-        return true;
-      }
-      case 'compaction_end': {
-        const notice = [...view.messages]
-          .reverse()
-          .find(
-            (message) =>
-              message.role === 'notice' && message.noticeKind === 'compaction' && message.streaming
-          );
-        if (notice) {
-          notice.streaming = false;
-          const previous = notice.compaction;
-          const aborted = (frame.aborted as boolean | undefined) ?? false;
-          const willRetry = (frame.willRetry as boolean | undefined) ?? false;
-          const errorMessage = frame.errorMessage as string | undefined;
-          const result = frame.result as
-            { estimatedTokensAfter?: number; tokensBefore?: number } | undefined;
-          const startedAt = previous?.startedAt ?? notice.createdAt;
-          const endedAt = Date.now();
-          const status: CompactionNoticeDetails['status'] = willRetry
-            ? 'retrying'
-            : errorMessage
-              ? 'failed'
-              : aborted
-                ? 'aborted'
-                : 'completed';
-          notice.compaction = {
-            ...(previous ?? { status: 'running', startedAt }),
-            status,
-            startedAt,
-            endedAt,
-            durationMs: Math.max(0, endedAt - startedAt),
-            ...(result?.tokensBefore !== undefined ? { tokensBefore: result.tokensBefore } : {}),
-            ...(result?.estimatedTokensAfter !== undefined
-              ? { tokensAfter: result.estimatedTokensAfter }
-              : {}),
-            ...(errorMessage ? { errorMessage } : {}),
-            willRetry,
-          };
-          notice.content = errorMessage
-            ? `compaction failed: ${errorMessage}`
-            : aborted
-              ? 'compaction aborted'
-              : willRetry
-                ? 'compaction failed · retrying…'
-                : 'context compacted';
-        }
-        const context = frame.contextUsage as ContextUsage | undefined;
-        if (context) view.contextUsage = { ...context };
-        return true;
-      }
-      case 'auto_retry_start': {
-        const attempt = (frame.attempt as number | undefined) ?? 1;
-        const max = (frame.maxAttempts as number | undefined) ?? 1;
-        const delayS = Math.round(((frame.delayMs as number | undefined) ?? 0) / 1000);
-        const errorMessage = (frame.errorMessage as string | undefined) ?? '';
-        view.messages.push({
-          id: uid(),
-          role: 'notice',
-          content: `retrying (${attempt}/${max}${delayS > 0 ? `, ${delayS}s` : ''})${errorMessage ? ` — ${errorMessage}` : ''}`,
-          noticeKind: 'retry',
-          streaming: true,
-          createdAt: Date.now(),
-        });
-        return true;
-      }
-      case 'auto_retry_end': {
-        const notice = [...view.messages]
-          .reverse()
-          .find(
-            (message) =>
-              message.role === 'notice' && message.noticeKind === 'retry' && message.streaming
-          );
-        if (notice) {
-          notice.streaming = false;
-          const success = (frame.success as boolean | undefined) ?? false;
-          const finalError = frame.finalError as string | undefined;
-          notice.content = success
-            ? 'retry succeeded'
-            : `retry failed${finalError ? `: ${finalError}` : ''}`;
-        }
-        return true;
-      }
-      default:
-        return true;
-    }
+    const result = reduceSession(
+      createSessionReducerState({
+        sessionId: sid,
+        messages: view.messages,
+        activeStreamMsg: view.activeStreamMsg,
+        toolsById: view.toolsById,
+        contextUsage: view.contextUsage,
+        queuedSteering: view.queuedSteering,
+        queuedFollowUp: view.queuedFollowUp,
+        toolsExpanded: toolsExpandedGlobal,
+      }),
+      { type: 'event', message: msg }
+    );
+    view.messages = result.state.messages;
+    view.activeStreamMsg = result.state.activeStreamMsg;
+    view.toolsById = result.state.toolsById;
+    view.contextUsage = result.state.contextUsage;
+    view.queuedSteering = result.state.queuedSteering;
+    view.queuedFollowUp = result.state.queuedFollowUp;
+    return true;
   }
 
   function handleServer(msg: ServerMessage) {
@@ -2857,8 +2213,9 @@
           resyncEditorMirror();
           sessionStartTime = Date.now();
         }
-        if (sessionId ?? serverSessionId) sendSessionFocus(sessionId ?? serverSessionId ?? null);
         connectedPushVapidKey = c.pushVapidKey ?? null;
+        notificationController.setPushVapidKey(connectedPushVapidKey);
+        notificationController.setConnectionOpen(true);
         if (c.piVersion) piVersion = c.piVersion;
         if (c.uiVersion) uiVersion = c.uiVersion;
         if (c.sessionMode && !shouldResumeTarget) sessionMode = c.sessionMode;
@@ -2882,7 +2239,7 @@
         send({ type: 'get_project_trust' });
         // Warm the project/session lists so pickers have data immediately.
         projectsState.refresh({ force: true });
-        updateAppBadge();
+        notificationController.updateBadge(projectsState.unreadCount);
         send({ type: 'get_settings' });
 
         if (targetPath && shouldResumeTarget) {
@@ -3021,39 +2378,10 @@
       }
 
       case 'tool_output': {
-        const toolFrame = msg as {
-          type: 'tool_output';
-          toolCallId: string;
-          content?: string;
-          details?: string;
-          diff?: string;
-          renderedResultHtml?: string[];
-          error?: string;
-        };
-        const tool = findToolMessage(toolFrame.toolCallId);
-        if (!tool) {
-          if (toolFrame.error) {
-            showChatNotice(`Failed to load tool output: ${toolFrame.error}`, 'error');
-          }
-          break;
-        }
-        tool.outputLoading = false;
+        reduceActiveSessionEvent(msg);
+        const toolFrame = msg as { error?: string };
         if (toolFrame.error) {
           showChatNotice(`Failed to load tool output: ${toolFrame.error}`, 'error');
-          break;
-        }
-        if (toolFrame.content !== undefined) tool.content = toolFrame.content;
-        if (toolFrame.details !== undefined) tool.details = toolFrame.details;
-        if (toolFrame.diff !== undefined) {
-          tool.diff = toolFrame.diff;
-          tool.lineCount = toolFrame.diff.split('\n').length;
-        }
-        if (toolFrame.renderedResultHtml !== undefined) {
-          tool.renderedResultHtml = toolFrame.renderedResultHtml;
-        }
-        tool.outputElided = false;
-        if (tool.content && tool.lineCount === undefined) {
-          tool.lineCount = tool.content.split('\n').length;
         }
         break;
       }
@@ -3094,7 +2422,7 @@
         // projects panel, which can mask the visible notice for consumers.
         projectsState.error = null;
         if (sessionSwitchDraft !== null) {
-          input = sessionSwitchDraft;
+          setComposerInput(sessionSwitchDraft);
           sessionSwitchDraft = null;
         }
         if (wasIdentityRestore) {
@@ -3130,7 +2458,7 @@
           _optimisticPrevMessages = null;
         }
         if (_optimisticPrevInput !== null) {
-          input = _optimisticPrevInput;
+          setComposerInput(_optimisticPrevInput);
           _optimisticPrevInput = null;
         }
         rebuildToolMessageIndex();
@@ -3179,10 +2507,10 @@
       }
 
       case 'agent_start':
+        reduceActiveSessionEvent(msg);
         // The first agent_start proves the server accepted the edit rewind;
         // keep the optimistic history and stop retaining its rollback copy.
         _pendingEdit = null;
-        isStreaming = true;
         projectsState.isStreaming = true;
         requestWakeLock();
         break;
@@ -3190,54 +2518,27 @@
       case 'message_start':
         // Fires for user, assistant, AND toolResult messages — only create a
         // bubble for the assistant turn.
-        if ((msg.message as { role?: string } | undefined)?.role === 'assistant') {
-          messages.push(freshAssistant());
-          activeStreamMsg = messages[messages.length - 1];
-        }
+        reduceActiveSessionEvent(msg);
         break;
 
       case 'agent_end': {
         const { willRetry } = msg as { type: 'agent_end'; willRetry?: boolean };
-        isStreaming = false;
+        reduceActiveSessionEvent(msg);
         projectsState.isStreaming = false;
-        sealStreaming();
-        activeStreamMsg = null;
-        // agent_end for the active session — results just appeared on screen,
-        // no "unseen" dot needed.
         if (conversationMode && !willRetry && wsState === 'open') {
           toggleSTT();
         }
         releaseWakeLock();
-        updateAppBadge();
-        if (notificationPrefs.onComplete && document.hidden && !willRetry) {
-          notifyPiEvent('Response Complete', 'pi finished responding.', 'pi-agent-end', {
-            kind: 'response_complete',
-          });
-        }
-        // Contextual permission nudge — once, after the first completed turn.
-        if (
-          !willRetry &&
-          !showNotifNudge &&
-          !notifNudgeSeen &&
-          notificationPrefs.enabled &&
-          'Notification' in window &&
-          Notification.permission === 'default'
-        ) {
-          showNotifNudge = true;
-        }
+        notificationController.updateBadge(projectsState.unreadCount);
+        notificationController.handleAgentEnd(Boolean(willRetry));
         saveSnapshot(sessionPath, sessionName, messages);
         break;
       }
 
       case 'agent_error': {
         // Server-side error during prompt/steer/followUp — unfreeze the UI.
-        isStreaming = false;
         projectsState.isStreaming = false;
-        sealStreaming();
-        activeStreamMsg = null;
-        releaseWakeLock();
         const errMsg = (msg as { error?: string }).error ?? 'Unknown error';
-        // Crash-containment broadcasts (reportCrash) loop by nature — the same
         // unhandled rejection refires while its owner (stale ctx timer, wedged
         // extension) lives. Collapse repeats so one looping fault renders one
         // notice instead of a stack; legitimately distinct errors still show.
@@ -3248,7 +2549,7 @@
             messages = _optimisticPrevMessages;
             _optimisticPrevMessages = null;
           }
-          if (_optimisticPrevInput !== null) input = _optimisticPrevInput;
+          if (_optimisticPrevInput !== null) setComposerInput(_optimisticPrevInput);
           _optimisticPrevInput = null;
           rebuildToolMessageIndex();
           projectsState.cancelPendingOps();
@@ -3264,226 +2565,25 @@
       }
 
       case 'message_update': {
-        const event = msg.assistantMessageEvent as { type: string; delta?: string } | undefined;
-        if (event?.type === 'text_delta' && typeof event.delta === 'string') {
-          const a = activeStreamMsg;
-          if (a) {
-            a.content += event.delta;
-            scheduleContentRender(a, true);
-          }
-        } else if (event?.type === 'thinking_delta' && typeof event.delta === 'string') {
-          const a = activeStreamMsg;
-          if (a) {
-            if (!a.thinkingStartMs) a.thinkingStartMs = Date.now();
-            a.thinking = (a.thinking ?? '') + event.delta;
-            scheduleContentRender(a);
-          }
-        }
+        reduceActiveSessionEvent(msg);
         break;
       }
 
       case 'message_end': {
         const endMsg = msg.message as
-          | {
-              role?: string;
-              usage?: {
-                input: number;
-                output: number;
-                totalTokens: number;
-                cost: { total: number };
-              };
-              content?: {
-                type: string;
-                text?: string;
-                thinking?: string;
-                data?: string;
-                mimeType?: string;
-              }[];
-              stopReason?: string;
-              errorMessage?: string;
-            }
-          | undefined;
-        if (endMsg?.role === 'custom') {
-          // Custom extension entries arrive as ordinary message_start/end
-          // pairs. They are not assistant bubbles, but still belong in the
-          // conversation and use the same conversion as loaded history.
-          const [custom] = rawMessagesToUI([endMsg]);
-          if (custom) messages.push(custom);
-        }
-        if (endMsg?.role === 'assistant') {
-          const a = activeStreamMsg;
-          if (a) {
-            a.endMs = Date.now();
-            a.streaming = false;
-            if (endMsg.stopReason === 'aborted') {
-              a.aborted = true;
-              a.content = 'Operation aborted';
-            } else {
-              // Replace streamed buffers with the sealed message only when
-              // the final payload actually contains those block types. A
-              // tool-only or wire-truncated final message must not erase text
-              // that arrived through deltas.
-              const finalText = extractTextContent(endMsg.content ?? []);
-              const finalThinking = (endMsg.content ?? [])
-                .filter((b) => b.type === 'thinking')
-                .map((b) => b.thinking ?? '')
-                .join('');
-              if (finalText) a.content = finalText;
-              if (finalThinking) a.thinking = finalThinking;
-              if (endMsg.usage) {
-                a.usage = {
-                  input: endMsg.usage.input,
-                  output: endMsg.usage.output,
-                  totalTokens: endMsg.usage.totalTokens,
-                  cost: { total: endMsg.usage.cost?.total ?? 0 },
-                };
-              }
-              // Extract any image blocks from the final message content
-              if (endMsg.content) {
-                const imgBlocks = endMsg.content.filter(
-                  (b) => b.type === 'image' && b.data && b.mimeType
-                );
-                if (imgBlocks.length > 0) {
-                  a.images = imgBlocks.map((b) => `data:${b.mimeType};base64,${b.data}`);
-                }
-              }
-            }
-            // Final markdown render — full parse with hljs now that streaming is done
-            if (a.content)
-              a.renderedContent = renderMarkdown(a.content, {
-                onUnresolvedLang: (lang) => recordUnresolvedLang(a, lang),
-              });
-            if (a.thinking)
-              a.renderedThinking = renderMarkdown(a.thinking, {
-                onUnresolvedLang: (lang) => recordUnresolvedLang(a, lang),
-              });
-          }
-        }
+          { role?: string; stopReason?: string; errorMessage?: string } | undefined;
+        reduceActiveSessionEvent(msg);
         if (endMsg?.role === 'assistant' && endMsg.stopReason === 'error' && endMsg.errorMessage) {
           showChatNotice(`Agent error: ${endMsg.errorMessage}`, 'error');
         }
-        activeStreamMsg = null;
-        // Use real context usage from the SDK (server enriches message_end with this)
-        const cu = (msg as Record<string, unknown>).contextUsage as
-          { tokens?: number | null; contextWindow?: number } | undefined;
-        if (cu) {
-          applySessionState({ contextUsage: cu });
-        }
         break;
       }
 
-      case 'tool_execution_start': {
-        const toolName = (msg.toolName as string | undefined) ?? 'tool';
-        const toolCallId = msg.toolCallId as string | undefined;
-        const details = (msg.args ?? msg.input ?? msg.details) as
-          Record<string, unknown> | undefined;
-        const renderedCallHtml = msg.renderedCallHtml as string[] | undefined;
-        let toolMessage = ensureToolMessage(toolCallId, toolName, details, renderedCallHtml);
-        if (!toolMessage) {
-          toolMessage = createToolMessage(toolName, toolCallId, details, renderedCallHtml);
-          messages.push(toolMessage);
-          indexToolMessage(toolMessage);
-        }
-        toolMessage.toolName = toolName;
-        toolMessage.toolInput = formatToolInput(toolName, details);
-        toolMessage.renderedCallHtml = renderedCallHtml;
-        toolMessage.streaming = true;
-        toolMessage.isError = false;
-        toolMessage.outputLoading = false;
-        toolMessage.outputElided = false;
-        toolMessage.endMs = undefined;
-        break;
-      }
-
-      case 'tool_execution_update': {
-        const updateId = msg.toolCallId as string | undefined;
-        const details = (msg.args ?? msg.input ?? msg.details) as
-          Record<string, unknown> | undefined;
-        const t = updateId
-          ? ensureToolMessage(
-              updateId,
-              (msg.toolName as string | undefined) ?? activeToolName ?? 'tool',
-              details,
-              msg.renderedCallHtml as string[] | undefined
-            )
-          : lastStreaming('tool');
-        if (t) {
-          const partial = msg.partialResult as
-            { content?: { type: string; text?: string }[] } | undefined;
-          if (partial?.content) {
-            t.content = extractTextContent(partial.content);
-          }
-          if (msg.renderedResultHtml) t.renderedResultHtml = msg.renderedResultHtml as string[];
-        }
-        break;
-      }
-
-      case 'tool_execution_end': {
-        const endId = msg.toolCallId as string | undefined;
-        const details = (msg.args ?? msg.input ?? msg.details) as
-          Record<string, unknown> | undefined;
-        const t = endId
-          ? ensureToolMessage(
-              endId,
-              (msg.toolName as string | undefined) ?? activeToolName ?? 'tool',
-              details,
-              msg.renderedCallHtml as string[] | undefined
-            )
-          : lastStreaming('tool');
-        if (t) {
-          if (msg.renderedResultHtml) t.renderedResultHtml = msg.renderedResultHtml as string[];
-          t.streaming = false;
-          t.isError = (msg.isError as boolean | undefined) ?? false;
-          const result = msg.result as
-            | {
-                content?: {
-                  type: string;
-                  text?: string;
-                  data?: string;
-                  mimeType?: string;
-                }[];
-                details?: { diff?: string; patch?: string };
-              }
-            | undefined;
-
-          if (result?.content) {
-            t.content = extractTextContent(result.content);
-            const imgBlocks = result.content.filter(
-              (b) => b.type === 'image' && b.data && b.mimeType
-            );
-            if (imgBlocks.length > 0) {
-              t.images = imgBlocks.map((b) => `data:${b.mimeType};base64,${b.data}`);
-            }
-          }
-          // Capture diff for edit tool
-          const diff = result?.details?.diff;
-          if (diff) {
-            t.diff = diff;
-            t.lineCount = diff.split('\n').length;
-            // Auto-expand diff so it's immediately visible
-            t.expanded = true;
-          } else if (t.content) {
-            const lines = t.content.split('\n').length;
-            t.lineCount = lines;
-            // Auto-expand errors (the user needs to see what failed) and
-            // short outputs (≤ 8 lines and ≤ 400 chars).
-            if (t.isError || (lines <= 8 && t.content.length <= 400)) {
-              t.expanded = true;
-            }
-          }
-        }
-        break;
-      }
-
+      case 'tool_execution_start':
+      case 'tool_execution_update':
+      case 'tool_execution_end':
       case 'bash_execution_update': {
-        const bashId = msg.id as string | undefined;
-        const delta = msg.delta as string | undefined;
-        const bash = bashId ? ensureToolMessage(bashId, 'bash') : undefined;
-        if (bash && delta) {
-          bash.content += delta;
-          bash.streaming = true;
-          bash.lineCount = bash.content.split('\n').length;
-        }
+        reduceActiveSessionEvent(msg);
         break;
       }
 
@@ -3525,7 +2625,7 @@
           extensionUiState.setTitle(msg.title as string | undefined);
         } else if (method === 'set_editor_text') {
           if (!projectsState.pendingNewSession) {
-            input = (msg.text as string | undefined) ?? '';
+            setComposerInput((msg.text as string | undefined) ?? '');
             tick().then(() => {
               autoResizeTextarea();
               inputEl?.focus();
@@ -3537,7 +2637,7 @@
             if (inputEl) {
               const start = inputEl.selectionStart ?? input.length;
               const end = inputEl.selectionEnd ?? input.length;
-              input = input.slice(0, start) + textToInsert + input.slice(end);
+              setComposerInput(input.slice(0, start) + textToInsert + input.slice(end));
               tick().then(() => {
                 if (inputEl) {
                   inputEl.selectionStart = inputEl.selectionEnd = start + textToInsert.length;
@@ -3546,7 +2646,7 @@
                 }
               });
             } else {
-              input += textToInsert;
+              setComposerInput(input + textToInsert);
             }
           }
         } else if (method === 'setWorkingMessage') {
@@ -3590,7 +2690,7 @@
           document.hidden &&
           ['confirm', 'input', 'select', 'editor', 'custom'].includes(method)
         ) {
-          notifyPiEvent(
+          notificationController.notify(
             'pi needs your input',
             (msg.title as string | undefined) || 'An extension is asking for a response.',
             `pi-ui-request-${String(msg.id ?? '')}`,
@@ -3603,15 +2703,6 @@
 
       case 'extension_ui_request_replay': {
         extensionUiState.replayModalFromRequest(msg);
-        break;
-      }
-      case 'extension_ui_state': {
-        const uiMsg = msg as {
-          type: 'extension_ui_state';
-          sessionId: string;
-          ui: ExtensionUiStatePayload;
-        };
-        if (uiMsg.sessionId === sessionId) extensionUiState.applySnapshot(uiMsg.ui);
         break;
       }
 
@@ -3640,22 +2731,18 @@
       }
 
       case 'queue_update': {
-        const steering = (msg.steering as string[] | undefined) ?? [];
-        const followUp = (msg.followUp as string[] | undefined) ?? [];
-        // Authoritative echo of our optimistic chip — Set-dedupe keeps the
-        // render stable whether the optimistic or server copy lands first.
-        queuedSteering = [...new Set(steering)];
-        queuedFollowUp = [...new Set(followUp)];
+        // Authoritative echo of optimistic queue chips is handled by the
+        // reducer; it deduplicates the server's arrays.
+        reduceActiveSessionEvent(msg);
         break;
       }
-
       case 'queue_restored': {
         const restoredText = (msg.text as string | undefined) ?? '';
 
         if (restoredText) {
           // Append restored queued text to the composer so the user can re-submit it.
           const prefix = input.trim() ? input + '\n\n' : '';
-          input = prefix + restoredText;
+          setComposerInput(prefix + restoredText);
           tick().then(() => {
             autoResizeTextarea();
             inputEl?.focus();
@@ -3664,136 +2751,12 @@
         break;
       }
 
-      case 'compaction_start': {
-        const startedAt = Date.now();
-        const reason = (msg.reason as string | undefined) ?? '';
-        const beforeTokens = effectiveContextTokens > 0 ? effectiveContextTokens : undefined;
-        isCompacting = true;
-        compactionStartedAt = startedAt;
-        messages.push({
-          id: uid(),
-          role: 'notice',
-          content:
-            reason === 'manual'
-              ? 'compacting context…'
-              : `auto-compacting context (${reason || 'automatic'})…`,
-          noticeKind: 'compaction',
-          compaction: {
-            reason: reason || 'automatic',
-            status: 'running',
-            startedAt,
-            ...(beforeTokens !== undefined ? { tokensBefore: beforeTokens } : {}),
-          },
-          streaming: true,
-          createdAt: startedAt,
-        });
+      case 'compaction_start':
+      case 'compaction_end':
+      case 'auto_retry_start':
+      case 'auto_retry_end':
+        reduceActiveSessionEvent(msg);
         break;
-      }
-
-      case 'compaction_end': {
-        const endedAt = Date.now();
-        const aborted = (msg.aborted as boolean | undefined) ?? false;
-        const willRetry = (msg.willRetry as boolean | undefined) ?? false;
-        const errMsg = msg.errorMessage as string | undefined;
-        const compResult = (msg as Record<string, unknown>).result as
-          { estimatedTokensAfter?: number; tokensBefore?: number } | undefined;
-        const cu = (msg as Record<string, unknown>).contextUsage as
-          { tokens?: number | null; contextWindow?: number } | undefined;
-        // Seal the in-progress compaction notice with its measured outcome.
-        const notice = [...messages]
-          .reverse()
-          .find((m) => m.role === 'notice' && m.noticeKind === 'compaction' && m.streaming);
-        const previous = notice?.compaction;
-        const startedAt =
-          compactionStartedAt ?? previous?.startedAt ?? notice?.createdAt ?? endedAt;
-        const durationMs = Math.max(0, endedAt - startedAt);
-        const tokensBefore = compResult?.tokensBefore ?? previous?.tokensBefore;
-        const tokensAfter = compResult?.estimatedTokensAfter ?? cu?.tokens ?? previous?.tokensAfter;
-        const status: CompactionNoticeDetails['status'] = willRetry
-          ? 'retrying'
-          : errMsg
-            ? 'failed'
-            : aborted
-              ? 'aborted'
-              : 'completed';
-        const reason =
-          ((msg.reason as string | undefined) ?? previous?.reason ?? 'automatic').trim() ||
-          'automatic';
-        isCompacting = false;
-        compactionStartedAt = null;
-        if (notice) {
-          notice.streaming = false;
-          notice.compaction = {
-            ...(previous ?? { status: 'running', startedAt }),
-            reason,
-            status,
-            startedAt,
-            endedAt,
-            durationMs,
-            ...(tokensBefore !== undefined ? { tokensBefore } : {}),
-            ...(tokensAfter !== undefined ? { tokensAfter } : {}),
-            ...(errMsg ? { errorMessage: errMsg } : {}),
-            willRetry,
-          };
-          notice.content = willRetry
-            ? `compaction failed${errMsg ? `: ${errMsg}` : ''} · retrying…`
-            : errMsg
-              ? `compaction failed: ${errMsg}`
-              : aborted
-                ? 'compaction aborted'
-                : compResult?.tokensBefore != null && compResult.estimatedTokensAfter != null
-                  ? `context compacted · ${compResult.tokensBefore.toLocaleString()} → ${compResult.estimatedTokensAfter.toLocaleString()} tokens`
-                  : 'context compacted';
-        }
-        if (cu?.tokens != null) {
-          applySessionState({ contextUsage: cu });
-        } else if (compResult?.estimatedTokensAfter != null) {
-          applySessionState({
-            contextUsage: {
-              tokens: compResult.estimatedTokensAfter,
-              contextWindow: contextUsageWindow || model?.contextWindow,
-            },
-          });
-        }
-        break;
-      }
-
-      case 'auto_retry_start': {
-        const attempt = (msg.attempt as number | undefined) ?? 1;
-        const max = (msg.maxAttempts as number | undefined) ?? 1;
-        const delayS = Math.round(((msg.delayMs as number | undefined) ?? 0) / 1000);
-        const errMsg = (msg.errorMessage as string | undefined) ?? '';
-
-        messages.push({
-          id: uid(),
-          role: 'notice',
-          content: `retrying (${attempt}/${max}${delayS > 0 ? `, ${delayS}s` : ''})${errMsg ? ` — ${errMsg}` : ''}`,
-          noticeKind: 'retry',
-          streaming: true,
-          createdAt: Date.now(),
-        });
-        break;
-      }
-
-      case 'auto_retry_end': {
-        const notice = [...messages]
-          .reverse()
-          .find((m) => m.role === 'notice' && m.noticeKind === 'retry' && m.streaming);
-        if (notice) {
-          notice.streaming = false;
-          const success = (msg.success as boolean | undefined) ?? false;
-          const finalErr = msg.finalError as string | undefined;
-          notice.content = success
-            ? 'retry succeeded'
-            : `retry failed${finalErr ? `: ${finalErr}` : ''}`;
-        }
-        break;
-      }
-
-      case 'session_info_changed': {
-        sessionName = msg.name as string | undefined;
-        break;
-      }
 
       case 'fork_points': {
         forkPoints = (msg.entries as { entryId: string; text: string }[] | undefined) ?? [];
@@ -3954,34 +2917,11 @@
         break;
       }
 
-      case 'file_completions': {
-        const fileMsg = msg as { type: string; query: string; entries: string[] };
-        if (fileMsg.query === shortcutQuery) fileCompletions = fileMsg.entries ?? [];
-        break;
-      }
-
-      case 'extension_completions': {
-        const extMsg = msg as unknown as {
-          trigger: string;
-          query: string;
-          items: { value: string; label: string; description?: string }[];
-        };
-        if (extMsg.trigger === shortcutTrigger && extMsg.query === shortcutQuery) {
-          extensionCompletions = extMsg.items ?? [];
-        }
-        break;
-      }
-
+      case 'file_completions':
+      case 'extension_completions':
       case 'command_completions': {
-        const cc = msg as unknown as {
-          command: string;
-          prefix: string;
-          items: { value: string; label: string; description?: string }[];
-        };
-        if (cc.command === commandArgCommand && cc.prefix === commandArgPrefix) {
-          commandArgCompletions = cc.items ?? [];
-          commandCompletionsPending = false;
-        }
+        const accepted = completionController.handleResponse(msg, currentCompletionView());
+        if (accepted && msg.type === 'extension_completions') showSlashMenu = true;
         break;
       }
 
@@ -4090,7 +3030,7 @@
         if (staged.error) {
           showChatNotice(`Failed to stage ${staged.name}: ${staged.error}`, 'error');
         } else {
-          input = input + `@${staged.path} `;
+          setComposerInput(input + `@${staged.path} `);
           showChatNotice(
             `Staged ${staged.name} as @${staged.path} — the agent can open it`,
             'info'
@@ -4167,7 +3107,7 @@
           if (isRunning || toolName) requestWakeLock();
           else releaseWakeLock();
         } else if (previousRuntime?.phase === 'running' && rt.phase !== 'running' && rt.unread) {
-          notifyBackgroundCompletion(rt);
+          notificationController.notifyBackgroundCompletion(rt);
         }
         break;
       }
@@ -4385,7 +3325,7 @@
   function restorePendingEdit(): boolean {
     if (!_pendingEdit) return false;
     messages = _pendingEdit.messages;
-    input = _pendingEdit.input;
+    setComposerInput(_pendingEdit.input);
     _pendingEdit = null;
     rebuildToolMessageIndex();
     return true;
@@ -4415,24 +3355,6 @@
 
   // ── Message helpers ──────────────────────────────────────────────────────────
 
-  function freshAssistant(): UIMessage {
-    return {
-      id: uid(),
-      role: 'assistant',
-      content: '',
-      thinking: '',
-      thinkingExpanded: false,
-      streaming: true,
-      startMs: Date.now(),
-      createdAt: Date.now(),
-    };
-  }
-
-  function lastStreaming(role: UIMessage['role']): UIMessage | undefined {
-    for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i].role === role && messages[i].streaming) return messages[i];
-    }
-  }
   // eslint-disable-next-line svelte/prefer-svelte-reactivity -- internal throttle buffer, never read reactively
   let _pendingRenderSet = new Set<UIMessage>();
   let _renderScheduled = false;
@@ -4477,7 +3399,7 @@
         if (m.streaming) {
           // Escaped plain-text preview — full markdown parse per delta is the
           // streaming hot spot (100k chars ≈ 24 ms parse, 60×/s); the
-          // message_end / sealStreaming finalize paths render real markdown.
+          // message_end / reducer finalization paths render real markdown.
           // Large buffers skip the per-char LaTeX scan (see markdown.ts).
           if (m.content) m.renderedContent = renderStreamingPreview(m.content);
           if (m.thinking) m.renderedThinking = renderStreamingPreview(m.thinking);
@@ -4506,28 +3428,6 @@
     });
   }
 
-  function sealStreaming() {
-    // Drop empty streaming assistant bubbles (LLM turns that produced only tool calls, no text/thinking).
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const m = messages[i];
-      if (m.streaming && m.role === 'assistant' && !m.content && !m.thinking) {
-        messages.splice(i, 1);
-      } else if (m.streaming) {
-        m.streaming = false;
-        // Finalize path for turns that ended without message_end (agent_error,
-        // abort): the streaming preview must be replaced with real markdown.
-        if (m.content)
-          m.renderedContent = renderMarkdown(m.content, {
-            onUnresolvedLang: (lang) => recordUnresolvedLang(m, lang),
-          });
-        if (m.thinking)
-          m.renderedThinking = renderMarkdown(m.thinking, {
-            onUnresolvedLang: (lang) => recordUnresolvedLang(m, lang),
-          });
-      }
-    }
-  }
-
   function indexToolMessage(message: UIMessage): void {
     if (message.role === 'tool' && message.toolCallId) {
       toolMessagesById.set(message.toolCallId, message);
@@ -4538,7 +3438,6 @@
     toolMessagesById.clear();
     for (const message of messages) indexToolMessage(message);
   }
-
   function findToolMessage(toolCallId: string): UIMessage | undefined {
     const indexed = toolMessagesById.get(toolCallId);
     if (indexed) return indexed;
@@ -4550,46 +3449,6 @@
       }
     }
     return undefined;
-  }
-
-  function createToolMessage(
-    toolName: string,
-    toolCallId: string | undefined,
-    details?: Record<string, unknown>,
-    renderedCallHtml?: string[]
-  ): UIMessage {
-    return {
-      id: uid(),
-      role: 'tool',
-      content: '',
-      toolName,
-      toolCallId,
-      toolInput: formatToolInput(toolName, details),
-      renderedCallHtml,
-      streaming: true,
-      expanded: toolsExpandedGlobal,
-      startMs: Date.now(),
-      createdAt: Date.now(),
-    };
-  }
-
-  function ensureToolMessage(
-    toolCallId: string | undefined,
-    toolName: string,
-    details?: Record<string, unknown>,
-    renderedCallHtml?: string[]
-  ): UIMessage | undefined {
-    if (!toolCallId) return undefined;
-    const existing = findToolMessage(toolCallId);
-    if (existing) return existing;
-    const created = createToolMessage(toolName, toolCallId, details, renderedCallHtml);
-    messages.push(created);
-    // `$state` deep-wraps objects when they enter the messages array. Index
-    // that wrapped value so later event mutations invalidate the rendered row;
-    // indexing the pre-push object bypasses Svelte's proxy.
-    const reactive = messages[messages.length - 1];
-    indexToolMessage(reactive);
-    return reactive;
   }
 
   /** One pending scroll per frame — token deltas and WS frames call this often. */
@@ -4807,71 +3666,49 @@
   // ── User input ───────────────────────────────────────────────────────────────
 
   async function processAttachmentFiles(files: File[]) {
-    for (const file of files) {
-      if (file.type.startsWith('image/')) {
-        const prepared = await prepareImage(file);
-        if (!prepared) continue;
-        if (prepared.data.length > MAX_IMAGE_PAYLOAD) {
-          showChatNotice(
-            `Image too large: ${file.name || 'clipboard image'} (max 3MB encoded)`,
-            'warning'
-          );
-          continue;
-        }
-        attachedImages.push({
-          data: prepared.data,
-          mimeType: prepared.mimeType,
-          name: file.name || 'clipboard image',
-          src: `data:${prepared.mimeType};base64,${prepared.data}`,
-        });
-        continue;
-      }
-
-      const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
+    const result = await composerController.processAttachmentFiles(files);
+    for (const notice of result.notices) showChatNotice(notice.message, notice.level);
+    for (const file of result.unsupported) {
+      const name = file.name || 'attachment';
+      const ext = name.split('.').pop()?.toLowerCase() ?? '';
       if (SPREADSHEET_EXTENSIONS.has(ext)) {
         if (file.size > 10 * 1024 * 1024) {
-          showChatNotice(`File too large: ${file.name} (max 10 MB workbook)`, 'warning');
+          showChatNotice(`File too large: ${name} (max 10 MB workbook)`, 'warning');
           continue;
         }
         try {
-          const content = xlsxToText(await file.arrayBuffer());
-          attachedFiles.push({ name: file.name, content, size: file.size });
+          const content = await xlsxToText(await file.arrayBuffer());
+          const draft = composerController.current;
+          composerController.setDraft({
+            ...draft,
+            attachedFiles: [...draft.attachedFiles, { name, content, size: file.size }],
+          });
         } catch {
-          showChatNotice(`Could not read spreadsheet: ${file.name}`, 'warning');
+          showChatNotice(`Could not read spreadsheet: ${name}`, 'warning');
         }
-        continue;
-      }
-
-      if (TEXT_FILE_EXTENSIONS.has(ext)) {
-        if (file.size > 1024 * 1024) {
-          showChatNotice(`File too large: ${file.name} (max 1MB)`, 'warning');
-          continue;
-        }
-        const content = await fileToText(file);
-        attachedFiles.push({ name: file.name, content, size: file.size });
         continue;
       }
 
       // Anything else stages as a binary for the agent to open via its `@` path.
       // Bounded by the 4 MB WS frame: base64 inflates ~33%, so ~3 MB of file.
       if (file.size > 4 * 1024 * 1024) {
-        showChatNotice(`File too large: ${file.name} (max ~3MB staged)`, 'warning');
+        showChatNotice(`File too large: ${name} (max ~3MB staged)`, 'warning');
         continue;
       }
-      pendingUploads.set(file.name, file);
-      showChatNotice(`Uploading ${file.name}…`, 'info');
+      pendingUploads.set(name, file);
+      showChatNotice(`Uploading ${name}…`, 'info');
       try {
         const data = await fileToBase64(file);
         if (data.length > 4190000) {
-          pendingUploads.delete(file.name);
-          showChatNotice(`File too large: ${file.name} (max ~3MB staged)`, 'warning');
-        } else if (!send({ type: 'upload_file', name: file.name, data })) {
-          pendingUploads.delete(file.name);
-          showChatNotice(`Failed to upload ${file.name}: not connected`, 'error');
+          pendingUploads.delete(name);
+          showChatNotice(`File too large: ${name} (max ~3MB staged)`, 'warning');
+        } else if (!send({ type: 'upload_file', name, data })) {
+          pendingUploads.delete(name);
+          showChatNotice(`Failed to upload ${name}: not connected`, 'error');
         }
       } catch {
-        pendingUploads.delete(file.name);
-        showChatNotice(`Failed to upload ${file.name}`, 'error');
+        pendingUploads.delete(name);
+        showChatNotice(`Failed to upload ${name}`, 'error');
       }
     }
   }
@@ -4902,13 +3739,12 @@
   }
 
   function removeAttachment(idx: number) {
-    attachedImages.splice(idx, 1);
+    composerController.removeAttachment(idx);
   }
 
   function removeFileAttachment(idx: number) {
-    attachedFiles.splice(idx, 1);
+    composerController.removeFileAttachment(idx);
   }
-
   /** Shows a transient status/error message inline in the chat transcript
    *  instead of a corner toast. Client-only — never sent to the session, so
    *  it does not persist past a reload. */
@@ -4931,32 +3767,12 @@
 
   function selectSlashCommand(shortcut: ComposerShortcut) {
     if (shortcut.disabled) return;
-    input = shortcut.insert;
+    setComposerInput(shortcut.insert);
     showSlashMenu = false;
     tick().then(() => {
       autoResizeTextarea();
       inputEl?.focus();
     });
-  }
-
-  function steerAgent() {
-    const text = input.trim();
-    if (!text || wsState !== 'open') return;
-    // Commands entered while the agent is running must retain command
-    // semantics; only ordinary text belongs in the steering queue.
-    if (runSlashCommand(text, true)) {
-      input = '';
-      resetTextareaHeight();
-      return;
-    }
-    // Keep the draft when the socket closes between the guard and send().
-    if (!send({ type: 'steer', message: text })) return;
-    // Optimistic queue chip — the server rebroadcasts authoritative
-    // queue_update (deduped below); the send path above already showed the
-    // text left the composer instantly.
-    if (!queuedSteering.includes(text)) queuedSteering = [...queuedSteering, text];
-    input = '';
-    resetTextareaHeight();
   }
 
   // ── STT ──────────────────────────────────────────────────────────────────────
@@ -4976,11 +3792,10 @@
     rec.lang = navigator.language || 'en-US';
     rec.continuous = false; // browser ends recognition after a silence gap automatically
     rec.interimResults = true; // show live transcript while speaking
-
+    const baseInput = input;
     sttManualStop = false; // reset for this session
     let hadFinalResult = false; // becomes true when browser emits a final (non-interim) result
 
-    const baseInput = input;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     rec.onresult = (e: any) => {
       let text = '';
@@ -4991,8 +3806,7 @@
       }
 
       const prefix = baseInput ? (baseInput.endsWith(' ') ? baseInput : baseInput + ' ') : '';
-
-      input = prefix + text;
+      setComposerInput(prefix + text);
     };
 
     rec.onend = () => {
@@ -5033,164 +3847,66 @@
   }
 
   function canSubmitFollowUp() {
-    return (
-      wsState === 'open' &&
-      !sessionLoading &&
-      !isStreaming &&
-      hasComposerText &&
-      attachedImages.length === 0 &&
-      attachedFiles.length === 0
-    );
+    return composerController.canSubmitFollowUp();
   }
 
-  function runSlashCommand(text: string, isStreamingNow = false): boolean {
-    // Handle ! shell commands – bypass the AI, execute directly.
-    if (text.startsWith('!')) {
-      const command = text.slice(1).trim();
-      if (command) {
-        send({ type: 'run_builtin', command: 'shell', args: command });
-        input = '';
-        resetTextareaHeight();
+  function dispatchComposerEffect(effect: ComposerEffect): boolean {
+    switch (effect.type) {
+      case 'notice':
+        showChatNotice(effect.notice.message, effect.notice.level);
         return true;
-      }
-      return false;
-    }
-    if (!text.startsWith('/')) return false;
-    const [rawCommand, ...rest] = text.slice(1).split(/\s+/);
-    const command = rawCommand.toLowerCase();
-    const args = rest.join(' ').trim();
-
-    // These mutate live session/agent state (context, tools/prompts, model
-    // auth, branch files) in ways that can race an in-flight turn — block
-    // them while the agent is streaming rather than dispatching them (or,
-    // absent this check, letting submitMessage() steer the literal command
-    // text into the conversation as a user message). Mirrors the server-side
-    // guard in the `run_builtin`/`compact` handlers.
-    if (isStreamingNow && ['compact', 'reload', 'login', 'logout', 'clone'].includes(command)) {
-      showChatNotice('Wait for the agent to finish before running this command.', 'warning');
-      return true;
-    }
-
-    switch (command) {
-      case 'new':
-        projectsState.newSession(args || undefined);
+      case 'new_session':
+        if (_optimisticPrevInput === null) _optimisticPrevInput = input;
+        projectsState.newSession(effect.targetCwd);
         return true;
-      case 'compact':
-        compactSession();
-        return true;
-      case 'fork':
+      case 'open_fork_dialog':
         openForkDialog();
         return true;
-      case 'resume':
+      case 'open_session_panel':
         showSessionPanel = true;
         showRightPanel = false;
         showSettingsPanel = false;
         return true;
-      case 'model':
+      case 'open_model_panel':
         openTab('models');
         return true;
-      case 'copy': {
-        const last = [...messages].reverse().find((m) => m.role === 'assistant' && m.content);
-        if (last) copyMessage(last);
+      case 'copy_last_assistant': {
+        const last = [...messages]
+          .reverse()
+          .find((message) => message.role === 'assistant' && message.content);
+        if (last) void copyMessage(last);
         else showChatNotice('No assistant message to copy yet.', 'warning');
         return true;
       }
-      case 'hotkeys':
+      case 'show_hotkeys':
         showChatNotice(
           'Shortcuts: Enter sends, Shift+Enter newline, Cmd/Ctrl+B opens sessions, Cmd/Ctrl+K opens model picker.',
           'info'
         );
         return true;
-      case 'reload':
-      case 'login':
-      case 'logout':
-      case 'session':
-      case 'clone':
-      case 'export':
-      case 'share':
-      case 'changelog':
-      case 'name':
-        send({ type: 'run_builtin', command, args });
-        return true;
-      case 'tree':
+      case 'open_tree_modal':
         send({ type: 'get_session_tree' });
         showTreeModal = true;
-        return true;
-      default: {
-        // Check if it's an extension command — route through the server
-        const extCmd = extensionCommands.find((c) => c.name.toLowerCase() === command);
-        if (extCmd) {
-          send({ type: 'run_builtin', command: 'extension', args: text });
-          return true;
-        }
-        return false;
-      }
     }
+    return true;
   }
 
   function submitMessage(asFollowUp = false) {
     if (wsState !== 'open' || sessionLoading) return;
     flushEditorMirror();
-    const text = input.trim();
+    const result = composerController.submit(asFollowUp);
+    if (!result.accepted) return;
 
-    // Slash/bang commands are commands, not conversation text — dispatch
-    // them before the streaming check so they run instead of being steered
-    // into the agent's turn as literal text. runSlashCommand() itself blocks
-    // the handful of commands unsafe to run mid-turn.
-    if (
-      attachedImages.length === 0 &&
-      attachedFiles.length === 0 &&
-      !asFollowUp &&
-      runSlashCommand(text, isStreaming)
-    ) {
-      input = '';
-      resetTextareaHeight();
-      return;
-    }
-
-    if (isStreaming) {
-      if (!text) return;
+    if (result.kind === 'prompt' || result.kind === 'steer' || result.kind === 'follow_up') {
       haptic();
-      steerAgent();
-      return;
     }
-
-    if (!text && attachedImages.length === 0 && attachedFiles.length === 0) return;
-    haptic();
-
-    const imgs =
-      attachedImages.length > 0
-        ? attachedImages.map((img) => ({ data: img.data, mimeType: img.mimeType }))
-        : undefined;
-
-    // Prepend file contents as text blocks before the user message
-    let fullText = text;
-    if (attachedFiles.length > 0) {
-      const fileBlocks = attachedFiles.map((f) => `Content of ${f.name}:\n${f.content}`);
-      fullText = fileBlocks.join('\n\n---\n\n') + (text ? '\n\n---\n\n' + text : '');
+    if (result.kind === 'steer') {
+      const message = result.message;
+      if (message?.type === 'steer' && !queuedSteering.includes(message.message)) {
+        queuedSteering = [...queuedSteering, message.message];
+      }
     }
-
-    messages.push({
-      id: uid(),
-      role: 'user',
-      content: fullText,
-      images: imgs ? attachedImages.map((img) => img.src) : undefined,
-      streaming: false,
-      createdAt: Date.now(),
-    });
-
-    if (asFollowUp && attachedImages.length === 0 && attachedFiles.length === 0) {
-      send({ type: 'follow_up', message: text });
-    } else {
-      send({
-        type: 'prompt',
-        message: fullText,
-        ...(imgs ? { images: imgs } : {}),
-      });
-    }
-    input = '';
-    attachedImages = [];
-    attachedFiles = [];
+    if (result.userMessage) messages.push(result.userMessage);
     resetTextareaHeight();
     scrollBottom();
   }
@@ -5277,7 +3993,7 @@
       return inputEl;
     },
     getInput: () => input,
-    setInput: (v) => (input = v),
+    setInput: (v) => setComposerInput(v),
     isMenuOpen: () => showSlashMenu,
     handleKey: (e) => handleComposerKey(e),
     handleGlobalKey: (e) => handleGlobalKeydown(e),
@@ -5288,16 +4004,19 @@
     getSessionId: () => sessionId,
   });
 
-  function handleComposerInput() {
+  function handleComposerInput(e: Event) {
+    // Read the textarea directly: Svelte's bind:value listener may run after
+    // this handler, so the component state can still hold the previous value.
+    const value = (e.currentTarget as HTMLTextAreaElement).value;
     // The bridge only tracks native-edit seqs while engaged; otherwise this
     // is a plain input event (draft save + resize).
+    composerController.setInput(value);
     if (composerBridgeActive) composerBridge.noteInput();
     if ((sessionLoading || projectsState.sessionLoading) && !projectsState.pendingNewSession) {
-      sessionSwitchDraft = input;
+      sessionSwitchDraft = value;
     }
     autoResizeTextarea();
   }
-
   function handleComposerKeydown(e: KeyboardEvent) {
     // Session/handshake guards stay local — never route keys for a stale session.
     if (
@@ -5338,11 +4057,10 @@
     haptic();
     // Freeze the UI instantly — the server ack (agent_end) can lag behind a
     // wedged provider stream or a queued mutation lock. agent_end/agent_error
-    // reconcile afterwards (idempotent: sealStreaming, isStreaming=false).
-    isStreaming = false;
+    // reconcile afterwards (idempotent: reducer finalization, isStreaming=false).
+    // Reuse the same pure finalization path as agent_end/agent_error.
+    reduceActiveSessionEvent({ type: 'agent_end' });
     projectsState.isStreaming = false;
-    sealStreaming();
-    activeStreamMsg = null;
     releaseWakeLock();
     send({ type: 'abort' });
   }
@@ -5392,6 +4110,21 @@
 
   // ── Lifecycle ────────────────────────────────────────────────────────────────
   $effect(() => {
+    const view = {
+      websocketOpen: wsState === 'open',
+      loading: sessionLoading || projectsState.sessionLoading,
+      sessionId,
+      trigger: shortcutTrigger,
+      query: shortcutQuery,
+      commandArgMode,
+    };
+    // The controller publishes projected state synchronously. Keep those
+    // writes out of this effect's dependency tracking or the subscription
+    // would make the effect depend on—and then rewrite—its own projections.
+    untrack(() => completionController.update(view));
+  });
+
+  $effect(() => {
     const commandLike = !!shortcutTrigger && !input.slice(1).includes('\n');
     showSlashMenu =
       !isStreaming && commandLike && (filteredSlashCommands.length > 0 || !!commandArgMode);
@@ -5402,56 +4135,6 @@
     ) {
       resourcesLoaded = true;
       send({ type: 'get_resources' });
-    }
-    if (shortcutTrigger === '@' && wsState === 'open' && shortcutQuery !== lastFileCompleteQuery) {
-      lastFileCompleteQuery = shortcutQuery;
-      if (_fileCompleteTimer) {
-        clearTimeout(_fileCompleteTimer);
-        _fileCompleteTimer = null;
-      }
-      _fileCompleteTimer = setTimeout(() => {
-        _fileCompleteTimer = null;
-        send({ type: 'file_complete', query: shortcutQuery });
-      }, 200);
-    } else if (shortcutTrigger !== '@') {
-      lastFileCompleteQuery = '';
-      fileCompletions = [];
-    }
-    // Request extension autocomplete items when trigger or query changes.
-    if (
-      shortcutTrigger &&
-      wsState === 'open' &&
-      (shortcutTrigger !== lastExtensionTrigger || shortcutQuery !== lastExtensionQuery)
-    ) {
-      lastExtensionTrigger = shortcutTrigger;
-      lastExtensionQuery = shortcutQuery;
-      extensionCompletions = [];
-      send({ type: 'get_extension_autocomplete', trigger: shortcutTrigger, query: shortcutQuery });
-    } else if (!shortcutTrigger) {
-      lastExtensionTrigger = '';
-      lastExtensionQuery = '';
-      extensionCompletions = [];
-    }
-    // Request command argument completions when user continues past a command name
-    if (commandArgMode) {
-      const needsFetch =
-        commandArgMode.command !== commandArgCommand || commandArgMode.prefix !== commandArgPrefix;
-      if (needsFetch) {
-        commandArgCommand = commandArgMode.command;
-        commandArgPrefix = commandArgMode.prefix;
-        commandCompletionsPending = true;
-        commandArgCompletions = [];
-        send({
-          type: 'get_command_completions',
-          command: commandArgMode.command,
-          prefix: commandArgMode.prefix,
-        });
-      }
-    } else {
-      commandArgCompletions = [];
-      commandArgCommand = '';
-      commandArgPrefix = '';
-      commandCompletionsPending = false;
     }
   });
 
@@ -5505,7 +4188,7 @@
       const sharedUrl = shareParams.get('share_url');
       if (sharedTitle || sharedText || sharedUrl) {
         shareTargetDraft = [sharedTitle, sharedText, sharedUrl].filter(Boolean).join('\n');
-        input = shareTargetDraft;
+        setComposerInput(shareTargetDraft);
         setUrlParams({ share_title: null, share_text: null, share_url: null });
         tick().then(autoResizeTextarea);
       }
@@ -5551,14 +4234,10 @@
     // event — focus is a reliable secondary resume signal.
     window.addEventListener('focus', _onFocusResume);
     _onlineHandler = () => {
-      if (wsState !== 'open') {
-        cancelReconnect();
-        connect();
-      }
+      wsController.handleOnline();
     };
     _offlineHandler = () => {
-      // Mark as offline so UI shows disconnected state
-      if (wsState === 'open') wsState = 'connecting';
+      wsController.handleOffline();
     };
     window.addEventListener('online', _onlineHandler);
     window.addEventListener('offline', _offlineHandler);
@@ -5602,9 +4281,8 @@
 
   onDestroy(() => {
     releaseWakeLock();
-    if (sendHoldTimer) clearTimeout(sendHoldTimer);
+    completionController.dispose();
     clearBootResumeTimer();
-    if (_fileCompleteTimer) clearTimeout(_fileCompleteTimer);
     if (_editorMirrorTimer) {
       clearTimeout(_editorMirrorTimer);
       _editorMirrorTimer = null;
@@ -5613,7 +4291,11 @@
       clearTimeout(modelRefreshFeedbackTimer);
       modelRefreshFeedbackTimer = null;
     }
-    disconnect();
+    if (sendHoldTimer) {
+      clearTimeout(sendHoldTimer);
+      sendHoldTimer = null;
+    }
+    wsController.dispose();
     document.removeEventListener('visibilitychange', _onVisibilityChange);
     window.removeEventListener('focus', _onFocusResume);
     if (_installPromptHandler)
@@ -5625,60 +4307,29 @@
     if (_unsubLangReady) _unsubLangReady();
   });
 
-  /**
-   * Secondary resume signal: some Android WebViews/OEM browsers return from
+  /** Secondary resume signal: some Android WebViews/OEM browsers return from
    * background without a visibilitychange event. Focus carries the same
-   * "user came back" meaning, so re-run the visibility resume path.
-   */
+   * "user came back" meaning, so re-run the controller resume path. */
   function _onFocusResume() {
-    if (document.hidden || _pageHiddenAt <= 0) return;
-    _onVisibilityChange();
+    if (document.hidden) return;
+    wsController.resume();
+    if (sessionId) sendSessionFocus(sessionId);
+    if (isStreaming) requestWakeLock();
   }
 
-  /** Single visibility-change handler: pause reconnection + manage wake lock. */
+  /** Single visibility-change handler: retain page UI work while the controller
+   * owns hidden-page reconnect timing and socket replacement. */
   function _onVisibilityChange() {
+    wsController.handleVisibilityChange();
     if (document.hidden) {
-      _pageHiddenAt = Date.now();
-      // Last reliable moment to persist before a possible OS freeze/discard
+      // Last reliable moment to persist before a possible OS freeze/discard.
       saveSnapshot(sessionPath, sessionName, messages);
       releaseWakeLock();
       sendSessionFocus(null);
-    } else {
-      // Wake lock: re-acquire if still streaming
-      if (sessionId) sendSessionFocus(sessionId);
-      if (isStreaming) requestWakeLock();
-      // Reconnection: resume if WS is down
-      if (_pageHiddenAt > 0) {
-        const wasHidden = Date.now() - _pageHiddenAt;
-        _pageHiddenAt = 0;
-        if (wsState === 'connecting' && wasHidden > 5000) {
-          // Server likely timed us out — reset and connect immediately
-          _intentionalClose = false;
-          cancelReconnect();
-          connect();
-        } else if (wsState === 'connecting') {
-          scheduleReconnect();
-        } else if (wsState === 'open' && wasHidden > 120_000) {
-          // Server idle timeout (120s) likely closed the socket — force reconnect
-          _intentionalClose = false;
-          const old = ws;
-          if (old) {
-            // Detach first: the close event fires asynchronously and must not
-            // reach the onclose of a socket we're about to supersede.
-            old.onclose = null;
-            old.onerror = null;
-            try {
-              old.close();
-            } catch {
-              /* ignore */
-            }
-          }
-          ws = null;
-          wsState = 'connecting';
-          connect();
-        }
-      }
+      return;
     }
+    if (sessionId) sendSessionFocus(sessionId);
+    if (isStreaming) requestWakeLock();
   }
 </script>
 
@@ -6214,11 +4865,11 @@
           >
           <button
             class="shrink-0 px-2 py-0.5 rounded-md font-semibold text-primary hover:text-primary/90 hover:bg-primary/12 transition-colors"
-            onclick={enableNotifications}>Enable</button
+            onclick={() => notificationController.enableNotifications()}>Enable</button
           >
           <button
             class="shrink-0 px-2 py-0.5 rounded-md text-base-content/50 hover:text-base-content/80 hover:bg-base-content/8 transition-colors"
-            onclick={dismissNotifNudge}
+            onclick={() => notificationController.dismissNotificationsNudge()}
             aria-label="Dismiss notification prompt"><X class="w-3 h-3" /></button
           >
         </div>
@@ -6239,8 +4890,6 @@
           >
         </div>
       {/if}
-
-      <!-- Message list -->
       <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
       <main
         id="main-content"
@@ -6287,19 +4936,7 @@
           onToggleTool={(msg) => {
             const expanding = !msg.expanded;
             msg.expanded = expanding;
-            if (
-              expanding &&
-              msg.outputElided &&
-              !msg.content &&
-              !msg.outputLoading &&
-              msg.toolCallId
-            ) {
-              msg.outputLoading = true;
-              if (!send({ type: 'get_tool_output', toolCallId: msg.toolCallId })) {
-                msg.outputLoading = false;
-                showChatNotice('Unable to load tool output while disconnected.', 'warning');
-              }
-            }
+            if (expanding) toolOutputController.request(msg);
           }}
           onProjectPickerToggle={(e) => {
             e.stopPropagation();
@@ -6307,7 +4944,7 @@
           }}
           onProjectPickerClose={() => (projectPickerOpen = false)}
           onInsertShortcut={(text) => {
-            input = text;
+            setComposerInput(text);
             tick().then(() => inputEl?.focus());
           }}
           onEditMessage={editMessage}
@@ -7155,7 +5792,7 @@
         send({ type: 'install_skill', url, scope });
       }}
       onUseSkill={(name) => {
-        input = `/skill:${name} `;
+        setComposerInput(`/skill:${name} `);
         showRightPanel = false;
         tick().then(() => inputEl?.focus());
       }}
@@ -7406,13 +6043,14 @@
                         <Switch
                           checked={notificationPrefs.enabled}
                           onCheckedChange={(v) => {
-                            notificationPrefs.enabled = v;
+                            notificationController.setEnabled(v);
                             if (
                               v &&
                               'Notification' in window &&
                               Notification.permission === 'default'
-                            )
-                              Notification.requestPermission();
+                            ) {
+                              notificationController.enableNotifications();
+                            }
                           }}
                           aria-label="Toggle all notifications"
                         />
@@ -7431,7 +6069,7 @@
                         <Switch
                           checked={notificationPrefs.onComplete}
                           onCheckedChange={(v) => {
-                            notificationPrefs.onComplete = v;
+                            notificationController.setOnComplete(v);
                           }}
                           disabled={!notificationPrefs.enabled}
                           aria-label="Toggle response complete notification"
@@ -8469,7 +7107,7 @@
         const ref = fileViewerPath.includes('/')
           ? (fileViewerPath.split('/').pop() ?? fileViewerPath)
           : fileViewerPath;
-        input = input + `@${ref} `;
+        setComposerInput(input + `@${ref} `);
         fileViewerOpen = false;
         tick().then(() => {
           autoResizeTextarea();

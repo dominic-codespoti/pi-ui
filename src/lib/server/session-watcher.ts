@@ -23,7 +23,7 @@ const MAX_DELAY_MS = 5_000;
  */
 export function startSessionWatch(
   getRoot: () => string,
-  onDirty: () => void,
+  onDirty: (paths: readonly string[]) => void,
   isIgnored?: (absolutePath: string) => boolean
 ): (() => void) | undefined {
   let root: string;
@@ -34,15 +34,17 @@ export function startSessionWatch(
   }
   let timer: Timer | null = null;
   let windowStartedAt: number | null = null;
+  const changedPaths = new Set<string>();
   let watcher: FSWatcher;
   try {
     mkdirSync(root, { recursive: true });
     watcher = watch(root, { recursive: true }, (_event, filename) => {
-      if (filename) {
-        const name = filename.toString();
-        if (!name.endsWith('.jsonl')) return;
-        if (isIgnored?.(resolve(root, name))) return;
-      }
+      if (!filename) return;
+      const name = filename.toString();
+      if (!name.endsWith('.jsonl')) return;
+      const absolutePath = resolve(root, name);
+      if (isIgnored?.(absolutePath)) return;
+      changedPaths.add(absolutePath);
 
       const now = Date.now();
       if (windowStartedAt === null) windowStartedAt = now;
@@ -51,14 +53,18 @@ export function startSessionWatch(
       if (remaining <= 0) {
         timer = null;
         windowStartedAt = now;
-        onDirty();
+        const paths = [...changedPaths];
+        changedPaths.clear();
+        onDirty(paths);
         return;
       }
       timer = setTimeout(
         () => {
           timer = null;
           windowStartedAt = null;
-          onDirty();
+          const paths = [...changedPaths];
+          changedPaths.clear();
+          onDirty(paths);
         },
         Math.min(DEBOUNCE_MS, remaining)
       );
@@ -74,6 +80,7 @@ export function startSessionWatch(
     if (timer) clearTimeout(timer);
     timer = null;
     windowStartedAt = null;
+    changedPaths.clear();
     watcher.close();
   };
 }

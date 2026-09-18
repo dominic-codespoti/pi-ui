@@ -580,8 +580,11 @@ export const DirCompletionsSchema = v.looseObject({
 
 export const FileCompletionsSchema = v.looseObject({
   type: v.literal('file_completions'),
+  sessionId: v.string(),
+  requestId: v.string(),
   query: v.string(),
   entries: v.array(v.string()),
+  error: v.optional(v.string()),
 });
 
 export const ProvidersListSchema = v.looseObject({
@@ -735,6 +738,8 @@ export const ServerRestartingSchema = v.looseObject({
 
 export const CommandCompletionsSchema = v.looseObject({
   type: v.literal('command_completions'),
+  sessionId: v.string(),
+  requestId: v.string(),
   command: v.string(),
   prefix: v.string(),
   items: v.array(
@@ -744,14 +749,23 @@ export const CommandCompletionsSchema = v.looseObject({
       description: v.optional(v.string()),
     })
   ),
-  sessionId: v.optional(v.string()),
+  error: v.optional(v.string()),
 });
 
 export const ExtensionCompletionsSchema = v.looseObject({
   type: v.literal('extension_completions'),
+  sessionId: v.string(),
+  requestId: v.string(),
   trigger: v.string(),
   query: v.string(),
-  items: v.array(v.unknown()),
+  items: v.array(
+    v.looseObject({
+      value: v.string(),
+      label: v.string(),
+      description: v.optional(v.string()),
+    })
+  ),
+  error: v.optional(v.string()),
 });
 
 export const PongSchema = v.looseObject({

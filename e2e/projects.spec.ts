@@ -183,6 +183,7 @@ test.describe('Projects sidebar', () => {
       timestamp: Date.now(),
     });
 
+    let lateSnapshotSent = false;
     await page.routeWebSocket('/ws', (ws) => {
       ws.onMessage((data) => {
         const msg = JSON.parse(String(data));
@@ -201,20 +202,24 @@ test.describe('Projects sidebar', () => {
               requestId: msg.requestId,
             })
           );
-          setTimeout(() => {
-            ws.send(
-              JSON.stringify({
-                ...SESSION_LOADED_PAYLOAD,
-                sessionId: 's1',
-                sessionPath: s1Path,
-                messages: [
-                  message('user', 'Session A prompt'),
-                  message('assistant', 'Session A only'),
-                ],
-                requestId: 'stale-session-operation',
-              })
-            );
-          }, 25);
+        }
+        // session_focus is sent only after the session_loaded snapshot has
+        // been applied, so this models a late snapshot without a wall-clock
+        // delay and makes the ordering an observable protocol handshake.
+        if (msg.type === 'session_focus' && msg.sessionId === 's2' && !lateSnapshotSent) {
+          lateSnapshotSent = true;
+          ws.send(
+            JSON.stringify({
+              ...SESSION_LOADED_PAYLOAD,
+              sessionId: 's1',
+              sessionPath: s1Path,
+              messages: [
+                message('user', 'Session A prompt'),
+                message('assistant', 'Session A only'),
+              ],
+              requestId: 'stale-session-operation',
+            })
+          );
         }
       });
       ws.send(
@@ -226,13 +231,16 @@ test.describe('Projects sidebar', () => {
         })
       );
     });
-
+    // beforeEach logs in before this test can install its scenario-specific
+    // route. Reload to close that initial socket and establish the mocked
+    // ordering on a socket this handler owns.
+    await page.reload();
     await expect(page.getByText('Session A only')).toBeVisible({ timeout: 3000 });
     await openProjectsSidebar(page);
     await page.getByRole('button', { name: 'Add tests' }).click();
 
     await expect(page.getByText('Session B only')).toBeVisible({ timeout: 3000 });
-    await page.waitForTimeout(75);
+    expect(lateSnapshotSent).toBe(true);
     await expect(page.getByText('Session A only')).toHaveCount(0);
     await expect(page.getByText('Session B only')).toBeVisible();
   });
@@ -279,6 +287,75 @@ test.describe('Projects sidebar', () => {
     await page.getByRole('button', { name: 'Add tests' }).click();
 
     await expect(header).not.toContainText('Bug fix', { timeout: 3000 });
+  });
+
+  test('renames and deletes the clicked pooled session by ID', async ({ page }) => {
+    const sessions = [
+      {
+        id: 'mem-1',
+        path: '(in-memory)',
+        cwd: '/home/user/project-a',
+        name: 'First pooled',
+        created: Date.now() - 86400000,
+        modified: Date.now() - 3600000,
+        messageCount: 2,
+        firstMessage: 'First pooled prompt',
+      },
+      {
+        id: 'mem-2',
+        path: '(in-memory)',
+        cwd: '/home/user/project-a',
+        name: 'Second pooled',
+        created: Date.now() - 43200000,
+        modified: Date.now() - 7200000,
+        messageCount: 1,
+        firstMessage: 'Second pooled prompt',
+      },
+    ];
+    const mutations: Record<string, unknown>[] = [];
+
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.onMessage((data) => {
+        const msg = JSON.parse(String(data));
+        if (msg.type === 'get_projects') ws.send(JSON.stringify(PROJECTS_LIST_PAYLOAD));
+        if (msg.type === 'get_all_sessions') {
+          ws.send(JSON.stringify({ ...ALL_SESSIONS_LIST_PAYLOAD, sessions }));
+        }
+        if (msg.type === 'rename_session' || msg.type === 'delete_session') mutations.push(msg);
+      });
+      ws.send(
+        JSON.stringify({
+          ...CONNECTED_PAYLOAD,
+          sessionId: 'active-session',
+          sessionPath: '/home/user/project-a/active.jsonl',
+          messages: [],
+        })
+      );
+    });
+
+    await openProjectsSidebar(page);
+
+    const firstRow = page
+      .locator('div.group.rounded-2xl')
+      .filter({ has: page.getByText('First pooled', { exact: true }) });
+    await firstRow.hover();
+    await firstRow.getByRole('button', { name: 'Rename session' }).click();
+    await page.getByRole('textbox', { name: 'Session name' }).fill('First renamed');
+    await page.getByRole('button', { name: 'Confirm rename' }).click();
+
+    const secondRow = page
+      .locator('div.group.rounded-2xl')
+      .filter({ has: page.getByText('Second pooled', { exact: true }) });
+    await secondRow.hover();
+    await secondRow.getByRole('button', { name: 'Delete session' }).click();
+    await page.getByRole('button', { name: 'Confirm', exact: true }).click();
+
+    await expect
+      .poll(() => mutations)
+      .toEqual([
+        { type: 'rename_session', sessionId: 'mem-1', name: 'First renamed' },
+        { type: 'delete_session', sessionId: 'mem-2' },
+      ]);
   });
 
   test('search filters projects', async ({ page }) => {

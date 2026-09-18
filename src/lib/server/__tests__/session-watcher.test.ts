@@ -14,22 +14,25 @@ afterEach(() => {
 });
 
 describe('session-watcher', () => {
-  it('fires onDirty after an external append to a nested .jsonl', async () => {
+  it('fires onDirty with absolute changed paths after an external append', async () => {
     const dir = join(ROOT, '--tmp-proj--');
     mkdirSync(dir, { recursive: true });
     let fired = 0;
+    const changed: string[][] = [];
     const stop = startSessionWatch(
       () => ROOT,
-      () => fired++
+      (paths) => {
+        fired++;
+        changed.push([...paths]);
+      }
     );
     if (stop) stopHandles.push(stop);
 
-    writeFileSync(
-      join(dir, '2026-01-01T00-00-00-000Z_s1.jsonl'),
-      JSON.stringify({ type: 'message' }) + '\n'
-    );
+    const path = join(dir, '2026-01-01T00-00-00-000Z_s1.jsonl');
+    writeFileSync(path, JSON.stringify({ type: 'message' }) + '\n');
     await new Promise((r) => setTimeout(r, 1200));
     expect(fired).toBeGreaterThan(0);
+    expect(changed.flat()).toContain(path);
   });
 
   it('trails the debounce window across rapid events', async () => {

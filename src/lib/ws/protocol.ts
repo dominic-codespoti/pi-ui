@@ -365,8 +365,8 @@ export type SessionPhase = 'idle' | 'running' | 'awaiting-input' | 'error';
  *       list per message; full all_sessions_list still fires on connect,
  *       switch, and structural changes (rename/remove/release).
  *   { type: "projects_list",           projects: ProjectInfo[] }
- *   { type: "dir_completions",         prefix: string; entries: string[] }
- *   { type: "file_completions",        query: string; entries: string[] }
+ *   { type: "dir_completions",          prefix: string; entries: string[] }
+ *   { type: "file_completions",        sessionId, requestId, query: string; entries: string[]; error?: string }
  *   { type: "providers_list",          providers: ProviderInfo[] }
  *   { type: "available_models_changed", availableModels: ModelInfo[] }
  *   { type: "sessions_error",          message: string }
@@ -459,7 +459,9 @@ export type SessionPhase = 'idle' | 'running' | 'awaiting-input' | 'error';
  *     set_header – extension header content (content), or empty to clear
  *     set_footer – extension footer content (content), or empty to clear
  *     set_editor_component – parsed component panel above composer (parsed), or null to clear
- *     extension_completions – response to get_extension_autocomplete (trigger, query, items[])
+ *     file_completions – response to file_complete (sessionId, requestId, query, entries[])
+ *     command_completions – response to get_command_completions (sessionId, requestId, command, prefix, items[])
+ *     extension_completions – response to get_extension_autocomplete (sessionId, requestId, trigger, query, items[])
  */
 /** Loose SDK-forwarded event (pi SDK passthrough, tagged with sessionId). */
 export type PiEvent = { type: string } & Record<string, unknown>;
@@ -470,6 +472,8 @@ export type ServerCustomEvent =
   | { type: 'model_changed'; model: ModelInfo | null; sessionId?: string }
   | {
       type: 'session_loaded';
+      /** Session described by this snapshot. */
+      sessionId: string;
       /** Correlation token for the initiating client; accept a snapshot only when it matches an in-flight switch_session/new_session request, and treat unstamped global broadcasts as foreign switches. */
       requestId?: string;
       isStreaming?: boolean;
@@ -517,6 +521,14 @@ export type ServerCustomEvent =
   | { type: 'session_updated'; session: SessionSummary }
   | { type: 'projects_list'; projects: ProjectInfo[] }
   | { type: 'dir_completions'; prefix: string; entries: string[] }
+  | {
+      type: 'file_completions';
+      sessionId: string;
+      requestId: string;
+      query: string;
+      entries: string[];
+      error?: string;
+    }
   | { type: 'models_refresh_result'; success: boolean; message: string; sessionId?: string }
   | {
       type: 'sessions_error';
@@ -583,11 +595,22 @@ export type ServerCustomEvent =
   | {
       type: 'command_completions';
       command: string;
+      /** Raw complete argument text passed to the SDK provider. */
       prefix: string;
       items: Array<{ value: string; label: string; description?: string }>;
-      sessionId?: string;
+      sessionId: string;
+      requestId: string;
+      error?: string;
     }
-  | { type: 'extension_completions'; trigger: string; query: string; items: unknown[] }
+  | {
+      type: 'extension_completions';
+      trigger: string;
+      query: string;
+      items: unknown[];
+      sessionId: string;
+      requestId: string;
+      error?: string;
+    }
   | { type: 'settings'; settings: Record<string, unknown> }
   | { type: 'pong' }
   | { type: 'agent_error'; error: string; sessionId?: string; dedupeKey?: string }
@@ -638,8 +661,9 @@ export type ServerMessage = ConnectedMessage | ServerCustomEvent | PiEvent;
 
 // ── Browser → Server ─────────────────────────────────────────────────────────
 
-// Session-scoped messages accept an optional target. Resolution falls back from explicit
-// `sessionId` to that socket's focused session, then to the server's selected session.
+// Most session-scoped messages may omit `sessionId` and resolve against socket focus.
+// Completion requests are the exception: file, extension, and command completion
+// requests require an explicit resident `sessionId` and never use this fallback.
 export type ClientMessage =
   | {
       type: 'prompt';
@@ -690,10 +714,15 @@ export type ClientMessage =
   | { type: 'rename_project'; cwd: string; name: string }
   /** Request filesystem directory entries for path autocomplete. Server replies with dir_completions. */
   | { type: 'dir_complete'; prefix: string }
-  /** Request lightweight workspace file matches for composer @ references. */
-  | { type: 'file_complete'; query: string }
+  | { type: 'file_complete'; sessionId: string; requestId: string; query: string }
   /** Request extension-registered autocomplete items for a trigger character. */
-  | { type: 'get_extension_autocomplete'; trigger: string; query: string }
+  | {
+      type: 'get_extension_autocomplete';
+      sessionId: string;
+      requestId: string;
+      trigger: string;
+      query: string;
+    }
   /** Forward raw terminal input to an interactive custom component (ConversationViewer
    * etc). `data` is the exact byte sequence a real terminal would send for the
    * keystroke/paste — see `#lib/terminal-key-encoder.js` — and is passed straight to
@@ -740,10 +769,10 @@ export type ClientMessage =
   | { type: 'set_provider_key'; provider: string; key: string }
   /** Remove stored API key for a provider. */
   | { type: 'remove_provider_key'; provider: string }
-  /** Rename a session (by file path) to a new display name. */
-  | { type: 'rename_session'; path: string; name: string }
-  /** Permanently delete a session file (cannot delete the active session). */
-  | { type: 'delete_session'; path: string }
+  /** Rename a session by its stable session ID. */
+  | { type: 'rename_session'; sessionId: string; name: string }
+  /** Permanently delete a session file by its stable session ID (cannot delete the active session). */
+  | { type: 'delete_session'; sessionId: string }
   /** Manually compact the session context (aborts running agent first). */
   | { type: 'compact'; sessionId?: string }
   /** Enable or disable automatic context compaction. */
@@ -806,8 +835,14 @@ export type ClientMessage =
   | { type: 'upload_file'; name: string; data: string }
   /** Request older messages before the current window. Server replies with older_messages. */
   | { type: 'load_messages'; sessionId?: string; count: number; alreadyHasCount: number }
-  /** Request argument completions for an extension slash command. Server replies with command_completions. */
-  | { type: 'get_command_completions'; command: string; prefix: string }
+  /** Request argument completions for an extension slash command. The prefix is raw full argument text. */
+  | {
+      type: 'get_command_completions';
+      sessionId: string;
+      requestId: string;
+      command: string;
+      prefix: string;
+    }
   /** Set the notification webhook URL (ntfy.sh, Pushover, Gotify, etc.). Empty string clears. */
   /** Read persisted UI settings. Server replies with 'settings' event. */
   | { type: 'get_settings' }

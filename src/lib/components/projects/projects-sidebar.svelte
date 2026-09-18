@@ -61,7 +61,7 @@
 
   const ps = projectsState;
 
-  /** Path of the session being renamed inline (null = none). */
+  /** ID of the session being renamed inline (null = none). */
   let renamingSession = $state<string | null>(null);
   /** Cwd of the project being renamed inline (null = none). */
   let renamingProject = $state<string | null>(null);
@@ -84,7 +84,7 @@
   function startSessionRename(s: SessionSummary) {
     renamingProject = null;
     renameDraft = s.name ?? '';
-    renamingSession = s.path;
+    renamingSession = s.id;
   }
 
   function startProjectRename(g: ProjectGroup) {
@@ -121,7 +121,7 @@
     const label =
       s.name || s.firstMessage || s.path.split('/').pop()?.replace('.jsonl', '') || s.path;
     onRequestConfirm(`Delete session "${label}"? This cannot be undone.`, () =>
-      ps.deleteSession(s.path)
+      ps.deleteSession(s.id)
     );
   }
 
@@ -288,7 +288,7 @@
           {@const sessionLabel = s.name ? s.name : s.firstMessage || '(empty)'}
           {@const isActiveSession = ps.activeSessionId === s.id}
           {@const isSubsessionsExpanded = ps.expandedSubsessions.has(s.id)}
-          {@const isRenamingSession = renamingSession === s.path}
+          {@const isRenamingSession = renamingSession === s.id}
           {@const isSessionToolRunning = Boolean(ps.sessionToolName(s.id))}
           {@const isSessionRunning = ps.isSessionRunning(s.id)}
           {@const needsAttention = ps.sessionNeedsAttention(s.id)}

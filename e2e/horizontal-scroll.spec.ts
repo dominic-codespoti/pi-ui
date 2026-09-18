@@ -17,6 +17,12 @@ const WIDE_TABLE_MD = [
 const LONG_CODE =
   'const veryLongIdentifierName = someFunction(argumentOne, argumentTwo, argumentThree, argumentFour, argumentFive, argumentSix, argumentSeven);';
 
+async function installAssistantRoute(page: Page, markdown: string): Promise<void> {
+  await page.routeWebSocket('/ws', (ws) => {
+    ws.send(connectedWithAssistant(markdown));
+  });
+}
+
 function connectedWithAssistant(markdown: string): string {
   return JSON.stringify({
     type: 'connected',
@@ -39,14 +45,10 @@ function connectedWithAssistant(markdown: string): string {
 }
 
 test('markdown tables pan horizontally instead of being clipped', async ({ page }) => {
-  await page.routeWebSocket('/ws', (ws) => {
-    ws.send(connectedWithAssistant(`Data:\n\n${WIDE_TABLE_MD}`));
-  });
-  await loginAndOpen(page);
+  await installAssistantRoute(page, `Data:\n\n${WIDE_TABLE_MD}`);
+  await loginAndOpen(page, '.prose table');
 
   const table = page.locator('.prose table');
-  await expect(table).toBeVisible({ timeout: 5000 });
-
   // The table is its own horizontal scroll container.
   await expect(table).toHaveCSS('overflow-x', 'auto');
   const pannable = await table.evaluate((el: HTMLElement) => ({
@@ -60,10 +62,8 @@ test('markdown tables pan horizontally instead of being clipped', async ({ page 
 });
 
 test('code blocks keep their horizontal scroll', async ({ page }) => {
-  await page.routeWebSocket('/ws', (ws) => {
-    ws.send(connectedWithAssistant(`Code:\n\n\`\`\`js\n${LONG_CODE}\n\`\`\``));
-  });
-  await loginAndOpen(page);
+  await installAssistantRoute(page, `Code:\n\n\`\`\`js\n${LONG_CODE}\n\`\`\``);
+  await loginAndOpen(page, '.code-block-pre');
 
   const pre = page.locator('.code-block-pre');
   await expect(pre).toBeVisible({ timeout: 5000 });
@@ -110,10 +110,8 @@ test('long custom notices wrap without widening the chat page', async ({ page })
 });
 
 test('the chat scroller clips page-level sideways pan', async ({ page }) => {
-  await page.routeWebSocket('/ws', (ws) => {
-    ws.send(connectedWithAssistant(`Data:\n\n${WIDE_TABLE_MD}`));
-  });
-  await loginAndOpen(page);
+  await installAssistantRoute(page, `Data:\n\n${WIDE_TABLE_MD}`);
+  await loginAndOpen(page, '.prose table');
 
   await expect(page.locator('.prose table')).toBeVisible({ timeout: 5000 });
   // The vertical chat column must not become a second horizontal scroller.
@@ -121,9 +119,10 @@ test('the chat scroller clips page-level sideways pan', async ({ page }) => {
   await expect(scroller).toHaveCSS('overflow-x', 'hidden');
 });
 
-async function loginAndOpen(page: Page): Promise<void> {
+async function loginAndOpen(page: Page, readySelector?: string): Promise<void> {
   await page.goto('/login');
   await page.fill('input[name="password"]', 'test-password');
   await page.click('button[type="submit"]');
   await page.waitForURL('/');
+  if (readySelector) await expect(page.locator(readySelector)).toBeVisible({ timeout: 5000 });
 }
