@@ -61,9 +61,16 @@
       <input
         autofocus
         type="search"
+        name="project-picker-search"
+        autocomplete="off"
+        spellcheck="false"
+        data-1p-ignore
+        data-lpignore="true"
+        data-bwignore
+        data-form-type="other"
         bind:value={query}
         placeholder="Search projects, paths, sessions…"
-        class="min-w-0 flex-1 bg-transparent text-base sm:text-sm text-base-content/82 placeholder-base-content/30 outline-none"
+        class="min-w-0 flex-1 bg-transparent text-base sm:text-sm text-base-content/82 placeholder:text-base-content/30 outline-none"
         aria-label="Search projects"
       />
       {#if query}

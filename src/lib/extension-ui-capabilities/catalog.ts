@@ -22,22 +22,21 @@ import type {
 export const UI_METHODS = {
   select: {
     support: { level: 'native', surface: 'modal-dialog' },
-    summary: 'Shows a choice dialog and returns the selected value or undefined when cancelled.',
+    summary:
+      'Shows a choice dialog and returns the selected value or undefined when cancelled, timed out, or aborted.',
     useWhen: 'Use for a small list of mutually exclusive choices.',
-    ignoredOptions: ['timeout', 'signal'],
   },
   confirm: {
     support: { level: 'native', surface: 'modal-dialog' },
-    summary: 'Shows a confirmation dialog and returns whether the user confirmed.',
+    summary:
+      'Shows a confirmation dialog and returns whether the user confirmed; timeout or abort resolves false.',
     useWhen: 'Use when an action needs an explicit yes-or-no decision.',
-    ignoredOptions: ['timeout', 'signal'],
   },
   input: {
     support: { level: 'native', surface: 'modal-dialog' },
     summary:
-      'Shows a single-line text input dialog and returns its value or undefined when cancelled.',
+      'Shows a single-line text input dialog and returns its value or undefined when cancelled, timed out, or aborted.',
     useWhen: 'Use to collect a short, single-line value.',
-    ignoredOptions: ['timeout', 'signal'],
   },
   notify: {
     support: { level: 'native', surface: 'toast' },
@@ -76,22 +75,16 @@ export const UI_METHODS = {
     useWhen: 'Use for session-scoped content that should remain visible beside the composer.',
   },
   setFooter: {
-    support: {
-      level: 'degraded',
-      surface: 'footer',
-      degradation: 'The parsed component tree is flattened to plain text.',
-    },
-    summary: 'Shows the factory output as plain text in the footer.',
-    avoidWhen: 'Avoid relying on interactive or structured components in the footer.',
+    support: { level: 'native', surface: 'footer' },
+    summary:
+      'Renders the factory component tree in the footer and refreshes it live with session footer data.',
+    useWhen:
+      'Use for compact session-scoped output that benefits from branch, status, or provider data.',
   },
   setHeader: {
-    support: {
-      level: 'degraded',
-      surface: 'header',
-      degradation: 'The parsed component tree is flattened to plain text.',
-    },
-    summary: 'Shows the factory output as plain text in the header.',
-    avoidWhen: 'Avoid relying on interactive or structured components in the header.',
+    support: { level: 'native', surface: 'header' },
+    summary:
+      'Renders the factory component tree in the chat header and refreshes it live with session footer data.',
   },
   setTitle: {
     support: { level: 'native', surface: 'document-title' },
@@ -146,23 +139,21 @@ export const UI_METHODS = {
     summary: 'Provides the stub theme used by extension UI factories.',
   },
   getAllThemes: {
-    support: { level: 'ignored', behavior: 'Returns an empty array.' },
-    summary: 'Returns no available themes.',
+    support: { level: 'native', surface: 'theme-catalog' },
+    summary: 'Returns Pi UI web themes with their names and undefined file paths.',
   },
   getTheme: {
     support: {
       level: 'degraded',
       surface: 'extension-styling',
-      degradation: 'Returns the stub theme regardless of the requested name.',
+      degradation:
+        'Returns the stub palette for known Pi UI theme names; browser colors are represented by the active CSS theme.',
     },
-    summary: 'Returns the stub theme regardless of the requested theme name.',
+    summary: 'Returns the stub theme for a known Pi UI theme name, otherwise undefined.',
   },
   setTheme: {
-    support: {
-      level: 'ignored',
-      behavior: 'Returns { success: true } without changing appearance.',
-    },
-    summary: 'Reports success but does not change the active theme.',
+    support: { level: 'native', surface: 'browser-theme' },
+    summary: 'Applies a known Pi UI browser theme; unknown names return { success: false, error }.',
   },
   getToolsExpanded: {
     support: { level: 'native', surface: 'tool-output' },
@@ -173,6 +164,12 @@ export const UI_METHODS = {
     summary: 'Sets whether tool output is expanded.',
   },
 } as const satisfies Record<UiMethodName, UiMethodCapability>;
+
+export const EXTENSION_SHORTCUTS = {
+  support: { level: 'native', surface: 'keyboard-shortcuts' },
+  summary:
+    'Registered extension shortcuts are bound globally, listed with their extension and description in keyboard help, and skipped for browser-reserved Ctrl/Cmd+W and Ctrl/Cmd+T combinations.',
+} as const;
 
 export const COMPONENTS = {
   select: {

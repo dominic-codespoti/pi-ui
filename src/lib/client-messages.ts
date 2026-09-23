@@ -1,8 +1,11 @@
 export type MsgUsage = {
   input: number;
   output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  reasoning?: number;
   totalTokens: number;
-  cost: { total: number };
+  cost: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
 };
 
 export type CompactionNoticeDetails = {
@@ -19,13 +22,22 @@ export type CompactionNoticeDetails = {
 
 export type UIMessage = {
   id: string;
-  role: 'user' | 'assistant' | 'tool' | 'notice' | 'diagnostic';
+  role:
+    | 'user'
+    | 'assistant'
+    | 'tool'
+    | 'notice'
+    | 'diagnostic'
+    | 'compaction_summary'
+    | 'branch_summary';
   content: string;
   images?: string[];
   toolInput?: string;
   toolArgs?: Record<string, unknown>;
+  toolArgsPreview?: string;
   toolCallId?: string;
   toolName?: string;
+  toolDetails?: ToolDetailsView;
   isError?: boolean;
   streaming: boolean;
   aborted?: boolean;
@@ -34,6 +46,10 @@ export type UIMessage = {
   lineCount?: number;
   usage?: MsgUsage;
   thinking?: string;
+  redactedThinking?: boolean;
+  blocks?: { type: 'text' | 'thinking'; text: string }[];
+  stopReason?: string;
+  errorMessage?: string;
   thinkingExpanded?: boolean;
   startMs?: number;
   endMs?: number;
@@ -42,21 +58,42 @@ export type UIMessage = {
   noticeKind?: 'compaction' | 'retry' | 'custom' | 'abort' | 'toast';
   compaction?: CompactionNoticeDetails;
   customType?: string;
+  summary?: string;
+  tokensBefore?: number;
+  fromId?: string;
+  excludeFromContext?: boolean;
+  cancelled?: boolean;
+  fullOutputPath?: string;
   renderedContent?: string;
   renderedThinking?: string;
   renderedCallHtml?: string[];
   renderedResultHtml?: string[];
-  // Full tool output was withheld from the wire.
   outputElided?: boolean;
-  // Original tool output character count before elision.
   outputBytes?: number;
-  // True while the client fetches withheld tool output.
   outputLoading?: boolean;
   renderedNoticeHtml?: string[];
   level?: 'info' | 'warning' | 'error' | 'success';
   source?: string;
   details?: string;
   createdAt: number;
+};
+
+export type ToolDetailsView = {
+  truncation?: {
+    truncated: boolean;
+    truncatedBy?: 'lines' | 'bytes' | null;
+    totalLines?: number;
+    outputLines?: number;
+    totalBytes?: number;
+    outputBytes?: number;
+  };
+  fullOutputPath?: string;
+  exitCode?: number | null;
+  cancelled?: boolean;
+  firstChangedLine?: number;
+  patch?: string;
+  limitReached?: 'match' | 'result' | 'entry';
+  linesTruncated?: boolean;
 };
 
 export function uid(): string {
@@ -261,20 +298,35 @@ export function agentMsgToUI(
     case 'ai': {
       let text = '';
       let thinkingText = '';
+      let redactedThinking = false;
       let images: string[] | undefined;
+      const orderedBlocks: { type: 'text' | 'thinking'; text: string }[] = [];
 
       if (typeof msg.content === 'string') {
         text = msg.content;
+        if (text) orderedBlocks.push({ type: 'text', text });
       } else if (Array.isArray(msg.content)) {
         const blocks = contentBlocks(msg.content);
-        text = blocks
-          .filter((b) => b.type === 'text')
-          .map((b) => (typeof b.text === 'string' ? b.text : ''))
-          .join('');
-        thinkingText = blocks
-          .filter((b) => b.type === 'thinking')
-          .map((b) => (typeof b.thinking === 'string' ? b.thinking : ''))
-          .join('');
+        for (const block of blocks) {
+          if (block.type === 'text' && typeof block.text === 'string') {
+            text += block.text;
+            const last = orderedBlocks[orderedBlocks.length - 1];
+            if (last?.type === 'text') last.text += block.text;
+            else orderedBlocks.push({ type: 'text', text: block.text });
+          } else if (block.type === 'thinking') {
+            if (block.redacted === true) {
+              redactedThinking = true;
+            } else {
+              const thinking = typeof block.thinking === 'string' ? block.thinking : '';
+              thinkingText += thinking;
+              if (thinking) {
+                const last = orderedBlocks[orderedBlocks.length - 1];
+                if (last?.type === 'thinking') last.text += thinking;
+                else orderedBlocks.push({ type: 'thinking', text: thinking });
+              }
+            }
+          }
+        }
         const imgBlocks = blocks.filter(
           (b) => b.type === 'image' && typeof b.data === 'string' && typeof b.mimeType === 'string'
         );
@@ -284,18 +336,42 @@ export function agentMsgToUI(
       }
 
       const rawUsage = msg.usage as
-        | { input?: number; output?: number; totalTokens?: number; cost?: { total?: number } }
-        | undefined;
-      const usage: MsgUsage | undefined = rawUsage?.totalTokens
-        ? {
-            input: rawUsage.input ?? 0,
-            output: rawUsage.output ?? 0,
-            totalTokens: rawUsage.totalTokens,
-            cost: { total: rawUsage.cost?.total ?? 0 },
+        | {
+            input?: number;
+            output?: number;
+            cacheRead?: number;
+            cacheWrite?: number;
+            reasoning?: number;
+            totalTokens?: number;
+            cost?: {
+              input?: number;
+              output?: number;
+              cacheRead?: number;
+              cacheWrite?: number;
+              total?: number;
+            };
           }
-        : undefined;
+        | undefined;
+      const usage: MsgUsage | undefined =
+        rawUsage?.totalTokens !== undefined
+          ? {
+              input: rawUsage.input ?? 0,
+              output: rawUsage.output ?? 0,
+              cacheRead: rawUsage.cacheRead ?? 0,
+              cacheWrite: rawUsage.cacheWrite ?? 0,
+              ...(rawUsage.reasoning !== undefined ? { reasoning: rawUsage.reasoning } : {}),
+              totalTokens: rawUsage.totalTokens,
+              cost: {
+                input: rawUsage.cost?.input ?? 0,
+                output: rawUsage.cost?.output ?? 0,
+                cacheRead: rawUsage.cost?.cacheRead ?? 0,
+                cacheWrite: rawUsage.cost?.cacheWrite ?? 0,
+                total: rawUsage.cost?.total ?? 0,
+              },
+            }
+          : undefined;
 
-      return text || thinkingText || images
+      return text || thinkingText || redactedThinking || images || msg.stopReason
         ? [
             {
               id: stableMsgId(msg, index),
@@ -303,6 +379,11 @@ export function agentMsgToUI(
               content: text,
               images,
               thinking: thinkingText || undefined,
+              redactedThinking: redactedThinking || undefined,
+              blocks: orderedBlocks,
+              stopReason: typeof msg.stopReason === 'string' ? msg.stopReason : undefined,
+              errorMessage: typeof msg.errorMessage === 'string' ? msg.errorMessage : undefined,
+              aborted: msg.stopReason === 'aborted' || undefined,
               thinkingExpanded: false,
               streaming: false,
               usage,
@@ -311,12 +392,67 @@ export function agentMsgToUI(
           ]
         : [];
     }
+    case 'compactionsummary':
+    case 'compaction_summary':
+      return [
+        {
+          id: stableMsgId(msg, index),
+          role: 'compaction_summary',
+          content: typeof msg.summary === 'string' ? msg.summary : '',
+          summary: typeof msg.summary === 'string' ? msg.summary : '',
+          tokensBefore: typeof msg.tokensBefore === 'number' ? msg.tokensBefore : undefined,
+          streaming: false,
+          createdAt: ts,
+        },
+      ];
+    case 'branchsummary':
+    case 'branch_summary':
+      return [
+        {
+          id: stableMsgId(msg, index),
+          role: 'branch_summary',
+          content: typeof msg.summary === 'string' ? msg.summary : '',
+          summary: typeof msg.summary === 'string' ? msg.summary : '',
+          fromId: typeof msg.fromId === 'string' ? msg.fromId : undefined,
+          streaming: false,
+          createdAt: ts,
+        },
+      ];
     case 'bashexecution':
     case 'bash_execution':
     case 'bash': {
       const cmd = (msg.command as string | undefined) ?? (msg.content as string | undefined);
       const output =
         (msg.output as string | undefined) ?? (typeof msg.content === 'string' ? '' : '');
+      const details = isRecord(msg.details) ? msg.details : {};
+      const truncation = isRecord(details.truncation) ? details.truncation : undefined;
+      const toolDetails: ToolDetailsView = {};
+      if (truncation || msg.truncated === true) {
+        toolDetails.truncation = {
+          truncated: Boolean(truncation?.truncated ?? msg.truncated),
+          truncatedBy:
+            truncation?.truncatedBy === 'lines' || truncation?.truncatedBy === 'bytes'
+              ? truncation.truncatedBy
+              : null,
+          totalLines:
+            typeof truncation?.totalLines === 'number' ? truncation.totalLines : undefined,
+          outputLines:
+            typeof truncation?.outputLines === 'number' ? truncation.outputLines : undefined,
+          totalBytes:
+            typeof truncation?.totalBytes === 'number' ? truncation.totalBytes : undefined,
+          outputBytes:
+            typeof truncation?.outputBytes === 'number' ? truncation.outputBytes : undefined,
+        };
+      }
+      const fullOutputPath =
+        typeof msg.fullOutputPath === 'string'
+          ? msg.fullOutputPath
+          : typeof details.fullOutputPath === 'string'
+            ? details.fullOutputPath
+            : undefined;
+      if (fullOutputPath) toolDetails.fullOutputPath = fullOutputPath;
+      if (typeof msg.exitCode === 'number') toolDetails.exitCode = msg.exitCode;
+      if (typeof msg.cancelled === 'boolean') toolDetails.cancelled = msg.cancelled;
       return [
         {
           id: stableMsgId(msg, index),
@@ -324,7 +460,11 @@ export function agentMsgToUI(
           toolName: 'bash',
           toolInput: cmd ? `$ ${cmd.split('\n')[0].trim()}` : undefined,
           content: output || '',
-          isError: typeof msg.exitCode === 'number' && (msg.exitCode as number) !== 0,
+          toolDetails,
+          fullOutputPath: toolDetails.fullOutputPath,
+          cancelled: Boolean(msg.cancelled),
+          excludeFromContext: Boolean(msg.excludeFromContext),
+          isError: typeof msg.exitCode === 'number' && msg.exitCode !== 0,
           streaming: false,
           createdAt: ts,
         },
@@ -353,6 +493,42 @@ export function agentMsgToUI(
         if (imgBlocks.length > 0)
           images = imgBlocks.map((b) => `data:${b.mimeType as string};base64,${b.data as string}`);
       }
+      const rawDetails = isRecord(msg.toolDetails)
+        ? msg.toolDetails
+        : isRecord(msg.details)
+          ? msg.details
+          : undefined;
+      const toolDetails: ToolDetailsView = {};
+      const truncation =
+        rawDetails && isRecord(rawDetails.truncation) ? rawDetails.truncation : undefined;
+      if (truncation) {
+        toolDetails.truncation = {
+          truncated: Boolean(truncation.truncated),
+          truncatedBy:
+            truncation.truncatedBy === 'lines' || truncation.truncatedBy === 'bytes'
+              ? truncation.truncatedBy
+              : null,
+          totalLines: typeof truncation.totalLines === 'number' ? truncation.totalLines : undefined,
+          outputLines:
+            typeof truncation.outputLines === 'number' ? truncation.outputLines : undefined,
+          totalBytes: typeof truncation.totalBytes === 'number' ? truncation.totalBytes : undefined,
+          outputBytes:
+            typeof truncation.outputBytes === 'number' ? truncation.outputBytes : undefined,
+        };
+      }
+      if (rawDetails && typeof rawDetails.fullOutputPath === 'string')
+        toolDetails.fullOutputPath = rawDetails.fullOutputPath;
+      if (rawDetails && typeof rawDetails.firstChangedLine === 'number')
+        toolDetails.firstChangedLine = rawDetails.firstChangedLine;
+      if (rawDetails && typeof rawDetails.patch === 'string') toolDetails.patch = rawDetails.patch;
+      if (rawDetails && typeof rawDetails.linesTruncated === 'boolean')
+        toolDetails.linesTruncated = rawDetails.linesTruncated;
+      if (rawDetails && typeof rawDetails.matchLimitReached === 'number')
+        toolDetails.limitReached = 'match';
+      else if (rawDetails && typeof rawDetails.resultLimitReached === 'number')
+        toolDetails.limitReached = 'result';
+      else if (rawDetails && typeof rawDetails.entryLimitReached === 'number')
+        toolDetails.limitReached = 'entry';
 
       const result: UIMessage = {
         id: stableMsgId(msg, index),
@@ -360,8 +536,12 @@ export function agentMsgToUI(
         toolName,
         toolCallId,
         toolInput,
+        toolArgs: toolInfo?.input,
         content,
         images,
+        diff: typeof msg.diff === 'string' ? msg.diff : undefined,
+        toolDetails,
+        fullOutputPath: toolDetails.fullOutputPath,
         isError: (msg.isError as boolean | undefined) ?? false,
         streaming: false,
         createdAt: ts,
@@ -369,16 +549,42 @@ export function agentMsgToUI(
       if (typeof msg.startMs === 'number') result.startMs = msg.startMs;
       if (typeof msg.endMs === 'number') result.endMs = msg.endMs;
       const rawUsage = msg.usage as
-        | { input?: number; output?: number; totalTokens?: number; cost?: { total?: number } }
+        | {
+            input?: number;
+            output?: number;
+            cacheRead?: number;
+            cacheWrite?: number;
+            reasoning?: number;
+            totalTokens?: number;
+            cost?: {
+              input?: number;
+              output?: number;
+              cacheRead?: number;
+              cacheWrite?: number;
+              total?: number;
+            };
+          }
         | undefined;
       if (rawUsage?.totalTokens !== undefined) {
         result.usage = {
           input: rawUsage.input ?? 0,
           output: rawUsage.output ?? 0,
+          cacheRead: rawUsage.cacheRead ?? 0,
+          cacheWrite: rawUsage.cacheWrite ?? 0,
+          ...(rawUsage.reasoning !== undefined ? { reasoning: rawUsage.reasoning } : {}),
           totalTokens: rawUsage.totalTokens,
-          cost: { total: rawUsage.cost?.total ?? 0 },
+          cost: {
+            input: rawUsage.cost?.input ?? 0,
+            output: rawUsage.cost?.output ?? 0,
+            cacheRead: rawUsage.cost?.cacheRead ?? 0,
+            cacheWrite: rawUsage.cost?.cacheWrite ?? 0,
+            total: rawUsage.cost?.total ?? 0,
+          },
         };
       }
+      result.toolDetails = toolDetails;
+      if (toolDetails.fullOutputPath) result.fullOutputPath = toolDetails.fullOutputPath;
+      if (typeof msg.cancelled === 'boolean') result.cancelled = msg.cancelled;
       if (typeof msg.outputElided === 'boolean') result.outputElided = msg.outputElided;
       if (typeof msg.outputBytes === 'number') result.outputBytes = msg.outputBytes;
       return [result];
@@ -408,27 +614,32 @@ export function agentMsgToUI(
         ];
       }
       if (customType) {
-        // display: false means LLM-context only — skip UI rendering.
         if (msg.display === false) return [];
         const details = msg.details as Record<string, unknown> | undefined;
         const rawContent = msg.content;
+        const customBlocks = contentBlocks(rawContent);
+        const images = customBlocks
+          .filter(
+            (b) =>
+              b.type === 'image' && typeof b.data === 'string' && typeof b.mimeType === 'string'
+          )
+          .map((b) => `data:${b.mimeType as string};base64,${b.data as string}`);
         let content =
           typeof rawContent === 'string'
             ? rawContent
             : Array.isArray(rawContent)
-              ? extractTextContent(rawContent as { type: string; text?: string }[])
+              ? extractTextContent(customBlocks)
               : typeof msg.display === 'string'
                 ? msg.display
                 : '';
         if (!content) content = `[${customType}]`;
-        if (details) {
-          content += '\n\n' + JSON.stringify(details, null, 2);
-        }
+        if (details) content += '\n\n' + JSON.stringify(details, null, 2);
         return [
           {
             id: stableMsgId(msg, index),
             role: 'notice' as const,
             content,
+            images: images.length ? images : undefined,
             noticeKind: 'custom' as const,
             customType,
             renderedNoticeHtml: msg.renderedNoticeHtml as string[] | undefined,

@@ -1,0 +1,17 @@
+export const THEMES: { id: string; name: string }[] = [
+  { id: 'pi', name: 'Pi' },
+  { id: 'night', name: 'Night' },
+  { id: 'dark', name: 'Dark' },
+  { id: 'dracula', name: 'Dracula' },
+  { id: 'synthwave', name: 'Synthwave' },
+  { id: 'forest', name: 'Forest' },
+  { id: 'luxury', name: 'Luxury' },
+  { id: 'coffee', name: 'Coffee' },
+  { id: 'sunset', name: 'Sunset' },
+  { id: 'dim', name: 'Dim' },
+  { id: 'black', name: 'Black' },
+  { id: 'nord', name: 'Nord' },
+  { id: 'abyss', name: 'Abyss' },
+  { id: 'winter', name: 'Winter' },
+  { id: 'emerald', name: 'Emerald' },
+];

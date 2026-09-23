@@ -148,6 +148,57 @@ describe('agentMsgToUI', () => {
     expect(result[0].thinking).toBe('Let me solve this...');
     expect(result[0].content).toBe('Here is the answer');
   });
+  it('preserves assistant block order, redacted thinking, usage, and stop metadata', () => {
+    const [message] = agentMsgToUI({
+      role: 'assistant',
+      content: [
+        { type: 'text', text: 'before' },
+        { type: 'thinking', thinking: 'hidden text' },
+        { type: 'thinking', redacted: true, thinkingSignature: 'never-render' },
+        { type: 'text', text: 'after' },
+      ],
+      stopReason: 'length',
+      errorMessage: 'max tokens',
+      usage: {
+        input: 10,
+        output: 5,
+        cacheRead: 3,
+        cacheWrite: 2,
+        reasoning: 4,
+        totalTokens: 15,
+        cost: { input: 0.1, output: 0.2, cacheRead: 0.03, cacheWrite: 0.02, total: 0.35 },
+      },
+    });
+    expect(message).toMatchObject({
+      role: 'assistant',
+      content: 'beforeafter',
+      thinking: 'hidden text',
+      redactedThinking: true,
+      stopReason: 'length',
+      errorMessage: 'max tokens',
+      blocks: [
+        { type: 'text', text: 'before' },
+        { type: 'thinking', text: 'hidden text' },
+        { type: 'text', text: 'after' },
+      ],
+      usage: {
+        cacheRead: 3,
+        cacheWrite: 2,
+        reasoning: 4,
+        cost: { input: 0.1, output: 0.2, cacheRead: 0.03, cacheWrite: 0.02, total: 0.35 },
+      },
+    });
+    expect(JSON.stringify(message)).not.toContain('never-render');
+  });
+
+  it('converts compaction and branch summaries from session history', () => {
+    expect(
+      agentMsgToUI({ role: 'compactionSummary', summary: 'kept context', tokensBefore: 900 })[0]
+    ).toMatchObject({ role: 'compaction_summary', summary: 'kept context', tokensBefore: 900 });
+    expect(
+      agentMsgToUI({ role: 'branchSummary', summary: 'branch notes', fromId: 'entry-1' })[0]
+    ).toMatchObject({ role: 'branch_summary', summary: 'branch notes', fromId: 'entry-1' });
+  });
 
   it('skips assistant messages with no displayable content', () => {
     const result = agentMsgToUI({
@@ -157,18 +208,31 @@ describe('agentMsgToUI', () => {
     expect(result).toHaveLength(0);
   });
 
-  it('converts bash execution messages', () => {
+  it('converts bash execution messages with lifecycle details', () => {
     const result = agentMsgToUI({
       role: 'bash_execution',
       command: 'ls',
       output: 'file1\nfile2',
       exitCode: 0,
+      cancelled: false,
+      truncated: true,
+      fullOutputPath: '/tmp/full-output.log',
+      excludeFromContext: true,
     });
     expect(result).toHaveLength(1);
-    expect(result[0].role).toBe('tool');
-    expect(result[0].toolName).toBe('bash');
-    expect(result[0].toolInput).toBe('$ ls');
-    expect(result[0].isError).toBe(false);
+    expect(result[0]).toMatchObject({
+      role: 'tool',
+      toolName: 'bash',
+      toolInput: '$ ls',
+      isError: false,
+      fullOutputPath: '/tmp/full-output.log',
+      excludeFromContext: true,
+      toolDetails: {
+        truncation: { truncated: true },
+        fullOutputPath: '/tmp/full-output.log',
+        exitCode: 0,
+      },
+    });
   });
 
   it('marks bash execution with non-zero exit as error', () => {
@@ -190,6 +254,16 @@ describe('agentMsgToUI', () => {
         role: 'tool_result',
         toolCallId: 'call-1',
         content: [{ type: 'text', text: 'file content here' }],
+        details: {
+          truncation: {
+            truncated: true,
+            truncatedBy: 'lines',
+            totalLines: 18432,
+            outputLines: 2000,
+            totalBytes: 900000,
+            outputBytes: 95000,
+          },
+        },
         isError: false,
       },
       map
@@ -199,6 +273,9 @@ describe('agentMsgToUI', () => {
     expect(result[0].toolName).toBe('read');
     expect(result[0].toolInput).toBe('file.ts');
     expect(result[0].content).toBe('file content here');
+    expect(result[0].toolDetails).toMatchObject({
+      truncation: { truncated: true, truncatedBy: 'lines', totalLines: 18432, outputLines: 2000 },
+    });
   });
   it('preserves elided tool output metadata without synthesising content', () => {
     const map = new Map<string, { name: string; input: Record<string, unknown> }>();
@@ -248,12 +325,13 @@ describe('agentMsgToUI', () => {
       customType: 'status',
       content: [
         { type: 'text', text: 'one' },
-        { type: 'image', data: 'ignored' },
+        { type: 'image', data: 'img-data', mimeType: 'image/png' },
         { type: 'text', text: 'two' },
       ],
       display: true,
     });
     expect(blocks[0].content).toBe('onetwo');
+    expect(blocks[0].images).toEqual(['data:image/png;base64,img-data']);
     expect(
       agentMsgToUI({
         role: 'custom',

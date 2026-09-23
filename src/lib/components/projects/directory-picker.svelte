@@ -98,6 +98,13 @@
     <input
       autofocus
       type="text"
+      name="project-directory-path"
+      autocomplete="off"
+      spellcheck="false"
+      data-1p-ignore
+      data-lpignore="true"
+      data-bwignore
+      data-form-type="other"
       bind:value
       {placeholder}
       class="focus-ring flex-1 min-w-0 bg-transparent outline-none text-base sm:text-sm text-base-content/84 placeholder-base-content/32 font-mono"

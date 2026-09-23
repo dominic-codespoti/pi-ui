@@ -120,6 +120,66 @@
       {#if msg.images?.length}<span>{msg.images.length}img</span>{/if}
     </span>
   </button>
+  {#if msg.toolDetails?.truncation?.truncated}
+    <div class="mt-1 flex flex-wrap items-center gap-1.5 px-2 text-[10px] text-warning/80">
+      <span class="rounded bg-warning/10 px-1.5 py-0.5">
+        truncated{#if msg.toolDetails.truncation.outputLines !== undefined && msg.toolDetails.truncation.totalLines !== undefined}
+          : {msg.toolDetails.truncation.outputLines.toLocaleString()} of {msg.toolDetails.truncation.totalLines.toLocaleString()}
+          lines
+        {:else if msg.toolDetails.truncation.outputBytes !== undefined && msg.toolDetails.truncation.totalBytes !== undefined}
+          : {msg.toolDetails.truncation.outputBytes.toLocaleString()} of {msg.toolDetails.truncation.totalBytes.toLocaleString()}
+          bytes
+        {/if}
+      </span>
+    </div>
+  {/if}
+  {#if msg.toolDetails?.limitReached}
+    <div class="mt-1 px-2 text-[10px] text-warning/80">
+      <span class="rounded bg-warning/10 px-1.5 py-0.5">
+        {msg.toolDetails.limitReached} limit reached
+      </span>
+    </div>
+  {/if}
+  {#if msg.toolDetails?.linesTruncated}
+    <div class="mt-1 px-2 text-[10px] text-warning/80">
+      <span class="rounded bg-warning/10 px-1.5 py-0.5">lines truncated</span>
+    </div>
+  {/if}
+  {#if msg.toolDetails?.exitCode !== undefined || msg.cancelled || msg.excludeFromContext}
+    <div class="mt-1 flex flex-wrap items-center gap-1.5 px-2 text-[10px]">
+      {#if msg.cancelled || msg.toolDetails?.cancelled}
+        <span class="rounded bg-warning/10 px-1.5 py-0.5 text-warning/80">cancelled</span>
+      {:else if msg.toolDetails?.exitCode !== undefined}
+        <span
+          class="rounded px-1.5 py-0.5 {msg.toolDetails.exitCode === 0
+            ? 'bg-success/10 text-success/80'
+            : 'bg-destructive/10 text-destructive/80'}"
+          >exit {msg.toolDetails.exitCode ?? 'unknown'}</span
+        >
+      {/if}
+      {#if msg.excludeFromContext}
+        <span class="rounded bg-base-content/[0.06] px-1.5 py-0.5 text-base-content/45"
+          >not sent to model</span
+        >
+      {/if}
+    </div>
+  {/if}
+  {#if msg.fullOutputPath || msg.toolDetails?.fullOutputPath}
+    {@const fullOutputPath = msg.fullOutputPath ?? msg.toolDetails?.fullOutputPath ?? ''}
+    <div class="mt-1 flex items-center gap-2 px-2 text-[10px] text-base-content/50">
+      <span class="truncate">full output saved at {fullOutputPath}</span>
+      <button
+        type="button"
+        class="file-link shrink-0 rounded px-1.5 py-0.5 text-primary/80 hover:text-primary hover:bg-primary/[0.06] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
+        data-filepath={fullOutputPath}
+        aria-label="Open full tool output file">open</button
+      >
+    </div>
+  {/if}
+  {#if msg.toolArgsPreview}
+    <pre
+      class="trace-output mt-1 max-h-24 overflow-auto whitespace-pre-wrap break-all px-2 text-[10px] text-base-content/45">{msg.toolArgsPreview}</pre>
+  {/if}
   <div
     id={outputPanelId}
     role="region"
@@ -147,6 +207,20 @@
       </div>
     {:else}
       {#if msg.diff}
+        {#if msg.toolDetails?.firstChangedLine !== undefined}
+          <div class="mb-1 flex items-center gap-2 text-[10px] text-base-content/45">
+            <span>first change: line {msg.toolDetails.firstChangedLine}</span>
+            {#if typeof msg.toolArgs?.path === 'string'}
+              <button
+                type="button"
+                class="file-link rounded px-1.5 py-0.5 text-primary/80 hover:text-primary hover:bg-primary/[0.06] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
+                data-filepath={msg.toolArgs.path}
+                data-fileline={msg.toolDetails.firstChangedLine}
+                >jump to line {msg.toolDetails.firstChangedLine}</button
+              >
+            {/if}
+          </div>
+        {/if}
         <div class="trace-output mt-1">
           {#await import('#lib/components/diff-viewer.svelte') then { default: DiffViewer }}
             <DiffViewer diff={msg.diff} />
@@ -195,7 +269,7 @@
             <div class="relative group/img">
               <img
                 {src}
-                alt=""
+                alt="Output image {idx + 1} from {msg.toolName ?? 'tool'}"
                 class="max-h-64 max-w-full rounded-lg object-contain border border-base-content/10"
               />
               <button

@@ -65,6 +65,7 @@ describe('session coordinator', () => {
       contextUsage: null,
       queuedSteering: [],
       queuedFollowUp: [],
+      queuedDeferred: [],
       scrollAtBottom: true,
     });
     coordinator.applySnapshot({
@@ -138,6 +139,7 @@ describe('session coordinator', () => {
       contextUsage: null,
       queuedSteering: [],
       queuedFollowUp: [],
+      queuedDeferred: [],
       scrollAtBottom: false,
     });
     coordinator.applySnapshot({ type: 'session_loaded', sessionId: 'two', messages: [] });

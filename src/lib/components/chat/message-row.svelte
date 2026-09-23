@@ -21,6 +21,7 @@
   import UserMessageRow from './user-message-row.svelte';
   import AssistantMessageRow from './assistant-message-row.svelte';
   import ToolMessageRow from './tool-message-row.svelte';
+  import SummaryMessageRow from './summary-message-row.svelte';
 
   let {
     msg: sourceMsg,
@@ -35,6 +36,7 @@
     truncatedUserMsgs,
     workingVisible,
     hiddenThinkingLabel,
+    hideThinkingBlock,
     workingIndicatorFrames,
     workingFrameIndex,
     workingMessage,
@@ -45,6 +47,8 @@
     onToggleTool,
     onEditMessage,
     onDismissNotice,
+    onAbortCompaction,
+    onAbortRetry,
     onHaptic,
   }: {
     msg: UIMessage;
@@ -59,6 +63,7 @@
     truncatedUserMsgs: Record<string, boolean>;
     workingVisible: boolean;
     hiddenThinkingLabel: string;
+    hideThinkingBlock: boolean;
     workingIndicatorFrames: string[];
     workingFrameIndex: number;
     workingMessage: string | undefined;
@@ -69,11 +74,19 @@
     onToggleTool: (msg: UIMessage) => void;
     onEditMessage: (originalText: string, newText: string) => void;
     onDismissNotice: (id: string) => void;
+    onAbortCompaction: () => void;
+    onAbortRetry: () => void;
     onHaptic?: () => void;
   } = $props();
   let msg = $derived.by(() => {
     void revision;
     return { ...sourceMsg };
+  });
+  let abortCompactionPending = $state(false);
+  let abortRetryPending = $state(false);
+  $effect(() => {
+    if (compactionStatus(msg) !== 'running') abortCompactionPending = false;
+    if (!msg.streaming) abortRetryPending = false;
   });
   let editingId: string | null = $state(null);
   let editingText = $state('');
@@ -136,6 +149,8 @@
     onLongPressMove={moveLongPress}
     onLongPressCancel={cancelLongPress}
   />
+{:else if msg.role === 'compaction_summary' || msg.role === 'branch_summary'}
+  <SummaryMessageRow {msg} />
 {:else if msg.role === 'assistant'}
   <AssistantMessageRow
     {msg}
@@ -146,6 +161,7 @@
     {isMobile}
     {workingVisible}
     {hiddenThinkingLabel}
+    {hideThinkingBlock}
     {workingIndicatorFrames}
     {workingFrameIndex}
     {workingMessage}
@@ -284,6 +300,18 @@
             </div>
             <p class="mt-1 text-[11px] leading-relaxed text-base-content/55">{msg.content}</p>
           </div>
+          {#if status === 'running'}
+            <Button
+              variant="ghost"
+              size="xs"
+              class="h-6 px-2 text-[10px]"
+              disabled={abortCompactionPending}
+              onclick={() => {
+                abortCompactionPending = true;
+                onAbortCompaction();
+              }}>{abortCompactionPending ? 'Cancelling…' : 'Cancel'}</Button
+            >
+          {/if}
           <LiveElapsed
             startMs={details?.startedAt}
             endMs={details?.endedAt}
@@ -339,7 +367,7 @@
       class:msg-in={isNewest}
     >
       <span class="min-w-0 flex-1 h-px bg-gradient-to-r from-transparent to-base-content/15"></span>
-      <span class="flex min-w-0 max-w-full items-start gap-1">
+      <div class="flex min-w-0 max-w-full items-start gap-1">
         {#if msg.streaming}
           <svg
             class="w-2 h-2 shrink-0 animate-spin"
@@ -366,7 +394,30 @@
           <span class="mt-0.5 h-2 w-2 shrink-0 rounded-full bg-secondary inline-block"></span>
         {/if}
         <span class="min-w-0 break-words whitespace-pre-wrap">{msg.content}</span>
-      </span>
+        {#if msg.noticeKind === 'retry' && msg.streaming}
+          <Button
+            variant="ghost"
+            size="xs"
+            class="h-6 shrink-0 px-2 text-[10px]"
+            disabled={abortRetryPending}
+            onclick={() => {
+              abortRetryPending = true;
+              onAbortRetry();
+            }}>{abortRetryPending ? 'Stopping…' : 'Stop retrying'}</Button
+          >
+        {/if}
+        {#if msg.noticeKind === 'custom' && msg.images?.length}
+          <div class="mt-2 flex flex-wrap gap-2">
+            {#each msg.images as src, i (`${msg.id}-image-${i}`)}
+              <img
+                {src}
+                alt={`Image from extension message ${i + 1}`}
+                class="max-h-48 max-w-full rounded-lg border border-base-content/10 object-contain"
+              />
+            {/each}
+          </div>
+        {/if}
+      </div>
       <span class="min-w-0 flex-1 h-px bg-gradient-to-l from-transparent to-base-content/15"></span>
     </div>
   {/if}

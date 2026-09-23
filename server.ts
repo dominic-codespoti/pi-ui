@@ -15,6 +15,7 @@
 
 import type { Server } from 'bun';
 import type * as PiSDKNS from '@earendil-works/pi-coding-agent';
+import { SessionFooterDataProvider } from './src/lib/server/footer-data.ts';
 import type {
   AgentSession,
   ExtensionUIContext,
@@ -23,11 +24,17 @@ import type {
   ExtensionCommandContextActions,
   ExtensionError,
 } from '@earendil-works/pi-coding-agent';
+import { THEMES } from './src/lib/themes.ts';
+import {
+  getBuiltinSlashCommands,
+  getLatestChangelogEntries,
+  prepareBugReport,
+  uploadPreparedBugReport,
+} from './src/lib/server/slash-command-catalog.ts';
 import type { AutocompleteProvider } from '@earendil-works/pi-tui';
-import type { AuthEvent, AuthInteraction, AuthPrompt } from '@earendil-works/pi-ai';
-import { rm, mkdir, writeFile } from 'node:fs/promises';
+import { rm, mkdir, writeFile, mkdtemp } from 'node:fs/promises';
 import { join, resolve, basename, sep, dirname } from 'node:path';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import {
   initPassword,
@@ -49,6 +56,12 @@ import {
 } from './src/lib/server/push-notifications.ts';
 import { persistProviderApiKey } from './src/lib/server/provider-auth.ts';
 import {
+  cancelProviderLogin,
+  cancelProviderLoginsForSocket,
+  respondToProviderLoginPrompt,
+  startProviderLogin,
+} from './src/lib/server/provider-login-session.ts';
+import {
   serializeModel,
   serializeSession,
   resolveGitHubRawUrl,
@@ -66,7 +79,9 @@ import {
 import { BUNDLED_SKILL_NAME, bundledSkillPaths } from './src/lib/server/bundled-resources.ts';
 import { log } from './src/lib/server/logger.ts';
 import { terminalInputRegistry } from './src/lib/server/terminal-input.ts';
-import { boundMessagesForWire } from './src/lib/server/wire-messages.ts';
+import { summarizeResources } from './src/lib/server/resources-summary.ts';
+import { boundMessagesForWire, MAX_WIRE_BLOCK_CHARS } from './src/lib/server/wire-messages.ts';
+import { toolDetailsForWire, toolResultsForWire } from './src/lib/server/tool-details.ts';
 import { createCompactionWatchdog } from './src/lib/server/compaction-watchdog.ts';
 import {
   createToolUpdateCoalescer,
@@ -99,6 +114,8 @@ import {
   dispatchExtensionUiMessage,
   type ExtensionUiHandlerDependencies,
 } from './src/lib/server/handlers/extension-ui-handlers.ts';
+import { navigateTree, setEntryLabel } from './src/lib/server/handlers/tree-handlers.ts';
+import { getSdkSettings, setSdkSetting } from './src/lib/server/handlers/sdk-settings-handlers.ts';
 import {
   ExtensionRuntime,
   type AutocompleteProviderFactory,
@@ -121,8 +138,6 @@ import {
   type ServerMessage,
   type ModelInfo,
   type ProviderInfo,
-  type SkillSummary,
-  type PromptSummary,
   type ExtensionSummary,
   type ExtensionErrorNotice,
   type ProjectTrustInfo,
@@ -160,6 +175,8 @@ import {
   WIDGET_REFRESH_MS,
   renderCustomMessagesForWire,
   type ParsedComponent,
+  clearToolRendererState,
+  setToolRendererUpdateHandler,
 } from './src/lib/tui-stubs.ts';
 import ownPkgJson from './package.json' with { type: 'json' };
 
@@ -236,7 +253,8 @@ function messagesForWire(
 ): unknown[] {
   const transformed = applyMarkdownTransformersToMessages(sess, messages);
   const withEntries = includeCustomEntries ? customEntriesForWire(sess, transformed) : transformed;
-  return boundMessagesForWire(renderCustomMessagesForWire(sess, withEntries));
+  const rendered = renderCustomMessagesForWire(sess, withEntries);
+  return boundMessagesForWire(toolResultsForWire(rendered));
 }
 
 function initialMessages(
@@ -276,6 +294,7 @@ function toolOutputForWire(
 ): {
   content: string;
   details?: string;
+  toolDetails?: Record<string, unknown>;
   diff?: string;
   renderedResultHtml?: string[];
 } | null {
@@ -323,35 +342,29 @@ function toolOutputForWire(
     boundedResult,
     args,
     toolCallId,
-    false
+    false,
+    toolsExpanded
   );
   const wireResult = boundMessagesForWire(
     [{ ...boundedResult, ...(renderedResultHtml ? { renderedResultHtml } : {}) }],
     { elideToolOutput: false }
   )[0] as Record<string, unknown>;
 
-  let details: string | undefined;
-  if (typeof wireResult.details === 'string') {
-    details = wireResult.details;
-  } else if (wireResult.details !== undefined) {
-    try {
-      details = JSON.stringify(wireResult.details);
-    } catch {
-      // Non-serializable extension details are not displayable on the wire.
-    }
-  }
   const detailsRecord =
     wireResult.details && typeof wireResult.details === 'object'
       ? (wireResult.details as Record<string, unknown>)
       : undefined;
+  const toolDetails = toolDetailsForWire(toolName, detailsRecord);
+  const details = toolDetails ? JSON.stringify(toolDetails) : undefined;
   const diff =
     typeof wireResult.diff === 'string'
-      ? wireResult.diff
+      ? wireResult.diff.slice(0, MAX_WIRE_BLOCK_CHARS)
       : typeof detailsRecord?.diff === 'string'
-        ? detailsRecord.diff
+        ? detailsRecord.diff.slice(0, MAX_WIRE_BLOCK_CHARS)
         : undefined;
 
   return {
+    ...(toolDetails ? { toolDetails } : {}),
     content: toolContentText(wireResult.content),
     ...(details !== undefined ? { details } : {}),
     ...(diff !== undefined ? { diff } : {}),
@@ -425,8 +438,14 @@ async function getProviders(runtime = activeSession().modelRuntime): Promise<Pro
   }
 
   const modelCounts = new Map<string, number>();
+  const modelBaseUrls = new Map<string, Set<string>>();
   for (const model of runtime.getModels()) {
     modelCounts.set(model.provider, (modelCounts.get(model.provider) ?? 0) + 1);
+    if (model.baseUrl) {
+      const baseUrls = modelBaseUrls.get(model.provider) ?? new Set<string>();
+      baseUrls.add(model.baseUrl);
+      modelBaseUrls.set(model.provider, baseUrls);
+    }
   }
 
   const providers: ProviderInfo[] = [];
@@ -441,11 +460,24 @@ async function getProviders(runtime = activeSession().modelRuntime): Promise<Pro
       !status.configured && storedProviderIds?.has(provider.id)
         ? { configured: true, source: 'stored' }
         : status;
+    const baseUrls = modelBaseUrls.get(provider.id);
+    const modelsJsonProvider =
+      effectiveStatus.source === 'models_json_key' ||
+      effectiveStatus.source === 'models_json_command';
     providers.push({
       id: provider.id,
       name: provider.name,
       configured: effectiveStatus.configured,
       source: effectiveStatus.source,
+      authLabel: status.label,
+      subscription: runtime.isUsingSubscription(provider.id),
+      oauthSubscription: provider.auth.oauth?.isSubscription,
+      ...(modelsJsonProvider && baseUrls?.size === 1 ? { baseUrl: [...baseUrls][0] } : {}),
+      oauthLoginLabel: provider.auth.oauth
+        ? (provider.auth.oauth.loginLabel ?? 'Sign in with account')
+        : undefined,
+      apiKeyLogin: Boolean(provider.auth.apiKey?.login),
+      oauthAuthenticated: runtime.isUsingOAuth(provider.id),
       modelCount,
     });
   }
@@ -459,33 +491,47 @@ async function getProviders(runtime = activeSession().modelRuntime): Promise<Pro
 
 async function availableModelsForBroadcast(
   runtime: AgentSession['modelRuntime'],
-  changedProviderId?: string
+  changedProviderId?: string,
+  defaultModel?: { provider?: string; modelId?: string }
 ): Promise<ModelInfo[]> {
-  const serializeAvailable = (models: readonly Parameters<typeof serializeModel>[0][]) =>
-    models.map(serializeModel).filter((model): model is ModelInfo => model !== null);
-
+  let available: readonly NonNullable<Parameters<typeof serializeModel>[0]>[];
   try {
-    return serializeAvailable(await runtime.getAvailable());
+    available = await runtime.getAvailable();
   } catch (err) {
     log.warn('[pifrontier] Provider availability refresh failed:', err);
     if (changedProviderId) {
       try {
-        // A single broken provider must not hide a successful login for another
-        // provider. Re-check the changed provider and merge it into the last
-        // good snapshot.
-        return serializeAvailable([
+        available = [
           ...runtime.getAvailableSnapshot().filter((model) => model.provider !== changedProviderId),
           ...(await runtime.getAvailable(changedProviderId)),
-        ]);
+        ];
       } catch (changedErr) {
         log.warn(
           `[pifrontier] Failed to refresh changed provider ${changedProviderId}:`,
           changedErr
         );
+        available = runtime.getAvailableSnapshot();
       }
+    } else {
+      available = runtime.getAvailableSnapshot();
     }
-    return serializeAvailable(runtime.getAvailableSnapshot());
   }
+  const availableIds = new Set(available.map((model) => `${model.provider}\0${model.id}`));
+  return runtime.getModels().flatMap((model): ModelInfo[] => {
+    const serialized = serializeModel(model);
+    if (!serialized) return [];
+    const isAvailable = availableIds.has(`${model.provider}\0${model.id}`);
+    return [
+      {
+        ...serialized,
+        isDefault: model.provider === defaultModel?.provider && model.id === defaultModel?.modelId,
+        available: isAvailable,
+        ...(!isAvailable && !runtime.hasConfiguredAuth(model.provider)
+          ? { authRequired: model.provider }
+          : {}),
+      },
+    ];
+  });
 }
 
 /** Broadcast the authoritative provider/auth and available-model snapshots. */
@@ -495,7 +541,16 @@ async function broadcastProviderState(
   ownerSessionId?: string
 ): Promise<void> {
   if (ownerSessionId && activeSessionId() !== ownerSessionId) return;
-  const availableModels = await availableModelsForBroadcast(runtime, changedProviderId);
+  const settingsManager = activeSession().settingsManager;
+  const defaultModel = {
+    provider: settingsManager.getDefaultProvider(),
+    modelId: settingsManager.getDefaultModel(),
+  };
+  const availableModels = await availableModelsForBroadcast(
+    runtime,
+    changedProviderId,
+    defaultModel
+  );
   if (ownerSessionId && activeSessionId() !== ownerSessionId) return;
   const providers = await getProviders(runtime);
   if (ownerSessionId && activeSessionId() !== ownerSessionId) return;
@@ -527,18 +582,37 @@ async function mutateProviderAuth(
   providerId: string,
   ownerSessionId: string | null,
   runtime: AgentSession['modelRuntime'],
-  mutation: (runtime: AgentSession['modelRuntime']) => Promise<void>
+  mutation: (runtime: AgentSession['modelRuntime']) => Promise<void>,
+  allowSessionChange = false
 ): Promise<void> {
   return enqueueProviderAuthMutation(async () => {
     // The request may wait behind another credential mutation. Keep the
     // runtime captured by the requesting session instead of resolving the
     // then-current active session after the queue drains.
     if (
-      !ownerSessionId ||
-      activeSessionId() !== ownerSessionId ||
-      residentStore.get(ownerSessionId)?.session.modelRuntime !== runtime
+      !allowSessionChange &&
+      (!ownerSessionId ||
+        activeSessionId() !== ownerSessionId ||
+        residentStore.get(ownerSessionId)?.session.modelRuntime !== runtime)
     ) {
       throw new Error('Session changed before provider auth operation could start');
+    }
+    if (allowSessionChange) {
+      // Runtimes share auth.json, but retain independent provider-availability snapshots.
+      // Refresh them after login so switching sessions sees the committed credential.
+      for (const entry of residentStore.values()) {
+        try {
+          await entry.session.modelRuntime.refresh({
+            allowNetwork: false,
+            providers: [providerId],
+          });
+        } catch (err) {
+          log.error(
+            `[pifrontier] Failed to refresh ${providerId} availability for session ${entry.session.sessionId}:`,
+            err
+          );
+        }
+      }
     }
     try {
       await mutation(runtime);
@@ -546,74 +620,12 @@ async function mutateProviderAuth(
       // A persisted credential is useful even when a model catalog or an
       // unrelated provider's availability check fails during SDK refresh.
       try {
-        await broadcastProviderState(runtime, providerId, ownerSessionId);
+        await broadcastProviderState(runtime, providerId, ownerSessionId ?? undefined);
       } catch (err) {
         log.error('[pifrontier] Failed to broadcast provider state:', err);
       }
     }
   });
-}
-
-function browserAuthInteraction(ownerSessionId: string | null): AuthInteraction {
-  return {
-    prompt: async (prompt: AuthPrompt) => {
-      if (prompt.type === 'select') {
-        const selected = await uiContext.select(
-          prompt.message,
-          prompt.options.map((option) => option.label),
-          undefined,
-          ownerSessionId
-        );
-        if (!selected) throw new Error('Login cancelled');
-        const option = prompt.options.find((candidate) => candidate.label === selected);
-        if (!option) throw new Error('Login cancelled');
-        return option.id;
-      }
-
-      const value = await createDialogPromise<string | undefined>(
-        crypto.randomUUID(),
-        {
-          method: 'input',
-          title: prompt.message,
-          placeholder: prompt.placeholder,
-          ...(prompt.type === 'secret' ? { secret: true } : {}),
-        },
-        (response) =>
-          'cancelled' in response && response.cancelled
-            ? undefined
-            : 'value' in response && typeof response.value === 'string'
-              ? response.value
-              : undefined,
-        ownerSessionId
-      );
-      if (value === undefined) throw new Error('Login cancelled');
-      return value;
-    },
-    notify: (event: AuthEvent) => {
-      switch (event.type) {
-        case 'info':
-          uiContext.notify(event.message, 'info', ownerSessionId);
-          break;
-        case 'progress':
-          uiContext.notify(event.message, 'info', ownerSessionId);
-          break;
-        case 'auth_url':
-          uiContext.notify(
-            `${event.instructions ? `${event.instructions}\n` : ''}${event.url}`,
-            'info',
-            ownerSessionId
-          );
-          break;
-        case 'device_code':
-          uiContext.notify(
-            `Enter ${event.userCode} at ${event.verificationUri}`,
-            'info',
-            ownerSessionId
-          );
-          break;
-      }
-    },
-  };
 }
 
 function sendSlashResult(
@@ -877,7 +889,9 @@ type TreeSerializationBudget = { remaining: number };
 function serializeTreeNode(
   node: RawTreeNode,
   depth: number,
-  budget: TreeSerializationBudget
+  budget: TreeSerializationBudget,
+  currentPath?: Set<string>,
+  currentLeafId?: string | null
 ): TreeNode {
   budget.remaining--;
   const entry = node.entry;
@@ -896,7 +910,9 @@ function serializeTreeNode(
   if (depth < MAX_SESSION_TREE_DEPTH) {
     for (const child of node.children) {
       if (budget.remaining <= 0) break;
-      children.push(serializeTreeNode(child as RawTreeNode, depth + 1, budget));
+      children.push(
+        serializeTreeNode(child as RawTreeNode, depth + 1, budget, currentPath, currentLeafId)
+      );
     }
   }
   return {
@@ -905,6 +921,8 @@ function serializeTreeNode(
     role,
     text,
     label: node.label?.slice(0, MAX_SESSION_TREE_TEXT_CHARS),
+    isCurrentLeaf: entry.id === currentLeafId,
+    isOnCurrentPath: currentPath?.has(entry.id),
     children,
   };
 }
@@ -932,6 +950,13 @@ function firstMessageForSession(sess: AgentSession): string {
  * Mirrors the scanner's SessionFileInfo shape so the merge is seamless.
  */
 function liveSummary(sess: AgentSession, entry: ManagedSession): SessionFileInfo {
+  const stats = sess.getSessionStats();
+  const labels = new Set<string>();
+  for (const sessionEntry of sess.sessionManager.getEntries()) {
+    if (sessionEntry.type !== 'label') continue;
+    if (sessionEntry.label) labels.add(sessionEntry.targetId);
+    else labels.delete(sessionEntry.targetId);
+  }
   return {
     id: sess.sessionId,
     path: entry.path ?? '(in-memory)',
@@ -941,6 +966,10 @@ function liveSummary(sess: AgentSession, entry: ManagedSession): SessionFileInfo
     modified: new Date(entry.lastActivity),
     messageCount: sess.messages.length,
     firstMessage: entry.firstMessage,
+    lastModel: sess.model ? { provider: sess.model.provider, modelId: sess.model.id } : undefined,
+    totalCost: stats.cost || undefined,
+    totalTokens: stats.tokens.total || undefined,
+    labelCount: labels.size || undefined,
   };
 }
 
@@ -1049,9 +1078,16 @@ function createDialogPromise<T>(
   id: string,
   requestPayload: Record<string, unknown>,
   parseResponse: (response: Record<string, unknown>) => T,
-  ownerSessionId: string | null = null
+  ownerSessionId: string | null = null,
+  options?: ExtensionUIDialogOptions
 ): Promise<T> {
-  return extensionRuntime.createDialogPromise(id, requestPayload, parseResponse, ownerSessionId);
+  return extensionRuntime.createDialogPromise(
+    id,
+    requestPayload,
+    parseResponse,
+    ownerSessionId,
+    options
+  );
 }
 function uiStateFor(owner: string | null): SessionUiState {
   return extensionRuntime.uiStateFor(owner);
@@ -1179,45 +1215,183 @@ type ServerExtensionUIContext = Omit<
   setToolsExpanded(expanded: boolean, ownerSessionId?: string | null): void;
 };
 
+type ExtensionBarKind = 'header' | 'footer';
+type ExtensionBarFactoryFn = NonNullable<Parameters<ExtensionUIContext['setFooter']>[0]>;
+interface ExtensionBarFactory {
+  factory: ExtensionBarFactoryFn;
+  interval: Timer | undefined;
+  render: (() => void) | undefined;
+  unsubscribe: (() => void) | undefined;
+  component: { dispose?(): void } | undefined;
+}
+const extensionBars = new Map<string, ExtensionBarFactory>();
+const footerProviders = new Map<string, SessionFooterDataProvider>();
+
+function footerProviderFor(owner: string | null): SessionFooterDataProvider {
+  const key = owner ?? '__ownerless__';
+  let provider = footerProviders.get(key);
+  if (provider) return provider;
+  const entry = owner ? residentStore.get(owner) : undefined;
+  const sess = entry?.session ?? activeSessionOrNull();
+  provider = new SessionFooterDataProvider(sess?.sessionManager.getCwd() || cwd);
+  if (sess) {
+    const models = sess.modelRuntime.getAvailableSnapshot();
+    provider.setAvailableProviderCount(new Set(models.map((model) => model.provider)).size);
+  }
+  const statuses = owner ? existingUiStateFor(owner)?.statuses : undefined;
+  for (const [statusKey, text] of statuses ?? []) provider.setExtensionStatus(statusKey, text);
+  if (owner)
+    provider.onBranchChange(() => broadcastFooterData(residentStore.get(owner)?.session ?? null));
+  footerProviders.set(key, provider);
+  return provider;
+}
+
+function setExtensionBar(
+  kind: ExtensionBarKind,
+  factory: unknown,
+  ownerSessionId?: string | null
+): void {
+  const owner = ownerSessionId ?? activeSessionId() ?? null;
+  const key = `${owner ?? '__ownerless__'}:${kind}`;
+  const existing = extensionBars.get(key);
+  clearInterval(existing?.interval);
+  existing?.component?.dispose?.();
+  existing?.unsubscribe?.();
+  extensionBars.delete(key);
+  const ui = uiStateFor(owner);
+  const field = kind === 'footer' ? 'footer' : 'header';
+  const treeField = kind === 'footer' ? 'footerTree' : 'headerTree';
+  if (typeof factory !== 'function') {
+    ui[field] = '';
+    ui[treeField] = undefined;
+    broadcast({
+      type: 'extension_ui_request',
+      id: crypto.randomUUID(),
+      method: `set_${kind}`,
+      content: '',
+      tree: null,
+      ...stampOwner(owner),
+    });
+    return;
+  }
+
+  const state: ExtensionBarFactory = {
+    factory: factory as ExtensionBarFactoryFn,
+    interval: undefined,
+    render: undefined,
+    unsubscribe: undefined,
+    component: undefined,
+  };
+  extensionBars.set(key, state);
+  const provider = footerProviderFor(owner);
+  const render = async () => {
+    if (extensionBars.get(key) !== state) return;
+    try {
+      const component = await state.factory(
+        stubTui as unknown as Parameters<ExtensionBarFactoryFn>[0],
+        stubTheme as unknown as Parameters<ExtensionBarFactoryFn>[1],
+        provider
+      );
+      if (extensionBars.get(key) !== state) {
+        (component as { dispose?(): void } | null)?.dispose?.();
+        return;
+      }
+      const parsed =
+        component && typeof component === 'object'
+          ? boundParsedComponentTree(
+              parseComponentTree(component as unknown as Record<string, unknown>)
+            )
+          : null;
+      state.component?.dispose?.();
+      state.component =
+        component && typeof component === 'object'
+          ? (component as { dispose?(): void })
+          : undefined;
+      const content = flattenParsedText(parsed);
+      ui[field] = content;
+      ui[treeField] = parsed ?? undefined;
+      broadcast({
+        type: 'extension_ui_request',
+        id: crypto.randomUUID(),
+        method: `set_${kind}`,
+        content,
+        tree: parsed,
+        ...stampOwner(owner),
+      });
+    } catch {
+      /* A failing extension factory must not prevent other session UI updates. */
+    }
+  };
+  state.render = () => {
+    void render();
+  };
+  state.unsubscribe = provider.onBranchChange(() => {
+    void render();
+  });
+  void render();
+  if (owner === activeSessionId())
+    state.interval = setInterval(() => {
+      void render();
+    }, WIDGET_REFRESH_MS);
+}
+
 const uiContext: ServerExtensionUIContext = {
-  select(title, options, _opts, ownerSessionId) {
+  select(title, options, opts, ownerSessionId) {
     const id = crypto.randomUUID();
     return createDialogPromise<string | undefined>(
       id,
-      { method: 'select', title, options },
+      {
+        method: 'select',
+        title,
+        options,
+        ...(opts?.timeout !== undefined ? { timeout: opts.timeout } : {}),
+      },
       (r) =>
         'cancelled' in r && r.cancelled
           ? undefined
           : 'value' in r
             ? (r.value as string)
             : undefined,
-      ownerSessionId
+      ownerSessionId,
+      opts
     );
   },
 
-  confirm(title, message, _opts, ownerSessionId) {
+  confirm(title, message, opts, ownerSessionId) {
     const id = crypto.randomUUID();
     return createDialogPromise<boolean>(
       id,
-      { method: 'confirm', title, message },
+      {
+        method: 'confirm',
+        title,
+        message,
+        ...(opts?.timeout !== undefined ? { timeout: opts.timeout } : {}),
+      },
       (r) =>
         'cancelled' in r && r.cancelled ? false : 'confirmed' in r ? Boolean(r.confirmed) : false,
-      ownerSessionId
+      ownerSessionId,
+      opts
     );
   },
 
-  input(title, placeholder, _opts, ownerSessionId) {
+  input(title, placeholder, opts, ownerSessionId) {
     const id = crypto.randomUUID();
     return createDialogPromise<string | undefined>(
       id,
-      { method: 'input', title, placeholder },
+      {
+        method: 'input',
+        title,
+        placeholder,
+        ...(opts?.timeout !== undefined ? { timeout: opts.timeout } : {}),
+      },
       (r) =>
         'cancelled' in r && r.cancelled
           ? undefined
           : 'value' in r
             ? (r.value as string)
             : undefined,
-      ownerSessionId
+      ownerSessionId,
+      opts
     );
   },
 
@@ -1450,6 +1624,10 @@ const uiContext: ServerExtensionUIContext = {
     const ui = uiStateFor(owner);
     if (text === undefined) ui.statuses.delete(key);
     else ui.statuses.set(key, text);
+    footerProviderFor(owner).setExtensionStatus(key, text);
+    for (const [barKey, bar] of extensionBars) {
+      if (barKey.startsWith(`${owner ?? '__ownerless__'}:`)) void bar.render?.();
+    }
     broadcast({
       type: 'extension_ui_request',
       id: crypto.randomUUID(),
@@ -1602,62 +1780,10 @@ const uiContext: ServerExtensionUIContext = {
   },
 
   setFooter(factory, ownerSessionId) {
-    const owner = ownerSessionId ?? activeSessionId() ?? null;
-    const ownerSession = owner ? residentStore.get(owner)?.session : undefined;
-    const ui = uiStateFor(owner);
-    const ownsLiveState = () =>
-      owner == null ||
-      (residentStore.get(owner)?.session === ownerSession &&
-        extensionRuntime.stateForSession(owner) === ui);
-    const apply = (content: string) => {
-      if (!ownsLiveState()) return;
-      ui.footer = content;
-      broadcast({
-        type: 'extension_ui_request',
-        id: crypto.randomUUID(),
-        method: 'set_footer',
-        content,
-        ...stampOwner(owner),
-      });
-    };
-    if (!factory) {
-      apply('');
-      return;
-    }
-    void callFactoryAndParse(factory, '', undefined)
-      .then((parsed) => apply(flattenParsedText(parsed)))
-      .catch(() => {
-        /* factory may fail without real TUI */
-      });
+    setExtensionBar('footer', factory, ownerSessionId);
   },
   setHeader(factory, ownerSessionId) {
-    const owner = ownerSessionId ?? activeSessionId() ?? null;
-    const ownerSession = owner ? residentStore.get(owner)?.session : undefined;
-    const ui = uiStateFor(owner);
-    const ownsLiveState = () =>
-      owner == null ||
-      (residentStore.get(owner)?.session === ownerSession &&
-        extensionRuntime.stateForSession(owner) === ui);
-    const apply = (content: string) => {
-      if (!ownsLiveState()) return;
-      ui.header = content;
-      broadcast({
-        type: 'extension_ui_request',
-        id: crypto.randomUUID(),
-        method: 'set_header',
-        content,
-        ...stampOwner(owner),
-      });
-    };
-    if (!factory) {
-      apply('');
-      return;
-    }
-    void callFactoryAndParse(factory, '', undefined)
-      .then((parsed) => apply(flattenParsedText(parsed)))
-      .catch(() => {
-        /* factory may fail without real TUI */
-      });
+    setExtensionBar('header', factory, ownerSessionId);
   },
 
   setTitle(title, ownerSessionId) {
@@ -1741,12 +1867,27 @@ const uiContext: ServerExtensionUIContext = {
   // Web extensions receive the same ANSI-capable theme stub used by widget factories.
   theme: stubTheme as unknown as ExtensionUIContext['theme'],
   getAllThemes() {
-    return [];
+    return THEMES.map(({ id, name }) => ({ name, path: undefined as string | undefined, id }));
   },
-  getTheme() {
-    return stubTheme as unknown as ExtensionUIContext['theme'];
+  getTheme(name: string) {
+    if (!THEMES.some((theme) => theme.id === name)) return undefined;
+    return { ...stubTheme, name } as unknown as ExtensionUIContext['theme'];
   },
-  setTheme() {
+  setTheme(theme: string | ExtensionUIContext['theme']) {
+    let name = '';
+    if (typeof theme === 'string') name = theme;
+    else if (theme && typeof theme === 'object' && typeof theme.name === 'string') {
+      name = theme.name;
+    }
+    if (!THEMES.some((item) => item.id === name)) {
+      return { success: false, error: `Unknown Pi UI theme: ${name}` };
+    }
+    broadcast({
+      type: 'extension_ui_request',
+      id: crypto.randomUUID(),
+      method: 'applyTheme',
+      theme: name,
+    });
     return { success: true };
   },
 
@@ -1838,6 +1979,14 @@ function extensionUiStateForSession(sid: string): ExtensionUiStatePayload {
 
 function syncWidgetFactories(activeSid: string | null): void {
   extensionRuntime.syncWidgetFactories(activeSid, tickWidgetFactory);
+  for (const [key, bar] of extensionBars) {
+    clearInterval(bar.interval);
+    bar.interval = undefined;
+    if (activeSid && key.startsWith(`${activeSid}:`)) {
+      void bar.render?.();
+      bar.interval = setInterval(() => bar.render?.(), WIDGET_REFRESH_MS);
+    }
+  }
 }
 
 function isWidgetComponent(
@@ -2119,19 +2268,24 @@ function activeSessionOrNullEntry(): ManagedSession | null {
   return selectedSessionId ? (residentStore.get(selectedSessionId) ?? null) : null;
 }
 
-function queuedStateFor(sess: AgentSession): { steering: string[]; followUp: string[] } {
+function queuedStateFor(sess: AgentSession): {
+  steering: string[];
+  followUp: string[];
+  deferred: string[];
+} {
   const pending = queuedRuns.get(sess.sessionId) ?? [];
   return {
-    steering: [
-      ...sess.getSteeringMessages(),
-      ...pending.filter((run) => run.mode === 'steer').map((run) => run.message),
-    ],
-    followUp: [
-      ...sess.getFollowUpMessages(),
-      ...pending
-        .filter((run) => run.mode === 'followUp' || run.mode === 'prompt')
-        .map((run) => run.message),
-    ],
+    steering: [...sess.getSteeringMessages()],
+    followUp: [...sess.getFollowUpMessages()],
+    deferred: pending.map((run) => run.message),
+  };
+}
+function queuedSnapshotFor(sess: AgentSession) {
+  const state = queuedStateFor(sess);
+  return {
+    queuedSteering: state.steering,
+    queuedFollowUp: state.followUp,
+    deferred: state.deferred,
   };
 }
 
@@ -2292,6 +2446,15 @@ function disposeSession(sid: string, reason: string): void {
   }
   entry.forwardingUnsub = null;
   entry.runtimeUnsub = null;
+  for (const [key, bar] of extensionBars) {
+    if (!key.startsWith(`${sid}:`)) continue;
+    clearInterval(bar.interval);
+    bar.component?.dispose?.();
+    bar.unsubscribe?.();
+    extensionBars.delete(key);
+  }
+  footerProviders.get(sid)?.dispose();
+  footerProviders.delete(sid);
   disposeUi(sid);
   sessionCatalog.apply({ kind: 'release', id: sid });
   // Tombstone: the sidebar must stop showing live status for a session that is
@@ -2612,6 +2775,22 @@ async function createSdkSession(
     },
   });
   const diagnostics: RuntimeDiagnostic[] = [...services.diagnostics];
+  const enabledModels = settingsManager.getEnabledModels();
+  if (enabledModels?.length) {
+    try {
+      const { scopedModels: scoped } = await sdk.resolveModelScopeWithDiagnostics(
+        enabledModels,
+        result.session.modelRuntime,
+        { signal: AbortSignal.timeout(15_000) }
+      );
+      result.session.setScopedModels(scoped);
+    } catch (error) {
+      diagnostics.push({
+        type: 'warning',
+        message: `Could not restore saved model scope: ${error instanceof Error ? error.message : String(error)}`,
+      });
+    }
+  }
   for (const error of result.extensionsResult.errors) {
     diagnostics.push({ type: 'error', message: `${error.path}: ${error.error}` });
   }
@@ -2721,9 +2900,29 @@ function commandContextActionsFor(
       residentStore.withGlobalLock(async () => {
         const sessionFile = session.sessionFile;
         if (!sessionFile) throw new Error('Cannot fork an in-memory session');
-        const forkPath = session.sessionManager.createBranchedSession(entryId);
-        if (!forkPath) throw new Error('Failed to create branched session');
-        const forkManager = sdkOrThrow().SessionManager.open(forkPath);
+        const selectedEntry = session.sessionManager.getEntry(entryId);
+        if (!selectedEntry) throw new Error('Invalid entry ID for forking');
+        const position = options?.position ?? 'before';
+        if (
+          position === 'before' &&
+          (selectedEntry.type !== 'message' || selectedEntry.message.role !== 'user')
+        ) {
+          throw new Error('Fork position "before" requires a user message entry');
+        }
+        const branchFrom = position === 'at' ? selectedEntry.id : selectedEntry.parentId;
+        const sdk = sdkOrThrow();
+        let forkManager;
+        if (branchFrom) {
+          const forkPath = session.sessionManager.createBranchedSession(branchFrom);
+          if (!forkPath) throw new Error('Failed to create branched session');
+          forkManager = sdk.SessionManager.open(forkPath);
+        } else {
+          forkManager = sdk.SessionManager.create(
+            session.sessionManager.getCwd() || cwd,
+            session.sessionManager.getSessionDir()
+          );
+          forkManager.newSession({ parentSession: sessionFile });
+        }
         const created = await createSdkSession(
           forkManager.getCwd() || session.sessionManager.getCwd() || cwd,
           forkManager,
@@ -3073,9 +3272,17 @@ function makeEventForwarder(sid: string, sess: AgentSession): EventForwarder {
           event.partialResult,
           args,
           toolCallId,
-          true
+          true,
+          toolsExpanded
         );
-        const wirePartialResult = boundMessagesForWire([event.partialResult])[0];
+        const rawPartial = boundMessagesForWire([event.partialResult])[0] as Record<
+          string,
+          unknown
+        >;
+        const partialDetails = toolDetailsForWire(event.toolName, rawPartial.details);
+        const wirePartialResult = { ...rawPartial };
+        delete wirePartialResult.details;
+        if (partialDetails) wirePartialResult.details = partialDetails;
         broadcastSdk({
           ...event,
           partialResult: wirePartialResult,
@@ -3109,9 +3316,15 @@ function makeEventForwarder(sid: string, sess: AgentSession): EventForwarder {
 
       // Normal completion/turn-end events must release argument payloads even
       // when no browser is connected.
-      if (event.type === 'agent_end') pendingToolArgs.clear();
+      if (event.type === 'agent_end') {
+        for (const toolCallId of pendingToolArgs.keys()) clearToolRendererState(toolCallId);
+        pendingToolArgs.clear();
+      }
       if (wsTransport.connectedClients === 0) {
-        if (event.type === 'tool_execution_end') pendingToolArgs.delete(event.toolCallId);
+        if (event.type === 'tool_execution_end') {
+          pendingToolArgs.delete(event.toolCallId);
+          clearToolRendererState(event.toolCallId);
+        }
         return;
       }
       if (event.type === 'message_update') {
@@ -3134,7 +3347,8 @@ function makeEventForwarder(sid: string, sess: AgentSession): EventForwarder {
           sess,
           event.toolName,
           event.args,
-          event.toolCallId
+          event.toolCallId,
+          toolsExpanded
         );
         broadcastSdk({
           ...event,
@@ -3152,18 +3366,38 @@ function makeEventForwarder(sid: string, sess: AgentSession): EventForwarder {
           event.result,
           args,
           event.toolCallId,
-          false
+          false,
+          toolsExpanded
         );
-        const wireResult = boundMessagesForWire([event.result])[0];
+        const rawResult = boundMessagesForWire([event.result])[0] as Record<string, unknown>;
+        const toolDetails = toolDetailsForWire(
+          event.toolName,
+          (rawResult.details as unknown) ?? undefined
+        );
+        const wireResult = { ...rawResult };
+        delete wireResult.details;
+        if (toolDetails) wireResult.details = toolDetails;
+        const rawDetails =
+          rawResult.details && typeof rawResult.details === 'object'
+            ? (rawResult.details as Record<string, unknown>)
+            : undefined;
+        const diff =
+          typeof rawResult.diff === 'string'
+            ? rawResult.diff
+            : typeof rawDetails?.diff === 'string'
+              ? rawDetails.diff
+              : undefined;
+        if (diff !== undefined) wireResult.diff = diff.slice(0, MAX_WIRE_BLOCK_CHARS);
         broadcastSdk({
           ...event,
           result: wireResult,
           sessionId: sid,
           ...(renderedResultHtml ? { renderedResultHtml } : {}),
         });
+        clearToolRendererState(event.toolCallId);
       } else if (event.type === 'agent_end') {
         const messages = Array.isArray(event.messages)
-          ? boundMessagesForWire(event.messages)
+          ? boundMessagesForWire(toolResultsForWire(event.messages))
           : event.messages;
         broadcastSdk({ ...event, messages, sessionId: sid });
       } else if (event.type === 'queue_update') {
@@ -3253,6 +3487,7 @@ function registerSession(
   };
   entry.sessionSummaryJson = JSON.stringify(serializeSession(liveSummary(sess, entry)));
   residentStore.register(entry);
+  footerProviderFor(sid).setCwd(cwdV);
   sessionCatalog.apply({ kind: 'upsert', session: liveSummary(sess, entry) });
   evictResidents();
 
@@ -3271,6 +3506,7 @@ function registerSession(
         entry.isRunning = false;
         entry.lastActivity = Date.now();
         entry.sessionSummaryDirty = true;
+        broadcastFooterData(sess);
         const finalMessage = event.messages.at(-1) as
           { role?: string; stopReason?: string } | undefined;
         if (!event.willRetry && finalMessage?.role === 'assistant') {
@@ -3502,23 +3738,57 @@ const compactionWatchdog = createCompactionWatchdog({
  * the session-switch critical path — the snapshot is fresh enough for the
  * picker, and the refresh result arrives a moment later.
  */
+
+function scopedModelsFor(sess: AgentSession) {
+  return sess.scopedModels.map(({ model, thinkingLevel }) => ({
+    provider: model.provider,
+    modelId: model.id,
+    ...(thinkingLevel ? { thinkingLevel } : {}),
+  }));
+}
+
+function modelStateFor(sess: AgentSession) {
+  return {
+    model: serializeModel(sess.model),
+    thinkingLevel: sess.thinkingLevel,
+    availableThinkingLevels: sess.getAvailableThinkingLevels(),
+    scopedModels: scopedModelsFor(sess),
+  };
+}
 function snapshotModels(sess: AgentSession): ModelInfo[] {
   const sessionId = sess.sessionId;
-  const snap = sess.modelRuntime
-    .getAvailableSnapshot()
-    .map(serializeModel)
-    .filter((m): m is ModelInfo => m !== null);
+  const serializeSnapshot = () => {
+    const availableIds = new Set(
+      sess.modelRuntime.getAvailableSnapshot().map((model) => `${model.provider}\0${model.id}`)
+    );
+    return sess.modelRuntime
+      .getModels()
+      .map((model) => {
+        const serialized = serializeModel(model);
+        if (!serialized) return null;
+        const available = availableIds.has(`${model.provider}\0${model.id}`);
+        return {
+          ...serialized,
+          available,
+          ...(!available && !sess.modelRuntime.hasConfiguredAuth(model.provider)
+            ? { authRequired: model.provider }
+            : {}),
+        };
+      })
+      .filter((model): model is ModelInfo & { available: boolean } => model !== null);
+  };
+  const snap = serializeSnapshot();
   sess.modelRuntime
     .getAvailable() // coalesced by the runtime; never blocks
     .then(() => {
       if (residentStore.get(sessionId)?.session !== sess || wsTransport.connectedClients === 0) {
         return;
       }
-      const fresh = sess.modelRuntime
-        .getAvailableSnapshot()
-        .map(serializeModel)
-        .filter((m): m is ModelInfo => m !== null);
-      broadcast({ type: 'available_models_changed', availableModels: fresh, sessionId });
+      broadcast({
+        type: 'available_models_changed',
+        availableModels: serializeSnapshot(),
+        sessionId,
+      });
     })
     .catch((err) => {
       log.error('[pifrontier] model availability refresh failed:', err);
@@ -3545,6 +3815,28 @@ function toolsPayloadFor(sess: AgentSession): {
 
 /** Broadcast a full session_loaded payload for `sess` — used on session switch
  *  and to refresh the client after a successful compaction. */
+function broadcastFooterData(sess: AgentSession | null): void {
+  if (!sess) return;
+  const provider = footerProviderFor(sess.sessionId);
+  const availableModels = sess.modelRuntime.getAvailableSnapshot();
+  provider.setAvailableProviderCount(new Set(availableModels.map((model) => model.provider)).size);
+  const stats = sess.getSessionStats();
+  broadcast({
+    type: 'footer_data',
+    sessionId: sess.sessionId,
+    gitBranch: provider.getGitBranch(),
+    availableProviderCount: provider.getAvailableProviderCount(),
+    stats: {
+      inputTokens: stats.tokens.input,
+      outputTokens: stats.tokens.output,
+      cacheReadTokens: stats.tokens.cacheRead,
+      cacheWriteTokens: stats.tokens.cacheWrite,
+      totalTokens: stats.tokens.total,
+      cost: stats.cost,
+    },
+  });
+}
+
 function broadcastSessionLoaded(
   sess: AgentSession,
   requestId?: string,
@@ -3561,8 +3853,7 @@ function broadcastSessionLoaded(
     sessionId: sess.sessionId,
     isStreaming: sess.isStreaming,
     ...(entry?.activeToolName ? { activeToolName: entry.activeToolName } : {}),
-    thinkingLevel: sess.thinkingLevel,
-    model: serializeModel(sess.model),
+    ...modelStateFor(sess),
     availableModels: snapshotModels(sess),
     messages: init.msgs,
     streamingMessage: streamingMessageForWire(sess),
@@ -3573,7 +3864,8 @@ function broadcastSessionLoaded(
     isCompacting: sess.isCompacting,
     autoCompactionEnabled: sess.autoCompactionEnabled,
     autoRetryEnabled: sess.autoRetryEnabled,
-    ...queuedStateFor(sess),
+    hideThinkingBlock: sess.settingsManager.getHideThinkingBlock(),
+    ...queuedSnapshotFor(sess),
     piVersion: PI_SDK_VERSION,
     uiVersion: UI_VERSION,
     sessionMode: sess.sessionManager.isPersisted() ? 'persisted' : 'in-memory',
@@ -3600,6 +3892,7 @@ function broadcastSessionLoaded(
   } else if (!requesterOnly) {
     broadcast(payload);
   }
+  broadcastFooterData(sess);
 }
 
 let _sessionListRefreshTimer: Timer | null = null;
@@ -3814,6 +4107,24 @@ const filesystemHandlerDependencies: FilesystemHandlerDependencies = {
   getCommandCompletions: (target, command, prefix) =>
     getCommandArgumentCompletions(target.session.extensionRunner, command, prefix),
   isInsideWorkspace,
+  isKnownToolOutputPath: (sessionId, resolvedPath) => {
+    const session = sessionId ? residentStore.get(sessionId)?.session : undefined;
+    if (!session) return false;
+    return session.messages.some((message) => {
+      if (!message || typeof message !== 'object') return false;
+      const record = message as unknown as Record<string, unknown>;
+      if (
+        typeof record.role !== 'string' ||
+        record.role.toLowerCase().replace('_', '') !== 'toolresult' ||
+        record.toolName !== 'bash' ||
+        !record.details ||
+        typeof record.details !== 'object'
+      )
+        return false;
+      const outputPath = (record.details as Record<string, unknown>).fullOutputPath;
+      return typeof outputPath === 'string' && resolve(outputPath) === resolvedPath;
+    });
+  },
   resolveUploadTarget: (requestedSessionId, focusedSessionId) => {
     const sessionId = requestedSessionId ?? focusedSessionId;
     const target = sessionId ? residentStore.get(sessionId) : undefined;
@@ -3989,6 +4300,7 @@ try {
           // The client may have disconnected while the SDK/model snapshot loaded —
           // don't send to (or install a timer on) a dead socket.
           if (ws.data.closed) return;
+          const builtinCommands = await getBuiltinSlashCommands();
 
           // Serialization/send of a pathological history must not kill the
           // connection — closing here would loop the client through reconnects.
@@ -4002,8 +4314,8 @@ try {
                 ...(residentStore.get(sess.sessionId)?.activeToolName
                   ? { activeToolName: residentStore.get(sess.sessionId)?.activeToolName }
                   : {}),
-                thinkingLevel: sess.thinkingLevel,
-                model: serializeModel(sess.model),
+                ...modelStateFor(sess),
+                builtinCommands,
                 availableModels,
                 messages,
                 messagesTruncated: truncated,
@@ -4015,8 +4327,9 @@ try {
                 isCompacting: sess.isCompacting,
                 autoCompactionEnabled: sess.autoCompactionEnabled,
                 autoRetryEnabled: sess.autoRetryEnabled,
+                hideThinkingBlock: sess.settingsManager.getHideThinkingBlock(),
                 sessionMode: sess.sessionManager.isPersisted() ? 'persisted' : 'in-memory',
-                ...queuedStateFor(sess),
+                ...queuedSnapshotFor(sess),
                 pushVapidKey: ensureVapidKeys().publicKey,
                 piVersion: PI_SDK_VERSION,
                 contextUsage: sess.getContextUsage(),
@@ -4045,6 +4358,7 @@ try {
               return;
             }
           }
+          broadcastFooterData(sess);
           // NOTE: connected already embeds commands via toolsPayloadFor, and
           // background bind completion publishes its own snapshot — no
           // standalone resend here (was duplicate traffic per connect).
@@ -4107,6 +4421,7 @@ try {
                 if (entry) {
                   entry.unread = false;
                   broadcastSessionRuntime(sessionId, entry);
+                  broadcastFooterData(entry.session);
                 }
               });
               break;
@@ -4300,6 +4615,34 @@ try {
               });
               break;
             }
+            case 'remove_queued': {
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
+              await residentStore.withSessionLock(target.session.sessionId, async () => {
+                const s = target.session;
+                if (msg.kind === 'deferred') {
+                  const queue = queuedRuns.get(s.sessionId) ?? [];
+                  if (Number.isInteger(msg.index) && msg.index >= 0 && msg.index < queue.length) {
+                    queue.splice(msg.index, 1);
+                    if (queue.length === 0) queuedRuns.delete(s.sessionId);
+                    else queuedRuns.set(s.sessionId, queue);
+                    broadcastQueueState(target);
+                  }
+                  return;
+                }
+                const queued = s.clearQueue();
+                const remaining = msg.kind === 'steer' ? queued.steering : queued.followUp;
+                if (Number.isInteger(msg.index) && msg.index >= 0 && msg.index < remaining.length) {
+                  remaining.splice(msg.index, 1);
+                }
+                // The SDK exposes whole-queue clear/read APIs, but no per-item
+                // removal; rebuild both ordered queues with its public enqueue API.
+                for (const text of queued.steering) await s.steer(text);
+                for (const text of queued.followUp) await s.followUp(text);
+                broadcastQueueState(target);
+              });
+              break;
+            }
             case 'abort': {
               const target = targetEntry(ws.data, msg, (data) => ws.send(data));
               if (!target) break;
@@ -4347,56 +4690,126 @@ try {
             case 'abort_compaction': {
               const target = targetEntry(ws.data, msg, (data) => ws.send(data));
               if (!target) break;
-              await residentStore.withSessionLock(target.session.sessionId, async () => {
-                target.session.abortCompaction();
-              });
+              target.session.abortCompaction();
               break;
             }
-            case 'abort_branch_summary':
+            case 'abort_branch_summary': {
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
+              target.session.abortBranchSummary();
+              break;
+            }
             case 'abort_retry': {
               const target = targetEntry(ws.data, msg, (data) => ws.send(data));
               if (!target) break;
-              await residentStore.withSessionLock(target.session.sessionId, async () => {
-                await target.session.abort();
+              void target.session.abort().catch((err) => {
+                log.error('[pifrontier] abort retry error:', err);
               });
               break;
             }
 
-            case 'set_thinking_level': {
+            case 'set_thinking_level':
+            case 'cycle_thinking_level': {
               const target = targetEntry(ws.data, msg, (data) => ws.send(data));
               if (!target) break;
               await residentStore.withSessionLock(target.session.sessionId, async () => {
-                target.session.setThinkingLevel(
-                  msg.level as Parameters<AgentSession['setThinkingLevel']>[0]
-                );
-              });
-              break;
-            }
-
-            case 'set_model': {
-              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
-              if (!target) break;
-              await residentStore.withSessionLock(target.session.sessionId, async () => {
-                const ownerSession = target.session;
-                const model = ownerSession.modelRuntime.getModel(msg.provider, msg.modelId);
-                if (!model) {
-                  log.warn(
-                    `[pifrontier] set_model: model not found: ${msg.provider}/${msg.modelId}`
+                const session = target.session;
+                if (msg.type === 'cycle_thinking_level') session.cycleThinkingLevel();
+                else {
+                  session.setThinkingLevel(
+                    msg.level as Parameters<AgentSession['setThinkingLevel']>[0]
                   );
-                  return;
                 }
+                broadcast({
+                  type: 'thinking_level_changed',
+                  level: session.thinkingLevel,
+                  availableThinkingLevels: session.getAvailableThinkingLevels(),
+                  ...stampOwner(session.sessionId),
+                });
+              });
+              break;
+            }
+
+            case 'set_model':
+            case 'cycle_model': {
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
+              await residentStore.withSessionLock(target.session.sessionId, async () => {
+                const session = target.session;
                 try {
-                  await ownerSession.setModel(model);
-                  if (residentStore.get(ownerSession.sessionId)?.session !== ownerSession) return;
+                  if (msg.type === 'cycle_model') await session.cycleModel(msg.direction);
+                  else {
+                    const model = session.modelRuntime.getModel(msg.provider, msg.modelId);
+                    if (!model) {
+                      const authRequired = session.modelRuntime.hasConfiguredAuth(msg.provider)
+                        ? ''
+                        : ` — sign in to provider ${msg.provider}`;
+                      sendSlashResult(
+                        ws,
+                        'set_model',
+                        `Model ${msg.modelId} is not available${authRequired}.`,
+                        'error'
+                      );
+                      return;
+                    }
+                    await session.setModel(model);
+                  }
+                  if (residentStore.get(session.sessionId)?.session !== session) return;
                   broadcast({
                     type: 'model_changed',
-                    model: serializeModel(model),
-                    ...stampOwner(ownerSession.sessionId),
+                    ...modelStateFor(session),
+                    ...stampOwner(session.sessionId),
                   });
                 } catch (err) {
-                  log.error('[pifrontier] set_model error:', err);
-                  sendSlashResult(ws, 'set_model', `Failed to switch model: ${err}`, 'error');
+                  log.error(`[pifrontier] ${msg.type} error:`, err);
+                  sendSlashResult(ws, msg.type, `Failed to switch model: ${err}`, 'error');
                 }
+              });
+              break;
+            }
+
+            case 'set_scoped_models': {
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
+              await residentStore.withSessionLock(target.session.sessionId, async () => {
+                const session = target.session;
+                const available = session.modelRuntime.getAvailableSnapshot();
+                const availableKeys = new Set(
+                  available.map((model) => `${model.provider}/${model.id}`)
+                );
+                const selected = msg.models.filter((item) =>
+                  availableKeys.has(`${item.provider}/${item.modelId}`)
+                );
+                const allSelected =
+                  selected.length > 0 &&
+                  available.length > 0 &&
+                  selected.every((item) => !item.thinkingLevel) &&
+                  available.every((model) =>
+                    selected.some(
+                      (item) => item.provider === model.provider && item.modelId === model.id
+                    )
+                  );
+                const patterns = selected.map(
+                  (item) =>
+                    `${item.provider}/${item.modelId}${item.thinkingLevel ? `:${item.thinkingLevel}` : ''}`
+                );
+                const { scopedModels: resolvedScope } =
+                  patterns.length === 0 || allSelected
+                    ? { scopedModels: [] }
+                    : await (
+                        await getSDK()
+                      ).resolveModelScopeWithDiagnostics(patterns, session.modelRuntime, {
+                        signal: AbortSignal.timeout(15_000),
+                      });
+                session.setScopedModels(resolvedScope);
+                session.settingsManager.setEnabledModels(
+                  allSelected || patterns.length === 0 ? undefined : patterns
+                );
+                broadcast({
+                  type: 'model_changed',
+                  ...modelStateFor(session),
+                  ...stampOwner(session.sessionId),
+                });
               });
               break;
             }
@@ -4611,6 +5024,50 @@ try {
                   sessionId: target.session.sessionId,
                 })
               );
+              break;
+            }
+            case 'provider_login': {
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
+              const session = target.session;
+              startProviderLogin({
+                socketOwner: ws.data,
+                socketSend: (message) => {
+                  if (!ws.data.closed) ws.send(JSON.stringify(message));
+                },
+                runtime: session.modelRuntime,
+                provider: msg.provider,
+                authType: msg.authType,
+                sessionId: session.sessionId,
+                mutate: (providerId, operation) =>
+                  mutateProviderAuth(
+                    providerId,
+                    session.sessionId,
+                    session.modelRuntime,
+                    operation,
+                    true
+                  ),
+                onTerminal: async (status, providerId) => {
+                  if (status === 'succeeded' && providerId && !ws.data.closed) {
+                    ws.send(
+                      JSON.stringify({
+                        type: 'providers_list',
+                        providers: await getProviders(session.modelRuntime),
+                        sessionId: session.sessionId,
+                      })
+                    );
+                    log.info(`[pifrontier] Provider login completed: ${providerId}`);
+                  }
+                },
+              });
+              break;
+            }
+            case 'provider_login_response': {
+              respondToProviderLoginPrompt(msg.loginId, msg.promptId, msg.value, msg.cancelled);
+              break;
+            }
+            case 'provider_login_cancel': {
+              cancelProviderLogin(msg.loginId);
               break;
             }
             case 'refresh_models': {
@@ -4855,7 +5312,7 @@ try {
                 // The SDK's compaction watchdog bounds this call.
                 const t0 = Date.now();
                 try {
-                  const result = await sess.compact();
+                  const result = await sess.compact(msg.customInstructions?.trim() || undefined);
                   log.info(
                     `[pifrontier] compact: finished in ${Date.now() - t0}ms` +
                       `${result ? ` (tokensBefore=${result.tokensBefore}, after=${result.estimatedTokensAfter})` : ''}`
@@ -4867,20 +5324,97 @@ try {
               break;
             }
 
+            case 'get_sdk_settings': {
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
+              await residentStore.withSessionLock(target.session.sessionId, async () => {
+                ws.send(JSON.stringify(getSdkSettings(target.session.settingsManager)));
+              });
+              break;
+            }
+            case 'set_sdk_setting': {
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
+              await residentStore.withSessionLock(target.session.sessionId, async () => {
+                const result = await setSdkSetting(
+                  target.session,
+                  msg.key,
+                  msg.value,
+                  msg.scope ?? 'global'
+                );
+                ws.send(
+                  JSON.stringify({
+                    type: 'sdk_setting_result',
+                    key: msg.key,
+                    ...result,
+                  })
+                );
+                if (!result.ok) return;
+                for (const resident of residentStore.values()) {
+                  if (resident === target) continue;
+                  if (msg.key === 'steeringMode')
+                    resident.session.setSteeringMode(msg.value as 'all' | 'one-at-a-time');
+                  else if (msg.key === 'followUpMode')
+                    resident.session.setFollowUpMode(msg.value as 'all' | 'one-at-a-time');
+                  else if (msg.key === 'compaction.enabled')
+                    resident.session.setAutoCompactionEnabled(msg.value as boolean);
+                  else if (msg.key === 'retry.enabled')
+                    resident.session.setAutoRetryEnabled(msg.value as boolean);
+                }
+              });
+              break;
+            }
             case 'set_auto_compaction': {
               const target = targetEntry(ws.data, msg, (data) => ws.send(data));
               if (!target) break;
-              target.session.setAutoCompactionEnabled(msg.enabled);
+              for (const resident of residentStore.values())
+                resident.session.setAutoCompactionEnabled(msg.enabled);
               break;
             }
 
             case 'set_auto_retry': {
               const target = targetEntry(ws.data, msg, (data) => ws.send(data));
               if (!target) break;
-              target.session.setAutoRetryEnabled(msg.enabled);
+              for (const resident of residentStore.values())
+                resident.session.setAutoRetryEnabled(msg.enabled);
               break;
             }
 
+            case 'import_session': {
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
+              const session = target.session;
+              const name = basename(String(msg.name ?? 'session.jsonl')).replace(
+                /[^a-zA-Z0-9._-]/g,
+                '_'
+              );
+              const importPath = join(
+                session.sessionManager.getSessionDir(),
+                `${Date.now()}-${crypto.randomUUID()}-${name.endsWith('.jsonl') ? name : 'session.jsonl'}`
+              );
+              try {
+                await writeFile(importPath, String(msg.content ?? ''), { flag: 'wx' });
+                const manager = _sdk!.SessionManager.open(
+                  importPath,
+                  session.sessionManager.getSessionDir(),
+                  session.sessionManager.getCwd() || target.cwd
+                );
+                const imported = await createSdkSession(
+                  manager.getCwd() || target.cwd,
+                  manager,
+                  'resume',
+                  session.sessionFile
+                );
+                await residentStore.withGlobalLock(() =>
+                  setActiveSession(imported.session, manager.getCwd() || target.cwd, imported)
+                );
+                sendSlashResult(ws, 'import', `Imported session “${name}”.`);
+              } catch (err) {
+                await rm(importPath, { force: true });
+                sendSlashResult(ws, 'import', `Could not import session: ${String(err)}`, 'error');
+              }
+              break;
+            }
             case 'run_builtin': {
               const target = targetEntry(ws.data, msg, (data) => ws.send(data));
               if (!target) break;
@@ -4909,6 +5443,16 @@ try {
               }
               try {
                 switch (command) {
+                  case 'bug_preview': {
+                    const report = await prepareBugReport(session, args);
+                    sendSlashResult(ws, 'bug_preview', JSON.stringify(report));
+                    break;
+                  }
+                  case 'bug_confirm': {
+                    const report = await uploadPreparedBugReport(args);
+                    sendSlashResult(ws, 'bug', `Bug report uploaded. Report ID: ${report.id}`);
+                    break;
+                  }
                   case 'reload': {
                     const reloadResult = await reloadSessionHost(session.sessionId, session);
                     if (reloadResult === 'deferred') {
@@ -4949,103 +5493,35 @@ try {
                   case 'login': {
                     const runtime = session.modelRuntime;
                     const providerInfos = await getProviders(runtime);
-                    const providerRef = args?.trim().toLowerCase();
-                    const loginCandidates = runtime.getProviders().filter((provider) => {
-                      if (!provider.auth.oauth && !provider.auth.apiKey) return false;
-                      if (providerRef) {
-                        return (
-                          provider.id.toLowerCase() === providerRef ||
-                          provider.name.toLowerCase() === providerRef
+                    startProviderLogin({
+                      socketOwner: ws.data,
+                      socketSend: (message) => {
+                        if (!ws.data.closed) ws.send(JSON.stringify(message));
+                      },
+                      runtime,
+                      provider: args || undefined,
+                      authType: undefined,
+                      sessionId: session.sessionId,
+                      onlyUnconfigured: !args,
+                      isConfigured: (providerId) =>
+                        providerInfos.find((candidate) => candidate.id === providerId)
+                          ?.configured ?? false,
+                      mutate: (providerId, operation) =>
+                        mutateProviderAuth(providerId, session.sessionId, runtime, operation, true),
+                      onTerminal: (status, providerId) => {
+                        if (ws.data.closed) return;
+                        sendSlashResult(
+                          ws,
+                          command,
+                          status === 'succeeded'
+                            ? `Logged in to ${providerId}.`
+                            : status === 'cancelled'
+                              ? 'Login cancelled.'
+                              : 'Provider login failed.',
+                          status === 'failed' ? 'error' : 'info'
                         );
-                      }
-                      const info = providerInfos.find((candidate) => candidate.id === provider.id);
-                      return !info?.configured;
+                      },
                     });
-
-                    if (loginCandidates.length === 0) {
-                      sendSlashResult(
-                        ws,
-                        command,
-                        providerRef
-                          ? `Unknown provider or no login method: ${args}`
-                          : 'All providers are already configured.',
-                        providerRef ? 'error' : 'info'
-                      );
-                      break;
-                    }
-
-                    let loginProvider = loginCandidates[0];
-                    if (!providerRef) {
-                      const labels = loginCandidates.map(
-                        (provider) => `${provider.name} (${provider.id})`
-                      );
-                      const selected = await uiContext.select(
-                        'Select a provider to log in',
-                        labels,
-                        undefined,
-                        session.sessionId
-                      );
-                      if (!selected) break;
-                      const index = labels.indexOf(selected);
-                      if (index === -1) break;
-                      loginProvider = loginCandidates[index];
-                    }
-
-                    const authChoices: Array<{ type: 'oauth' | 'api_key'; label: string }> = [];
-                    if (loginProvider.auth.oauth) {
-                      authChoices.push({
-                        type: 'oauth',
-                        label: loginProvider.auth.oauth.loginLabel ?? 'Sign in with account',
-                      });
-                    }
-                    if (loginProvider.auth.apiKey) {
-                      authChoices.push({ type: 'api_key', label: 'Sign in with API key' });
-                    }
-                    if (authChoices.length === 0) break;
-
-                    let authType = authChoices[0].type;
-                    if (authChoices.length > 1) {
-                      const selected = await uiContext.select(
-                        `Select authentication method for ${loginProvider.name}`,
-                        authChoices.map((choice) => choice.label),
-                        undefined,
-                        session.sessionId
-                      );
-                      if (!selected) break;
-                      const choice = authChoices.find((candidate) => candidate.label === selected);
-                      if (!choice) break;
-                      authType = choice.type;
-                    }
-
-                    if (authType === 'api_key' && !loginProvider.auth.apiKey?.login) {
-                      sendSlashResult(
-                        ws,
-                        command,
-                        `${loginProvider.name} is configured outside pi.`,
-                        'warning'
-                      );
-                      break;
-                    }
-
-                    try {
-                      const authOwnerSession = session;
-                      await mutateProviderAuth(
-                        loginProvider.id,
-                        authOwnerSession.sessionId,
-                        authOwnerSession.modelRuntime,
-                        (providerRuntime) =>
-                          providerRuntime
-                            .login(
-                              loginProvider.id,
-                              authType,
-                              browserAuthInteraction(authOwnerSession.sessionId)
-                            )
-                            .then(() => undefined)
-                      );
-                      sendSlashResult(ws, command, `Logged in to ${loginProvider.name}.`);
-                    } catch (err) {
-                      sendSlashResult(ws, command, String(err), 'error');
-                    }
                     break;
                   }
                   case 'logout': {
@@ -5177,24 +5653,61 @@ try {
                     break;
                   }
                   case 'share': {
-                    const out = await session.exportToHtml();
-                    sendSlashResult(
-                      ws,
-                      command,
-                      `Created a local share/export at ${out}. GitHub gist sharing is not configured in pi-ui.`
-                    );
+                    const tempDir = await mkdtemp(join(tmpdir(), 'pi-ui-share-'));
+                    try {
+                      const htmlPath = join(tempDir, 'session.html');
+                      await session.exportToHtml(htmlPath);
+                      let fallbackReason = 'GitHub CLI (gh) is not installed.';
+                      let uploadedUrl: string | undefined;
+                      try {
+                        const auth = Bun.spawnSync(['gh', 'auth', 'status'], {
+                          stdout: 'ignore',
+                          stderr: 'ignore',
+                        });
+                        if (auth.success) {
+                          const proc = Bun.spawn(['gh', 'gist', 'create', '--secret', htmlPath], {
+                            stdout: 'pipe',
+                            stderr: 'pipe',
+                          });
+                          const [stdout, stderr, status] = await Promise.all([
+                            new Response(proc.stdout).text(),
+                            new Response(proc.stderr).text(),
+                            proc.exited,
+                          ]);
+                          if (status === 0) uploadedUrl = stdout.trim();
+                          else fallbackReason = stderr.trim() || 'GitHub gist creation failed.';
+                        } else {
+                          fallbackReason = "GitHub CLI is not authenticated; run 'gh auth login'.";
+                        }
+                      } catch {
+                        fallbackReason = 'GitHub CLI (gh) is not installed.';
+                      }
+                      if (uploadedUrl) {
+                        sendSlashResult(ws, command, `Created secret GitHub gist: ${uploadedUrl}`);
+                      } else {
+                        const out = await session.exportToHtml();
+                        sendSlashResult(
+                          ws,
+                          command,
+                          `${fallbackReason} Created a local HTML export instead at ${out}; it was not shared online.`,
+                          'warning'
+                        );
+                      }
+                    } finally {
+                      await rm(tempDir, { recursive: true, force: true });
+                    }
                     break;
                   }
                   case 'changelog': {
-                    const { readFile } = await import('node:fs/promises');
-                    const text = await readFile(
-                      join(
-                        process.cwd(),
-                        'node_modules/@earendil-works/pi-coding-agent/CHANGELOG.md'
-                      ),
-                      'utf8'
-                    );
-                    sendSlashResult(ws, command, text.split('\n').slice(0, 80).join('\n'));
+                    const entries = await getLatestChangelogEntries();
+                    const markdown = entries
+                      .map((entry: { version: string; content: string }) =>
+                        entry.content.startsWith('## ')
+                          ? entry.content
+                          : `## ${entry.version}\n\n${entry.content}`
+                      )
+                      .join('\n\n');
+                    sendSlashResult(ws, command, markdown || 'No changelog entries are available.');
                     break;
                   }
                   case 'name': {
@@ -5350,16 +5863,29 @@ try {
                 const treeBudget: TreeSerializationBudget = {
                   remaining: MAX_SESSION_TREE_NODES,
                 };
+                const currentPath = new Set(
+                  sess.sessionManager.getBranch().map((entry) => entry.id)
+                );
+                const currentLeafId = sess.sessionManager.getLeafId();
                 const serialized: TreeNode[] = [];
                 for (const node of tree) {
                   if (treeBudget.remaining <= 0) break;
-                  serialized.push(serializeTreeNode(node as RawTreeNode, 0, treeBudget));
+                  serialized.push(
+                    serializeTreeNode(
+                      node as RawTreeNode,
+                      0,
+                      treeBudget,
+                      currentPath,
+                      currentLeafId
+                    )
+                  );
                 }
                 ws.send(
                   JSON.stringify({
                     type: 'session_tree',
                     tree: serialized,
                     sessionId: sess.sessionId,
+                    branchSummarySkipPrompt: sess.settingsManager.getBranchSummarySkipPrompt(),
                   })
                 );
               } catch (err) {
@@ -5372,6 +5898,113 @@ try {
                   })
                 );
               }
+              break;
+            }
+            case 'navigate_tree': {
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
+              if (target.session.isStreaming) {
+                ws.send(
+                  JSON.stringify({
+                    type: 'tree_navigated',
+                    sessionId: target.session.sessionId,
+                    ok: false,
+                    error: 'Cannot navigate the session tree while the agent is streaming.',
+                  })
+                );
+                break;
+              }
+              await residentStore.withSessionLock(target.session.sessionId, async () => {
+                const session = target.session;
+                const sessionId = session.sessionId;
+                try {
+                  const result = await navigateTree(session, {
+                    entryId: msg.entryId,
+                    summarize: msg.summarize,
+                    customInstructions: msg.customInstructions,
+                    label: msg.label,
+                  });
+                  refreshSessionSummary(session);
+                  if (result.cancelled || result.aborted) {
+                    ws.send(
+                      JSON.stringify({
+                        type: 'tree_navigated',
+                        sessionId,
+                        ok: false,
+                        error: 'Branch summary was cancelled.',
+                      })
+                    );
+                    return;
+                  }
+                  broadcastSessionLoaded(session);
+                  ws.send(
+                    JSON.stringify({
+                      type: 'tree_navigated',
+                      sessionId,
+                      ok: true,
+                      ...(result.editorText !== undefined ? { editorText: result.editorText } : {}),
+                    })
+                  );
+                } catch (err) {
+                  ws.send(
+                    JSON.stringify({
+                      type: 'tree_navigated',
+                      sessionId,
+                      ok: false,
+                      error: err instanceof Error ? err.message : String(err),
+                    })
+                  );
+                }
+              });
+              break;
+            }
+            case 'set_entry_label': {
+              const target = targetEntry(ws.data, msg, (data) => ws.send(data));
+              if (!target) break;
+              await residentStore.withSessionLock(target.session.sessionId, async () => {
+                const session = target.session;
+                try {
+                  setEntryLabel(session, msg.entryId, msg.label);
+                  const tree = session.sessionManager.getTree();
+                  const treeBudget: TreeSerializationBudget = {
+                    remaining: MAX_SESSION_TREE_NODES,
+                  };
+                  const currentPath = new Set(
+                    session.sessionManager.getBranch().map((entry) => entry.id)
+                  );
+                  const currentLeafId = session.sessionManager.getLeafId();
+                  const serialized: TreeNode[] = [];
+                  for (const node of tree) {
+                    if (treeBudget.remaining <= 0) break;
+                    serialized.push(
+                      serializeTreeNode(
+                        node as RawTreeNode,
+                        0,
+                        treeBudget,
+                        currentPath,
+                        currentLeafId
+                      )
+                    );
+                  }
+                  ws.send(
+                    JSON.stringify({
+                      type: 'session_tree',
+                      tree: serialized,
+                      sessionId: session.sessionId,
+                      branchSummarySkipPrompt: session.settingsManager.getBranchSummarySkipPrompt(),
+                    })
+                  );
+                } catch (err) {
+                  ws.send(
+                    JSON.stringify({
+                      type: 'tree_navigated',
+                      sessionId: session.sessionId,
+                      ok: false,
+                      error: err instanceof Error ? err.message : String(err),
+                    })
+                  );
+                }
+              });
               break;
             }
             case 'get_fork_points': {
@@ -5456,29 +6089,12 @@ try {
               if (!target) break;
               try {
                 const sess = target.session;
-                const { skills } = sess.resourceLoader.getSkills();
-                const { prompts } = sess.resourceLoader.getPrompts();
-                const skillSummaries: SkillSummary[] = skills.map((skill) => ({
-                  name: skill.name,
-                  description: skill.description,
-                  scope: skill.sourceInfo.scope,
-                  isBuiltin: skill.sourceInfo.origin === 'package',
-                  source: skill.sourceInfo.source,
-                }));
-                const promptSummaries: PromptSummary[] = prompts.map((prompt) => ({
-                  name: prompt.name,
-                  description: prompt.description,
-                  argumentHint: prompt.argumentHint,
-                  scope: prompt.sourceInfo.scope,
-                  isBuiltin: prompt.sourceInfo.origin === 'package',
-                  source: prompt.sourceInfo.source,
-                }));
+                const summary = summarizeResources(sess.resourceLoader);
                 ws.send(
                   JSON.stringify({
                     type: 'resources_list',
                     sessionId: sess.sessionId,
-                    skills: skillSummaries,
-                    prompts: promptSummaries,
+                    ...summary,
                   })
                 );
               } catch (err) {
@@ -6196,6 +6812,7 @@ try {
       },
 
       close(ws) {
+        cancelProviderLoginsForSocket(ws.data);
         wsTransport.onClose(ws);
       },
 
@@ -6224,6 +6841,15 @@ broadcastAny = (payload) => {
 };
 broadcast = (payload) => broadcastAny(payload);
 broadcastSdk = (payload) => broadcastAny(payload);
+setToolRendererUpdateHandler((sessionId, toolCallId, kind, html) => {
+  broadcast({
+    type: 'tool_renderer_update',
+    sessionId,
+    toolCallId,
+    kind,
+    ...(kind === 'call' ? { renderedCallHtml: html } : { renderedResultHtml: html }),
+  });
+});
 // Hydrate session summaries from the previous run — sidebar loads become
 // stat-calls-only; files are fully read at most once per change.
 initSessionScanCache(join(homedir(), '.pi', 'agent', 'pi-ui-session-scan.json'));

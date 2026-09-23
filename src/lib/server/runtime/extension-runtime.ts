@@ -10,6 +10,8 @@ export interface PendingRequest {
   requestPayload: Record<string, unknown>;
   resolve: (response: Record<string, unknown>) => void;
   timeoutId?: RuntimeTimer;
+  abortSignal?: AbortSignal;
+  abortHandler?: () => void;
 }
 
 type DisposableComponent = Record<string, unknown> & {
@@ -48,6 +50,8 @@ export interface SessionUiState {
   hiddenThinkingLabel: string;
   header: string;
   footer: string;
+  headerTree?: ParsedComponent;
+  footerTree?: ParsedComponent;
   editorComponent?: ParsedComponent;
   title: string;
   editorText: string;
@@ -178,14 +182,30 @@ export class ExtensionRuntime {
     id: string,
     requestPayload: Record<string, unknown>,
     parseResponse: (response: Record<string, unknown>) => T,
-    owner: string | null = null
+    owner: string | null = null,
+    options?: { timeout?: number; signal?: AbortSignal }
   ): Promise<T> {
     return new Promise<T>((resolve) => {
       const ui = this.uiStateFor(owner);
+      const signal = options?.signal;
+      if (signal?.aborted) {
+        this.hooks.broadcast({
+          type: 'extension_ui_cancel',
+          id,
+          ...(owner ? { sessionId: owner } : {}),
+          reason: 'aborted',
+        });
+        resolve(parseResponse({ cancelled: true }));
+        return;
+      }
       const entry: PendingRequest = {
         requestPayload,
+        abortSignal: signal,
         resolve: (response) => {
-          if (entry.timeoutId) clearTimeout(entry.timeoutId);
+          clearTimeout(entry.timeoutId);
+          if (entry.abortSignal && entry.abortHandler) {
+            entry.abortSignal.removeEventListener('abort', entry.abortHandler);
+          }
           ui.pendingDialogs.delete(id);
           if (owner) this.hooks.scheduleSessionRuntimeBroadcast?.(owner);
           this.finalizeExtensionResponse(id);
@@ -202,9 +222,20 @@ export class ExtensionRuntime {
         ...requestPayload,
         ...this.stampOwner(owner),
       });
-      entry.timeoutId = setTimeout(() => {
-        if (ui.pendingDialogs.get(id) === entry) entry.resolve({ cancelled: true });
-      }, this.dialogTimeoutMs);
+      const cancel = (reason: 'timeout' | 'aborted') => {
+        if (ui.pendingDialogs.get(id) !== entry) return;
+        this.hooks.broadcast({
+          type: 'extension_ui_cancel',
+          id,
+          ...(owner ? { sessionId: owner } : {}),
+          reason,
+        });
+        entry.resolve({ cancelled: true });
+      };
+      entry.abortHandler = () => cancel('aborted');
+      signal?.addEventListener('abort', entry.abortHandler, { once: true });
+      const timeout = options?.timeout ?? this.dialogTimeoutMs;
+      entry.timeoutId = setTimeout(() => cancel('timeout'), Math.max(0, timeout));
     });
   }
 
@@ -396,6 +427,8 @@ export class ExtensionRuntime {
       hiddenThinkingLabel: ui.hiddenThinkingLabel,
       ...(ui.header ? { header: ui.header } : {}),
       ...(ui.footer ? { footer: ui.footer } : {}),
+      ...(ui.headerTree ? { headerTree: ui.headerTree } : {}),
+      ...(ui.footerTree ? { footerTree: ui.footerTree } : {}),
       ...(ui.editorComponent ? { editorComponent: ui.editorComponent } : {}),
       ...(ui.title !== 'pi UI' ? { title: ui.title } : {}),
       widgets: this.widgetsForSession(sid),

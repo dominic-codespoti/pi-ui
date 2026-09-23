@@ -73,6 +73,13 @@
       >
       <input
         type="search"
+        name="tools-filter"
+        autocomplete="off"
+        spellcheck="false"
+        data-1p-ignore
+        data-lpignore="true"
+        data-bwignore
+        data-form-type="other"
         placeholder="filter tools…"
         bind:value={toolFilter}
         class="focus-ring w-full bg-transparent outline-none text-sm text-base-content/80 placeholder-base-content/20 pl-6 transition-all duration-150 focus:placeholder-base-content/35"

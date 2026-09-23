@@ -31,6 +31,14 @@ export function serializeModel(model: Model<Api> | undefined | null): ModelInfo 
     name: model.name,
     reasoning: model.reasoning,
     contextWindow: model.contextWindow,
+    input: model.input,
+    cost: {
+      input: model.cost.input,
+      output: model.cost.output,
+      cacheRead: model.cost.cacheRead,
+      cacheWrite: model.cost.cacheWrite,
+    },
+    maxTokens: model.maxTokens,
     thinkingLevelMap: model.thinkingLevelMap,
   };
 }
@@ -46,6 +54,10 @@ export function serializeSession(s: SessionSummaryInput): SessionSummary {
     modified: s.modified instanceof Date ? s.modified.getTime() : s.modified,
     messageCount: rawCount,
     turns: s.turns ?? (rawCount > 0 ? undefined : 0),
+    lastModel: s.lastModel,
+    totalCost: s.totalCost,
+    totalTokens: s.totalTokens,
+    labelCount: s.labelCount,
     parentSession: s.parentSessionPath,
     firstMessage: s.firstMessage,
   };

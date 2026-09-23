@@ -53,17 +53,24 @@ export type ComposerSlashRoute =
   | 'model'
   | 'copy'
   | 'hotkeys'
+  | 'settings'
+  | 'thinking'
+  | 'scoped-models'
+  | 'trust'
   | 'reload'
   | 'login'
   | 'logout'
   | 'session'
   | 'clone'
   | 'export'
+  | 'import'
+  | 'bug'
   | 'share'
   | 'changelog'
   | 'name'
   | 'tree'
   | 'extension'
+  | 'shell'
   | 'unknown';
 
 export type ComposerEffect =
@@ -74,6 +81,10 @@ export type ComposerEffect =
   | { type: 'open_model_panel' }
   | { type: 'copy_last_assistant' }
   | { type: 'show_hotkeys' }
+  | { type: 'open_settings'; section?: 'session' | 'shortcuts' }
+  | { type: 'open_scoped_models' }
+  | { type: 'open_import' }
+  | { type: 'confirm_share'; sessionId?: string }
   | { type: 'open_tree_modal' };
 
 export type ComposerUserMessage = {
@@ -146,16 +157,23 @@ const BUILTIN_COMMANDS: Record<string, true> = {
   model: true,
   copy: true,
   hotkeys: true,
+  settings: true,
+  thinking: true,
+  'scoped-models': true,
+  trust: true,
   reload: true,
   login: true,
   logout: true,
   session: true,
   clone: true,
   export: true,
+  bug: true,
+  import: true,
   share: true,
   changelog: true,
   name: true,
   tree: true,
+  shell: true,
 };
 
 const defaultId = (): string => crypto.randomUUID();
@@ -572,6 +590,47 @@ export class ComposerController {
         case 'model':
           effectAccepted = this.effect({ type: 'open_model_panel' }, effects);
           break;
+        case 'settings':
+          effectAccepted = this.effect({ type: 'open_settings' }, effects);
+          break;
+        case 'trust':
+          effectAccepted = this.effect({ type: 'open_settings', section: 'session' }, effects);
+          break;
+        case 'scoped-models':
+          effectAccepted = this.effect({ type: 'open_scoped_models' }, effects);
+          break;
+        case 'thinking':
+          message = classification.args
+            ? {
+                type: 'set_thinking_level',
+                ...(this.context.sessionId ? { sessionId: this.context.sessionId } : {}),
+                level: classification.args,
+              }
+            : {
+                type: 'cycle_thinking_level',
+                ...(this.context.sessionId ? { sessionId: this.context.sessionId } : {}),
+              };
+          break;
+        case 'bug':
+          message = {
+            type: 'run_builtin',
+            ...(this.context.sessionId ? { sessionId: this.context.sessionId } : {}),
+            command: 'bug_preview',
+            ...(classification.args ? { args: classification.args } : {}),
+          };
+          break;
+        case 'import':
+          effectAccepted = this.effect({ type: 'open_import' }, effects);
+          break;
+        case 'share':
+          effectAccepted = this.effect(
+            {
+              type: 'confirm_share',
+              ...(this.context.sessionId ? { sessionId: this.context.sessionId } : {}),
+            },
+            effects
+          );
+          break;
         case 'copy':
           effectAccepted = this.effect({ type: 'copy_last_assistant' }, effects);
           break;
@@ -585,6 +644,7 @@ export class ComposerController {
           message = {
             type: 'compact',
             ...(this.context.sessionId ? { sessionId: this.context.sessionId } : {}),
+            ...(classification.args ? { customInstructions: classification.args } : {}),
           };
           break;
         case 'extension':

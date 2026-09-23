@@ -32,10 +32,22 @@ export const ModelInfoSchema = v.looseObject({
   id: v.string(),
   name: v.string(),
   reasoning: v.boolean(),
+  available: v.optional(v.boolean()),
+  authRequired: v.optional(v.string()),
   contextWindow: v.optional(v.number()),
+  input: v.optional(v.array(v.union([v.literal('text'), v.literal('image')]))),
+  cost: v.optional(
+    v.looseObject({
+      input: v.number(),
+      output: v.number(),
+      cacheRead: v.number(),
+      cacheWrite: v.number(),
+    })
+  ),
+  maxTokens: v.optional(v.number()),
   thinkingLevelMap: v.optional(v.record(v.string(), v.nullable(v.string()))),
+  isDefault: v.optional(v.boolean()),
 });
-
 export const ContextUsageSchema = v.looseObject({
   tokens: v.nullable(v.number()),
   contextWindow: v.number(),
@@ -53,6 +65,10 @@ export const SessionSummarySchema = v.looseObject({
   turns: v.optional(v.number()),
   parentSession: v.optional(v.string()),
   firstMessage: v.string(),
+  lastModel: v.optional(v.looseObject({ provider: v.string(), modelId: v.string() })),
+  totalCost: v.optional(v.number()),
+  totalTokens: v.optional(v.number()),
+  labelCount: v.optional(v.number()),
 });
 
 export const ProjectInfoSchema = v.looseObject({
@@ -62,6 +78,7 @@ export const ProjectInfoSchema = v.looseObject({
   exists: v.boolean(),
   registered: v.boolean(),
   sessionCount: v.number(),
+  gitBranch: v.optional(v.nullable(v.string())),
   lastActivity: v.number(),
 });
 
@@ -70,7 +87,14 @@ export const ProviderInfoSchema = v.looseObject({
   name: v.string(),
   configured: v.boolean(),
   source: v.optional(v.string()),
+  oauthLoginLabel: v.optional(v.string()),
+  apiKeyLogin: v.optional(v.boolean()),
+  oauthAuthenticated: v.optional(v.boolean()),
   modelCount: v.number(),
+  authLabel: v.optional(v.string()),
+  subscription: v.optional(v.boolean()),
+  oauthSubscription: v.optional(v.boolean()),
+  baseUrl: v.optional(v.string()),
 });
 
 export const SkillSummarySchema = v.looseObject({
@@ -79,6 +103,8 @@ export const SkillSummarySchema = v.looseObject({
   scope: v.string(),
   isBuiltin: v.boolean(),
   source: v.string(),
+  sourcePath: v.optional(v.string()),
+  disableModelInvocation: v.optional(v.boolean()),
 });
 
 export const PromptSummarySchema = v.looseObject({
@@ -88,6 +114,19 @@ export const PromptSummarySchema = v.looseObject({
   scope: v.string(),
   isBuiltin: v.boolean(),
   source: v.string(),
+  sourcePath: v.optional(v.string()),
+});
+
+export const ThemeSummarySchema = v.looseObject({
+  name: v.string(),
+  scope: v.optional(v.string()),
+  sourcePath: v.optional(v.string()),
+});
+
+export const ResourceDiagnosticSummarySchema = v.looseObject({
+  type: v.union([v.literal('warning'), v.literal('error'), v.literal('collision')]),
+  message: v.string(),
+  path: v.optional(v.string()),
 });
 
 export const ExtensionFlagInfoSchema = v.looseObject({
@@ -177,6 +216,8 @@ export const TreeNodeSchema: v.GenericSchema<TreeNode> = v.looseObject({
   role: v.optional(v.string()),
   text: v.optional(v.string()),
   label: v.optional(v.string()),
+  isCurrentLeaf: v.optional(v.boolean()),
+  isOnCurrentPath: v.optional(v.boolean()),
   children: v.array(v.lazy(() => TreeNodeSchema)),
 });
 const ParsedComponentSchema: v.GenericSchema = v.lazy(() =>
@@ -296,6 +337,8 @@ const ExtensionUiStatePayloadSchema = v.looseObject({
   hiddenThinkingLabel: v.optional(v.string()),
   header: v.optional(v.string()),
   footer: v.optional(v.string()),
+  headerTree: v.optional(ParsedComponentSchema),
+  footerTree: v.optional(ParsedComponentSchema),
   editorComponent: v.optional(ParsedComponentSchema),
   title: v.optional(v.string()),
   widgets: v.optional(v.array(WidgetPayloadSchema)),
@@ -338,7 +381,26 @@ export const ConnectedMessageSchema = v.looseObject({
   isStreaming: v.boolean(),
   activeToolName: v.optional(v.string()),
   thinkingLevel: v.string(),
+  availableThinkingLevels: v.optional(v.array(v.string())),
+  scopedModels: v.optional(
+    v.array(
+      v.looseObject({
+        provider: v.string(),
+        modelId: v.string(),
+        thinkingLevel: v.optional(v.string()),
+      })
+    )
+  ),
   model: v.nullable(ModelInfoSchema),
+  builtinCommands: v.optional(
+    v.array(
+      v.looseObject({
+        name: v.string(),
+        description: v.string(),
+        argumentHint: v.optional(v.string()),
+      })
+    )
+  ),
   availableModels: v.array(ModelInfoSchema),
   messages: v.array(v.unknown()),
   streamingMessage: v.optional(v.unknown()),
@@ -349,6 +411,10 @@ export const ConnectedMessageSchema = v.looseObject({
   isCompacting: v.optional(v.boolean()),
   autoCompactionEnabled: v.optional(v.boolean()),
   autoRetryEnabled: v.optional(v.boolean()),
+  hideThinkingBlock: v.optional(v.boolean()),
+  queuedSteering: v.optional(v.array(v.string())),
+  queuedFollowUp: v.optional(v.array(v.string())),
+  deferred: v.optional(v.array(v.string())),
   pushVapidKey: v.optional(v.nullable(v.string())),
   piVersion: v.optional(v.string()),
   uiVersion: v.optional(v.string()),
@@ -391,6 +457,7 @@ export const ToolOutputSchema = v.looseObject({
   details: v.optional(v.string()),
   diff: v.optional(v.string()),
   renderedResultHtml: v.optional(v.array(v.string())),
+  toolDetails: v.optional(v.looseObject({})),
   error: v.optional(v.string()),
   requestId: v.optional(v.string()),
 });
@@ -402,6 +469,16 @@ export const SessionLoadedSchema = v.looseObject({
   isStreaming: v.optional(v.boolean()),
   activeToolName: v.optional(v.string()),
   thinkingLevel: v.string(),
+  availableThinkingLevels: v.optional(v.array(v.string())),
+  scopedModels: v.optional(
+    v.array(
+      v.looseObject({
+        provider: v.string(),
+        modelId: v.string(),
+        thinkingLevel: v.optional(v.string()),
+      })
+    )
+  ),
   model: v.nullable(ModelInfoSchema),
   availableModels: v.array(ModelInfoSchema),
   messages: v.array(v.unknown()),
@@ -413,8 +490,10 @@ export const SessionLoadedSchema = v.looseObject({
   isCompacting: v.optional(v.boolean()),
   autoCompactionEnabled: v.optional(v.boolean()),
   autoRetryEnabled: v.optional(v.boolean()),
+  hideThinkingBlock: v.optional(v.boolean()),
   queuedSteering: v.optional(v.array(v.string())),
   queuedFollowUp: v.optional(v.array(v.string())),
+  deferred: v.optional(v.array(v.string())),
   piVersion: v.optional(v.string()),
   uiVersion: v.optional(v.string()),
   sessionMode: v.optional(v.union([v.literal('in-memory'), v.literal('persisted')])),
@@ -438,12 +517,25 @@ export const SessionsErrorSchema = v.looseObject({
 export const ModelChangedSchema = v.looseObject({
   type: v.literal('model_changed'),
   model: v.nullable(ModelInfoSchema),
+  thinkingLevel: v.optional(v.string()),
+  availableThinkingLevels: v.optional(v.array(v.string())),
+  scopedModels: v.optional(
+    v.array(
+      v.looseObject({
+        provider: v.string(),
+        modelId: v.string(),
+        thinkingLevel: v.optional(v.string()),
+      })
+    )
+  ),
   sessionId: v.optional(v.string()),
 });
 
 export const ThinkingLevelChangedSchema = v.looseObject({
   type: v.literal('thinking_level_changed'),
   level: v.string(),
+  availableThinkingLevels: v.optional(v.array(v.string())),
+  sessionId: v.optional(v.string()),
 });
 
 export const AvailableModelsChangedSchema = v.looseObject({
@@ -557,6 +649,9 @@ export const ResourcesListSchema = v.looseObject({
   skills: v.array(SkillSummarySchema),
   prompts: v.array(PromptSummarySchema),
   sessionId: v.optional(v.string()),
+  themes: v.optional(v.array(ThemeSummarySchema)),
+  contextFiles: v.optional(v.array(v.string())),
+  diagnostics: v.optional(v.array(ResourceDiagnosticSummarySchema)),
 });
 
 export const CommandsListSchema = v.looseObject({
@@ -575,6 +670,7 @@ export const QueueUpdateSchema = v.looseObject({
   type: v.literal('queue_update'),
   steering: v.array(v.string()),
   followUp: v.array(v.string()),
+  deferred: v.optional(v.array(v.string())),
   sessionId: v.optional(v.string()),
 });
 
@@ -676,6 +772,14 @@ export const SessionTreeSchema = v.looseObject({
   type: v.literal('session_tree'),
   tree: v.array(TreeNodeSchema),
   sessionId: v.optional(v.string()),
+  branchSummarySkipPrompt: v.optional(v.boolean()),
+});
+export const TreeNavigatedSchema = v.looseObject({
+  type: v.literal('tree_navigated'),
+  sessionId: v.string(),
+  ok: v.boolean(),
+  error: v.optional(v.string()),
+  editorText: v.optional(v.string()),
 });
 
 export const ExtensionErrorSchema = v.looseObject({
@@ -816,8 +920,90 @@ export const CompactionEndSchema = v.looseObject({
 
 // The extension_ui_request* payloads are open records, so they intentionally remain on the SDK passthrough path.
 
+export const FooterDataSchema = v.looseObject({
+  type: v.literal('footer_data'),
+  sessionId: v.string(),
+  gitBranch: v.nullable(v.string()),
+  availableProviderCount: v.number(),
+  stats: v.optional(
+    v.looseObject({
+      inputTokens: v.number(),
+      outputTokens: v.number(),
+      cacheReadTokens: v.number(),
+      cacheWriteTokens: v.number(),
+      totalTokens: v.number(),
+      cost: v.number(),
+    })
+  ),
+});
+
+export const SdkSettingsSchema = v.looseObject({
+  type: v.literal('sdk_settings'),
+  settings: v.record(v.string(), v.unknown()),
+  projectOverrides: v.record(v.string(), v.unknown()),
+  descriptions: v.record(v.string(), v.string()),
+});
+
+export const SdkSettingResultSchema = v.looseObject({
+  type: v.literal('sdk_setting_result'),
+  key: v.string(),
+  ok: v.boolean(),
+  error: v.optional(v.string()),
+});
+
+export const ToolRendererUpdateSchema = v.looseObject({
+  type: v.literal('tool_renderer_update'),
+  sessionId: v.string(),
+  toolCallId: v.string(),
+  kind: v.union([v.literal('call'), v.literal('result')]),
+  renderedCallHtml: v.optional(v.array(v.string())),
+  renderedResultHtml: v.optional(v.array(v.string())),
+});
+
+export const ExtensionUiCancelSchema = v.looseObject({
+  type: v.literal('extension_ui_cancel'),
+  id: v.string(),
+  sessionId: v.optional(v.string()),
+  reason: v.union([v.literal('timeout'), v.literal('aborted')]),
+});
+
+export const ProviderLoginStateSchema = v.looseObject({
+  type: v.literal('provider_login_state'),
+  loginId: v.string(),
+  provider: v.string(),
+  providerName: v.string(),
+  authType: v.union([v.literal('oauth'), v.literal('api_key')]),
+  status: v.union([
+    v.literal('started'),
+    v.literal('succeeded'),
+    v.literal('failed'),
+    v.literal('cancelled'),
+  ]),
+  error: v.optional(v.string()),
+});
+export const ProviderLoginEventSchema = v.looseObject({
+  type: v.literal('provider_login_event'),
+  loginId: v.string(),
+  event: v.looseObject({ type: v.string() }),
+});
+export const ProviderLoginPromptSchema = v.looseObject({
+  type: v.literal('provider_login_prompt'),
+  loginId: v.string(),
+  promptId: v.string(),
+  prompt: v.looseObject({ type: v.string(), message: v.string() }),
+});
+export const ProviderLoginPromptCancelSchema = v.looseObject({
+  type: v.literal('provider_login_prompt_cancel'),
+  loginId: v.string(),
+  promptId: v.string(),
+});
+
 /** Registry of custom server events explicitly parsed into kind: 'custom' */
 export const customEventSchemas = {
+  provider_login_state: ProviderLoginStateSchema,
+  provider_login_event: ProviderLoginEventSchema,
+  provider_login_prompt: ProviderLoginPromptSchema,
+  provider_login_prompt_cancel: ProviderLoginPromptCancelSchema,
   bash_execution_update: BashExecutionUpdateSchema,
   extension_flag_result: ExtensionFlagResultSchema,
   shutdown_requested: ShutdownRequestedSchema,
@@ -837,20 +1023,26 @@ export const customEventSchemas = {
   agent_error: AgentErrorSchema,
   queue_restored: QueueRestoredSchema,
   extension_ui_state: ExtensionUiStateSchema,
+  extension_ui_cancel: ExtensionUiCancelSchema,
   extension_terminal_input_active: ExtensionTerminalInputActiveSchema,
   extension_ui_dismiss: ExtensionUiDismissSchema,
   extension_ui_update: ExtensionUiUpdateSchema,
   custom_render: CustomRenderSchema,
+  tool_renderer_update: ToolRendererUpdateSchema,
   compaction_end: CompactionEndSchema,
   session_loaded: SessionLoadedSchema,
   sessions_error: SessionsErrorSchema,
   model_changed: ModelChangedSchema,
+  thinking_level_changed: ThinkingLevelChangedSchema,
   available_models_changed: AvailableModelsChangedSchema,
   models_refresh_result: ModelsRefreshResultSchema,
   older_messages: OlderMessagesSchema,
   session_runtime: SessionRuntimeSchema,
   extension_terminal_input_result: ExtensionTerminalInputResultSchema,
   file_content: FileContentSchema,
+  footer_data: FooterDataSchema,
+  sdk_settings: SdkSettingsSchema,
+  sdk_setting_result: SdkSettingResultSchema,
   file_saved: FileSavedSchema,
   file_staged: FileStagedSchema,
   slash_result: SlashResultSchema,
@@ -876,6 +1068,7 @@ export const customEventSchemas = {
   session_stats: SessionStatsEventSchema,
   update_status: UpdateStatusEventSchema,
   session_tree: SessionTreeSchema,
+  tree_navigated: TreeNavigatedSchema,
 } as const;
 
 export type CustomEventType = keyof typeof customEventSchemas;

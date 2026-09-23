@@ -7,7 +7,8 @@
   import CornerDownRight from '@lucide/svelte/icons/corner-down-right';
   import Check from '@lucide/svelte/icons/check';
   import X from '@lucide/svelte/icons/x';
-  import { formatRelativeDate } from '#lib/utils.js';
+  import Tag from '@lucide/svelte/icons/tag';
+  import { formatRelativeDate, providerColor } from '#lib/utils.js';
   import type { SessionRow as SessionTreeRow } from '#lib/state/projects-state.svelte.js';
   import type { SessionSummary } from '#lib/ws/protocol.js';
 
@@ -179,14 +180,49 @@
         {#if session.name && session.firstMessage}
           <p class="text-xs text-base-content/60 mt-0.5 truncate pl-4">{session.firstMessage}</p>
         {/if}
-        <p class="text-xs text-base-content/60 mt-0.5 pl-4 flex items-center gap-1.5">
-          <span>{formatRelativeDate(session.modified)}</span>
+        <p
+          class="min-w-0 text-xs text-base-content/60 mt-0.5 pl-4 flex items-center gap-1.5 overflow-hidden"
+        >
+          {#if session.lastModel}
+            <span
+              class="min-w-0 max-w-[42%] inline-flex items-center gap-1 shrink"
+              title="{session.lastModel.provider}/{session.lastModel
+                .modelId}{session.totalTokens !== undefined
+                ? ` · ${session.totalTokens.toLocaleString()} tokens`
+                : ''}"
+            >
+              <span
+                class="w-1.5 h-1.5 rounded-full shrink-0"
+                style="background-color: {providerColor(session.lastModel.provider)}"
+                aria-hidden="true"
+              ></span>
+              <span class="truncate">{session.lastModel.modelId}</span>
+            </span>
+          {/if}
+          {#if session.totalCost && session.totalCost > 0}
+            <span class="shrink-0">${session.totalCost.toFixed(2)}</span>
+          {/if}
+          {#if session.labelCount && session.labelCount > 0}
+            <span
+              class="inline-flex shrink-0 items-center gap-0.5"
+              aria-label="{session.labelCount} {session.labelCount === 1 ? 'label' : 'labels'}"
+              title="{session.labelCount} {session.labelCount === 1 ? 'label' : 'labels'}"
+            >
+              <Tag class="w-3 h-3" aria-hidden="true" />
+              {session.labelCount}
+            </span>
+          {/if}
+          <span class="shrink-0">{formatRelativeDate(session.modified)}</span>
           {#if (session.turns ?? session.messageCount) > 0}
-            <span class="text-base-content/45">·</span>
+            <span class="shrink-0 text-base-content/45">·</span>
             {#if session.turns !== undefined}
-              <span>{session.turns} {session.turns === 1 ? 'exchange' : 'exchanges'}</span>
+              <span class="shrink-0"
+                >{session.turns} {session.turns === 1 ? 'exchange' : 'exchanges'}</span
+              >
             {:else}
-              <span>{session.messageCount} {session.messageCount === 1 ? 'msg' : 'msgs'}</span>
+              <span class="shrink-0"
+                >{session.messageCount} {session.messageCount === 1 ? 'msg' : 'msgs'}</span
+              >
             {/if}
           {/if}
         </p>

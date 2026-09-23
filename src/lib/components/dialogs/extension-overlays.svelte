@@ -70,6 +70,26 @@
   $effect(() => {
     focusElRef?.(modalFocusEl);
   });
+  let timeoutProgress = $state(100);
+  $effect(() => {
+    const active = modal;
+    if (
+      !active ||
+      active.method === 'custom' ||
+      active.timeout === undefined ||
+      active.timeout <= 0
+    ) {
+      timeoutProgress = 100;
+      return;
+    }
+    const timeout = active.timeout;
+    const update = () => {
+      timeoutProgress = Math.max(0, 100 - ((Date.now() - active.requestedAt) / timeout) * 100);
+    };
+    update();
+    const interval = setInterval(update, 100);
+    return () => clearInterval(interval);
+  });
 </script>
 
 <!-- ── Extension UI modal ─────────────────────────────────────────────────────── -->
@@ -151,6 +171,13 @@
         </div>
         <input
           type="text"
+          name="extension-terminal-input"
+          autocomplete="off"
+          spellcheck="false"
+          data-1p-ignore
+          data-lpignore="true"
+          data-bwignore
+          data-form-type="other"
           class="absolute left-1/2 top-1/2 h-px w-px opacity-0"
           aria-label="Extension terminal input"
           aria-describedby="extension-terminal-instructions"
@@ -162,6 +189,21 @@
         />
       </div>
     {:else}
+      {#if modal && modal.method !== 'custom' && modal.timeout !== undefined && modal.timeout > 0}
+        <div
+          class="h-0.5 w-full bg-base-content/8"
+          role="progressbar"
+          aria-label="Dialog time remaining"
+          aria-valuemin="0"
+          aria-valuemax="100"
+          aria-valuenow={Math.round(timeoutProgress)}
+        >
+          <div
+            class="h-full bg-primary transition-[width] duration-100"
+            style={`width: ${timeoutProgress}%`}
+          ></div>
+        </div>
+      {/if}
       <Dialog.Header class="border-b border-base-content/8 px-5 py-4">
         <div class="flex items-center gap-3">
           <div
@@ -192,6 +234,15 @@
         <input
           bind:this={modalFocusEl}
           type={modal.secret ? 'password' : 'text'}
+          name={modal.secret ? 'extension-secret-input' : 'extension-text-input'}
+          autocomplete={modal.secret ? 'new-password' : 'off'}
+          spellcheck="false"
+          autocapitalize="off"
+          autocorrect="off"
+          data-1p-ignore
+          data-lpignore="true"
+          data-bwignore
+          data-form-type="other"
           bind:value={modalInput}
           placeholder={modal.placeholder ?? ''}
           class="dialog-input mx-5 mb-5 mt-5 w-[calc(100%-2.5rem)] rounded-xl px-3.5 py-2.5 text-sm outline-none placeholder-muted-foreground transition-colors"
@@ -203,6 +254,13 @@
               <div class="relative mb-3">
                 <input
                   type="search"
+                  name="extension-select-filter"
+                  autocomplete="off"
+                  spellcheck="false"
+                  data-1p-ignore
+                  data-lpignore="true"
+                  data-bwignore
+                  data-form-type="other"
                   bind:value={selectFilter}
                   placeholder="Filter options…"
                   aria-label="Filter options"
@@ -292,6 +350,13 @@
               <input
                 bind:this={modalFocusEl}
                 type="text"
+                name="extension-custom-response"
+                autocomplete="off"
+                spellcheck="false"
+                data-1p-ignore
+                data-lpignore="true"
+                data-bwignore
+                data-form-type="other"
                 bind:value={modalInput}
                 placeholder="Type your response…"
                 class="dialog-input mt-4 w-full rounded-xl px-3.5 py-2.5 text-sm placeholder-muted-foreground transition-colors"
@@ -302,6 +367,13 @@
             <input
               bind:this={modalFocusEl}
               type="text"
+              name="extension-response"
+              autocomplete="off"
+              spellcheck="false"
+              data-1p-ignore
+              data-lpignore="true"
+              data-bwignore
+              data-form-type="other"
               bind:value={modalInput}
               placeholder="Type your response…"
               class="dialog-input w-full rounded-xl px-3.5 py-2.5 text-sm placeholder-muted-foreground transition-colors"

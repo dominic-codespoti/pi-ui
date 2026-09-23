@@ -33,6 +33,10 @@ export interface SessionFileInfo {
   modified: Date;
   messageCount: number;
   firstMessage: string;
+  lastModel?: { provider: string; modelId: string };
+  totalCost?: number;
+  totalTokens?: number;
+  labelCount?: number;
 }
 
 /** Concurrent file parses. Deliberately low: bounds peak RSS during a cold scan. */
@@ -76,30 +80,18 @@ export function initSessionScanCache(filePath: string): void {
     if (
       !parsed ||
       typeof parsed !== 'object' ||
+      !('version' in parsed) ||
+      parsed.version !== 2 ||
       !('entries' in parsed) ||
       !Array.isArray(parsed.entries)
     )
       return;
     for (const raw of parsed.entries) {
-      if (!Array.isArray(raw)) continue;
-      let path: unknown;
-      let mtimeMs: unknown;
-      let size: unknown;
-      let dev: unknown;
-      let ino: unknown;
-      let info: unknown;
-      if (raw.length === 4) {
-        [path, mtimeMs, size, info] = raw;
-      } else if (raw.length === 6) {
-        [path, mtimeMs, size, dev, ino, info] = raw;
-      } else {
-        continue;
-      }
+      if (!Array.isArray(raw) || raw.length !== 7) continue;
+      const [path, mtimeMs, size, dev, ino, info, foldValue] = raw;
       if (typeof path !== 'string' || typeof mtimeMs !== 'number' || typeof size !== 'number')
         continue;
       const revived = reviveInfo(info);
-      // `modified` is derived from the file's stat mtime (single clock with
-      // the pooled-session overlay) — the persisted value is never authoritative.
       if (revived) {
         revived.path = resolve(path);
         revived.modified = new Date(mtimeMs);
@@ -110,6 +102,7 @@ export function initSessionScanCache(filePath: string): void {
         info: revived,
         dev: typeof dev === 'number' ? dev : undefined,
         ino: typeof ino === 'number' ? ino : undefined,
+        fold: reviveFold(foldValue) ?? undefined,
       });
     }
   } catch (err) {
@@ -124,6 +117,16 @@ function reviveInfo(raw: unknown): SessionFileInfo | null {
   // the honest type; every field is still runtime-checked below.
   const record = raw as Record<string, unknown>;
   if (typeof record.path !== 'string' || typeof record.id !== 'string') return null;
+  const lastModel =
+    record.lastModel &&
+    typeof record.lastModel === 'object' &&
+    typeof (record.lastModel as Record<string, unknown>).provider === 'string' &&
+    typeof (record.lastModel as Record<string, unknown>).modelId === 'string'
+      ? {
+          provider: (record.lastModel as Record<string, string>).provider,
+          modelId: (record.lastModel as Record<string, string>).modelId,
+        }
+      : undefined;
   return {
     path: record.path,
     id: record.id,
@@ -135,6 +138,54 @@ function reviveInfo(raw: unknown): SessionFileInfo | null {
     modified: new Date(typeof record.modified === 'number' ? record.modified : 0),
     messageCount: typeof record.messageCount === 'number' ? record.messageCount : 0,
     firstMessage: typeof record.firstMessage === 'string' ? record.firstMessage : '',
+    lastModel,
+    totalCost: typeof record.totalCost === 'number' ? record.totalCost : undefined,
+    totalTokens: typeof record.totalTokens === 'number' ? record.totalTokens : undefined,
+    labelCount: typeof record.labelCount === 'number' ? record.labelCount : undefined,
+  };
+}
+function reviveFold(raw: unknown): SessionScanFold | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const value = raw as Record<string, unknown>;
+  if (
+    typeof value.headerCwd !== 'string' ||
+    typeof value.sawHeader !== 'boolean' ||
+    typeof value.rejected !== 'boolean' ||
+    typeof value.messageCount !== 'number' ||
+    typeof value.firstMessage !== 'string' ||
+    typeof value.totalCost !== 'number' ||
+    typeof value.totalTokens !== 'number' ||
+    typeof value.labelCount !== 'number' ||
+    !value.labels ||
+    typeof value.labels !== 'object'
+  )
+    return null;
+  const lastModel =
+    value.lastModel &&
+    typeof value.lastModel === 'object' &&
+    typeof (value.lastModel as Record<string, unknown>).provider === 'string' &&
+    typeof (value.lastModel as Record<string, unknown>).modelId === 'string'
+      ? {
+          provider: (value.lastModel as Record<string, string>).provider,
+          modelId: (value.lastModel as Record<string, string>).modelId,
+        }
+      : undefined;
+  return {
+    headerId: typeof value.headerId === 'string' ? value.headerId : undefined,
+    headerCwd: value.headerCwd,
+    headerTimestamp: typeof value.headerTimestamp === 'string' ? value.headerTimestamp : undefined,
+    parentSessionPath:
+      typeof value.parentSessionPath === 'string' ? value.parentSessionPath : undefined,
+    sawHeader: value.sawHeader,
+    rejected: value.rejected,
+    name: typeof value.name === 'string' ? value.name : undefined,
+    messageCount: value.messageCount,
+    firstMessage: value.firstMessage,
+    lastModel,
+    totalCost: value.totalCost,
+    totalTokens: value.totalTokens,
+    labels: value.labels as Record<string, string>,
+    labelCount: value.labelCount,
   };
 }
 
@@ -180,10 +231,11 @@ async function persistCache(): Promise<void> {
           c.info
             ? { ...c.info, created: c.info.created.getTime(), modified: c.info.modified.getTime() }
             : null,
+          c.fold,
         ]);
         mkdirSync(dirname(filePath), { recursive: true });
         const tmp = `${filePath}.tmp`;
-        await writeFile(tmp, JSON.stringify({ version: 1, entries }));
+        await writeFile(tmp, JSON.stringify({ version: 2, entries }));
         await rename(tmp, filePath);
         // A scan can mutate the cache while the write is awaited. Keep the
         // dirty bit set for that newer generation so the loop persists it too.
@@ -231,37 +283,26 @@ export function firstTextContent(message: object): string {
     const text = content.replace(/\s+/g, ' ').trim();
     if (text) return text.slice(0, FIRST_MESSAGE_MAX_CHARS);
   }
-
   const candidates: string[] = [];
   const addCandidate = (value: unknown) => {
     if (typeof value !== 'string') return;
     const text = value.replace(/\s+/g, ' ').trim();
     if (text) candidates.push(text);
   };
-
   addCandidate(record.text);
   addCandidate(record.thinking);
   addCandidate(record.reasoning);
   addCandidate(record.summary);
-
   if (Array.isArray(content)) {
     for (const block of content) {
       if (!block || typeof block !== 'object') continue;
       const blockRecord = block as Record<string, unknown>;
-      addCandidate(blockRecord.text);
-      addCandidate(blockRecord.thinking);
-      addCandidate(blockRecord.reasoning);
-      addCandidate(blockRecord.summary);
-      if (candidates.length > 0) break;
+      if (blockRecord.type === 'thinking') addCandidate(blockRecord.thinking);
+      else if (blockRecord.type === 'text') addCandidate(blockRecord.text);
     }
   }
-
   return candidates[0]?.slice(0, FIRST_MESSAGE_MAX_CHARS) ?? '';
 }
-
-/** Folding state accumulated while streaming a session file's lines — the
- *  same locals parseSessionFile used before extraction, now reusable so an
- *  appended tail can resume folding instead of re-reading from byte 0. */
 interface SessionScanFold {
   headerId: string | undefined;
   headerCwd: string;
@@ -272,6 +313,11 @@ interface SessionScanFold {
   name: string | undefined;
   messageCount: number;
   firstMessage: string;
+  lastModel: { provider: string; modelId: string } | undefined;
+  totalCost: number;
+  totalTokens: number;
+  labels: Record<string, string>;
+  labelCount: number;
 }
 
 function createEmptyFold(): SessionScanFold {
@@ -285,20 +331,20 @@ function createEmptyFold(): SessionScanFold {
     name: undefined,
     messageCount: 0,
     firstMessage: '',
+    lastModel: undefined,
+    totalCost: 0,
+    totalTokens: 0,
+    labels: {},
+    labelCount: 0,
   };
 }
+
 function strField(obj: object, key: string): string | undefined {
-  // Parsed-JSON object with arbitrary keys — a string-keyed record view is the
-  // honest type here; every read is still runtime-checked below.
-  const record = obj as Record<string, unknown>;
-  const value = record[key];
+  const value = (obj as Record<string, unknown>)[key];
   return typeof value === 'string' ? value : undefined;
 }
-/** Fold one line into `fold`, mutating it in place. Mirrors the exact
- *  per-line rules parseSessionFile used inline: the first line must be a
- *  `session` header (else the file is permanently rejected, and every
- *  later call is a no-op), later `session_info` lines update the display
- *  name, and only `message` entries with a user/assistant role count. */
+
+/** Fold one line into `fold`, mutating it in place. */
 function foldSessionLine(fold: SessionScanFold, line: string): void {
   if (fold.rejected || !line.trim()) return;
   let entry: unknown;
@@ -325,17 +371,47 @@ function foldSessionLine(fold: SessionScanFold, line: string): void {
     fold.name = strField(entry, 'name')?.trim() || undefined;
     return;
   }
+  if (type === 'model_change') {
+    const provider = strField(entry, 'provider');
+    const modelId = strField(entry, 'modelId');
+    if (provider && modelId) fold.lastModel = { provider, modelId };
+    return;
+  }
+  if (type === 'label') {
+    const targetId = strField(entry, 'targetId');
+    if (!targetId) return;
+    const label = strField(entry, 'label');
+    const hadLabel = Object.hasOwn(fold.labels, targetId);
+    if (label) {
+      fold.labels[targetId] = label;
+      if (!hadLabel) fold.labelCount++;
+    } else if (hadLabel) {
+      delete fold.labels[targetId];
+      fold.labelCount--;
+    }
+    return;
+  }
   if (type !== 'message') return;
   const message = 'message' in entry ? entry.message : undefined;
   if (!message || typeof message !== 'object') return;
   const role = strField(message, 'role');
   if (role !== 'user' && role !== 'assistant') return;
   fold.messageCount++;
-  if (!fold.firstMessage && role === 'user') {
-    fold.firstMessage = firstTextContent(message);
+  if (!fold.firstMessage && role === 'user') fold.firstMessage = firstTextContent(message);
+  if (role !== 'assistant') return;
+  const provider = strField(message, 'provider');
+  const modelId = strField(message, 'model');
+  if (provider && modelId) fold.lastModel = { provider, modelId };
+  const usage = 'usage' in message ? message.usage : undefined;
+  if (!usage || typeof usage !== 'object') return;
+  const cost = 'cost' in usage ? usage.cost : undefined;
+  if (cost && typeof cost === 'object' && 'total' in cost) {
+    const total = cost.total;
+    if (typeof total === 'number' && Number.isFinite(total)) fold.totalCost += total;
   }
+  if ('totalTokens' in usage && typeof usage.totalTokens === 'number')
+    fold.totalTokens += usage.totalTokens;
 }
-
 /** Stream `filePath` from `startByte` (default 0) through `fold`, mutating
  *  it in place. Stops as soon as the file is rejected — matching the
  *  original single-return-null behavior — instead of reading the rest of
@@ -379,6 +455,10 @@ function summaryFromFold(
     modified: new Date(mtimeMs),
     messageCount: fold.messageCount,
     firstMessage: fold.firstMessage || '(no messages)',
+    lastModel: fold.lastModel,
+    totalCost: fold.totalCost || undefined,
+    totalTokens: fold.totalTokens || undefined,
+    labelCount: fold.labelCount || undefined,
   };
 }
 
@@ -492,7 +572,7 @@ async function tryExtendFold(
       await handle.close();
     }
   }
-  const fold: SessionScanFold = { ...cached.fold };
+  const fold: SessionScanFold = { ...cached.fold, labels: { ...cached.fold.labels } };
   try {
     await foldSessionFileFrom(filePath, fold, cached.size);
   } catch {

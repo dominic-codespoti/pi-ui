@@ -8,15 +8,33 @@ export const CONNECTED_PAYLOAD = {
   sessionId: 'mock-session-001',
   isStreaming: false,
   thinkingLevel: 'medium',
+  availableThinkingLevels: ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'],
+  scopedModels: [],
+  hideThinkingBlock: false,
+  builtinCommands: [
+    { name: 'help', description: 'Show available commands' },
+    { name: 'hotkeys', description: 'Show keyboard shortcuts' },
+    { name: 'session', description: 'Show session information' },
+    { name: 'tree', description: 'Browse the session tree' },
+    { name: 'compact', description: 'Compact the conversation' },
+  ],
   model: {
     provider: 'openai',
     id: 'gpt-4o',
     name: 'GPT-4o',
     reasoning: false,
     contextWindow: 128_000,
+    available: true,
   },
   availableModels: [
-    { provider: 'openai', id: 'gpt-4o', name: 'GPT-4o', reasoning: false, contextWindow: 128_000 },
+    {
+      provider: 'openai',
+      id: 'gpt-4o',
+      name: 'GPT-4o',
+      reasoning: false,
+      contextWindow: 128_000,
+      available: true,
+    },
   ],
   messages: [],
   cwd: '/home/user/project',
@@ -42,15 +60,26 @@ export const SESSION_LOADED_PAYLOAD = {
   sessionId: 'mock-session-002',
   isStreaming: false,
   thinkingLevel: 'medium',
+  availableThinkingLevels: ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'],
+  scopedModels: [],
+  hideThinkingBlock: false,
   model: {
     provider: 'openai',
     id: 'gpt-4o',
     name: 'GPT-4o',
     reasoning: false,
     contextWindow: 128_000,
+    available: true,
   },
   availableModels: [
-    { provider: 'openai', id: 'gpt-4o', name: 'GPT-4o', reasoning: false, contextWindow: 128_000 },
+    {
+      provider: 'openai',
+      id: 'gpt-4o',
+      name: 'GPT-4o',
+      reasoning: false,
+      contextWindow: 128_000,
+      available: true,
+    },
   ],
   messages: [
     {
@@ -337,4 +366,36 @@ export function extensionEventPayload(
     level,
     ...(message ? { message } : {}),
   };
+}
+
+export function providerLoginStatePayload(
+  loginId: string,
+  status: 'started' | 'succeeded' | 'failed' | 'cancelled',
+  overrides: Record<string, unknown> = {}
+) {
+  return {
+    type: 'provider_login_state',
+    loginId,
+    provider: 'anthropic',
+    providerName: 'Anthropic',
+    authType: 'oauth',
+    status,
+    ...overrides,
+  };
+}
+
+export function providerLoginEventPayload(loginId: string, event: Record<string, unknown>) {
+  return { type: 'provider_login_event', loginId, event };
+}
+
+export function providerLoginPromptPayload(
+  loginId: string,
+  promptId: string,
+  prompt: Record<string, unknown>
+) {
+  return { type: 'provider_login_prompt', loginId, promptId, prompt };
+}
+
+export function providerLoginPromptCancelPayload(loginId: string, promptId: string) {
+  return { type: 'provider_login_prompt_cancel', loginId, promptId };
 }

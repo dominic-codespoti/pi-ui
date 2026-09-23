@@ -8,10 +8,39 @@ import {
 
 /** A modal dialog queued for the active session (queue head renders). */
 export type ModalState =
-  | { method: 'confirm'; id: string; title: string; message: string }
-  | { method: 'input'; id: string; title: string; placeholder?: string; secret?: boolean }
-  | { method: 'select'; id: string; title: string; options: string[] }
-  | { method: 'editor'; id: string; title: string; prefill?: string }
+  | {
+      method: 'confirm';
+      id: string;
+      title: string;
+      message: string;
+      timeout?: number;
+      requestedAt: number;
+    }
+  | {
+      method: 'input';
+      id: string;
+      title: string;
+      placeholder?: string;
+      secret?: boolean;
+      timeout?: number;
+      requestedAt: number;
+    }
+  | {
+      method: 'select';
+      id: string;
+      title: string;
+      options: string[];
+      timeout?: number;
+      requestedAt: number;
+    }
+  | {
+      method: 'editor';
+      id: string;
+      title: string;
+      prefill?: string;
+      timeout?: number;
+      requestedAt: number;
+    }
   | {
       method: 'custom';
       id: string;
@@ -50,8 +79,9 @@ export class ExtensionUiState {
   hiddenThinkingLabel = $state('thinking');
   /** Extension-injected header content (setHeader). */
   header = $state('');
-  /** Extension-injected footer content (setFooter). */
   footer = $state('');
+  headerTree = $state<ParsedComponent | null>(null);
+  footerTree = $state<ParsedComponent | null>(null);
   /** Extension-injected editor component panel (setEditorComponent). */
   editorComponentPanel = $state<ParsedComponent | null>(null);
   /** Document title set by the active session's extension (setTitle). */
@@ -131,10 +161,12 @@ export class ExtensionUiState {
 
   setHeader(content: string | undefined): void {
     this.header = content ?? '';
+    this.headerTree = null;
   }
 
   setFooter(content: string | undefined): void {
     this.footer = content ?? '';
+    this.footerTree = null;
   }
 
   setEditorComponent(parsed: ParsedComponent | null): void {
@@ -160,6 +192,8 @@ export class ExtensionUiState {
           id,
           title: (msg.title as string | undefined) ?? 'Confirm',
           message: (msg.message as string | undefined) ?? '',
+          timeout: msg.timeout as number | undefined,
+          requestedAt: Date.now(),
         };
       case 'input':
         return {
@@ -168,6 +202,8 @@ export class ExtensionUiState {
           title: (msg.title as string | undefined) ?? 'Input',
           placeholder: msg.placeholder as string | undefined,
           ...(msg.secret === true ? { secret: true } : {}),
+          timeout: msg.timeout as number | undefined,
+          requestedAt: Date.now(),
         };
       case 'select':
         return {
@@ -175,6 +211,8 @@ export class ExtensionUiState {
           id,
           title: (msg.title as string | undefined) ?? 'Select',
           options: (msg.options as string[] | undefined) ?? [],
+          timeout: msg.timeout as number | undefined,
+          requestedAt: Date.now(),
         };
       case 'editor':
         return {
@@ -182,6 +220,8 @@ export class ExtensionUiState {
           id,
           title: (msg.title as string | undefined) ?? 'Editor',
           prefill: msg.prefill as string | undefined,
+          timeout: msg.timeout as number | undefined,
+          requestedAt: Date.now(),
         };
       case 'custom': {
         const parsed = msg.parsed as ParsedComponent | undefined;
@@ -344,6 +384,8 @@ export class ExtensionUiState {
     this.hiddenThinkingLabel = ui.hiddenThinkingLabel ?? 'thinking';
     this.header = ui.header ?? '';
     this.footer = ui.footer ?? '';
+    this.headerTree = ui.headerTree ?? null;
+    this.footerTree = ui.footerTree ?? null;
     this.editorComponentPanel = ui.editorComponent ?? null;
     this.setTitle(ui.title ?? 'pi UI');
     this.terminalInputActive = ui.terminalInputActive ?? false;
@@ -364,6 +406,8 @@ export class ExtensionUiState {
     this.hiddenThinkingLabel = 'thinking';
     this.header = '';
     this.footer = '';
+    this.headerTree = null;
+    this.footerTree = null;
     this.editorComponentPanel = null;
     this.setTitle('pi UI');
     this.terminalInputActive = false;

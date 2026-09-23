@@ -130,7 +130,9 @@ test.describe('Chat / prompt streaming', () => {
 
     await submitPrompt(page, 'Trigger provider failure');
 
-    await expect(page.getByText('Agent error: 503 upstream overloaded')).toBeVisible({
+    await expect(
+      page.getByRole('status').filter({ hasText: '503 upstream overloaded' })
+    ).toBeVisible({
       timeout: 3000,
     });
   });
@@ -341,13 +343,8 @@ test.describe('Chat / prompt streaming', () => {
       });
       ws.send(
         JSON.stringify({
-          type: 'connected',
+          ...CONNECTED_PAYLOAD,
           sessionId: 's1',
-          isStreaming: false,
-          thinkingLevel: 'medium',
-          model: null,
-          availableModels: [],
-          messages: [],
         })
       );
       ws.send(JSON.stringify({ type: 'projects_list', projects: [] }));
@@ -639,13 +636,8 @@ test.describe('Chat / prompt streaming', () => {
     await page.routeWebSocket('/ws', (ws) => {
       ws.send(
         JSON.stringify({
-          type: 'connected',
+          ...CONNECTED_PAYLOAD,
           sessionId: 'escape-session',
-          isStreaming: false,
-          thinkingLevel: 'medium',
-          model: null,
-          availableModels: [],
-          messages: [],
         })
       );
     });
@@ -665,13 +657,9 @@ test.describe('Chat / prompt streaming', () => {
     await page.routeWebSocket('/ws', (ws) => {
       ws.send(
         JSON.stringify({
-          type: 'connected',
+          ...CONNECTED_PAYLOAD,
           sessionId: 'streaming-menu-session',
           isStreaming: true,
-          thinkingLevel: 'medium',
-          model: null,
-          availableModels: [],
-          messages: [],
         })
       );
     });
@@ -1080,17 +1068,25 @@ test.describe('Message accessibility regressions', () => {
       ],
     });
 
-    const thinkingToggle = page.getByRole('button', { name: /thinking/ }).first();
+    const thinkingToggle = page.getByRole('button', { name: 'Toggle thinking block 1' });
+    const thinkingToggleId = await thinkingToggle.getAttribute('id');
     const thinkingControls = await thinkingToggle.getAttribute('aria-controls');
-    if (!thinkingControls) throw new Error('thinking disclosure has no controlled region');
+    if (!thinkingToggleId || !thinkingControls)
+      throw new Error('thinking disclosure relationships are missing');
+    const stableThinkingToggle = page.locator(`#${thinkingToggleId}`);
     const thinkingRegion = page.locator(`#${thinkingControls}`);
-    await expect(thinkingToggle).toHaveAttribute('aria-expanded', 'false');
-    await expect(thinkingRegion).toHaveCount(1);
-    await expect(thinkingRegion).toBeHidden();
+    await expect(stableThinkingToggle).toHaveAttribute('aria-expanded', 'false');
+    await expect
+      .poll(() => thinkingRegion.evaluate((element) => (element as HTMLElement).hidden))
+      .toBe(true);
     await thinkingToggle.focus();
     await thinkingToggle.press('Enter');
-    await expect(thinkingToggle).toHaveAttribute('aria-expanded', 'true');
-    await expect(thinkingRegion).toBeVisible();
+    await expect(stableThinkingToggle).toHaveAttribute('aria-expanded', 'true');
+    await expect
+      .poll(() => thinkingRegion.evaluate((element) => (element as HTMLElement).hidden))
+      .toBe(false);
+    await expect(thinkingRegion).toContainText('First reason carefully.');
+    await expect(page.getByText('Final answer.')).toBeVisible();
 
     const toolToggle = page.getByRole('button', { name: 'Expand Shell output' });
     const toolToggleId = await toolToggle.getAttribute('id');

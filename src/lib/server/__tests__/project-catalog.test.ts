@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdirSync, rmSync, existsSync } from 'node:fs';
+import { mkdirSync, rmSync, existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { clearSessionScanCache } from '../session-scan';
 import type { SessionCatalog } from '../session-catalog';
@@ -197,5 +197,31 @@ describe('project-catalog', () => {
     expect(loadProjectRecords()).toEqual([
       { path: '/proj/keep', pinned: true, lastOpened: expect.any(Number) },
     ]);
+  });
+  it('reads Git branch names for regular and linked worktree repositories', async () => {
+    const regular = join(TEST_HOME, 'regular');
+    const regularGit = join(regular, '.git');
+    mkdirSync(regularGit, { recursive: true });
+    writeFileSync(join(regularGit, 'HEAD'), 'ref: refs/heads/main\n');
+    catalog.apply({ kind: 'touch', path: regular });
+
+    const worktree = join(TEST_HOME, 'worktree');
+    const worktreeGitDir = join(TEST_HOME, 'common', 'worktrees', 'worktree');
+    mkdirSync(worktree, { recursive: true });
+    mkdirSync(worktreeGitDir, { recursive: true });
+    writeFileSync(join(worktree, '.git'), 'gitdir: ../common/worktrees/worktree\n');
+    writeFileSync(join(worktreeGitDir, 'HEAD'), 'ref: refs/heads/feature/sidebar\n');
+    catalog.apply({ kind: 'touch', path: worktree });
+
+    const detached = join(TEST_HOME, 'detached');
+    const detachedGit = join(detached, '.git');
+    mkdirSync(detachedGit, { recursive: true });
+    writeFileSync(join(detachedGit, 'HEAD'), `${'a1b2c3d'.repeat(5)}aa\n`);
+    catalog.apply({ kind: 'touch', path: detached });
+
+    const projects = await catalog.list();
+    expect(projects.find((project) => project.cwd === regular)?.gitBranch).toBe('main');
+    expect(projects.find((project) => project.cwd === detached)?.gitBranch).toBe('a1b2c3d');
+    expect(projects.find((project) => project.cwd === worktree)?.gitBranch).toBe('feature/sidebar');
   });
 });

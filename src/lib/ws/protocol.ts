@@ -35,10 +35,28 @@ export interface ModelInfo {
   id: string;
   name: string;
   reasoning: boolean;
+  /** Whether the runtime currently considers this model available. */
+  available?: boolean;
+  /** Provider id that must be authenticated before this model can be used. */
+  authRequired?: string;
   /** Context window size in tokens (from the model definition). */
   contextWindow?: number;
+  /** Input types supported by this model; absent means unknown. */
+  input?: ('text' | 'image')[];
+  /** USD per million tokens. */
+  cost?: { input: number; output: number; cacheRead: number; cacheWrite: number };
+  /** Maximum output tokens. */
+  maxTokens?: number;
   /** Map of thinking levels this model supports (keys = level names). */
   thinkingLevelMap?: Record<string, string | null>;
+  /** Matches the SDK configured default provider/model pair. */
+  isDefault?: boolean;
+}
+
+export interface ScopedModelInfo {
+  provider: string;
+  modelId: string;
+  thinkingLevel?: string;
 }
 
 /** Real-time context window usage — from pi SDK's getContextUsage(). */
@@ -71,6 +89,10 @@ export interface SessionSummary {
    */
   parentSession?: string;
   firstMessage: string;
+  lastModel?: { provider: string; modelId: string };
+  totalCost?: number;
+  totalTokens?: number;
+  labelCount?: number;
 }
 
 /**
@@ -93,6 +115,8 @@ export interface ProjectInfo {
   sessionCount: number;
   /** Unix ms of the most recent activity (session modified or last opened). */
   lastActivity: number;
+  /** Current Git branch or short detached-HEAD hash; null when unavailable. */
+  gitBranch?: string | null;
 }
 
 export interface ProviderInfo {
@@ -102,8 +126,22 @@ export interface ProviderInfo {
   configured: boolean;
   /** How the credential is stored: 'stored' | 'runtime' | 'environment' | 'fallback' */
   source?: string;
-  /** Number of models available for this provider */
+  /** OAuth sign-in label, when the provider offers an OAuth flow. */
+  oauthLoginLabel?: string;
+  /** Whether the provider offers SDK-managed API-key login. */
+  apiKeyLogin?: boolean;
+  /** True when the active provider credential is OAuth-backed. */
+  oauthAuthenticated?: boolean;
+  /** Number of models in the registry for this provider */
   modelCount: number;
+  /** Exact SDK auth status label, e.g. an environment variable or credentials path. */
+  authLabel?: string;
+  /** Active authentication uses a subscription. */
+  subscription?: boolean;
+  /** Provider's OAuth flow represents a subscription. */
+  oauthSubscription?: boolean;
+  /** Custom provider endpoint when explicitly provided by SDK catalog data. */
+  baseUrl?: string;
 }
 
 export interface SkillSummary {
@@ -115,6 +153,8 @@ export interface SkillSummary {
   isBuiltin: boolean;
   /** Package / source identifier (e.g. package name or file path) */
   source: string;
+  sourcePath?: string;
+  disableModelInvocation?: boolean;
 }
 
 export interface PromptSummary {
@@ -126,6 +166,19 @@ export interface PromptSummary {
   /** 'package' | 'top-level' */
   isBuiltin: boolean;
   source: string;
+  sourcePath?: string;
+}
+
+export interface ThemeSummary {
+  name: string;
+  scope?: string;
+  sourcePath?: string;
+}
+
+export interface ResourceDiagnosticSummary {
+  type: 'warning' | 'error' | 'collision';
+  message: string;
+  path?: string;
 }
 
 export interface ExtensionFlagInfo {
@@ -155,6 +208,15 @@ export interface ProjectTrustInfo {
   decision: ProjectTrustDecision;
   requiresDecision: boolean;
   persisted: boolean;
+}
+
+export interface FooterStats {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  totalTokens: number;
+  cost: number;
 }
 
 export interface SessionStats {
@@ -278,6 +340,8 @@ export interface ExtensionUiStatePayload {
   hiddenThinkingLabel: string;
   header?: string;
   footer?: string;
+  headerTree?: ParsedComponent;
+  footerTree?: ParsedComponent;
   editorComponent?: ParsedComponent;
   title?: string;
   widgets: WidgetPayload[];
@@ -294,6 +358,8 @@ export interface TreeNode {
   role?: string;
   text?: string;
   label?: string;
+  isCurrentLeaf?: boolean;
+  isOnCurrentPath?: boolean;
   children: TreeNode[];
 }
 
@@ -307,7 +373,11 @@ export interface ConnectedMessage {
   /** Name of the tool currently executing in this session (if any). */
   activeToolName?: string;
   thinkingLevel: string;
+  availableThinkingLevels?: string[];
+  scopedModels?: ScopedModelInfo[];
   model: ModelInfo | null;
+  builtinCommands?: Array<{ name: string; description: string; argumentHint?: string }>;
+  /** All registry models; each entry carries available and may require auth. */
   availableModels: ModelInfo[];
   /** Recent raw SDK message window at connect time. Tool-result records may include outputElided?: boolean and outputBytes?: number metadata. */
   messages: unknown[];
@@ -327,6 +397,12 @@ export interface ConnectedMessage {
   autoCompactionEnabled?: boolean;
   /** Whether auto-retry on transient errors is enabled. */
   autoRetryEnabled?: boolean;
+  /** Whether thinking messages should start collapsed in the transcript. */
+  hideThinkingBlock?: boolean;
+  queuedSteering?: string[];
+  queuedFollowUp?: string[];
+  /** Messages waiting for the server's global run-concurrency slot. */
+  deferred?: string[];
   /** VAPID public key for Web Push subscription (null when push is unavailable). */
   pushVapidKey?: string | null;
   /** pi SDK version (e.g. "0.75.5"). */
@@ -493,7 +569,20 @@ export type PiEvent = { type: string } & Record<string, unknown>;
 /** Custom server-authored events (not from the SDK). Typed so payload drift —
  *  a missing or renamed field — fails at compile time on the broadcast site. */
 export type ServerCustomEvent =
-  | { type: 'model_changed'; model: ModelInfo | null; sessionId?: string }
+  | {
+      type: 'model_changed';
+      model: ModelInfo | null;
+      thinkingLevel: string;
+      availableThinkingLevels: string[];
+      scopedModels: ScopedModelInfo[];
+      sessionId?: string;
+    }
+  | {
+      type: 'thinking_level_changed';
+      level: string;
+      availableThinkingLevels: string[];
+      sessionId?: string;
+    }
   | { type: 'shutdown_requested'; sessionId: string }
   | { type: 'bash_execution_update'; id: string; delta: string; sessionId: string }
   | {
@@ -512,7 +601,10 @@ export type ServerCustomEvent =
       /** Name of the tool currently executing in this session (if any). */
       activeToolName?: string;
       thinkingLevel: string;
+      availableThinkingLevels?: string[];
+      scopedModels?: ScopedModelInfo[];
       model: ModelInfo | null;
+      /** All registry models; each entry carries available and may require auth. */
       availableModels: ModelInfo[];
       /** History tool-result records may include outputElided?: boolean and outputBytes?: number metadata. */
       messages: unknown[];
@@ -525,8 +617,10 @@ export type ServerCustomEvent =
       isCompacting?: boolean;
       autoCompactionEnabled?: boolean;
       autoRetryEnabled?: boolean;
+      hideThinkingBlock?: boolean;
       queuedSteering?: string[];
       queuedFollowUp?: string[];
+      deferred?: string[];
       piVersion?: string;
       uiVersion?: string;
       projectTrust?: ProjectTrustInfo;
@@ -539,16 +633,25 @@ export type ServerCustomEvent =
       activeToolNames?: string[];
       commands?: CommandSummary[];
     }
-  | { type: 'resources_list'; skills: SkillSummary[]; prompts: PromptSummary[]; sessionId?: string }
+  | {
+      type: 'resources_list';
+      skills: SkillSummary[];
+      prompts: PromptSummary[];
+      themes?: ThemeSummary[];
+      contextFiles?: string[];
+      diagnostics?: ResourceDiagnosticSummary[];
+      sessionId?: string;
+    }
   | { type: 'commands_list'; commands: CommandSummary[]; sessionId?: string }
   | { type: 'providers_error'; message: string; sessionId?: string }
   | {
       type: 'queue_update';
       steering: string[];
       followUp: string[];
+      /** Messages waiting for the server's global run-concurrency slot. */
+      deferred?: string[];
       sessionId?: string;
     }
-  /** Full tool output fetched for an expanded history row. */
   | {
       type: 'tool_output';
       sessionId: string;
@@ -557,9 +660,46 @@ export type ServerCustomEvent =
       details?: string;
       diff?: string;
       renderedResultHtml?: string[];
+      toolDetails?: Record<string, unknown>;
       error?: string;
       requestId?: string;
     }
+  | {
+      type: 'provider_login_state';
+      loginId: string;
+      provider: string;
+      providerName: string;
+      authType: 'oauth' | 'api_key';
+      status: 'started' | 'succeeded' | 'failed' | 'cancelled';
+      error?: string;
+    }
+  | {
+      type: 'provider_login_event';
+      loginId: string;
+      event:
+        | { type: 'info'; message: string; links?: { url: string; label?: string }[] }
+        | { type: 'auth_url'; url: string; instructions?: string }
+        | {
+            type: 'device_code';
+            userCode: string;
+            verificationUri: string;
+            intervalSeconds?: number;
+            expiresInSeconds?: number;
+          }
+        | { type: 'progress'; message: string };
+    }
+  | {
+      type: 'provider_login_prompt';
+      loginId: string;
+      promptId: string;
+      prompt: {
+        type: 'text' | 'secret' | 'select' | 'manual_code';
+        message: string;
+        placeholder?: string;
+        options?: { id: string; label: string; description?: string }[];
+      };
+    }
+  | { type: 'provider_login_prompt_cancel'; loginId: string; promptId: string }
   | { type: 'sessions_list'; sessions: SessionSummary[] }
   | { type: 'all_sessions_list'; sessions: SessionSummary[] }
   | { type: 'session_updated'; session: SessionSummary }
@@ -604,6 +744,13 @@ export type ServerCustomEvent =
       updates?: PackageUpdateInfo[];
       sessionId?: string;
     }
+  | {
+      type: 'footer_data';
+      sessionId: string;
+      gitBranch: string | null;
+      availableProviderCount: number;
+      stats?: FooterStats;
+    }
   | { type: 'package_progress'; progress: PackageProgress; sessionId?: string }
   | { type: 'package_result'; success: boolean; message: string; sessionId?: string }
   | { type: 'session_stats'; stats: SessionStats; sessionId?: string }
@@ -644,7 +791,19 @@ export type ServerCustomEvent =
       messagesTruncated: boolean;
       sessionId?: string;
     }
-  | { type: 'session_tree'; tree: TreeNode[]; sessionId?: string }
+  | {
+      type: 'session_tree';
+      tree: TreeNode[];
+      sessionId?: string;
+      branchSummarySkipPrompt?: boolean;
+    }
+  | {
+      type: 'tree_navigated';
+      sessionId: string;
+      ok: boolean;
+      error?: string;
+      editorText?: string;
+    }
   | {
       type: 'command_completions';
       command: string;
@@ -665,6 +824,14 @@ export type ServerCustomEvent =
       error?: string;
     }
   | { type: 'settings'; settings: Record<string, unknown> }
+  | {
+      type: 'sdk_settings';
+      settings: Record<string, unknown>;
+      projectOverrides: Record<string, unknown>;
+      descriptions: Record<string, string>;
+    }
+  | { type: 'sdk_setting_result'; key: string; ok: boolean; error?: string }
+  | { type: 'extension_ui_cancel'; id: string; sessionId?: string; reason: 'timeout' | 'aborted' }
   | { type: 'pong' }
   | { type: 'agent_error'; error: string; sessionId?: string; dedupeKey?: string }
   | { type: 'queue_restored'; text: string }
@@ -700,6 +867,14 @@ export type ServerCustomEvent =
   | { type: 'extension_ui_dismiss'; id: string; sessionId?: string }
   | { type: 'extension_ui_update'; id: string; parsed: ParsedComponent; sessionId?: string }
   | { type: 'custom_render'; id: string; lines: string[]; htmlLines?: string[]; sessionId?: string }
+  | {
+      type: 'tool_renderer_update';
+      sessionId: string;
+      toolCallId: string;
+      kind: 'call' | 'result';
+      renderedCallHtml?: string[];
+      renderedResultHtml?: string[];
+    }
   | {
       type: 'compaction_end';
       sessionId: string;
@@ -743,6 +918,9 @@ export type ClientMessage =
   | { type: 'abort_retry'; sessionId?: string }
   | { type: 'set_thinking_level'; sessionId?: string; level: string }
   | { type: 'set_model'; sessionId?: string; provider: string; modelId: string }
+  | { type: 'cycle_model'; sessionId?: string; direction?: 'forward' | 'backward' }
+  | { type: 'cycle_thinking_level'; sessionId?: string }
+  | { type: 'set_scoped_models'; sessionId?: string; models: ScopedModelInfo[] }
   | { type: 'new_session'; targetCwd?: string; requestId: string }
   | { type: 'switch_session'; path: string; requestId: string }
   /** Tell the server which session this socket is looking at; drives unread and visibility semantics. */
@@ -765,6 +943,16 @@ export type ClientMessage =
   | { type: 'pin_project'; cwd: string; pinned: boolean }
   /** Set a custom display name for a project. Empty name resets to the basename. */
   | { type: 'rename_project'; cwd: string; name: string }
+  /** Start an SDK provider login flow. */
+  | { type: 'provider_login'; sessionId?: string; provider: string; authType: 'oauth' | 'api_key' }
+  | {
+      type: 'provider_login_response';
+      loginId: string;
+      promptId: string;
+      value?: string;
+      cancelled?: boolean;
+    }
+  | { type: 'provider_login_cancel'; loginId: string }
   /** Request filesystem directory entries for path autocomplete. Server replies with dir_completions. */
   | { type: 'dir_complete'; prefix: string }
   | { type: 'file_complete'; sessionId: string; requestId: string; query: string }
@@ -826,8 +1014,15 @@ export type ClientMessage =
   | { type: 'rename_session'; sessionId: string; name: string; requestId: string }
   /** Permanently delete a session file by its stable session ID (cannot delete the active session). */
   | { type: 'delete_session'; sessionId: string; requestId: string }
-  /** Manually compact the session context (aborts running agent first). */
-  | { type: 'compact'; sessionId?: string }
+  /** Manually compact the session context with optional summary instructions. */
+  | { type: 'compact'; sessionId?: string; customInstructions?: string }
+  /** Remove one pending SDK or concurrency-deferred queue item by its current index. */
+  | {
+      type: 'remove_queued';
+      sessionId?: string;
+      kind: 'steer' | 'followUp' | 'deferred';
+      index: number;
+    }
   /** Enable or disable automatic context compaction. */
   | { type: 'set_auto_compaction'; sessionId?: string; enabled: boolean }
   /** Enable or disable automatic retry on transient errors. */
@@ -875,12 +1070,22 @@ export type ClientMessage =
   | { type: 'restart_server'; nonce?: string }
   /** Execute a built-in slash command in the server session context. */
   | { type: 'run_builtin'; sessionId?: string; command: string; args?: string }
+  | { type: 'import_session'; name: string; content: string }
   /** Request aggregate counts, token usage, and cost for the active session. */
   | { type: 'get_session_stats'; sessionId?: string }
   /** Export the active session branch. */
   | { type: 'export_session'; sessionId?: string; format: 'html' | 'jsonl' }
   /** Request the session tree data for visual display. Server replies with session_tree. */
   | { type: 'get_session_tree'; sessionId?: string }
+  | {
+      type: 'navigate_tree';
+      sessionId?: string;
+      entryId: string;
+      summarize?: boolean;
+      customInstructions?: string;
+      label?: string;
+    }
+  | { type: 'set_entry_label'; sessionId?: string; entryId: string; label?: string }
   | { type: 'read_file'; path: string }
   /** Write file content from the file viewer modal's edit mode. */
   | { type: 'write_file'; path: string; content: string }
@@ -899,6 +1104,14 @@ export type ClientMessage =
   /** Set the notification webhook URL (ntfy.sh, Pushover, Gotify, etc.). Empty string clears. */
   /** Read persisted UI settings. Server replies with 'settings' event. */
   | { type: 'get_settings' }
+  | { type: 'get_sdk_settings'; sessionId?: string }
+  | {
+      type: 'set_sdk_setting';
+      sessionId?: string;
+      key: string;
+      value: unknown;
+      scope?: 'global' | 'project';
+    }
   /** Persist UI settings to disk. Values are merged shallowly into the stored object. */
   | { type: 'set_settings'; settings: Record<string, unknown> }
   /** Heartbeat — server replies with `{ type: 'pong' }`. Keeps the socket alive and detects zombies. */

@@ -19,7 +19,10 @@ Sent on WS open. Contains the full state for the session selected for this conne
   isStreaming: boolean;
   activeToolName?: string;
   thinkingLevel: string;
+  availableThinkingLevels?: string[];
+  scopedModels?: ScopedModelInfo[];
   model: ModelInfo | null;
+  builtinCommands?: Array<{ name: string; description: string; argumentHint?: string }>;
   availableModels: ModelInfo[];
   messages: AgentMessage[];
   streamingMessage?: AgentMessage;
@@ -30,8 +33,10 @@ Sent on WS open. Contains the full state for the session selected for this conne
   isCompacting?: boolean;
   autoCompactionEnabled?: boolean;
   autoRetryEnabled?: boolean;
+  hideThinkingBlock?: boolean;
   queuedSteering?: string[];
   queuedFollowUp?: string[];
+  deferred?: string[];
   pushVapidKey?: string | null;
   piVersion?: string;
   uiVersion?: string;
@@ -44,12 +49,24 @@ Sent on WS open. Contains the full state for the session selected for this conne
   modelFallbackMessage?: string;
   tools?: Array<{ name: string; description: string; isBuiltin: boolean; origin?: string }>;
   activeToolNames?: string[];
-  /** Legacy extension widgets replayed for this session. */
   widgets?: WidgetPayload[];
-  /** Full extension UI snapshot (statuses, widgets, dialogs, terminalInputActive). */
   extensionUiState?: ExtensionUiStatePayload;
 }
 ```
+
+`availableThinkingLevels` and `scopedModels` report server/SDK-owned model state. `builtinCommands` is the SDK command catalog. `queuedSteering` and `queuedFollowUp` are SDK queues; `deferred` contains prompts waiting for the server's global run-concurrency slot. `ModelInfo.available` is an optional boolean and `authRequired` an optional provider ID. `ProviderInfo` may include `oauthLoginLabel`, `apiKeyLogin`, and `oauthAuthenticated`.
+
+#### Session snapshot model and queue fields
+
+The authoritative session snapshot carries `availableThinkingLevels`, `scopedModels`, `hideThinkingBlock`, and `deferred` alongside the queue and model fields. The SDK command catalog (`builtinCommands`) is sent in the initial `connected` snapshot.
+
+#### Tree and rendered tool payloads
+
+`session_tree` returns `tree: TreeNode[]` and may include `branchSummarySkipPrompt`. Each node has `entryId`, `type`, `children`, and optional `role`, `text`, `label`, `isCurrentLeaf`, and `isOnCurrentPath`. `tool_output` may contain `toolDetails: Record<string, unknown>` projected only from recognized built-in tool details; extension details are not exposed. `resources_list` may include `diagnostics: ResourceDiagnosticSummary[]` (`type: 'warning' | 'error' | 'collision'`, `message`, optional `path`), `contextFiles: string[]`, and `themes: ThemeSummary[]` (`name`, optional `scope`, `sourcePath`), alongside skills and prompts.
+
+`footer_data` is `{ sessionId, gitBranch: string | null, availableProviderCount, stats? }`; `stats` contains token totals (`inputTokens`, `outputTokens`, `cacheReadTokens`, `cacheWriteTokens`, `totalTokens`) and `cost`.
+
+Extension UI snapshots may include parsed `headerTree` and `footerTree`, in addition to the legacy text `header` and `footer`.
 
 #### `session_loaded`
 
@@ -60,8 +77,9 @@ Broadcast when the visible session changes (new session, switch, or fork) or aft
   type: 'session_loaded';
   sessionId: string;
   isStreaming: boolean;
-  activeToolName?: string;
   thinkingLevel: string;
+  availableThinkingLevels?: string[];
+  scopedModels?: ScopedModelInfo[];
   model: ModelInfo | null;
   availableModels: ModelInfo[];
   messages: AgentMessage[];
@@ -72,8 +90,10 @@ Broadcast when the visible session changes (new session, switch, or fork) or aft
   sessionName?: string;
   isCompacting?: boolean;
   autoCompactionEnabled?: boolean;
+  hideThinkingBlock?: boolean;
   autoRetryEnabled?: boolean;
   queuedSteering?: string[];
+  deferred?: string[];
   queuedFollowUp?: string[];
   piVersion?: string;
   uiVersion?: string;
@@ -108,10 +128,52 @@ interface SessionSummary {
   turns?: number; // User + assistant turns
   parentSession?: string; // Forked file path or subagent task parent session ID
   firstMessage: string;
+  lastModel?: { provider: string; modelId: string };
+  totalCost?: number;
+  totalTokens?: number;
+  labelCount?: number;
 }
 ```
 
 When `parentSession` is present, clients organize sessions into hierarchical trees/threads under the parent session.
+
+#### Session and catalog metadata
+
+`ModelInfo` includes optional `input?: ('text' | 'image')[]`, `cost?: { input: number; output: number; cacheRead: number; cacheWrite: number }` (USD per million tokens), `maxTokens?: number`, and `isDefault?: boolean`, in addition to availability, authentication, and thinking metadata.
+
+`ProviderInfo` may include `authLabel?: string`, `subscription?: boolean`, `oauthSubscription?: boolean`, and `baseUrl?: string`, alongside `oauthLoginLabel`, `apiKeyLogin`, and `oauthAuthenticated`.
+
+`ProjectInfo` may include `gitBranch?: string | null` (the current branch, a short detached-HEAD hash, or `null` when unavailable).
+
+#### Provider login events
+
+`provider_login` is an asynchronous start request: the server responds immediately with a `provider_login_state` whose `status` is `started` (or a terminal `failed` state if it cannot start). Further status, event, and prompt messages are sent only to the requesting socket; they are not broadcast to other clients. A started login later receives a terminal `provider_login_state` with `status: 'succeeded' | 'failed' | 'cancelled'`.
+
+```ts
+// Server → requesting client
+{ type: 'provider_login_state'; loginId: string; provider: string; providerName: string;
+  authType: 'oauth' | 'api_key'; status: 'started' | 'succeeded' | 'failed' | 'cancelled';
+  error?: string }
+{ type: 'provider_login_event'; loginId: string;
+  event:
+    | { type: 'info'; message: string; links?: { url: string; label?: string }[] }
+    | { type: 'auth_url'; url: string; instructions?: string }
+    | { type: 'device_code'; userCode: string; verificationUri: string;
+        intervalSeconds?: number; expiresInSeconds?: number }
+    | { type: 'progress'; message: string } }
+{ type: 'provider_login_prompt'; loginId: string; promptId: string;
+  prompt: { type: 'text' | 'secret' | 'select' | 'manual_code'; message: string;
+    placeholder?: string; options?: { id: string; label: string; description?: string }[] } }
+{ type: 'provider_login_prompt_cancel'; loginId: string; promptId: string }
+
+// Client → server
+{ type: 'provider_login'; sessionId?: string; provider: string; authType: 'oauth' | 'api_key' }
+{ type: 'provider_login_response'; loginId: string; promptId: string;
+  value?: string; cancelled?: boolean }
+{ type: 'provider_login_cancel'; loginId: string }
+```
+
+`provider_login_response` answers a specific outstanding prompt; `cancelled: true` (or an omitted `value`) rejects it. `provider_login_cancel` aborts the whole login. `provider_login_prompt_cancel` tells the requesting client that the prompt was invalidated, for example because its prompt signal or login was aborted.
 
 #### SDK Events (forwarded as-is)
 
@@ -125,30 +187,35 @@ When `parentSession` is present, clients organize sessions into hierarchical tre
 
 #### Custom Server Events
 
-- `model_changed` — `{ model: ModelInfo | null, thinkingLevel?: string, sessionId?: string }`; model selection or thinking level updated for the stamped session
-- **Session stamps** — Session-scoped events carry `sessionId` so clients route each event to the corresponding resident session view, rather than treating the stamp only as a stale-event guard. `connected` and `session_loaded` snapshots describe the session visible to the receiving client, while `session_runtime` deltas may describe any resident session.
-- `thinking_level_changed` — `{ level: string }`; reasoning depth updated
+- `model_changed` — `{ model: ModelInfo | null, thinkingLevel: string, availableThinkingLevels: string[], scopedModels: ScopedModelInfo[], sessionId?: string }`; model or scope changed
+- `thinking_level_changed` — `{ level: string, availableThinkingLevels: string[], sessionId?: string }`; thinking level changed
+- **Session stamps** — Session-scoped events carry `sessionId` so clients route each event to the corresponding resident session view; `connected` and `session_loaded` describe the visible session, while `session_runtime` deltas may describe any resident.
 - `available_models_changed` — `{ availableModels: ModelInfo[], sessionId?: string }`; session-stamped refreshes from a prior session are ignored by clients
 - `models_refresh_result` — `{ success: boolean, message: string }`; completion status for a forced network model-catalog refresh
-- `sessions_error` — `{ message: string, requestId?: string }`; operation error with an optional vestigial compatibility echo (clients do not correlate it)
-- `session_runtime` — Coalesced runtime status for a resident session; see the field reference below. A snapshot for every resident session is sent during connection initialisation.
-
+- `sessions_error` — `{ message: string, requestId?: string }`; operation error with an optional vestigial compatibility echo
+- `session_runtime` — Coalesced runtime status for a resident session; see the field reference below.
+- `tree_navigated` — `{ sessionId, ok, error?, editorText? }`; result of `navigate_tree`
+- `extension_ui_cancel` — `{ id, sessionId?, reason: 'timeout' | 'aborted' }`; pending extension dialog timed out or was aborted
+- `tool_renderer_update` — `{ sessionId, toolCallId, kind: 'call' | 'result', html: string[] }`; custom renderer state update
+- `footer_data` — `{ sessionId, gitBranch: string | null, availableProviderCount, stats? }`; `stats` has `inputTokens`, `outputTokens`, `cacheReadTokens`, `cacheWriteTokens`, `totalTokens`, and `cost`
+- `sdk_settings` — `{ settings, projectOverrides, descriptions }`; `sdk_setting_result` — `{ key, ok, error? }`
 - `session_updated` — `{ session: SessionSummary }`; coalesced catalog delta for one session (emitted on `message_end` turns)
+- `queue_update` — `{ steering: string[], followUp: string[], deferred?: string[], sessionId? }`; SDK queues plus prompts waiting for global concurrency
 - `all_sessions_list` / `sessions_list` — `{ sessions: SessionSummary[] }`; full session inventory
 - `projects_list` — `{ projects: ProjectInfo[] }`; merged list of registered and discovered session projects
 - `dir_completions` — `{ prefix: string, entries: string[] }`; filesystem directory completion matches
 - `file_completions` — `{ query: string, entries: string[] }`; workspace file completion matches for composer `@` references
 - `file_content` — `{ path: string, content: string, error?: string }`; file read response
 - `file_saved` — `{ path: string, error?: string }`; file write response
-- `file_staged` — `{ name: string, path: string, error?: string }`; binary upload staged under `.pi-ui-uploads/` (workspace-relative `path`) for `@` references
-- `extension_terminal_input_active` — `{ active: boolean, sessionId?: string }`; emitted when a session's `onTerminalInput` handler set appears/disappears (register, unregister, extension reload, session dispose)
-- `extension_terminal_input_result` — `{ id: string, consumed: boolean, data?: string, sessionId?: string }`; verdict for a client's `extension_terminal_input` round trip (`consumed: true` swallows the key; `data` replaces it)
+- `file_staged` — `{ name: string, path: string, error?: string }`; binary upload staged under `.pi-ui-uploads/` for `@` references
+- `extension_terminal_input_active` — `{ active: boolean, sessionId?: string }`; emitted when a session's `onTerminalInput` handlers appear or disappear
+- `extension_terminal_input_result` — `{ id: string, consumed: boolean, data?: string, sessionId?: string }`; verdict for terminal input round trip
 - `extension_ui_state` — `{ sessionId: string, ui: ExtensionUiStatePayload }`; full extension UI snapshot
-- `extension_ui_request` — `{ id, method, ... }`; extension modal/dialog request (e.g. `setWidget` with `widgetKey`, `widgetType`, `widgetPlacement`)
-- `extension_ui_dismiss` — `{ id: string, sessionId?: string }`; dismisses an open extension dialog across all tabs
+- `extension_ui_request` — `{ id, method, ... }`; extension modal/dialog request
+- `extension_ui_dismiss` — `{ id, sessionId?: string }`; dismisses an open extension dialog across all tabs
 - `update_status` — Update check results
 - `server_restarting` — Server shutdown initiated
-- `slash_result` — `{ command: string, message: string, level?: 'info' | 'warning' | 'error', sessionId?: string }`; output from built-in commands like direct shell execution (`!`)
+- `slash_result` — `{ command: string, message: string, level?: 'info' | 'warning' | 'error', sessionId?: string }`; built-in command output
 - `agent_error` — Error from SDK or server
 
 ##### `session_runtime` fields
@@ -184,31 +251,38 @@ Session-scoped client messages accept an optional target field, `sessionId?: str
 
 #### Session Management
 
-| Type                  | Payload                         | Purpose                                                                                                          |
-| --------------------- | ------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| `new_session`         | `{ targetCwd?, requestId? }`    | Start a new session; an optional legacy `requestId` may be echoed in `session_loaded`/`sessions_error`           |
-| `switch_session`      | `{ path, requestId? }`          | Switch to an existing session; an optional legacy `requestId` may be echoed in `session_loaded`/`sessions_error` |
-| `session_focus`       | `{ sessionId: string \| null }` | Set the session visible to this socket and clear its unread flag when non-null                                   |
-| `fork_session`        | `{ sessionId?, entryId }`       | Fork a specific resident session at an entry                                                                     |
-| `get_all_sessions`    | —                               | Request all sessions across all project directories (replies with `all_sessions_list`)                           |
-| `get_session_tree`    | `{ sessionId? }`                | Request session branch tree                                                                                      |
-| `get_fork_points`     | `{ sessionId? }`                | Request user messages for forking                                                                                |
-| `compact`             | `{ sessionId? }`                | Manually compact session context (carries updated `contextUsage`)                                                |
-| `set_auto_compaction` | `{ sessionId?, enabled }`       | Toggle auto-compaction                                                                                           |
-| `set_auto_retry`      | `{ sessionId?, enabled }`       | Toggle auto-retry                                                                                                |
-| `rename_session`      | `{ path, name }`                | Set session display name                                                                                         |
-| `delete_session`      | `{ path }`                      | Delete a session file (resident session protected while busy)                                                    |
+| Type                  | Payload                                                            | Purpose                                                                                                          |
+| --------------------- | ------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------- |
+| `new_session`         | `{ targetCwd?, requestId? }`                                       | Start a new session; an optional legacy `requestId` may be echoed in `session_loaded`/`sessions_error`           |
+| `switch_session`      | `{ path, requestId? }`                                             | Switch to an existing session; an optional legacy `requestId` may be echoed in `session_loaded`/`sessions_error` |
+| `session_focus`       | `{ sessionId: string \| null }`                                    | Set the session visible to this socket and clear its unread flag when non-null                                   |
+| `fork_session`        | `{ sessionId?, entryId }`                                          | Fork a specific resident session at an entry                                                                     |
+| `get_all_sessions`    | —                                                                  | Request all sessions across all project directories (replies with `all_sessions_list`)                           |
+| `get_fork_points`     | `{ sessionId? }`                                                   | Request user messages for forking                                                                                |
+| `set_auto_compaction` | `{ sessionId?, enabled }`                                          | Toggle auto-compaction                                                                                           |
+| `compact`             | `{ sessionId?, customInstructions? }`                              | Manually compact with optional summary instructions                                                              |
+| `remove_queued`       | `{ sessionId?, kind: 'steer' \| 'followUp' \| 'deferred', index }` | Remove an item from an SDK or concurrency-deferred queue                                                         |
+| `navigate_tree`       | `{ sessionId?, entryId, summarize?, customInstructions?, label? }` | Navigate to a branch, optionally summarize and label it                                                          |
+| `set_entry_label`     | `{ sessionId?, entryId, label? }`                                  | Set or clear an entry label                                                                                      |
+| `get_session_tree`    | `{ sessionId? }`                                                   | Request the branch tree with labels and path/leaf state                                                          |
+| `set_auto_retry`      | `{ sessionId?, enabled }`                                          | Toggle auto-retry                                                                                                |
+| `rename_session`      | `{ path, name }`                                                   | Set session display name                                                                                         |
+| `delete_session`      | `{ path }`                                                         | Delete a session file (resident session protected while busy)                                                    |
 
 #### Model & Provider
 
-| Type                  | Payload                             | Purpose                                           |
-| --------------------- | ----------------------------------- | ------------------------------------------------- |
-| `set_model`           | `{ sessionId?, provider, modelId }` | Switch session's model                            |
-| `set_thinking_level`  | `{ sessionId?, level }`             | Set session reasoning depth                       |
-| `get_providers`       | —                                   | Request provider list                             |
-| `refresh_models`      | —                                   | Force a network refresh of dynamic model catalogs |
-| `set_provider_key`    | `{ provider, key }`                 | Persist API key for provider                      |
-| `remove_provider_key` | `{ provider }`                      | Remove stored API key                             |
+| Type                   | Payload                                                    | Purpose                                                                                    |
+| ---------------------- | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| `set_model`            | `{ sessionId?, provider, modelId }`                        | Switch session's model                                                                     |
+| `set_thinking_level`   | `{ sessionId?, level }`                                    | Set session reasoning depth                                                                |
+| `cycle_model`          | `{ sessionId?, direction?: 'forward' \| 'backward' }`      | Cycle available models                                                                     |
+| `cycle_thinking_level` | `{ sessionId? }`                                           | Cycle server-supported thinking levels                                                     |
+| `set_scoped_models`    | `{ sessionId?, models: ScopedModelInfo[] }`                | Set session model scope; each item has `provider`, `modelId`, and optional `thinkingLevel` |
+| `provider_login`       | `{ sessionId?, provider, authType: 'oauth' \| 'api_key' }` | Start SDK provider authentication                                                          |
+| `get_providers`        | —                                                          | Request provider list                                                                      |
+| `refresh_models`       | —                                                          | Force a network refresh of dynamic model catalogs                                          |
+| `set_provider_key`     | `{ provider, key }`                                        | Persist API key for provider                                                               |
+| `remove_provider_key`  | `{ provider }`                                             | Remove stored API key                                                                      |
 
 #### Project & Filesystem
 
@@ -239,17 +313,20 @@ Session-scoped client messages accept an optional target field, `sessionId?: str
 
 #### Admin
 
-| Type                | Payload                     | Purpose                                                             |
-| ------------------- | --------------------------- | ------------------------------------------------------------------- |
-| `get_tools`         | —                           | Request full tool list and active tools (replies with `tools_list`) |
-| `set_active_tools`  | `{ sessionId?, toolNames }` | Set the active tool subset for a session                            |
-| `get_resources`     | —                           | Request skills/prompts (replies with `resources_list`)              |
-| `get_extensions`    | —                           | Request extension list (replies with `extensions_list`)             |
-| `install_skill`     | `{ url, scope }`            | Install a skill from URL (replies with `skill_install_result`)      |
-| `get_update_status` | —                           | Check for updates (replies with `update_status`)                    |
-| `run_update`        | `{ target }`                | Execute update (`ui` or `sdk`)                                      |
-| `request_restart`   | —                           | Request single-use nonce for server restart                         |
-| `restart_server`    | `{ nonce? }`                | Restart server process                                              |
+| Type                | Payload                                                     | Purpose                                                                       |
+| ------------------- | ----------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| `get_tools`         | —                                                           | Request full tool list and active tools (replies with `tools_list`)           |
+| `set_active_tools`  | `{ sessionId?, toolNames }`                                 | Set the active tool subset for a session                                      |
+| `get_resources`     | —                                                           | Request skills/prompts (replies with `resources_list`)                        |
+| `get_extensions`    | —                                                           | Request extension list (replies with `extensions_list`)                       |
+| `import_session`    | `{ name, content }`                                         | Import session data                                                           |
+| `get_sdk_settings`  | `{ sessionId? }`                                            | Read SDK settings and project overrides                                       |
+| `set_sdk_setting`   | `{ sessionId?, key, value, scope?: 'global' \| 'project' }` | Update a writable allow-listed SDK setting (writes are currently global-only) |
+| `install_skill`     | `{ url, scope }`                                            | Install a skill from URL (replies with `skill_install_result`)                |
+| `get_update_status` | —                                                           | Check for updates (replies with `update_status`)                              |
+| `run_update`        | `{ target }`                                                | Execute update (`ui` or `sdk`)                                                |
+| `request_restart`   | —                                                           | Request single-use nonce for server restart                                   |
+| `restart_server`    | `{ nonce? }`                                                | Restart server process                                                        |
 
 ## Session Switching
 

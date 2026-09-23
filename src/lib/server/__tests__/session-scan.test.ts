@@ -230,6 +230,24 @@ describe('session-scan', () => {
     expect(second[0].name).toBe('Original name');
     expect(second[0].messageCount).toBe(1);
     expect(second[0].modified.getTime()).toBe(first[0].modified.getTime());
+    appendFileSync(
+      path,
+      JSON.stringify({
+        type: 'message',
+        id: 'assistant-after-restart',
+        message: {
+          role: 'assistant',
+          provider: 'anthropic',
+          model: 'claude-sonnet-4-5',
+          usage: { totalTokens: 12, cost: { total: 0.25 } },
+        },
+      }) + '\n'
+    );
+    expect((await scanAllSessions(ROOT))[0]).toMatchObject({
+      totalTokens: 12,
+      totalCost: 0.25,
+      lastModel: { provider: 'anthropic', modelId: 'claude-sonnet-4-5' },
+    });
   });
 
   it('starts empty on a corrupt cache file and re-parses', async () => {
@@ -273,5 +291,82 @@ describe('session-scan', () => {
     const infos = await scanAllSessions(ROOT);
     expect(infos.map((i) => i.id).sort()).toEqual(['parent-id', 'task-id']);
     expect(infos.find((i) => i.id === 'task-id')?.parentSessionPath).toBe('parent-id');
+  });
+
+  it('folds assistant usage and model changes incrementally like a full scan', async () => {
+    const path = writeSession('usage-fold.jsonl', {
+      id: 'usage-fold',
+      ts: '2026-01-01T00:00:00.000Z',
+      messages: [{ role: 'user', text: 'question' }],
+    });
+    const append = (entry: object) => appendFileSync(path, JSON.stringify(entry) + '\n');
+    append({
+      type: 'message',
+      id: 'a1',
+      message: {
+        role: 'assistant',
+        provider: 'anthropic',
+        model: 'claude-sonnet-4-5',
+        usage: { totalTokens: 125, cost: { total: 0.12 } },
+      },
+    });
+    const first = (await scanAllSessions(ROOT))[0];
+    expect(first).toMatchObject({
+      totalTokens: 125,
+      totalCost: 0.12,
+      lastModel: { provider: 'anthropic', modelId: 'claude-sonnet-4-5' },
+    });
+
+    append({
+      type: 'message',
+      id: 'a2',
+      message: {
+        role: 'assistant',
+        provider: 'openai',
+        model: 'gpt-4.1',
+        usage: { totalTokens: 200, cost: { total: 0.3 } },
+      },
+    });
+    append({ type: 'model_change', id: 'mc1', provider: 'google', modelId: 'gemini-2.5-pro' });
+    const incremental = (await scanAllSessions(ROOT))[0];
+    expect(incremental).toMatchObject({
+      totalTokens: 325,
+      totalCost: 0.42,
+      lastModel: { provider: 'google', modelId: 'gemini-2.5-pro' },
+    });
+
+    clearSessionScanCache();
+    const full = (await scanAllSessions(ROOT))[0];
+    expect({
+      totalTokens: incremental.totalTokens,
+      totalCost: incremental.totalCost,
+      lastModel: incremental.lastModel,
+    }).toEqual({
+      totalTokens: full.totalTokens,
+      totalCost: full.totalCost,
+      lastModel: full.lastModel,
+    });
+  });
+
+  it('counts currently labelled entries with set and clear semantics', async () => {
+    const path = writeSession('labels.jsonl', { id: 'labels', ts: '2026-01-01T00:00:00.000Z' });
+    const appendLabel = (targetId: string, label?: string) =>
+      appendFileSync(
+        path,
+        JSON.stringify({
+          type: 'label',
+          id: `label-${targetId}-${label ?? 'clear'}`,
+          targetId,
+          label,
+        }) + '\n'
+      );
+    appendLabel('entry-1', 'checkpoint');
+    appendLabel('entry-2', 'review');
+    appendLabel('entry-1', 'important');
+    expect((await scanAllSessions(ROOT))[0].labelCount).toBe(2);
+    appendLabel('entry-2');
+    expect((await scanAllSessions(ROOT))[0].labelCount).toBe(1);
+    appendLabel('entry-1');
+    expect((await scanAllSessions(ROOT))[0].labelCount).toBeUndefined();
   });
 });

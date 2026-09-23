@@ -16,6 +16,7 @@
     isMobile,
     workingVisible,
     hiddenThinkingLabel,
+    hideThinkingBlock,
     workingIndicatorFrames,
     workingFrameIndex,
     workingMessage,
@@ -34,6 +35,7 @@
     isMobile: boolean;
     workingVisible: boolean;
     hiddenThinkingLabel: string;
+    hideThinkingBlock: boolean;
     workingIndicatorFrames: string[];
     workingFrameIndex: number;
     workingMessage: string | undefined;
@@ -46,8 +48,19 @@
   } = $props();
   let messageLabelId = $derived(messageElementId('assistant-label', msg.id));
   let thinkingToggleId = $derived(messageElementId('thinking-toggle', msg.id));
+  let thinkingHiddenText = $derived(
+    hiddenThinkingLabel ||
+      (msg.endMs && msg.thinkingStartMs
+        ? `Thought for ${Math.round((msg.endMs - msg.thinkingStartMs) / 1000)}s`
+        : 'Thinking…')
+  );
   let thinkingPanelId = $derived(messageElementId('thinking', msg.id));
   let thinkingText = $derived(msg.thinking ?? '');
+  let usageTitle = $derived(
+    msg.usage
+      ? `Input ${msg.usage.input} · Output ${msg.usage.output} · Cache read ${msg.usage.cacheRead} · Cache write ${msg.usage.cacheWrite}${msg.usage.reasoning !== undefined ? ` · Reasoning ${msg.usage.reasoning}` : ''} · Total ${msg.usage.totalTokens} tokens · Cost: input $${msg.usage.cost.input.toFixed(6)}, output $${msg.usage.cost.output.toFixed(6)}, cache read $${msg.usage.cost.cacheRead.toFixed(6)}, cache write $${msg.usage.cost.cacheWrite.toFixed(6)}, total $${msg.usage.cost.total.toFixed(6)}`
+      : ''
+  );
 </script>
 
 <!-- Long-press gesture surface — children are the interactive elements -->
@@ -75,10 +88,12 @@
           class="w-3.5 h-3.5 flex-shrink-0"
           style="color:var(--color-secondary);animation:pulse 1.5s ease-in-out infinite"
         />
-        <span class="trace-row-label italic shimmer-text">{hiddenThinkingLabel}</span>
-        <span class="trace-row-detail italic"
-          >{thinkingText.slice(0, 120)}{thinkingText.length > 120 ? '…' : ''}</span
-        >
+        <span class="trace-row-label italic shimmer-text">{thinkingHiddenText}</span>
+        {#if !hideThinkingBlock}
+          <span class="trace-row-detail italic"
+            >{thinkingText.slice(0, 120)}{thinkingText.length > 120 ? '…' : ''}</span
+          >
+        {/if}
       </div>
     {:else if !msg.content}
       <!-- Waiting/loading: flat flex row -->
@@ -87,12 +102,17 @@
           class="w-3 h-3 flex-shrink-0 animate-spin"
           style="color:var(--color-secondary);opacity:0.6"
         />
-        <span class="trace-row-label italic shimmer-text">{hiddenThinkingLabel}</span>
+        <span class="trace-row-label italic shimmer-text">{thinkingHiddenText}</span>
         <span class="trace-row-detail italic">…</span>
       </div>
     {/if}
-  {:else if thinkingText}
-    {#if msg.content}
+  {:else if thinkingText && !msg.blocks?.length}
+    {#if hideThinkingBlock}
+      <div class="trace-row">
+        <Brain class="w-3.5 h-3.5 flex-shrink-0" style="color:var(--color-secondary)" />
+        <span class="trace-row-label italic">{thinkingHiddenText}</span>
+      </div>
+    {:else if msg.content}
       <!-- Collapsed thinking toggle: flat flex row -->
       <button
         id={thinkingToggleId}
@@ -130,15 +150,19 @@
     id={thinkingPanelId}
     role="region"
     aria-labelledby={thinkingText && msg.content ? thinkingToggleId : undefined}
-    hidden={!msg.thinkingExpanded || !thinkingText || !msg.content}
+    hidden={!msg.thinkingExpanded ||
+      !thinkingText ||
+      !msg.content ||
+      Boolean(msg.blocks?.length) ||
+      hideThinkingBlock}
     class="trace-output text-[11px] text-base-content/55 max-h-56 overflow-y-auto leading-relaxed bg-base-content/[0.03] rounded-r px-3 py-2 mb-4 select-text prose prose-sm"
   >
-    {#if msg.thinkingExpanded && thinkingText && msg.content}
+    {#if msg.thinkingExpanded && thinkingText && msg.content && !msg.blocks?.length && !hideThinkingBlock}
       {@html msg.renderedThinking ?? memoizedRenderMarkdown(thinkingText)}
     {/if}
   </div>
 
-  {#if msg.content || msg.streaming}
+  {#if (msg.content || msg.streaming) && !(msg.blocks?.length && !msg.streaming)}
     <div class="trace-body leading-relaxed select-text">
       {#if !msg.content && msg.streaming}
         {#if workingVisible && thinkingText.length === 0}
@@ -184,15 +208,104 @@
         </div>
         {#if msg.images?.length}
           <div class="flex gap-2 flex-wrap mt-2">
-            {#each msg.images as src (src)}<img
+            {#each msg.images as src, i (`${msg.id}-image-${i}`)}<img
                 {src}
-                alt=""
+                alt={`Image from assistant ${i + 1}`}
                 class="max-h-64 max-w-full rounded-lg object-contain border border-base-content/10"
               />{/each}
           </div>
         {/if}
         {#if msg.streaming}<span class="text-primary animate-pulse">▌</span>{/if}
       {/if}
+    </div>
+  {/if}
+  {#if !msg.streaming && msg.blocks?.length}
+    <div class="trace-body leading-relaxed select-text">
+      {#each msg.blocks as block, i (`${block.type}-${i}`)}
+        {#if block.type === 'text'}
+          <div class="prose text-base-content/90">
+            {@html memoizedRenderMarkdown(block.text)}
+          </div>
+        {:else if hideThinkingBlock}
+          <span
+            class="my-1 inline-flex items-center gap-1.5 rounded-full bg-base-content/[0.04] px-2.5 py-1 text-xs text-base-content/55"
+          >
+            <Brain class="size-3" aria-hidden="true" />{thinkingHiddenText}
+          </span>
+        {:else}
+          {@const blockThinkingToggleId = messageElementId('thinking-toggle', `${msg.id}-${i}`)}
+          {@const blockThinkingPanelId = messageElementId('thinking', `${msg.id}-${i}`)}
+          <button
+            id={blockThinkingToggleId}
+            type="button"
+            class="trace-row trace-row-toggle mb-3 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
+            aria-label={`Toggle thinking block ${i + 1}`}
+            aria-expanded={Boolean(msg.thinkingExpanded)}
+            aria-controls={blockThinkingPanelId}
+            onclick={() => onToggleThinking(msg)}
+          >
+            <ChevronRight
+              class="w-2.5 h-2.5 flex-shrink-0 transition-transform duration-150 {msg.thinkingExpanded
+                ? 'rotate-90'
+                : ''}"
+              aria-hidden="true"
+            />
+            <Brain
+              class="w-3.5 h-3.5 flex-shrink-0"
+              style="color:var(--color-secondary)"
+              aria-hidden="true"
+            />
+            <span class="trace-row-label italic">{hiddenThinkingLabel || 'Thinking'}</span>
+            <span class="trace-row-detail italic">
+              {block.text.slice(0, 120)}{block.text.length > 120 ? '…' : ''}
+            </span>
+          </button>
+          <div
+            id={blockThinkingPanelId}
+            role="region"
+            aria-labelledby={blockThinkingToggleId}
+            hidden={!msg.thinkingExpanded || hideThinkingBlock}
+            class="trace-output text-[11px] text-base-content/55 max-h-56 overflow-y-auto leading-relaxed bg-base-content/[0.03] rounded-r px-3 py-2 mb-4 select-text prose prose-sm"
+          >
+            {#if msg.thinkingExpanded && !hideThinkingBlock}
+              {@html memoizedRenderMarkdown(block.text)}
+            {/if}
+          </div>
+        {/if}
+      {/each}
+    </div>
+  {/if}
+  {#if msg.redactedThinking}
+    <span
+      class="my-2 inline-flex items-center rounded-full border border-base-content/10 bg-base-content/[0.04] px-2.5 py-1 text-xs text-base-content/55"
+    >
+      <Brain class="mr-1.5 size-3" aria-hidden="true" />Thinking hidden by provider
+    </span>
+  {/if}
+  {#if msg.blocks?.length && msg.images?.length}
+    <div class="flex gap-2 flex-wrap mt-2">
+      {#each msg.images as src, i (`${msg.id}-ordered-image-${i}`)}<img
+          {src}
+          alt={`Image from assistant ${i + 1}`}
+          class="max-h-64 max-w-full rounded-lg object-contain border border-base-content/10"
+        />{/each}
+    </div>
+  {/if}
+  {#if msg.stopReason === 'length'}
+    <div class="mt-2 text-xs text-warning/80" role="status">
+      Response truncated (max output tokens reached)
+    </div>
+  {:else if msg.stopReason === 'error'}
+    <div class="mt-2 text-xs text-error" role="status">
+      {msg.errorMessage || 'The model returned an error'}
+    </div>
+  {:else if msg.stopReason === 'deferred'}
+    <div class="mt-2 text-xs text-base-content/45" role="status">Response deferred</div>
+  {:else if msg.stopReason === 'aborted' || msg.aborted}
+    <div class="mt-2 text-xs text-base-content/45" role="status">
+      Aborted{msg.errorMessage && msg.errorMessage !== 'Request was aborted'
+        ? ` — ${msg.errorMessage}`
+        : ''}
     </div>
   {/if}
 
@@ -289,7 +402,7 @@
       {/if}
       <!-- Metrics — right side -->
       <span class="ml-auto flex items-center gap-2 text-base-content/55">
-        {#if msg.usage}<span class="tabular-nums"
+        {#if msg.usage}<span class="tabular-nums" title={usageTitle}
             >{msg.usage.totalTokens >= 1000
               ? (msg.usage.totalTokens / 1000).toFixed(1) + 'k'
               : msg.usage.totalTokens}t</span

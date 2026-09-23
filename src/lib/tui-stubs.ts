@@ -1143,40 +1143,93 @@ function extractLabel(comp: Record<string, unknown>): string {
 
 // ── Extension render hooks ─────────────────────────────────────────────────────
 
-/**
- * Build the ToolRenderContext extensions expect for renderCall/renderResult.
- * pi-ui renders once per event (no live redraw loop), so `invalidate` is a
- * no-op and `state`/`lastComponent` always start fresh — extensions that rely
- * on `context.state` persisting across renders will not see that persistence.
- * `expanded: true` always — pi-ui's own expand/collapse toggle is client-side
- * only (never re-requests a render), so the extension is asked for its
- * fullest rendering and the client's existing show/hide toggle wraps it.
- */
+type ToolRendererDefinition = {
+  renderCall?: (args: unknown, theme: unknown, context: unknown) => unknown;
+  renderResult?: (
+    result: unknown,
+    options: { expanded: boolean; isPartial: boolean },
+    theme: unknown,
+    context: unknown
+  ) => unknown;
+};
+
+type ToolRendererState = {
+  state: Record<string, unknown>;
+  lastComponent?: unknown;
+  rerender?: () => void;
+  timer?: ReturnType<typeof setTimeout>;
+  errorLogged: boolean;
+};
+
+const toolRendererStates = new Map<string, ToolRendererState>();
+const MAX_TOOL_RENDERER_STATES = 256;
+let toolRendererUpdateHandler:
+  | ((sessionId: string, toolCallId: string, kind: 'call' | 'result', html: string[]) => void)
+  | undefined;
+
+export function setToolRendererUpdateHandler(
+  handler:
+    | ((sessionId: string, toolCallId: string, kind: 'call' | 'result', html: string[]) => void)
+    | undefined
+): void {
+  toolRendererUpdateHandler = handler;
+}
+
+export function clearToolRendererState(toolCallId: string): void {
+  const entry = toolRendererStates.get(toolCallId);
+  clearTimeout(entry?.timer);
+  toolRendererStates.delete(toolCallId);
+}
+
+function toolRendererState(toolCallId: string): ToolRendererState {
+  let entry = toolRendererStates.get(toolCallId);
+  if (!entry) {
+    entry = { state: {}, errorLogged: false };
+    toolRendererStates.set(toolCallId, entry);
+    if (toolRendererStates.size > MAX_TOOL_RENDERER_STATES) {
+      const oldest = toolRendererStates.keys().next().value;
+      if (oldest) clearToolRendererState(oldest);
+    }
+  } else {
+    toolRendererStates.delete(toolCallId);
+    toolRendererStates.set(toolCallId, entry);
+  }
+  return entry;
+}
+
 function buildToolRenderContext(
   args: unknown,
   toolCallId: string,
   isPartial: boolean,
-  isError: boolean
+  isError: boolean,
+  expanded: boolean,
+  rendererState: ToolRendererState
 ) {
   return {
     args,
     toolCallId,
-    invalidate: () => {},
-    lastComponent: undefined,
-    state: {},
+    invalidate: () => {
+      clearTimeout(rendererState.timer);
+      rendererState.timer = setTimeout(() => rendererState.rerender?.(), 40);
+    },
+    get lastComponent() {
+      return rendererState.lastComponent;
+    },
+    set lastComponent(component: unknown) {
+      rendererState.lastComponent = component;
+    },
+    state: rendererState.state,
     cwd: process.cwd(),
     executionStarted: true,
     argsComplete: true,
     isPartial,
-    expanded: true,
+    expanded,
     showImages: false,
     isError,
   };
 }
 
-/** Run a rendered `Component` through the same ansiToHtml pipeline setWidget uses.
- * Derived HTML is capped before it can be retained in a UI message or replay
- * payload; the source session data remains untouched. */
+/** Run a rendered `Component` through the same ansiToHtml pipeline setWidget uses. */
 function componentToHtmlLines(component: unknown): string[] | undefined {
   if (
     !component ||
@@ -1191,57 +1244,75 @@ function componentToHtmlLines(component: unknown): string[] | undefined {
   return output.length > 0 ? output : undefined;
 }
 
-/**
- * Invoke the tool's `renderCall` (if registered) and convert its output to
- * HTML lines. Returns undefined when the tool has no `renderCall`, isn't
- * found (extensions not yet bound), or the call throws/returns nothing
- * renderable — callers must fall back to the existing plain rendering.
- */
 export function renderToolCallHtml(
   sess: AgentSession,
   toolName: string,
   args: unknown,
-  toolCallId: string
+  toolCallId: string,
+  expanded = false
 ): string[] | undefined {
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- SDK's Theme type isn't exported publicly; renderCall's real signature is unreachable by name.
-    const toolDef = sess.extensionRunner.getToolDefinition(toolName) as any;
-    if (!toolDef?.renderCall) return undefined;
-    const ctx = buildToolRenderContext(args, toolCallId, false, false);
-    return componentToHtmlLines(toolDef.renderCall(args, stubTheme, ctx));
-  } catch {
-    return undefined;
-  }
+  const toolDef = sess.extensionRunner.getToolDefinition(toolName) as unknown as
+    ToolRendererDefinition | undefined;
+  const renderCall = toolDef?.renderCall;
+  if (!renderCall) return undefined;
+  const state = toolRendererState(toolCallId);
+  const render = () => {
+    try {
+      const ctx = buildToolRenderContext(args, toolCallId, false, false, expanded, state);
+      const component = renderCall(args, stubTheme, ctx);
+      state.lastComponent = component;
+      return componentToHtmlLines(component);
+    } catch (err) {
+      if (!state.errorLogged) {
+        state.errorLogged = true;
+        console.error(`[pi-ui] tool renderer failed for ${toolName}:`, err);
+      }
+      return ['renderer error'];
+    }
+  };
+  state.rerender = () => {
+    const html = render();
+    if (html) toolRendererUpdateHandler?.(sess.sessionId, toolCallId, 'call', html);
+  };
+  return render();
 }
 
-/**
- * Invoke the tool's `renderResult` (if registered) and convert its output to
- * HTML lines. `result` must be the `AgentToolResult<TDetails>` object the
- * tool's `execute`/`onUpdate` produced (the `result`/`partialResult` field of
- * `tool_execution_end`/`tool_execution_update` events, which mirror the SDK's
- * `AgentToolUpdateCallback<T> = (partialResult: AgentToolResult<T>) => void`
- * contract exactly). Returns undefined on no renderer / not-found / failure.
- */
 export function renderToolResultHtml(
   sess: AgentSession,
   toolName: string,
   result: unknown,
   args: unknown,
   toolCallId: string,
-  isPartial: boolean
+  isPartial: boolean,
+  expanded = false
 ): string[] | undefined {
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- see renderToolCallHtml
-    const toolDef = sess.extensionRunner.getToolDefinition(toolName) as any;
-    if (!toolDef?.renderResult) return undefined;
-    const isError = !!(result as { isError?: boolean } | undefined)?.isError;
-    const ctx = buildToolRenderContext(args, toolCallId, isPartial, isError);
-    return componentToHtmlLines(
-      toolDef.renderResult(result, { expanded: true, isPartial }, stubTheme, ctx)
-    );
-  } catch {
-    return undefined;
-  }
+  const toolDef = sess.extensionRunner.getToolDefinition(toolName) as unknown as
+    ToolRendererDefinition | undefined;
+  const renderResult = toolDef?.renderResult;
+  if (!renderResult) return undefined;
+  const state = toolRendererState(toolCallId);
+  const render = () => {
+    try {
+      const isError = Boolean(
+        result && typeof result === 'object' && 'isError' in result && result.isError === true
+      );
+      const ctx = buildToolRenderContext(args, toolCallId, isPartial, isError, expanded, state);
+      const component = renderResult(result, { expanded, isPartial }, stubTheme, ctx);
+      state.lastComponent = component;
+      return componentToHtmlLines(component);
+    } catch (err) {
+      if (!state.errorLogged) {
+        state.errorLogged = true;
+        console.error(`[pi-ui] tool renderer failed for ${toolName}:`, err);
+      }
+      return ['renderer error'];
+    }
+  };
+  state.rerender = () => {
+    const html = render();
+    if (html) toolRendererUpdateHandler?.(sess.sessionId, toolCallId, 'result', html);
+  };
+  return render();
 }
 
 /**

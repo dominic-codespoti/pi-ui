@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-pi-ui (v0.17.1, `@thed24/pi-ui`) is a **self-hosted PWA frontend for the `pi` coding agent** — analogous to how OpenChamber fronts OpenCode. It runs as a standalone Bun server that bridges `pi` SDK events to a browser over a single WebSocket. Designed for low-memory environments (Raspberry Pi).
+pi-ui (v0.23.0, `@thed24/pi-ui`) is a **self-hosted PWA frontend for the `pi` coding agent** — analogous to how OpenChamber fronts OpenCode. It runs as a standalone Bun server that bridges `pi` SDK events to a browser over a single WebSocket. Designed for low-memory environments (Raspberry Pi).
 
 Key constraints: ESM-only, Bun ≥1.0.0, no TTS, no Workbox, no node-pty.
 
@@ -34,26 +34,34 @@ Bun server bridges pi SDK events to browser over WebSocket. Key flow: CLI → se
 
 ## Key Directories
 
-| Path                                 | Purpose                                                                                                                                                   |
-| ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `src/lib/auth/`                      | Password hashing (bcrypt/PBKDF2), JWT (crypto.subtle), IP rate limiter (`rate-limiter.ts`)                                                                |
-| `src/lib/ws/`                        | Shared WebSocket protocol types (`protocol.ts`), Valibot wire schemas (`server-message-schema.ts`)                                                        |
-| `src/lib/server/`                    | Server-side helpers: session catalog, project catalog, wire bounding, watcher, extension tools/completions, webhooks, push                                |
-| `src/lib/state/`                     | Runes-based shared stores: `projects-state.svelte.ts`, `extension-ui-state.svelte.ts`                                                                     |
-| `src/lib/components/chat/`           | Chat components: `message-list.svelte`, `chat-header.svelte`, `status-banners.svelte` (reconnection/read-only alerts, context meter)                      |
-| `src/lib/extension-ui-capabilities/` | Typed catalog of how each `ctx.ui` capability renders in Pi UI, with executable examples and a pure skill renderer; source of truth for the bundled skill |
-| `skills/pi-ui-extension-ui/`         | GENERATED bundled Pi skill, loaded into every Pi UI session through `additionalSkillPaths`; do not edit by hand                                           |
-| `src/lib/components/panels/`         | Panel components: `right-panel.svelte`, `settings-panel.svelte` (theme, notifications, UI options), lazy panel wrappers                                   |
-| `src/lib/components/dialogs/`        | Dialogs: `confirm-dialog.svelte`, `fork-dialog.svelte`, `session-tree-modal.svelte`, `extension-overlays.svelte`, `toast-container.svelte`                |
-| `src/lib/components/projects/`       | Project management: `projects-sidebar.svelte`, `project-picker.svelte`, `directory-picker.svelte`                                                         |
-| `src/lib/components/`                | Svelte 5 components: chat, panels, projects, dialogs, `file-viewer-modal.svelte`, `diff-viewer.svelte`, `sidebar-panel.svelte`                            |
-| `src/lib/components/ui/`             | shadcn-style primitives (button, dialog, select, switch, tabs, card, tooltip, scroll-area, separator, bottom-sheet)                                       |
-| `src/routes/(app)/`                  | Main SPA (chat UI) — `ssr=false, prerender=false`                                                                                                         |
-| `src/routes/(auth)/`                 | Login page (auth group separates routing from hooks guard)                                                                                                |
-| `bin/`                               | CLI entry point (`pifrontier.ts`) and shell shim                                                                                                          |
-| `scripts/`                           | Dev orchestrator (`dev.ts` — parallel Vite + WS server), `maybe-build.ts` freshness check guard                                                           |
-| `e2e/`                               | Playwright E2E tests: mock WS specs, live agent specs, `global-setup.ts` scratch dirs, fake LLM server stub                                               |
-| `static/`                            | PWA assets: icons, manifest.webmanifest                                                                                                                   |
+| Path                                               | Purpose                                                                                                                                                                    |
+| -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `src/lib/auth/`                                    | Password hashing (bcrypt/PBKDF2), JWT (crypto.subtle), IP rate limiter (`rate-limiter.ts`)                                                                                 |
+| `src/lib/ws/`                                      | Shared WebSocket protocol types (`protocol.ts`), Valibot wire schemas (`server-message-schema.ts`)                                                                         |
+| `src/lib/server/`                                  | Server-side helpers: session catalog, project catalog, wire bounding, watcher, extension tools/completions, webhooks, push                                                 |
+| `src/lib/server/handlers/`                         | Focused WebSocket handler modules: filesystem, extension UI, project/system, session-tree navigation, and SDK settings                                                     |
+| `src/lib/server/footer-data.ts`                    | Per-session SDK footer data provider (Git branch, extension statuses, provider count, change notification)                                                                 |
+| `src/lib/server/tool-details.ts`                   | Allow-listed projection of built-in tool-result details for WebSocket history                                                                                              |
+| `src/lib/server/slash-command-catalog.ts`          | SDK-sourced built-in slash catalog plus SDK changelog/bug-report module loading                                                                                            |
+| `src/lib/server/provider-login-session.ts`         | Requester-scoped provider login lifecycle, prompt bridging, and cancellation                                                                                               |
+| `src/lib/server/provider-login.ts`                 | Provider selection/auth-type resolution and SDK login-flow helper                                                                                                          |
+| `src/lib/server/handlers/tree-handlers.ts`         | Validated SDK tree navigation and entry-label helpers                                                                                                                      |
+| `src/lib/server/handlers/sdk-settings-handlers.ts` | Allow-listed SDK settings read/write handler                                                                                                                               |
+| `src/lib/state/`                                   | Runes-based shared stores: `projects-state.svelte.ts`, `extension-ui-state.svelte.ts`                                                                                      |
+| `src/lib/components/chat/`                         | Chat components: `message-list.svelte`, `chat-header.svelte`, `status-banners.svelte` (reconnection/read-only alerts, context meter)                                       |
+| `src/lib/extension-ui-capabilities/`               | Typed catalog of how each `ctx.ui` capability renders in Pi UI, with executable examples and a pure skill renderer; source of truth for the bundled skill                  |
+| `skills/pi-ui-extension-ui/`                       | GENERATED bundled Pi skill, loaded into every Pi UI session through `additionalSkillPaths`; do not edit by hand                                                            |
+| `src/lib/components/panels/`                       | Panel components: `right-panel.svelte`, `settings-panel.svelte` (theme, notifications, UI options), lazy panel wrappers                                                    |
+| `src/lib/components/dialogs/`                      | Dialogs: `confirm-dialog.svelte`, `fork-dialog.svelte`, `provider-login-dialog.svelte`, `session-tree-modal.svelte`, `extension-overlays.svelte`, `toast-container.svelte` |
+| `src/lib/components/projects/`                     | Project management: `projects-sidebar.svelte` (including `gitBranch`), `project-picker.svelte`, `directory-picker.svelte`                                                  |
+| `src/lib/components/`                              | Svelte 5 components: chat, panels, projects, dialogs, `file-viewer-modal.svelte`, `diff-viewer.svelte`, `sidebar-panel.svelte`                                             |
+| `src/lib/components/ui/`                           | shadcn-style primitives (button, dialog, select, switch, tabs, card, tooltip, scroll-area, separator, bottom-sheet)                                                        |
+| `src/routes/(app)/`                                | Main SPA (chat UI) — `ssr=false, prerender=false`                                                                                                                          |
+| `src/routes/(auth)/`                               | Login page (auth group separates routing from hooks guard)                                                                                                                 |
+| `bin/`                                             | CLI entry point (`pifrontier.ts`) and shell shim                                                                                                                           |
+| `scripts/`                                         | Dev orchestrator (`dev.ts` — parallel Vite + WS server), `maybe-build.ts` freshness check guard                                                                            |
+| `e2e/`                                             | Playwright E2E tests: mock WS specs, live agent specs, `global-setup.ts` scratch dirs, fake LLM server stub                                                                |
+| `static/`                                          | PWA assets: icons, manifest.webmanifest                                                                                                                                    |
 
 ---
 
@@ -87,7 +95,7 @@ bun run check:skill      # fail if the committed skill is stale (part of test:ci
 
 # Tests
 bun test src/lib/auth     # Bun-native test runner for auth/rate-limiter (timeout 15s)
-bun run test:unit         # vitest run (jsdom — 34 test files, 451 tests)
+bun run test:unit         # vitest run (jsdom — 50 test files, 614 tests)
 bun run test:unit:watch   # vitest (watch mode)
 bun run test:coverage     # vitest run --coverage (v8 provider)
 bun run test:e2e          # playwright test (chains mock E2E suite + live agent suite)
@@ -135,6 +143,10 @@ bun run test:ci           # check + check:sw + check:server + check:skill + lint
 - **Data attributes** like `data-slot="button"`, `data-size="sm"` drive internal styling
 - **No component unit tests** — UI is tested exclusively via Playwright E2E
 
+### Credential & search inputs
+
+- Password inputs used for credentials must set `type="password"` only with `autocomplete="new-password"`, a unique `name`, and `data-1p-ignore`, `data-lpignore="true"`, `data-bwignore`, and `data-form-type="other"`. Search inputs use `autocomplete="off"`. Browser password managers can otherwise autofill the pi-ui login password into API-key fields.
+
 ### Auth Patterns
 
 - **Password hashing**: `Bun.password.hash()` with bcrypt cost 10 (production); PBKDF2 600k iterations (Vite dev fallback)
@@ -145,7 +157,7 @@ bun run test:ci           # check + check:sw + check:server + check:skill + lint
 
 ### Server Patterns
 
-- **`switch(msg.type)` routing**: server.ts dispatches ~76 ClientMessage types in one large switch. Notable handlers: `prompt` (send to SDK), `edit_message` (rewind + resend via `navigateTree`), `fork_session` (branch session at entry)
+- **`switch(msg.type)` routing**: server dispatches 87 `ClientMessage` union variants. Notable handlers: `prompt`, `edit_message`, `navigate_tree`/`set_entry_label`, `cycle_model`/`cycle_thinking_level`, provider login, and SDK settings
 - **Lazy imports**: SDK and SvelteKit handler both lazy-imported on first use
 - **`globalThis` for state**: bcrypt hash, JWT secret, and rate limit data are stored on `globalThis`; resident sessions and selection are maintained in the server module
 - **Bun pub/sub**: `server.publish('pi', payload)` sends to all WS clients
@@ -157,7 +169,7 @@ bun run test:ci           # check + check:sw + check:server + check:skill + lint
 
 - **`client-messages.ts`** — `UIMessage` type conversion pipeline: `agentMsgToUI()` maps SDK messages → flat `UIMessage[]`; `rawMessagesToUI()` single-pass batch converter; `formatToolInput()` extracts per-tool one-line summaries; `reconnectDelay()` exponential backoff 1s→30s with jitter; `outputElided`/`outputBytes`/`outputLoading` track lazy tool-result output
 - **`session-view-cache.ts`** — Bounded LRU of three per-session client views (messages, streams, tools, expansion, draft, context, queues); clones views while stripping base64 image data and attachments from inactive-session state
-- **`thinking-levels.ts`** — `THINKING_LEVEL_CANONICAL` ('off', 'minimal', 'low', 'medium', 'high', 'max'), `getSupportedThinkingLevels()`, and `clampThinkingLevelForModel()`
+- **`thinking-levels.ts`** — `THINKING_LEVEL_CANONICAL` ordering for SDK-provided levels (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`); supported levels and current level come from the server/SDK
 - **`attachments.ts`** — File attachment handling: `prepareImage()` (in-browser downscale ≤1600px, base64 encoding ≤3 MB), `fileToText()`, accepted text extensions
 - **`terminal-key-encoder.ts`** — Encodes browser key events into terminal byte sequences
 - **`notification-prefs.ts`** — Client-side notification preferences (`loadNotificationPrefs`, `saveNotificationPrefs`, VAPID key conversion `urlBase64ToUint8Array`)
@@ -167,6 +179,13 @@ bun run test:ci           # check + check:sw + check:server + check:skill + lint
 - **`server/session-watcher.ts`** — `startSessionWatch()` filesystem watcher with trailing 500 ms debounce, a 5 s max coalescing window, and optional live-path `isIgnored` exclusion
 - **`server/ui-settings.ts`** — Server-side UI settings persistence, including the durable `lastSession` pointer
 - **`server/extension-tools.ts`** & **`extension-completions.ts`** — Extension tool discovery, dynamic tool enablement (`activateNewExtensionTools`), and slash command argument auto-completions
+- **`server/footer-data.ts`** — Session-owned SDK extension-footer data (Git branch, extension status map, provider count, branch-change notifications)
+- **`server/tool-details.ts`** — Allow-lists built-in tool detail fields for safe wire projection
+- **`server/handlers/tree-handlers.ts`** — Validates session-tree navigation targets and writes entry labels
+- **`server/handlers/sdk-settings-handlers.ts`** — SDK settings read projection and allow-listed writes through public setters
+- **`server/slash-command-catalog.ts`** — SDK built-in slash catalog, changelog, and bug-report module loaders
+- **`server/provider-login-session.ts`** — Requester-scoped provider login lifecycle, prompt bridge, and cancellation
+- **`server/provider-login.ts`** — Selects provider/auth method and invokes the SDK login flow
 - **`markdown.ts`** — `marked` configured with HTML stripping, hljs language registration, file links, LaTeX block/inline extensions (`@earendil-works/pi-tui/dist/latex.js`), an escaped `<pre><code>` fallback for large source-dump-shaped bodies, and `memoizedRenderMarkdown()` (FNV-1a 300/4M LRU cache)
 - **`tui-stubs.ts`** — `StubTui` and `HeadlessTerminal` running pi-tui extension factories server-side; `parseComponentTree()` parses interactive components; `applyMarkdownTransformersToMessages()` and `customEntriesForWire()` translate custom entries and markdown transforms for web rendering
 - **`diff-parser.ts`** — `parseDiff()` → `DiffFile[]` with hunks, line numbers, add/delete/context lines
@@ -174,17 +193,15 @@ bun run test:ci           # check + check:sw + check:server + check:skill + lint
 
 ### WebSocket Protocol (`protocol.ts`)
 
-- **ConnectedMessage**: sent server→client on WS open (session state, models, thinkingLevel, contextUsage, tools, activeToolNames, truncated messages)
-- **ServerMessage** includes `tool_output` for requester-only lazy tool-result responses
-- **ClientMessage**: union of ~76 tagged types; messages targeting an existing session accept optional `sessionId` (path-based `switch_session`, `rename_session`, and `delete_session` remain path-targeted) and resolve explicit target → socket `focusedSessionId` → server `selectedSessionId`
-- - Session lifecycle: `new_session`, `switch_session`, `fork_session`, `rename_session`, `delete_session`
-- - Session focus: `session_focus` updates the socket's visible session and unread semantics
-- - Messaging: `prompt`, `edit_message`, `steer`, `follow_up`, `abort`
-- - Model & settings: `set_model`, `set_thinking_level`, `set_settings`
-- - Projects: `get_projects`, `get_all_sessions`, `pin_project`, `rename_project`, `delete_project` (removes project dir & all sessions)
-- - Extensions & tools: `get_tools`, `set_active_tools`, `extension_ui_response`, `extension_terminal_input` (interactive terminal input loop)
-- - Filesystem & completions: `read_file`, `write_file`, `dir_complete`, `file_complete`, `get_command_completions`
-- - Session recovery: `get_tool_output`, `resync_session`
+- **ConnectedMessage**: server→client session snapshot; includes SDK-supported thinking levels/scoped models, SDK built-in commands, visible queue/deferred state, provider/model metadata, and extension UI snapshot
+- **ServerMessage** includes `tool_output` with projected `toolDetails`; custom events include `footer_data`, `tree_navigated`, `extension_ui_cancel`, and `tool_renderer_update`
+- Model & provider: `set_model`, `set_thinking_level`, `cycle_model`, `cycle_thinking_level`, `set_scoped_models`, `provider_login` (non-blocking), `provider_login_response`, `provider_login_cancel`
+- Tree navigation: `get_session_tree`, `navigate_tree`, `set_entry_label`; compact accepts optional `customInstructions`
+- SDK settings/import: `get_sdk_settings`, `set_sdk_setting`, `import_session`
+- Projects: `get_projects`, `get_all_sessions`, `pin_project`, `rename_project`, `delete_project`
+- Extensions & tools: `get_tools`, `set_active_tools`, `extension_ui_response`, `extension_terminal_input`
+- Filesystem & completions: `read_file`, `write_file`, `dir_complete`, `file_complete`, `get_command_completions`
+- Session recovery: `get_tool_output`, `resync_session`
 
 > **Deep dive:** [`docs/websocket-protocol.md`](docs/websocket-protocol.md) — full message type reference, edit flow, extension UI flow
 
@@ -201,41 +218,50 @@ bun run test:ci           # check + check:sw + check:server + check:skill + lint
 
 ## Important Files
 
-| File                                                   | Role                                                                                                |
-| ------------------------------------------------------ | --------------------------------------------------------------------------------------------------- |
-| `server.ts`                                            | Main Bun server (~6570 lines) — WS routing, resident session map, SDK bridge, extension UI, updates |
-| `src/routes/(app)/+page.svelte`                        | Main chat UI (~8650 lines) — WS connect, message stream, STT, settings, tool/panel rendering        |
-| `src/hooks.server.ts`                                  | SvelteKit auth guard — JWT validation, redirect to `/login`                                         |
-| `src/routes/(auth)/login/+page.server.ts`              | Login action — CSRF, rate limit, verify password, set JWT cookie                                    |
-| `src/lib/auth/password.ts`                             | Password hashing, JWT create/verify, cookie helpers                                                 |
-| `src/lib/auth/rate-limiter.ts`                         | IP-based login rate limiter                                                                         |
-| `src/lib/ws/protocol.ts`                               | Shared WS message types (ConnectedMessage, ServerMessage, ~76 ClientMessage types)                  |
-| `src/lib/ws/server-message-schema.ts`                  | Valibot runtime validation schemas (`parseServerMessage`) for inbound WS messages                   |
-| `src/lib/state/projects-state.svelte.ts`               | Runes-based projects/sessions state singleton                                                       |
-| `src/lib/state/extension-ui-state.svelte.ts`           | Extension modals, widgets, status texts, and action responses state singleton                       |
-| `src/lib/client-messages.ts`                           | UIMessage type, SDK→UI conversion, tool formatting                                                  |
-| `src/lib/server/wire-messages.ts`                      | Payload budget bounding (`boundMessagesForWire`)                                                    |
-| `src/lib/server/extension-tools.ts`                    | Tool activation and extension tool discovery helpers                                                |
-| `src/lib/server/extension-completions.ts`              | Slash command argument completions resolver for extensions                                          |
-| `src/lib/server/ws-helpers.ts`                         | Shared helpers (serializeModel, serializeSession, semver, GitHub URL, etc.)                         |
-| `src/lib/components/chat/message-list.svelte`          | Message stream rendering, tool execution cards, thinking blocks, code blocks                        |
-| `src/lib/components/chat/chat-header.svelte`           | Header bar with model selector, session title, context ring, and panel toggles                      |
-| `src/lib/components/chat/status-banners.svelte`        | Top banner alerts (disconnected, read-only mode, server notifications)                              |
-| `src/lib/components/panels/right-panel.svelte`         | Sidebar tabbed panel for models, tools, skills, prompts, extensions, stats                          |
-| `src/lib/components/panels/settings-panel.svelte`      | User settings dialog for appearance, themes, notifications, and dev options                         |
-| `src/lib/components/dialogs/extension-overlays.svelte` | Modal dialogs and overlay renderer for extension interactions                                       |
-| `src/lib/markdown.ts`                                  | Configured marked + hljs + LaTeX renderer + FNV-1a LRU memoization                                  |
-| `src/lib/tui-stubs.ts`                                 | Server-side pi-tui stub bridge, component tree parser, markdown transformer runner                  |
-| `src/lib/extension-ui-capabilities/catalog.ts`         | Typed source of truth for extension UI capability rendering and bundled skill content               |
-| `src/lib/diff-parser.ts`                               | Unified diff parser                                                                                 |
-| `e2e/fixtures.ts`                                      | Playwright custom fixtures — `mockWs`, `login`                                                      |
-| `e2e/global-setup.ts`                                  | E2E test suite scratch directory initialization and fake LLM config                                 |
-| `e2e/mocks/payloads.ts`                                | Mock WS message factory functions                                                                   |
-| `scripts/dev.ts`                                       | Dev orchestrator (parallel Vite + WS server)                                                        |
-| `scripts/maybe-build.ts`                               | Incremental build cache freshness check                                                             |
-| `benchmark.ts`                                         | Playwright-based WS latency benchmark                                                               |
-| `static/manifest.webmanifest`                          | PWA manifest                                                                                        |
-| `.env.example`                                         | Required env vars documented                                                                        |
+| File                                                      | Role                                                                                                |
+| --------------------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| `server.ts`                                               | Main Bun server (~6570 lines) — WS routing, resident session map, SDK bridge, extension UI, updates |
+| `src/routes/(app)/+page.svelte`                           | Main chat UI (~8650 lines) — WS connect, message stream, STT, settings, tool/panel rendering        |
+| `src/hooks.server.ts`                                     | SvelteKit auth guard — JWT validation, redirect to `/login`                                         |
+| `src/routes/(auth)/login/+page.server.ts`                 | Login action — CSRF, rate limit, verify password, set JWT cookie                                    |
+| `src/lib/auth/password.ts`                                | Password hashing, JWT create/verify, cookie helpers                                                 |
+| `src/lib/auth/rate-limiter.ts`                            | IP-based login rate limiter                                                                         |
+| `src/lib/server/provider-login-session.ts`                | Requester-scoped SDK provider login prompts, events, and cancellation                               |
+| `src/lib/server/provider-login.ts`                        | SDK provider login resolution and invocation                                                        |
+| `src/lib/components/projects/project-row.svelte`          | Project row rendering, including the optional `gitBranch` metadata                                  |
+| `src/lib/components/dialogs/provider-login-dialog.svelte` | Interactive SDK provider login prompts and status                                                   |
+| `src/lib/ws/server-message-schema.ts`                     | Valibot runtime validation schemas (`parseServerMessage`) for inbound WS messages                   |
+| `src/lib/state/projects-state.svelte.ts`                  | Runes-based projects/sessions state singleton                                                       |
+| `src/lib/state/extension-ui-state.svelte.ts`              | Extension modals, widgets, status texts, and action responses state singleton                       |
+| `src/lib/client-messages.ts`                              | UIMessage type, SDK→UI conversion, tool formatting                                                  |
+| `src/lib/server/wire-messages.ts`                         | Payload budget bounding (`boundMessagesForWire`)                                                    |
+| `src/lib/server/extension-tools.ts`                       | Tool activation and extension tool discovery helpers                                                |
+| `src/lib/server/extension-completions.ts`                 | Slash command argument completions resolver for extensions                                          |
+| `src/lib/server/ws-helpers.ts`                            | Shared helpers (serializeModel, serializeSession, semver, GitHub URL, etc.)                         |
+| `src/lib/server/footer-data.ts`                           | Session-owned data provider for SDK extension footers                                               |
+| `src/lib/server/tool-details.ts`                          | Built-in tool-details projection and output sanitation                                              |
+| `src/lib/server/handlers/tree-handlers.ts`                | Session tree navigation and label updates                                                           |
+| `src/lib/server/handlers/sdk-settings-handlers.ts`        | SDK settings allow-list and typed public setter operations                                          |
+| `src/lib/server/slash-command-catalog.ts`                 | SDK built-in slash catalog and changelog/bug-report loaders                                         |
+| `src/lib/components/projects/project-row.svelte`          | Project row rendering, including the optional `gitBranch` metadata                                  |
+| `src/lib/components/dialogs/provider-login-dialog.svelte` | Interactive SDK provider login prompts and status                                                   |
+| `src/lib/components/chat/chat-header.svelte`              | Header bar with model selector, session title, context ring, and panel toggles                      |
+| `src/lib/components/chat/status-banners.svelte`           | Top banner alerts (disconnected, read-only mode, server notifications)                              |
+| `src/lib/components/panels/right-panel.svelte`            | Sidebar tabbed panel for models, tools, skills, prompts, extensions, stats                          |
+| `src/lib/components/panels/settings-panel.svelte`         | User settings dialog for appearance, themes, notifications, and dev options                         |
+| `src/lib/components/dialogs/extension-overlays.svelte`    | Modal dialogs and overlay renderer for extension interactions                                       |
+| `src/lib/markdown.ts`                                     | Configured marked + hljs + LaTeX renderer + FNV-1a LRU memoization                                  |
+| `src/lib/tui-stubs.ts`                                    | Server-side pi-tui stub bridge, component tree parser, markdown transformer runner                  |
+| `src/lib/extension-ui-capabilities/catalog.ts`            | Typed source of truth for extension UI capability rendering and bundled skill content               |
+| `src/lib/diff-parser.ts`                                  | Unified diff parser                                                                                 |
+| `e2e/fixtures.ts`                                         | Playwright custom fixtures — `mockWs`, `login`                                                      |
+| `e2e/global-setup.ts`                                     | E2E test suite scratch directory initialization and fake LLM config                                 |
+| `e2e/mocks/payloads.ts`                                   | Mock WS message factory functions                                                                   |
+| `scripts/dev.ts`                                          | Dev orchestrator (parallel Vite + WS server)                                                        |
+| `scripts/maybe-build.ts`                                  | Incremental build cache freshness check                                                             |
+| `benchmark.ts`                                            | Playwright-based WS latency benchmark                                                               |
+| `static/manifest.webmanifest`                             | PWA manifest                                                                                        |
+| `.env.example`                                            | Required env vars documented                                                                        |
 
 ---
 
@@ -265,10 +291,10 @@ bun run test:ci           # check + check:sw + check:server + check:skill + lint
 
 ## Testing & QA
 
-Three layers: **Unit** (Vitest, jsdom — 34 test files, 451 tests), **E2E** (Playwright with mock WebSocket + Live SDK suite), **CI** (GitHub Actions). The Bun-native auth suite still has one pre-existing failure: `password.test.ts` uses `vi.resetModules()`, which Bun's runner does not implement; it passes under Vitest.
+Three layers: **Unit** (Vitest, jsdom — 49 test files, 606 tests), **E2E** (Playwright with mock WebSocket + Live SDK suite), **CI** (GitHub Actions). The Bun-native auth suite still has one pre-existing failure: `password.test.ts` uses `vi.resetModules()`, which Bun's runner does not implement; it passes under Vitest.
 
 ```bash
-bun run test:unit         # vitest run (jsdom — 34 test files, 451 tests)
+bun run test:unit         # vitest run (jsdom — 49 test files, 606 tests)
 bun run test:e2e          # playwright test (chains mock suite + live agent suite)
 bun run test:e2e:fast     # playwright test --project=chromium (mock suite only)
 bun run test:e2e:live     # playwright test -c playwright.live.config.ts (live suite only)

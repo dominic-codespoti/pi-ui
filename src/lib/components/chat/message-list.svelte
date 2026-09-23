@@ -62,6 +62,7 @@
     truncatedUserMsgs = $bindable(),
     workingVisible,
     hiddenThinkingLabel,
+    hideThinkingBlock,
     workingIndicatorFrames,
     workingFrameIndex,
     workingMessage,
@@ -81,6 +82,8 @@
     onInsertShortcut,
     onEditMessage,
     onDismissNotice,
+    onAbortCompaction,
+    onAbortRetry,
     onHaptic,
   }: {
     messages: UIMessage[];
@@ -96,6 +99,7 @@
     truncatedUserMsgs: Record<string, boolean>;
     workingVisible: boolean;
     hiddenThinkingLabel: string;
+    hideThinkingBlock: boolean;
     workingIndicatorFrames: string[];
     workingFrameIndex: number;
     workingMessage: string | undefined;
@@ -115,6 +119,8 @@
     onInsertShortcut: (text: string) => void;
     onEditMessage: (originalText: string, newText: string) => void;
     onDismissNotice: (id: string) => void;
+    onAbortCompaction: () => void;
+    onAbortRetry: () => void;
     onHaptic?: () => void;
   } = $props();
 
@@ -311,6 +317,7 @@
             {truncatedUserMsgs}
             {workingVisible}
             {hiddenThinkingLabel}
+            {hideThinkingBlock}
             {workingIndicatorFrames}
             {workingFrameIndex}
             {workingMessage}
@@ -321,6 +328,8 @@
             {onToggleTool}
             {onEditMessage}
             {onDismissNotice}
+            {onAbortCompaction}
+            {onAbortRetry}
             {onHaptic}
           />
         {/each}

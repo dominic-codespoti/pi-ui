@@ -134,6 +134,7 @@ export class SessionCoordinator {
       contextUsage: view.contextUsage,
       queuedSteering: view.queuedSteering,
       queuedFollowUp: view.queuedFollowUp,
+      queuedDeferred: view.queuedDeferred,
       toolsExpanded: this.stateValue.toolsExpanded,
     });
     const result = reduceSession(background, { type: 'event', message }, this.reducerOptions);
@@ -143,6 +144,7 @@ export class SessionCoordinator {
     view.contextUsage = result.state.contextUsage;
     view.queuedSteering = result.state.queuedSteering;
     view.queuedFollowUp = result.state.queuedFollowUp;
+    view.queuedDeferred = result.state.queuedDeferred;
     return true;
   }
 
@@ -183,6 +185,7 @@ export class SessionCoordinator {
       contextUsage: null,
       queuedSteering: [],
       queuedFollowUp: [],
+      queuedDeferred: [],
       totalRawMessagesLoaded: 0,
       totalMessageCount: 0,
       messagesTruncated: false,

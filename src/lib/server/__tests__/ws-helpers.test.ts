@@ -46,21 +46,34 @@ describe('serializeModel', () => {
     expect(serializeModel(undefined)).toBeNull();
   });
 
-  it('serializes model with all fields', () => {
+  it('serializes model fields while omitting SDK-only properties', () => {
     const model = {
       provider: 'openai',
       id: 'gpt-4o',
       name: 'GPT-4o',
       reasoning: true,
       contextWindow: 128_000,
+      input: ['text', 'image'],
+      cost: { input: 2.5, output: 10, cacheRead: 1.25, cacheWrite: 5 },
+      maxTokens: 16_384,
       thinkingLevelMap: { off: null, low: 'low', high: 'high' },
+      headers: { 'x-custom': 'value' },
+      compat: { supportsTools: true },
     };
     const result = serializeModel(model as never);
-    expect(result?.provider).toBe('openai');
-    expect(result?.contextWindow).toBe(128_000);
-    // Regression: server.ts used to duplicate this serializer and drop
-    // thinkingLevelMap, silently forcing every model's thinking-level UI to ['off'].
-    expect(result?.thinkingLevelMap).toEqual({ off: null, low: 'low', high: 'high' });
+    expect(result).toEqual({
+      provider: 'openai',
+      id: 'gpt-4o',
+      name: 'GPT-4o',
+      reasoning: true,
+      contextWindow: 128_000,
+      input: ['text', 'image'],
+      cost: { input: 2.5, output: 10, cacheRead: 1.25, cacheWrite: 5 },
+      maxTokens: 16_384,
+      thinkingLevelMap: { off: null, low: 'low', high: 'high' },
+    });
+    expect(result).not.toHaveProperty('headers');
+    expect(result).not.toHaveProperty('compat');
   });
 });
 

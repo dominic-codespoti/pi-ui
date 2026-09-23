@@ -448,6 +448,13 @@ const CONNECTED_S1 = {
   isStreaming: false,
   thinkingLevel: 'medium',
   model: null,
+  builtinCommands: [
+    { name: 'help', description: 'Show help' },
+    { name: 'hotkeys', description: 'Show keyboard shortcuts' },
+    { name: 'session', description: 'Manage sessions' },
+    { name: 'tree', description: 'Show session tree' },
+    { name: 'compact', description: 'Compact the current session' },
+  ],
   availableModels: [],
   messages: [],
   cwd: '/home/user/project-a',
@@ -1611,7 +1618,7 @@ test.describe('Extension terminal input', () => {
     await pressKey(page, 'ArrowDown');
     await pressKey(page, 'Enter');
 
-    await expect(page.locator('textarea')).toHaveValue('/reload ');
+    await expect(page.locator('textarea')).toHaveValue('/help ');
   });
 
   test('set_editor_text programmatic changes sync to the editor mirror', async ({ page }) => {
@@ -1784,7 +1791,7 @@ test.describe('Extension terminal input', () => {
     await pressKey(page, 'ArrowDown');
     await pressKey(page, 'Enter');
 
-    await expect(page.locator('textarea')).toHaveValue('/reload ');
+    await expect(page.locator('textarea')).toHaveValue('/help ');
   });
 
   test('optimistic rewritten data replaces the key instead of stacking on it', async ({ page }) => {

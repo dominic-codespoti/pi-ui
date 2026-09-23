@@ -1,30 +1,40 @@
 <script lang="ts">
   import { ScrollArea } from '#lib/components/ui/scroll-area/index.js';
   import CornerDownLeft from '@lucide/svelte/icons/corner-down-left';
-  import type { SkillSummary, PromptSummary } from '#lib/ws/protocol.js';
+  import ExternalLink from '@lucide/svelte/icons/external-link';
+  import AlertTriangle from '@lucide/svelte/icons/triangle-alert';
+  import type { SkillSummary, PromptSummary, ResourceDiagnosticSummary } from '#lib/ws/protocol.js';
 
   let {
     open,
     resourcesLoaded,
     skillFilter = $bindable(),
     filteredSkills,
+    diagnostics,
+    contextFiles,
     skillInstallUrl = $bindable(),
     skillInstallScope = $bindable(),
     skillInstalling,
     skillInstallFeedback = $bindable(),
     onInstallSkill,
     onUseSkill,
+    onUsePrompt,
+    onOpenFile,
   }: {
     open: boolean;
     resourcesLoaded: boolean;
     skillFilter: string;
     filteredSkills: { skills: SkillSummary[]; prompts: PromptSummary[] };
+    diagnostics: ResourceDiagnosticSummary[];
+    contextFiles: string[];
     skillInstallUrl: string;
     skillInstallScope: 'project' | 'user';
     skillInstalling: boolean;
     skillInstallFeedback: { success: boolean; message: string } | null;
     onInstallSkill: (url: string, scope: 'project' | 'user') => void;
     onUseSkill: (name: string) => void;
+    onUsePrompt: (name: string) => void;
+    onOpenFile: (path: string) => void;
   } = $props();
 </script>
 
@@ -47,19 +57,30 @@
     <span class="min-w-0 flex-1">
       <span class="flex items-center gap-1.5 mb-0.5 flex-wrap">
         <span class="text-sm font-mono text-base-content/80 truncate">{skill.name}</span>
-        {#if skill.isBuiltin}<span
-            class="shrink-0 px-1.5 py-0.5 rounded text-base-content/30 bg-base-content/6"
-            style="font-size:9px">pkg</span
+        <span class="rounded bg-base-content/6 px-1.5 py-0.5 text-[9px] text-base-content/45"
+          >{skill.isBuiltin ? 'package' : skill.scope}</span
+        >
+        {#if skill.disableModelInvocation}<span class="text-[9px] text-warning/70">manual</span
           >{/if}
       </span>
       {#if skill.description}<span class="text-xs text-base-content/40 leading-relaxed line-clamp-2"
           >{skill.description}</span
         >{/if}
+      {#if skill.sourcePath}
+        <button
+          onclick={() => onOpenFile(skill.sourcePath!)}
+          class="mt-1 max-w-full truncate text-left text-[10px] text-base-content/30 hover:text-primary"
+          title={skill.sourcePath}
+          aria-label="Open skill file {skill.sourcePath}"
+          >{skill.sourcePath} <ExternalLink class="inline h-3 w-3" /></button
+        >
+      {/if}
     </span>
     <button
       onclick={() => onUseSkill(skill.name)}
       class="shrink-0 mt-0.5 w-7 h-7 flex items-center justify-center text-base-content/30 hover:text-primary hover:bg-primary/10 rounded transition-colors"
-      title="Use skill"><CornerDownLeft class="w-3.5 h-3.5" /></button
+      title="Use skill"
+      aria-label="Use skill {skill.name}"><CornerDownLeft class="w-3.5 h-3.5" /></button
     >
   </div>
 {/snippet}
@@ -69,16 +90,31 @@
     <span class="min-w-0 flex-1">
       <span class="flex items-center gap-1.5 mb-0.5 flex-wrap">
         <span class="text-sm font-mono text-base-content/80 truncate">{prompt.name}</span>
-        {#if prompt.isBuiltin}<span
-            class="shrink-0 px-1.5 py-0.5 rounded text-base-content/30 bg-base-content/6"
-            style="font-size:9px">pkg</span
-          >{/if}
+        <span class="rounded bg-base-content/6 px-1.5 py-0.5 text-[9px] text-base-content/45"
+          >{prompt.isBuiltin ? 'package' : prompt.scope}</span
+        >
       </span>
       {#if prompt.description}<span
           class="text-xs text-base-content/40 leading-relaxed line-clamp-2"
           >{prompt.description}</span
         >{/if}
+      {#if prompt.argumentHint}<span class="mt-1 block font-mono text-[10px] text-primary/60"
+          >{prompt.argumentHint}</span
+        >{/if}
+      {#if prompt.sourcePath}<button
+          onclick={() => onOpenFile(prompt.sourcePath!)}
+          class="mt-1 max-w-full truncate text-left text-[10px] text-base-content/30 hover:text-primary"
+          title={prompt.sourcePath}
+          aria-label="Open prompt file {prompt.sourcePath}"
+          >{prompt.sourcePath} <ExternalLink class="inline h-3 w-3" /></button
+        >{/if}
     </span>
+    <button
+      onclick={() => onUsePrompt(prompt.name)}
+      class="shrink-0 mt-0.5 w-7 h-7 flex items-center justify-center text-base-content/30 hover:text-primary hover:bg-primary/10 rounded transition-colors"
+      title="Use prompt"
+      aria-label="Use prompt {prompt.name}"><CornerDownLeft class="w-3.5 h-3.5" /></button
+    >
   </div>
 {/snippet}
 
@@ -103,6 +139,13 @@
       >
       <input
         type="search"
+        name="skills-filter"
+        autocomplete="off"
+        spellcheck="false"
+        data-1p-ignore
+        data-lpignore="true"
+        data-bwignore
+        data-form-type="other"
         placeholder="filter skills & prompts…"
         bind:value={skillFilter}
         class="focus-ring w-full bg-transparent outline-none text-sm text-base-content/80 placeholder-base-content/20 pl-6 transition-all duration-150 focus:placeholder-base-content/35"
@@ -135,7 +178,7 @@
         {@const projectSkills = filteredSkills.skills.filter((s) => s.scope === 'project')}
         {@const userSkills = filteredSkills.skills.filter((s) => s.scope === 'user')}
         {@const builtinSkills = filteredSkills.skills.filter(
-          (s) => s.isBuiltin && s.scope !== 'project' && s.scope !== 'user'
+          (s) => s.scope !== 'project' && s.scope !== 'user'
         )}
         {#if projectSkills.length > 0}{@render sectionHeader(
             'P',
@@ -157,7 +200,9 @@
       {#if filteredSkills.prompts.length > 0}
         {@const projectPrompts = filteredSkills.prompts.filter((p) => p.scope === 'project')}
         {@const userPrompts = filteredSkills.prompts.filter((p) => p.scope === 'user')}
-        {@const builtinPrompts = filteredSkills.prompts.filter((p) => p.isBuiltin)}
+        {@const builtinPrompts = filteredSkills.prompts.filter(
+          (p) => p.scope !== 'project' && p.scope !== 'user'
+        )}
         {#if projectPrompts.length > 0}{@render sectionHeader(
             'P',
             'bg-primary/70',
@@ -178,6 +223,34 @@
           </div>{/if}
       {/if}
     {/if}
+    {#if diagnostics.length > 0}
+      {@render sectionHeader('!', 'bg-warning/70', 'resource diagnostics')}
+      <div class="px-5 py-2 space-y-2">
+        {#each diagnostics as diagnostic, index (`${diagnostic.type}:${diagnostic.path ?? ''}:${index}`)}
+          <div class="flex items-start gap-2 text-xs">
+            <AlertTriangle class="mt-0.5 h-3.5 w-3.5 shrink-0 text-warning" />
+            <div class="min-w-0">
+              <p class="text-base-content/65">{diagnostic.message}</p>
+              {#if diagnostic.path}<button
+                  onclick={() => onOpenFile(diagnostic.path!)}
+                  class="mt-0.5 block max-w-full truncate text-left text-[10px] text-base-content/35 hover:text-primary"
+                  title={diagnostic.path}>{diagnostic.path}</button
+                >{/if}
+            </div>
+          </div>
+        {/each}
+      </div>
+    {/if}
+    {#if contextFiles.length > 0}
+      {@render sectionHeader('C', 'bg-info/60', 'context files')}
+      <div class="px-5 py-2 space-y-1">
+        {#each contextFiles as path (path)}
+          <span class="block max-w-full truncate text-xs text-base-content/45" title={path}
+            >{path}</span
+          >
+        {/each}
+      </div>
+    {/if}
   </ScrollArea>
 </div>
 
@@ -186,6 +259,13 @@
   <input
     bind:value={skillInstallUrl}
     type="url"
+    name="skill-install-url"
+    autocomplete="off"
+    spellcheck="false"
+    data-1p-ignore
+    data-lpignore="true"
+    data-bwignore
+    data-form-type="other"
     placeholder="GitHub URL or raw .md URL"
     class="w-full text-xs bg-base-content/5 border border-base-content/10 rounded-lg px-3 py-2 text-base-content/80 placeholder-base-content/30 focus:outline-none focus:border-primary/50"
     tabindex={open ? 0 : -1}

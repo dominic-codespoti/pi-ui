@@ -90,6 +90,10 @@ export function fmtTokens(n: number): string {
   if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
   return `${n}`;
 }
+/** USD per million tokens, trimmed for compact model-list labels. */
+export function fmtPricePerMillion(value: number): string {
+  return `$${(value < 0.01 ? value.toFixed(3) : value.toFixed(2)).replace(/\.?0+$/, '')}`;
+}
 
 export function fmtCost(c: number): string | null {
   if (!c) return null;

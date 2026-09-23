@@ -12,6 +12,7 @@ export type SessionViewUiState = {
   contextUsage: ContextUsage | null;
   queuedSteering: string[];
   queuedFollowUp: string[];
+  queuedDeferred: string[];
   scrollAtBottom: boolean;
 };
 
@@ -193,6 +194,7 @@ function cloneUiState(view: SessionViewUiState): SessionViewUiState {
     contextUsage: view.contextUsage ? { ...view.contextUsage } : null,
     queuedSteering: view.queuedSteering.slice(),
     queuedFollowUp: view.queuedFollowUp.slice(),
+    queuedDeferred: view.queuedDeferred.slice(),
     scrollAtBottom: view.scrollAtBottom,
   };
 }

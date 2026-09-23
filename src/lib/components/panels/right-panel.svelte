@@ -3,7 +3,15 @@
   import ModelsTab from './models-tab.svelte';
   import ToolsTab from './tools-tab.svelte';
   import SkillsTab from './skills-tab.svelte';
-  import type { ModelInfo, ProviderInfo, SkillSummary, PromptSummary } from '#lib/ws/protocol.js';
+  import type {
+    ModelInfo,
+    ProviderInfo,
+    SkillSummary,
+    PromptSummary,
+    ResourceDiagnosticSummary,
+    ScopedModelInfo,
+  } from '#lib/ws/protocol.js';
+  import AlertTriangle from '@lucide/svelte/icons/triangle-alert';
 
   let {
     open,
@@ -13,14 +21,17 @@
     tab,
     modelTab = $bindable(),
     model,
-    availableModels,
+    allModels,
     modelRefreshLoading,
     modelRefreshFeedback,
     toolsList,
     activeToolNames,
     resourcesLoaded,
+    resourceDiagnostics,
+    contextFiles,
     thinkingLevel,
     availableThinkingLevels,
+    scopedModels,
     providers,
     providerError = $bindable(),
     providerKeyInputs = $bindable(),
@@ -29,10 +40,14 @@
     toolFilter = $bindable(),
     skillFilter = $bindable(),
     filteredProviders,
+    providerLoginPending,
     configuredProviderCount,
     filteredModelsByProvider,
+    highlightProviderId,
     filteredTools,
     filteredSkills,
+    onUsePrompt,
+    onOpenResourceFile,
     skillInstallUrl = $bindable(),
     skillInstallScope = $bindable(),
     skillInstalling,
@@ -44,8 +59,12 @@
     onTabChange,
     onSelectModel,
     onPickThinkingLevel,
+    onOpenScopedModels,
     onToggleTool,
     onSetProviderKey,
+    onProviderLogin,
+    onOpenProviderKey,
+    onHighlightConsumed,
     onRemoveProviderKey,
     onSetActiveTools,
     onInstallSkill,
@@ -60,7 +79,7 @@
     tab: 'models' | 'tools' | 'skills';
     modelTab: 'models' | 'providers';
     model: ModelInfo | null;
-    availableModels: ModelInfo[];
+    allModels: ModelInfo[];
     modelRefreshLoading: boolean;
     modelRefreshFeedback: { success: boolean; message: string } | null;
     toolsList: { name: string; description: string; isBuiltin: boolean; origin?: string }[];
@@ -68,6 +87,7 @@
     resourcesLoaded: boolean;
     thinkingLevel: string;
     availableThinkingLevels: readonly string[];
+    scopedModels: ScopedModelInfo[];
     providers: ProviderInfo[];
     providerError: string | null;
     providerKeyInputs: Record<string, string>;
@@ -78,8 +98,12 @@
     filteredProviders: ProviderInfo[];
     configuredProviderCount: number;
     filteredModelsByProvider: [string, ModelInfo[]][];
+    providerLoginPending: string | null;
+    highlightProviderId: string | null;
     filteredTools: { name: string; description: string; isBuiltin: boolean; origin?: string }[];
     filteredSkills: { skills: SkillSummary[]; prompts: PromptSummary[] };
+    resourceDiagnostics: ResourceDiagnosticSummary[];
+    contextFiles: string[];
     skillInstallUrl: string;
     skillInstallScope: 'project' | 'user';
     skillInstalling: boolean;
@@ -91,12 +115,18 @@
     onTabChange: (tab: 'models' | 'tools' | 'skills') => void;
     onSelectModel: (m: ModelInfo) => void;
     onPickThinkingLevel: (level: string) => void;
+    onOpenScopedModels: () => void;
     onToggleTool: (name: string) => void;
     onSetProviderKey: (id: string) => void;
+    onProviderLogin: (id: string) => void;
+    onHighlightConsumed: () => void;
+    onOpenProviderKey: (id: string) => void;
     onRemoveProviderKey: (id: string) => void;
     onSetActiveTools: (names: string[]) => void;
     onInstallSkill: (url: string, scope: 'project' | 'user') => void;
     onUseSkill: (name: string) => void;
+    onUsePrompt: (name: string) => void;
+    onOpenResourceFile: (path: string) => void;
     onDismissProviderError: () => void;
     onRefreshModels: () => void;
   } = $props();
@@ -166,7 +196,15 @@
         'skills'
           ? 'text-base-content bg-base-content/12 shadow-sm shadow-black/10'
           : 'text-base-content/45 hover:text-base-content/70'}"
-        tabindex={open ? 0 : -1}>skills</button
+        tabindex={open ? 0 : -1}
+        aria-label="skills and prompts{resourceDiagnostics.length
+          ? `, ${resourceDiagnostics.length} resource diagnostics`
+          : ''}"
+        >skills{#if resourceDiagnostics.length > 0}<AlertTriangle
+            class="ml-1 inline h-3 w-3 text-warning"
+            aria-hidden="true"
+          /><span class="ml-0.5 text-[10px] text-warning">{resourceDiagnostics.length}</span
+          >{/if}</button
       >
     </div>
     <button
@@ -188,11 +226,12 @@
       {open}
       bind:modelTab
       {model}
-      {availableModels}
+      {allModels}
       {modelRefreshLoading}
       {modelRefreshFeedback}
       {thinkingLevel}
       {availableThinkingLevels}
+      {scopedModels}
       {providers}
       bind:providerError
       bind:providerKeyInputs
@@ -201,8 +240,14 @@
       {filteredProviders}
       {configuredProviderCount}
       {filteredModelsByProvider}
+      {highlightProviderId}
+      {providerLoginPending}
+      {onHighlightConsumed}
+      {onProviderLogin}
+      {onOpenProviderKey}
       {onSelectModel}
       {onPickThinkingLevel}
+      {onOpenScopedModels}
       {onSetProviderKey}
       {onRemoveProviderKey}
       {onDismissProviderError}
@@ -222,6 +267,8 @@
     <SkillsTab
       {open}
       {resourcesLoaded}
+      diagnostics={resourceDiagnostics}
+      {contextFiles}
       bind:skillFilter
       {filteredSkills}
       bind:skillInstallUrl
@@ -230,6 +277,8 @@
       bind:skillInstallFeedback
       {onInstallSkill}
       {onUseSkill}
+      {onUsePrompt}
+      onOpenFile={onOpenResourceFile}
     />
   {/if}
 </SidebarPanel>

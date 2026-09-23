@@ -28,6 +28,9 @@ export type Surface =
   | 'working-indicator'
   | 'thinking-block'
   | 'tool-output'
+  | 'theme-catalog'
+  | 'browser-theme'
+  | 'keyboard-shortcuts'
   /** Colors and text styles of every extension-rendered surface. */
   | 'extension-styling';
 

@@ -1,21 +1,26 @@
 <script lang="ts">
+  import { tick } from 'svelte';
+  import { SvelteMap, SvelteSet } from 'svelte/reactivity';
   import { Button } from '#lib/components/ui/button/index.js';
   import * as Tabs from '#lib/components/ui/tabs/index.js';
   import { ScrollArea } from '#lib/components/ui/scroll-area/index.js';
   import Sparkles from '@lucide/svelte/icons/sparkles';
   import RefreshCw from '@lucide/svelte/icons/refresh-cw';
-  import type { ModelInfo, ProviderInfo } from '#lib/ws/protocol.js';
-  import { providerColor, sourceLabel, canRemove } from '#lib/utils.js';
+  import Eye from '@lucide/svelte/icons/eye';
+  import LoaderCircle from '@lucide/svelte/icons/loader-circle';
+  import type { ModelInfo, ProviderInfo, ScopedModelInfo } from '#lib/ws/protocol.js';
+  import { providerColor, sourceLabel, canRemove, fmtPricePerMillion } from '#lib/utils.js';
 
   let {
     open,
     modelTab = $bindable(),
     model,
-    availableModels,
+    allModels,
     modelRefreshLoading,
     modelRefreshFeedback,
     thinkingLevel,
     availableThinkingLevels,
+    scopedModels,
     providers,
     providerError = $bindable(),
     providerKeyInputs = $bindable(),
@@ -24,21 +29,28 @@
     filteredProviders,
     configuredProviderCount,
     filteredModelsByProvider,
+    providerLoginPending,
+    highlightProviderId,
+    onHighlightConsumed,
     onSelectModel,
     onPickThinkingLevel,
+    onOpenScopedModels,
     onSetProviderKey,
     onRemoveProviderKey,
+    onProviderLogin,
+    onOpenProviderKey,
     onDismissProviderError,
     onRefreshModels,
   }: {
     open: boolean;
     modelTab: 'models' | 'providers';
     model: ModelInfo | null;
-    availableModels: ModelInfo[];
+    allModels: ModelInfo[];
     modelRefreshLoading: boolean;
     modelRefreshFeedback: { success: boolean; message: string } | null;
     thinkingLevel: string;
     availableThinkingLevels: readonly string[];
+    scopedModels: ScopedModelInfo[];
     providers: ProviderInfo[];
     providerError: string | null;
     providerKeyInputs: Record<string, string>;
@@ -47,13 +59,105 @@
     filteredProviders: ProviderInfo[];
     configuredProviderCount: number;
     filteredModelsByProvider: [string, ModelInfo[]][];
+    providerLoginPending: string | null;
+    highlightProviderId: string | null;
+    onHighlightConsumed: () => void;
     onSelectModel: (m: ModelInfo) => void;
     onPickThinkingLevel: (level: string) => void;
+    onOpenScopedModels: () => void;
     onSetProviderKey: (id: string) => void;
     onRemoveProviderKey: (id: string) => void;
+    onProviderLogin: (id: string) => void;
+    onOpenProviderKey: (id: string) => void;
     onDismissProviderError: () => void;
     onRefreshModels: () => void;
   } = $props();
+  let providerCards: Record<string, HTMLDivElement | undefined> = $state({});
+  let providerKeyFields: Record<string, HTMLInputElement | undefined> = $state({});
+  const userTypedProviderKeys = new SvelteSet<string>();
+  let highlightedProviderId = $state<string | null>(null);
+  $effect(() => {
+    const id = highlightProviderId;
+    if (!id) return;
+    modelTab = 'providers';
+    void (async () => {
+      await tick();
+      const card = providerCards[id];
+      card?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      providerKeyFields[id]?.focus();
+      highlightedProviderId = id;
+      onHighlightConsumed();
+      setTimeout(() => {
+        if (highlightedProviderId === id) highlightedProviderId = null;
+      }, 1400);
+    })();
+  });
+  const unavailableModelsByProvider = $derived.by(() => {
+    const query = modelFilter.trim().toLowerCase();
+    const grouped = new SvelteMap<string, ModelInfo[]>();
+    for (const model of allModels) {
+      if (model.available !== false) continue;
+      if (
+        query &&
+        !model.name.toLowerCase().includes(query) &&
+        !model.provider.toLowerCase().includes(query)
+      )
+        continue;
+      const group = grouped.get(model.provider) ?? [];
+      group.push(model);
+      grouped.set(model.provider, group);
+    }
+    return [...grouped.entries()];
+  });
+  const visibleProviders = $derived.by(() => {
+    if (
+      !highlightProviderId ||
+      filteredProviders.some((provider) => provider.id === highlightProviderId)
+    ) {
+      return filteredProviders;
+    }
+    const requested = providers.find((provider) => provider.id === highlightProviderId);
+    return requested ? [...filteredProviders, requested] : filteredProviders;
+  });
+  function modelDetailsTitle(model: ModelInfo): string {
+    const prices = model.cost
+      ? `Input ${fmtPricePerMillion(model.cost.input)} · output ${fmtPricePerMillion(model.cost.output)} · cache read ${fmtPricePerMillion(model.cost.cacheRead)} · cache write ${fmtPricePerMillion(model.cost.cacheWrite)} per Mtok`
+      : 'Pricing unknown';
+    const thinking = Object.keys(model.thinkingLevelMap ?? {}).filter(
+      (level) => model.thinkingLevelMap?.[level] !== null
+    );
+    return [
+      model.id,
+      prices,
+      model.maxTokens ? `${model.maxTokens.toLocaleString()} output tokens` : undefined,
+      thinking.length ? `Thinking: ${thinking.join(', ')}` : undefined,
+    ]
+      .filter(Boolean)
+      .join('\n');
+  }
+  function authSourceText(provider: ProviderInfo): string | undefined {
+    if (provider.oauthAuthenticated) return 'OAuth';
+    switch (provider.source) {
+      case 'stored':
+        return 'stored key';
+      case 'runtime':
+        return 'runtime key';
+      case 'environment':
+        return 'environment variable';
+      case 'fallback':
+        return 'ambient credentials';
+      case 'models_json_key':
+      case 'models_json_command':
+        return 'models.json';
+      default:
+        return sourceLabel(provider.source);
+    }
+  }
+  function providerHeaderText(provider?: ProviderInfo): string {
+    if (!provider) return 'not signed in';
+    if (provider.oauthAuthenticated) return 'OAuth';
+    return provider.authLabel ?? authSourceText(provider) ?? 'not signed in';
+  }
 </script>
 
 {#snippet sectionHeader(letter: string, bg: string, label: string, color?: string)}
@@ -103,6 +207,18 @@
   >
     <RefreshCw class="h-3.5 w-3.5 {modelRefreshLoading ? 'animate-spin' : ''}" aria-hidden="true" />
   </Button>
+  {#if modelTab === 'models'}
+    <Button
+      variant="ghost"
+      size="sm"
+      onclick={onOpenScopedModels}
+      disabled={!open}
+      aria-label="Scope models"
+      title="Choose models available for cycling"
+      tabindex={open ? 0 : -1}
+      class="shrink-0 text-[10px] text-base-content/40 hover:text-base-content/75">Scope…</Button
+    >
+  {/if}
 </div>
 {#if modelRefreshFeedback}
   <div
@@ -117,7 +233,7 @@
 {/if}
 
 {#if modelTab === 'models'}
-  {#if model?.reasoning}
+  {#if availableThinkingLevels.length > 0}
     <div class="shrink-0 px-5 py-3.5 border-b border-base-content/8">
       <p class="text-[10px] text-base-content/35 uppercase tracking-[0.12em] mb-3 font-semibold">
         thinking
@@ -151,6 +267,13 @@
         >
         <input
           type="search"
+          name="models-panel-model-filter"
+          autocomplete="off"
+          spellcheck="false"
+          data-1p-ignore
+          data-lpignore="true"
+          data-bwignore
+          data-form-type="other"
           placeholder="filter models…"
           bind:value={modelFilter}
           class="focus-ring w-full bg-transparent outline-none text-sm text-base-content/80 placeholder-base-content/20 pl-6 transition-all duration-150 focus:placeholder-base-content/35"
@@ -160,28 +283,31 @@
       </div>
     </div>
     <ScrollArea class="flex-1 min-h-0">
-      {#if availableModels.length === 0}
+      {#if allModels.length === 0}
         <div class="flex-1 flex items-center justify-center px-5 py-8">
           <p class="text-xs text-base-content/45">no models configured</p>
         </div>
-      {:else if filteredModelsByProvider.length === 0}
+      {:else if filteredModelsByProvider.length === 0 && unavailableModelsByProvider.length === 0}
         <div class="flex-1 flex items-center justify-center px-5 py-8">
           <p class="text-xs text-base-content/20">no match</p>
         </div>
       {:else}
         {#each filteredModelsByProvider as [provider, models] (provider)}
+          {@const providerInfo = providers.find((item) => item.id === provider)}
           <div>
             {@render sectionHeader(
               provider[0].toUpperCase(),
               '',
-              provider,
+              `${provider} · ${providerHeaderText(providerInfo)} · ${models.length} models`,
               providerColor(provider)
             )}
             {#each models as m (m.id)}
               {@const isActive = model?.id === m.id && model?.provider === m.provider}
+              {@const included = providerInfo?.subscription || providerInfo?.oauthSubscription}
               <button
                 onclick={() => onSelectModel(m)}
-                class="w-full text-left px-5 py-2.5 text-sm transition-all duration-150 flex items-center gap-3 relative {isActive
+                title={modelDetailsTitle(m)}
+                class="w-full text-left px-5 py-2 text-sm transition-all duration-150 flex items-center gap-2.5 relative {isActive
                   ? 'text-primary bg-primary/[0.06]'
                   : 'text-base-content/70 hover:text-base-content hover:bg-base-content/[0.03]'}"
                 aria-pressed={isActive}
@@ -195,14 +321,49 @@
                   style="background:{providerColor(provider)}"
                 ></span>
                 <span class="flex-1 truncate">{m.name}</span>
-                {#if m.contextWindow}<span
-                    class="text-[10px] text-base-content/25 tabular-nums shrink-0"
+                {#if !m.input || m.input.includes('image')}
+                  <Eye class="w-3.5 h-3.5 text-base-content/35 shrink-0" aria-label="Image input" />
+                {/if}
+                {#if scopedModels.some((scope) => scope.provider === m.provider && scope.modelId === m.id)}
+                  <span
+                    class="shrink-0 rounded-full bg-primary/10 px-1.5 py-0.5 text-[9px] font-medium text-primary/75"
+                    >scoped</span
+                  >
+                {/if}
+                {#if m.isDefault}
+                  <span
+                    class="shrink-0 rounded-full bg-success/10 px-1.5 py-0.5 text-[9px] font-medium text-success/75"
+                    >default</span
+                  >
+                {/if}
+                {#if included}
+                  <span
+                    class="shrink-0 rounded-full bg-secondary/10 px-1.5 py-0.5 text-[9px] font-medium text-secondary/75"
+                    >included</span
+                  >
+                {:else if m.cost}
+                  <span
+                    class="hidden sm:inline text-[10px] text-base-content/35 tabular-nums shrink-0"
+                    title={modelDetailsTitle(m)}
+                  >
+                    {fmtPricePerMillion(m.cost.input)} / {fmtPricePerMillion(m.cost.output)} per Mtok
+                  </span>
+                {/if}
+                {#if m.contextWindow}
+                  <span class="text-[10px] text-base-content/25 tabular-nums shrink-0"
                     >{m.contextWindow >= 1_000_000
                       ? `${(m.contextWindow / 1_000_000).toFixed(0)}M`
                       : m.contextWindow >= 1_000
                         ? `${Math.round(m.contextWindow / 1_000)}k`
                         : m.contextWindow}</span
-                  >{/if}
+                  >
+                {/if}
+                {#if m.maxTokens}
+                  <span
+                    class="hidden sm:inline text-[10px] text-base-content/25 tabular-nums shrink-0"
+                    >{m.maxTokens >= 1_000 ? `${Math.round(m.maxTokens / 1_000)}k` : m.maxTokens} out</span
+                  >
+                {/if}
                 {#if m.reasoning}<Sparkles
                     class="w-3 h-3 text-secondary/50 shrink-0"
                     aria-label="Supports reasoning"
@@ -222,6 +383,48 @@
             {/each}
           </div>
         {/each}
+        {#each unavailableModelsByProvider as [provider, models] (provider)}
+          {@const providerInfo = providers.find((item) => item.id === provider)}
+          <details class="border-b border-base-content/6">
+            <summary
+              class="cursor-pointer list-none px-5 py-2.5 text-xs text-warning/75 flex items-center justify-between"
+            >
+              <span>Needs sign-in · {provider}</span>
+              <span class="text-[10px] text-base-content/30">{models.length} models</span>
+            </summary>
+            <div class="flex items-center gap-1 px-5 py-1.5 border-b border-base-content/5">
+              {#if providerInfo?.oauthLoginLabel}
+                <Button
+                  variant="ghost"
+                  size="xs"
+                  disabled={providerLoginPending === provider}
+                  onclick={() => onProviderLogin(provider)}
+                  tabindex={open ? 0 : -1}
+                  >{#if providerLoginPending === provider}<LoaderCircle
+                      class="w-3 h-3 animate-spin"
+                    />{/if}Sign in</Button
+                >
+              {/if}
+              {#if providerInfo?.apiKeyLogin}
+                <Button
+                  variant="ghost"
+                  size="xs"
+                  disabled={providerLoginPending === provider}
+                  onclick={() => onOpenProviderKey(provider)}
+                  tabindex={open ? 0 : -1}>Add key</Button
+                >
+              {/if}
+            </div>
+            {#each models as unavailable (unavailable.id)}
+              <div
+                class="px-5 py-1 text-[11px] text-base-content/45 truncate"
+                title={unavailable.name}
+              >
+                {unavailable.name}
+              </div>
+            {/each}
+          </details>
+        {/each}
       {/if}
     </ScrollArea>
   </div>
@@ -240,6 +443,13 @@
         >
         <input
           type="search"
+          name="models-panel-provider-filter"
+          autocomplete="off"
+          spellcheck="false"
+          data-1p-ignore
+          data-lpignore="true"
+          data-bwignore
+          data-form-type="other"
           placeholder="filter providers…"
           bind:value={providerFilter}
           class="focus-ring w-full bg-transparent outline-none text-sm text-base-content/80 placeholder-base-content/20 pl-6 transition-all duration-150 focus:placeholder-base-content/35"
@@ -270,6 +480,10 @@
         >
       </div>
     {/if}
+    <p class="px-5 py-2 text-[10px] text-base-content/35 border-b border-base-content/6">
+      Credential precedence: runtime key → stored key → models.json → environment variable or
+      ambient credentials.
+    </p>
 
     <ScrollArea class="flex-1 min-h-0">
       {#if providers.length === 0}
@@ -284,28 +498,34 @@
             </div>
           {/each}
         </div>
-      {:else if filteredProviders.length === 0}
+      {:else if visibleProviders.length === 0}
         <div class="flex-1 flex items-center justify-center px-5 py-8">
           <p class="text-xs text-base-content/20">no match</p>
         </div>
       {:else}
-        {#each filteredProviders as p (p.id)}
+        {#each visibleProviders as p (p.id)}
           {@const isCurrentProvider = model?.provider === p.id}
-          {@const label = sourceLabel(p.source)}
+          {@const isPending = providerLoginPending === p.id}
+          {@const label = p.authLabel ?? authSourceText(p)}
           <div
-            class="px-5 py-3 border-b border-base-content/6 transition-colors duration-150 {isCurrentProvider
-              ? 'bg-primary/[0.04]'
-              : 'hover:bg-base-content/[0.02]'}"
+            bind:this={providerCards[p.id]}
+            class="px-5 py-3 border-b border-base-content/6 transition-colors duration-300 {highlightedProviderId ===
+            p.id
+              ? 'bg-primary/15 ring-1 ring-inset ring-primary/40'
+              : isCurrentProvider
+                ? 'bg-primary/[0.04]'
+                : 'hover:bg-base-content/[0.02]'}"
           >
             <div class="flex items-center gap-3 mb-2">
               <span
-                class="text-sm flex-1 truncate {p.configured
+                class="text-sm flex-1 min-w-0 truncate {p.configured
                   ? 'text-base-content/85'
                   : 'text-base-content/40'} {isCurrentProvider ? 'text-primary' : ''}"
                 >{p.name}</span
               >
-              {#if label}<span class="text-[10px] text-base-content/25 shrink-0 font-mono"
-                  >{label}</span
+              {#if label}<span
+                  class="text-[10px] text-base-content/50 shrink-0 font-mono truncate max-w-[45%]"
+                  title={label}>{label}</span
                 >{/if}
               <span
                 class="w-2 h-2 rounded-full shrink-0 {p.configured
@@ -314,40 +534,106 @@
                 role="img"
                 aria-label={p.configured ? 'Configured' : 'Not configured'}
               ></span>
-              <span class="text-[10px] text-base-content/25 shrink-0">{p.modelCount}m</span>
+              <button
+                class="text-[10px] text-base-content/35 hover:text-primary shrink-0"
+                onclick={() => {
+                  modelTab = 'models';
+                  modelFilter = '';
+                  providerFilter = p.id;
+                }}
+                aria-label="Show {p.modelCount} models from {p.name}"
+                tabindex={open ? 0 : -1}>{p.modelCount} models</button
+              >
             </div>
-            {#if p.configured}
-              {#if canRemove(p.source)}
+            {#if p.baseUrl}
+              <p class="mb-2 truncate text-[10px] text-base-content/30 font-mono" title={p.baseUrl}>
+                {p.baseUrl}
+              </p>
+            {/if}
+            <div class="flex flex-wrap gap-1.5 items-center mb-2">
+              {#if p.oauthLoginLabel}<span
+                  class="rounded-full bg-secondary/10 px-1.5 py-0.5 text-[9px] text-secondary/75"
+                  >OAuth</span
+                >{/if}
+              {#if p.apiKeyLogin}<span
+                  class="rounded-full bg-base-content/5 px-1.5 py-0.5 text-[9px] text-base-content/45"
+                  >API key</span
+                >{/if}
+              {#if p.subscription || p.oauthSubscription}<span
+                  class="rounded-full bg-success/10 px-1.5 py-0.5 text-[9px] text-success/75"
+                  >Subscription</span
+                >{/if}
+              {#if isPending}<span
+                  class="inline-flex items-center gap-1 text-[10px] text-primary/70"
+                  ><LoaderCircle class="w-3 h-3 animate-spin" />Signing in…</span
+                >{/if}
+            </div>
+            <div class="flex flex-wrap gap-2 items-center">
+              {#if p.oauthLoginLabel && !p.oauthAuthenticated}
+                <Button
+                  variant="ghost"
+                  size="xs"
+                  disabled={isPending}
+                  onclick={() => onProviderLogin(p.id)}
+                  tabindex={open ? 0 : -1}>{p.oauthLoginLabel}</Button
+                >
+              {/if}
+              {#if p.oauthAuthenticated}
+                <Button
+                  variant="ghost"
+                  size="xs"
+                  onclick={() => onRemoveProviderKey(p.id)}
+                  tabindex={open ? 0 : -1}>Sign out</Button
+                >
+              {:else if p.configured && canRemove(p.source)}
                 <Button
                   variant="ghost"
                   size="xs"
                   onclick={() => onRemoveProviderKey(p.id)}
                   tabindex={open ? 0 : -1}>remove key</Button
                 >
-              {:else}
-                <span class="text-xs text-base-content/15">set externally</span>
+              {:else if p.configured}
+                <span class="text-xs text-base-content/35">configured outside pi</span>
               {/if}
-            {:else}
-              <div class="flex gap-2 items-center mt-1">
+              {#if !p.configured && p.apiKeyLogin}
                 <input
+                  bind:this={providerKeyFields[p.id]}
                   type="password"
+                  name="provider-api-key-{p.id}"
+                  autocomplete="new-password"
+                  disabled={isPending}
+                  data-1p-ignore
+                  data-lpignore="true"
+                  data-bwignore
+                  data-form-type="other"
+                  spellcheck="false"
+                  autocapitalize="off"
+                  autocorrect="off"
                   placeholder="API key…"
                   bind:value={providerKeyInputs[p.id]}
+                  oninput={() => userTypedProviderKeys.add(p.id)}
                   onkeydown={(e) => {
-                    if (e.key === 'Enter') onSetProviderKey(p.id);
+                    if (
+                      e.key === 'Enter' &&
+                      userTypedProviderKeys.has(p.id) &&
+                      providerKeyInputs[p.id]?.trim()
+                    )
+                      onSetProviderKey(p.id);
                   }}
                   class="focus-ring flex-1 bg-transparent border-b border-base-content/10 focus:border-base-content/30 outline-none text-sm py-1.5 placeholder-base-content/15 transition-all duration-150 min-w-0"
                   aria-label="API key for {p.name}"
                   tabindex={open ? 0 : -1}
                 />
-                <button
-                  onclick={() => onSetProviderKey(p.id)}
-                  disabled={!(providerKeyInputs[p.id] ?? '').trim()}
-                  class="text-xs text-base-content/35 hover:text-base-content disabled:opacity-20 transition-all duration-150 shrink-0 px-2 py-1.5"
-                  tabindex={open ? 0 : -1}>save</button
-                >
-              </div>
-            {/if}
+                {#if userTypedProviderKeys.has(p.id) && providerKeyInputs[p.id]?.trim()}
+                  <button
+                    disabled={isPending}
+                    onclick={() => onSetProviderKey(p.id)}
+                    class="text-xs text-base-content/35 hover:text-base-content transition-all duration-150 shrink-0 px-2 py-1.5"
+                    tabindex={open ? 0 : -1}>save</button
+                  >
+                {/if}
+              {/if}
+            </div>
           </div>
         {/each}
       {/if}

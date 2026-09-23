@@ -15,15 +15,26 @@ export type SessionReducerState = {
   model: ModelInfo | null;
   thinkingLevel: string;
   availableModels: ModelInfo[];
+  allModels: ModelInfo[];
   cwd: string;
   sessionPath: string | undefined;
   sessionName: string | undefined;
   messages: UIMessage[];
   activeStreamMsg: UIMessage | null;
   toolsById: Map<string, UIMessage>;
+  pendingToolCalls: Map<
+    number,
+    {
+      toolCallId: string;
+      toolName: string;
+      preview: string;
+      args?: Record<string, unknown>;
+    }
+  >;
   contextUsage: ContextUsage | null;
   queuedSteering: string[];
   queuedFollowUp: string[];
+  queuedDeferred: string[];
   isCompacting: boolean;
   compactionStartedAt: number | null;
   autoCompactionEnabled: boolean;
@@ -85,15 +96,18 @@ export function createSessionReducerState(
     model: null,
     thinkingLevel: 'off',
     availableModels: [],
+    allModels: [],
     cwd: '',
     sessionPath: undefined,
     sessionName: undefined,
     messages: [],
     activeStreamMsg: null,
     toolsById: new Map(),
+    pendingToolCalls: new Map(),
     contextUsage: null,
     queuedSteering: [],
     queuedFollowUp: [],
+    queuedDeferred: [],
     isCompacting: false,
     compactionStartedAt: null,
     autoCompactionEnabled: true,
@@ -225,9 +239,11 @@ function applySnapshot(
     state.messages = [];
     state.activeStreamMsg = null;
     state.toolsById = new Map();
+    state.pendingToolCalls = new Map();
     state.contextUsage = null;
     state.queuedSteering = [];
     state.queuedFollowUp = [];
+    state.queuedDeferred = [];
     state.compactionStartedAt = null;
     state.isCompacting = false;
     transcriptReplaced = true;
@@ -243,8 +259,11 @@ function applySnapshot(
   }
   if (payload.model !== undefined) state.model = (payload.model as ModelInfo | null) ?? null;
   if (typeof payload.thinkingLevel === 'string') state.thinkingLevel = payload.thinkingLevel;
-  if (payload.availableModels !== undefined)
-    state.availableModels = (payload.availableModels as ModelInfo[]) ?? [];
+  if (payload.availableModels !== undefined) {
+    const models = (payload.availableModels as ModelInfo[]) ?? [];
+    state.allModels = models;
+    state.availableModels = models.filter((model) => model.available !== false);
+  }
   if (typeof payload.cwd === 'string' && payload.cwd) state.cwd = payload.cwd;
   if ('sessionPath' in payload) {
     state.sessionPath = typeof payload.sessionPath === 'string' ? payload.sessionPath : undefined;
@@ -283,16 +302,20 @@ function applySnapshot(
     transcriptReplaced = true;
   }
 
-  if ('queuedSteering' in payload || 'queuedFollowUp' in payload) {
+  if ('queuedSteering' in payload || 'queuedFollowUp' in payload || 'deferred' in payload) {
     state.queuedSteering = Array.isArray(payload.queuedSteering)
       ? [...(payload.queuedSteering as string[])]
       : [];
     state.queuedFollowUp = Array.isArray(payload.queuedFollowUp)
       ? [...(payload.queuedFollowUp as string[])]
       : [];
+    state.queuedDeferred = Array.isArray(payload.deferred)
+      ? [...(payload.deferred as string[])]
+      : [];
   } else if ('sessionId' in payload) {
     state.queuedSteering = [];
     state.queuedFollowUp = [];
+    state.queuedDeferred = [];
   }
 
   let window = 0;
@@ -340,10 +363,27 @@ function applyEvent(
   switch (type) {
     case 'agent_start':
       state.isStreaming = true;
+      state.pendingToolCalls.clear();
       state.activeToolName = undefined;
       return;
-    case 'agent_end':
+    case 'agent_end': {
+      state.isStreaming = false;
+      state.pendingToolCalls.clear();
+      state.activeToolName = undefined;
+      sealStreaming(state, effects, touchedMessageIds);
+      const endedMessages = Array.isArray(frame.messages) ? frame.messages : [];
+      for (const message of rawMessagesToUI(endedMessages)) {
+        if (
+          (message.role === 'compaction_summary' || message.role === 'branch_summary') &&
+          !state.messages.some((existing) => existing.id === message.id)
+        ) {
+          state.messages.push(message);
+        }
+      }
+      return;
+    }
     case 'agent_error':
+      state.pendingToolCalls.clear();
       state.isStreaming = false;
       state.activeToolName = undefined;
       sealStreaming(state, effects, touchedMessageIds);
@@ -367,93 +407,166 @@ function applyEvent(
       return;
     }
     case 'message_update': {
-      const event = frame.assistantMessageEvent as { type?: string; delta?: string } | undefined;
+      const event = frame.assistantMessageEvent as
+        | {
+            type?: string;
+            delta?: string;
+            contentIndex?: number;
+            id?: string;
+            toolName?: string;
+            toolCall?: { id?: string; name?: string; arguments?: unknown };
+          }
+        | undefined;
+      if (event?.type === 'toolcall_start') {
+        const contentIndex = event.contentIndex;
+        if (typeof contentIndex !== 'number' || !event.id || !event.toolName) return;
+        const pending = { toolCallId: event.id, toolName: event.toolName, preview: '' };
+        state.pendingToolCalls.set(contentIndex, pending);
+        const tool = createTool(
+          state,
+          pending.toolName,
+          pending.toolCallId,
+          undefined,
+          undefined,
+          options
+        );
+        if (tool) {
+          tool.toolName = pending.toolName;
+          tool.toolArgsPreview = '';
+          touchedMessageIds.add(tool.id);
+        }
+        return;
+      }
+      if (event?.type === 'toolcall_delta' || event?.type === 'toolcall_end') {
+        const contentIndex = event.contentIndex;
+        if (typeof contentIndex !== 'number') return;
+        const pending = state.pendingToolCalls.get(contentIndex);
+        if (!pending) return;
+        if (event.type === 'toolcall_delta' && typeof event.delta === 'string') {
+          pending.preview = (pending.preview + event.delta).slice(0, 1200);
+        } else if (event.type === 'toolcall_end' && event.toolCall) {
+          pending.toolCallId = event.toolCall.id ?? pending.toolCallId;
+          pending.toolName = event.toolCall.name ?? pending.toolName;
+          pending.args =
+            event.toolCall.arguments && typeof event.toolCall.arguments === 'object'
+              ? (event.toolCall.arguments as Record<string, unknown>)
+              : undefined;
+          try {
+            pending.preview = JSON.stringify(pending.args ?? {}).slice(0, 1200);
+          } catch {
+            pending.preview = '';
+          }
+        }
+        const tool = findTool(state, pending.toolCallId);
+        if (tool) {
+          tool.toolName = pending.toolName;
+          tool.toolArgsPreview = pending.preview;
+          if (pending.args) tool.toolArgs = pending.args;
+          touchedMessageIds.add(tool.id);
+          effects.push({
+            type: 'render_message',
+            messageId: tool.id,
+            streaming: true,
+            scroll: false,
+          });
+        }
+        return;
+      }
       const active = state.activeStreamMsg;
       if (!active || typeof event?.delta !== 'string') return;
-      if (event.type === 'text_delta') {
-        active.content += event.delta;
-        touchedMessageIds.add(active.id);
-        effects.push({
-          type: 'render_message',
-          messageId: active.id,
-          streaming: true,
-          scroll: true,
-        });
-      } else if (event.type === 'thinking_delta') {
+      const blockType =
+        event.type === 'text_delta' ? 'text' : event.type === 'thinking_delta' ? 'thinking' : null;
+      if (!blockType) return;
+      if (blockType === 'text') active.content += event.delta;
+      else {
         active.thinking = (active.thinking ?? '') + event.delta;
         if (!active.thinkingStartMs) active.thinkingStartMs = options.now();
-        touchedMessageIds.add(active.id);
-        effects.push({
-          type: 'render_message',
-          messageId: active.id,
-          streaming: true,
-          scroll: false,
-        });
       }
+      const blocks = active.blocks ?? (active.blocks = []);
+      const last = blocks[blocks.length - 1];
+      if (last?.type === blockType) last.text += event.delta;
+      else blocks.push({ type: blockType, text: event.delta });
+      touchedMessageIds.add(active.id);
+      effects.push({
+        type: 'render_message',
+        messageId: active.id,
+        streaming: true,
+        scroll: blockType === 'text',
+      });
       return;
     }
     case 'message_end': {
-      const endMessage = frame.message as
-        | {
-            role?: string;
-            content?: {
-              type: string;
-              text?: string;
-              thinking?: string;
-              data?: string;
-              mimeType?: string;
-            }[];
-            usage?: {
-              input: number;
-              output: number;
-              totalTokens: number;
-              cost?: { total?: number };
-            };
-            stopReason?: string;
-          }
-        | undefined;
-      if (endMessage?.role === 'custom') {
-        const [custom] = rawMessagesToUI([endMessage]);
-        if (custom) state.messages.push(custom);
-      }
-      if (endMessage?.role === 'assistant') {
-        const active = state.activeStreamMsg;
-        if (active) {
-          active.endMs = options.now();
-          active.streaming = false;
-          if (endMessage.stopReason === 'aborted') {
-            active.aborted = true;
-            active.content = 'Operation aborted';
+      const endMessage = frame.message as { role?: string } | undefined;
+      if (endMessage) {
+        const [converted] = rawMessagesToUI([endMessage]);
+        const isBashExecution =
+          typeof endMessage.role === 'string' &&
+          ['bashexecution', 'bash_execution', 'bash'].includes(
+            endMessage.role.toLowerCase().replace('_', '')
+          );
+        if (isBashExecution && converted?.role === 'tool') {
+          const bash =
+            (typeof (endMessage as Record<string, unknown>).id === 'string'
+              ? findTool(state, (endMessage as Record<string, unknown>).id as string)
+              : undefined) ?? lastStreaming(state, 'tool');
+          if (bash?.toolName === 'bash') {
+            Object.assign(bash, converted, {
+              id: bash.id,
+              toolCallId: bash.toolCallId,
+              startMs: bash.startMs,
+              endMs: options.now(),
+              streaming: false,
+            });
+            touchedMessageIds.add(bash.id);
+            effects.push({
+              type: 'render_message',
+              messageId: bash.id,
+              streaming: false,
+              scroll: false,
+            });
           } else {
-            const content = endMessage.content ?? [];
-            const text = extractTextContent(content);
-            const thinking = content
-              .filter((block) => block.type === 'thinking')
-              .map((block) => block.thinking ?? block.text ?? '')
-              .join('');
-            if (text) active.content = text;
-            if (thinking) active.thinking = thinking;
-            if (endMessage.usage) {
-              active.usage = {
-                input: endMessage.usage.input,
-                output: endMessage.usage.output,
-                totalTokens: endMessage.usage.totalTokens,
-                cost: { total: endMessage.usage.cost?.total ?? 0 },
-              };
-            }
-            const images = content.filter(
-              (block) => block.type === 'image' && block.data && block.mimeType
-            );
-            if (images.length > 0)
-              active.images = images.map((block) => `data:${block.mimeType};base64,${block.data}`);
+            state.messages.push(converted);
+            addToolIndex(state, converted);
           }
-          touchedMessageIds.add(active.id);
-          effects.push({
-            type: 'render_message',
-            messageId: active.id,
-            streaming: false,
-            scroll: false,
-          });
+        } else if (
+          converted?.role === 'notice' ||
+          converted?.role === 'diagnostic' ||
+          converted?.role === 'compaction_summary' ||
+          converted?.role === 'branch_summary'
+        ) {
+          state.messages.push(converted);
+        } else if (converted?.role === 'assistant') {
+          const active = state.activeStreamMsg;
+          if (active) {
+            const id = active.id;
+            const startMs = active.startMs;
+            const streamedBlocks = active.blocks;
+            Object.assign(active, converted, {
+              id,
+              startMs,
+              endMs: options.now(),
+              streaming: false,
+              // Some SDK end events omit the accumulated content. Keep the
+              // ordered deltas already rendered rather than replacing them
+              // with an empty final snapshot.
+              ...(streamedBlocks?.length && !converted.blocks?.length
+                ? {
+                    content: active.content,
+                    thinking: active.thinking,
+                    blocks: streamedBlocks,
+                  }
+                : {}),
+            });
+            touchedMessageIds.add(active.id);
+            effects.push({
+              type: 'render_message',
+              messageId: active.id,
+              streaming: false,
+              scroll: false,
+            });
+          } else {
+            state.messages.push(converted);
+          }
         }
       }
       state.activeStreamMsg = null;
@@ -480,7 +593,9 @@ function applyEvent(
       state.activeToolName = toolName;
       if (tool) {
         tool.toolName = toolName;
+        tool.toolArgs = details;
         tool.toolInput = formatToolInput(toolName, details);
+        tool.toolArgsPreview = undefined;
         tool.renderedCallHtml = frame.renderedCallHtml as string[] | undefined;
         tool.streaming = true;
         tool.isError = false;
@@ -509,11 +624,20 @@ function applyEvent(
         : lastStreaming(state, 'tool');
       if (tool) {
         const partial = frame.partialResult as
-          { content?: { type: string; text?: string }[] } | undefined;
+          | {
+              content?: { type: string; text?: string; data?: string; mimeType?: string }[];
+              details?: Record<string, unknown>;
+            }
+          | undefined;
         if (partial?.content) {
           tool.content = extractTextContent(partial.content);
+          const images = partial.content.filter(
+            (block) => block.type === 'image' && block.data && block.mimeType
+          );
+          tool.images = images.map((block) => `data:${block.mimeType};base64,${block.data}`);
           delete tool.renderedResultHtml;
         }
+        if (partial?.details) tool.toolDetails = partial.details as UIMessage['toolDetails'];
         if (frame.renderedResultHtml)
           tool.renderedResultHtml = frame.renderedResultHtml as string[];
         touchedMessageIds.add(tool.id);
@@ -544,7 +668,10 @@ function applyEvent(
       const result = frame.result as
         | {
             content?: { type: string; text?: string; data?: string; mimeType?: string }[];
-            details?: { diff?: string; patch?: string };
+            details?: Record<string, unknown>;
+            diff?: string;
+            exitCode?: number;
+            cancelled?: boolean;
           }
         | undefined;
       if (result?.content) {
@@ -552,12 +679,40 @@ function applyEvent(
         const images = result.content.filter(
           (block) => block.type === 'image' && block.data && block.mimeType
         );
-        if (images.length > 0)
-          tool.images = images.map((block) => `data:${block.mimeType};base64,${block.data}`);
+        tool.images = images.map((block) => `data:${block.mimeType};base64,${block.data}`);
       }
-      const diff = result?.details?.diff ?? result?.details?.patch;
+      const rawDetails = result?.details;
+      if (rawDetails) tool.toolDetails = rawDetails as UIMessage['toolDetails'];
+      const exitCodeFromOutput =
+        toolName === 'bash' && tool.isError
+          ? tool.content.match(/Command exited with code (-?\d+)/)?.[1]
+          : undefined;
+      const exitCode =
+        typeof result?.exitCode === 'number'
+          ? result.exitCode
+          : exitCodeFromOutput !== undefined
+            ? Number(exitCodeFromOutput)
+            : undefined;
+      if (exitCode !== undefined) tool.toolDetails = { ...tool.toolDetails, exitCode };
+      if (typeof result?.cancelled === 'boolean') {
+        tool.cancelled = result.cancelled;
+        tool.toolDetails = { ...tool.toolDetails, cancelled: result.cancelled };
+      }
+      if (toolName === 'bash' && tool.isError && exitCode === undefined)
+        tool.toolDetails = { ...tool.toolDetails, exitCode: null };
+      const diff = result?.diff ?? rawDetails?.diff ?? rawDetails?.patch;
+      const firstChangedLine = rawDetails?.firstChangedLine;
+      if (typeof firstChangedLine === 'number')
+        tool.toolDetails = { ...tool.toolDetails, firstChangedLine };
+      if (typeof rawDetails?.patch === 'string')
+        tool.toolDetails = { ...tool.toolDetails, patch: rawDetails.patch };
+      for (const [contentIndex, pending] of state.pendingToolCalls) {
+        if (pending.toolCallId === toolCallId) state.pendingToolCalls.delete(contentIndex);
+      }
+      tool.toolArgs = details;
+      tool.toolArgsPreview = undefined;
       touchedMessageIds.add(tool.id);
-      if (diff) {
+      if (typeof diff === 'string' && diff) {
         tool.diff = diff;
         tool.lineCount = diff.split('\n').length;
         tool.expanded = true;
@@ -586,6 +741,16 @@ function applyEvent(
       }
       return;
     }
+    case 'tool_renderer_update': {
+      const tool = findTool(state, frame.toolCallId as string);
+      if (!tool) return;
+      if (Array.isArray(frame.renderedCallHtml))
+        tool.renderedCallHtml = frame.renderedCallHtml as string[];
+      if (Array.isArray(frame.renderedResultHtml))
+        tool.renderedResultHtml = frame.renderedResultHtml as string[];
+      touchedMessageIds.add(tool.id);
+      return;
+    }
     case 'tool_output': {
       const toolCallId = frame.toolCallId as string | undefined;
       if (!toolCallId) return;
@@ -601,14 +766,18 @@ function applyEvent(
         tool.renderedResultHtml = frame.renderedResultHtml as string[];
       tool.outputLoading = false;
       tool.outputElided = false;
+      if (frame.toolDetails && typeof frame.toolDetails === 'object')
+        tool.toolDetails = frame.toolDetails as UIMessage['toolDetails'];
+      if (tool.toolDetails?.fullOutputPath) tool.fullOutputPath = tool.toolDetails.fullOutputPath;
       if (tool.content && tool.lineCount === undefined)
         tool.lineCount = tool.content.split('\n').length;
       touchedMessageIds.add(tool.id);
       return;
     }
     case 'queue_update':
-      state.queuedSteering = [...new Set((frame.steering as string[] | undefined) ?? [])];
-      state.queuedFollowUp = [...new Set((frame.followUp as string[] | undefined) ?? [])];
+      state.queuedSteering = [...((frame.steering as string[] | undefined) ?? [])];
+      state.queuedFollowUp = [...((frame.followUp as string[] | undefined) ?? [])];
+      state.queuedDeferred = [...((frame.deferred as string[] | undefined) ?? [])];
       return;
     case 'compaction_start': {
       const startedAt = options.now();
@@ -742,6 +911,110 @@ function applyEvent(
       }
       return;
     }
+    case 'summarization_retry_scheduled': {
+      const delayMs = (frame.delayMs as number | undefined) ?? 0;
+      const notice: UIMessage = {
+        id: options.createId(),
+        role: 'notice',
+        content: `Summary retry scheduled${delayMs > 0 ? ` in ${Math.ceil(delayMs / 1000)}s` : ''}`,
+        noticeKind: 'retry',
+        streaming: true,
+        createdAt: options.now(),
+      };
+      state.messages.push(notice);
+      return;
+    }
+    case 'summarization_retry_attempt_start': {
+      const source = frame.source === 'compaction' ? 'Context compaction' : 'Branch summary';
+      const notice = [...state.messages]
+        .reverse()
+        .find(
+          (message) =>
+            message.role === 'notice' && message.noticeKind === 'retry' && message.streaming
+        );
+      if (notice) {
+        notice.content = `${source} retry in progress…`;
+        touchedMessageIds.add(notice.id);
+        effects.push({
+          type: 'render_message',
+          messageId: notice.id,
+          streaming: true,
+          scroll: false,
+        });
+      } else
+        state.messages.push({
+          id: options.createId(),
+          role: 'notice',
+          content: `${source} retry in progress…`,
+          noticeKind: 'retry',
+          streaming: true,
+          createdAt: options.now(),
+        });
+      return;
+    }
+    case 'summarization_retry_finished': {
+      const notice = [...state.messages]
+        .reverse()
+        .find(
+          (message) =>
+            message.role === 'notice' && message.noticeKind === 'retry' && message.streaming
+        );
+      if (notice) {
+        notice.streaming = false;
+        notice.content = 'Summary retry finished';
+        touchedMessageIds.add(notice.id);
+      }
+      return;
+    }
+    case 'agent_settled':
+      state.isStreaming = false;
+      state.activeToolName = undefined;
+      sealStreaming(state, effects, touchedMessageIds);
+      return;
+    case 'entry_appended': {
+      const entry = frame.entry as Record<string, unknown> | undefined;
+      if (entry?.type === 'session_info') {
+        if (typeof entry.name === 'string') state.sessionName = entry.name;
+        return;
+      }
+      let candidate = (entry?.message ?? entry) as Record<string, unknown> | undefined;
+      if (entry?.type === 'custom_message') {
+        candidate = {
+          ...entry,
+          role: 'custom',
+          timestamp:
+            typeof entry.timestamp === 'string' ? Date.parse(entry.timestamp) : entry.timestamp,
+        };
+      }
+      if (
+        candidate &&
+        (candidate.role === 'custom' ||
+          candidate.role === 'compactionSummary' ||
+          candidate.role === 'branchSummary')
+      ) {
+        const [appended] = rawMessagesToUI([candidate]);
+        if (
+          appended &&
+          !state.messages.some(
+            (existing) =>
+              existing.id === appended.id ||
+              (existing.role === 'notice' &&
+                existing.noticeKind === 'custom' &&
+                existing.customType === appended.customType &&
+                existing.content === appended.content &&
+                existing.createdAt === appended.createdAt)
+          )
+        ) {
+          state.messages.push(appended);
+        }
+      }
+      // Label entries are consumed by the session-tree refresh path.
+      return;
+    }
+    // Turn boundaries carry no additional transcript state; message events own rendering.
+    case 'turn_start':
+    case 'turn_end':
+      return;
   }
 }
 

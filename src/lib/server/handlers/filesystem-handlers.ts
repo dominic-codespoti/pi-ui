@@ -15,13 +15,14 @@ export interface FilesystemUploadTarget {
   readonly sessionId: string | null;
 }
 
-/** The only resident-session shape needed by filesystem completions. */
+/** The resident-session fields needed by filesystem completions and verified tool-output reads. */
 export interface FilesystemResidentTarget {
   readonly session: {
     readonly sessionManager: {
       getCwd(): string | undefined;
     };
     readonly extensionRunner: ExtensionCommandResolver;
+    readonly messages: readonly unknown[];
   };
 }
 
@@ -54,6 +55,8 @@ export interface FilesystemHandlerDependencies {
   ) => Promise<readonly CommandCompletionItem[]>;
   /** Check an already-resolved path against a workspace root (including symlinks). */
   isInsideWorkspace: (resolvedPath: string, workspaceRoot?: string) => boolean;
+  /** Allow a path only when it is a built-in bash result file in this session. */
+  isKnownToolOutputPath: (sessionId: string | undefined, resolvedPath: string) => boolean;
   /**
    * Resolve the upload workspace and session before any asynchronous staging work.
    * An unresolved explicit/focused session returns the active workspace and null.
@@ -415,7 +418,10 @@ export async function dispatchFilesystemMessage(
           return true;
         }
         const resolved = resolve(dependencies.activeCwd(), expandTilde(filePath));
-        if (!dependencies.isInsideWorkspace(resolved)) {
+        if (
+          !dependencies.isInsideWorkspace(resolved) &&
+          !dependencies.isKnownToolOutputPath(socket.data?.focusedSessionId, resolved)
+        ) {
           socket.send(
             JSON.stringify({
               type: 'file_content',

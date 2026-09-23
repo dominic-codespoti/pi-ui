@@ -17,8 +17,8 @@
  *   (counts, recency) re-derives without server.ts wiring it up.
  */
 
-import { existsSync } from 'node:fs';
-import { basename } from 'node:path';
+import { existsSync, readFileSync, statSync } from 'node:fs';
+import { basename, join, resolve } from 'node:path';
 import { loadProjectRecords, saveProjectRecords, type ProjectRecord } from './project-registry';
 import type { ProjectInfo } from '../ws/protocol';
 import type { SessionCatalog, SessionCatalogPatch } from './session-catalog';
@@ -35,11 +35,18 @@ const EXISTS_TTL_MS = 30_000;
 const PERSIST_DEBOUNCE_MS = 500;
 type SessionAggregate = { count: number; lastModified: number; maxSessionId: string };
 type SessionIdentity = { cwd: string; modified: number };
+type GitBranchCacheEntry = {
+  branch: string | null;
+  headPath: string | null;
+  mtimeMs: number;
+  size: number;
+};
 
 export class ProjectCatalog {
   private readonly listeners = new Set<() => void>();
   private persistTimer: Timer | null = null;
   private readonly existsCache = new Map<string, { exists: boolean; at: number }>();
+  private readonly gitBranchCache = new Map<string, GitBranchCacheEntry>();
   /** Cached session-derived values used by project list merges. */
   private readonly sessionAggregates = new Map<string, SessionAggregate>();
   /** Session identities let exact upsert/remove patches update only affected cwds. */
@@ -56,6 +63,7 @@ export class ProjectCatalog {
 
   /** Single write chokepoint for all project-registry mutations. */
   apply(patch: ProjectCatalogPatch): void {
+    this.gitBranchCache.delete(patch.path);
     const records = loadProjectRecords();
     const now = Date.now();
     switch (patch.kind) {
@@ -138,6 +146,7 @@ export class ProjectCatalog {
     for (const key of this.existsCache.keys()) {
       if (!map.has(key)) this.existsCache.delete(key);
     }
+    for (const project of map.values()) project.gitBranch = this.gitBranch(project.cwd);
 
     return [...map.values()].sort((a, b) =>
       a.pinned !== b.pinned ? (a.pinned ? -1 : 1) : b.lastActivity - a.lastActivity
@@ -145,6 +154,12 @@ export class ProjectCatalog {
   }
 
   private handleSessionChange(patch?: SessionCatalogPatch): void {
+    if (!patch) this.gitBranchCache.clear();
+    else if (patch.kind === 'upsert') this.gitBranchCache.delete(patch.session.cwd);
+    else if (patch.kind === 'remove' || patch.kind === 'release') {
+      const previous = this.sessionById.get(patch.id);
+      if (previous) this.gitBranchCache.delete(previous.cwd);
+    }
     this.aggregateRevision++;
     if (!patch || !this.aggregatesInitialized || this.aggregatesDirty || this.aggregateRebuild) {
       this.aggregatesDirty = true;
@@ -169,6 +184,7 @@ export class ProjectCatalog {
     const previous = this.sessionById.get(session.id);
     if (previous) this.removeSession(session.id, previous, previous.cwd !== session.cwd);
     const identity = { cwd: session.cwd, modified: session.modified.getTime() };
+    this.gitBranchCache.delete(identity.cwd);
     this.sessionById.set(session.id, identity);
     if (!identity.cwd) return;
     let times = this.sessionTimesByCwd.get(identity.cwd);
@@ -297,5 +313,45 @@ export class ProjectCatalog {
     const e = existsSync(path);
     this.existsCache.set(path, { exists: e, at: now });
     return e;
+  }
+  private gitBranch(cwd: string): string | null {
+    const cached = this.gitBranchCache.get(cwd);
+    if (cached) {
+      if (!cached.headPath) return cached.branch;
+      try {
+        const stats = statSync(cached.headPath);
+        if (stats.mtimeMs === cached.mtimeMs && stats.size === cached.size) return cached.branch;
+      } catch {
+        // Re-resolve .git if the cached HEAD disappeared or moved.
+      }
+    }
+
+    let branch: string | null = null;
+    let headPath: string | null = null;
+    let mtimeMs = 0;
+    let size = 0;
+    try {
+      const dotGit = join(cwd, '.git');
+      let gitDir = dotGit;
+      if (!statSync(dotGit).isDirectory()) {
+        const marker = readFileSync(dotGit, 'utf8').trim();
+        if (marker.startsWith('gitdir:')) gitDir = resolve(cwd, marker.slice(7).trim());
+      }
+      headPath = join(gitDir, 'HEAD');
+      const head = readFileSync(headPath, 'utf8').trim();
+      const stats = statSync(headPath);
+      mtimeMs = stats.mtimeMs;
+      size = stats.size;
+      if (head.startsWith('ref: ')) {
+        const ref = head.slice(5);
+        branch = ref.startsWith('refs/heads/') ? ref.slice('refs/heads/'.length) : ref;
+      } else if (/^[0-9a-f]{7,}$/i.test(head)) {
+        branch = head.slice(0, 7);
+      }
+    } catch {
+      // No repository, inaccessible metadata, or malformed .git pointer.
+    }
+    this.gitBranchCache.set(cwd, { branch, headPath, mtimeMs, size });
+    return branch;
   }
 }

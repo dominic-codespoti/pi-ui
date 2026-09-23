@@ -3,6 +3,7 @@
   import Folder from '@lucide/svelte/icons/folder';
   import FolderOpen from '@lucide/svelte/icons/folder-open';
   import ChevronRight from '@lucide/svelte/icons/chevron-right';
+  import GitBranch from '@lucide/svelte/icons/git-branch';
   import Plus from '@lucide/svelte/icons/plus';
   import Pin from '@lucide/svelte/icons/pin';
   import Pencil from '@lucide/svelte/icons/pencil';
@@ -160,6 +161,15 @@
           <FolderOpen class="w-4 h-4 shrink-0 text-primary/70" aria-hidden="true" />
         {:else}
           <Folder class="w-4 h-4 shrink-0 text-base-content/45" aria-hidden="true" />
+        {/if}
+        {#if group.gitBranch}
+          <span
+            class="min-w-0 max-w-[30%] flex shrink items-center gap-1 text-[10px] text-base-content/45"
+            title="Git branch: {group.gitBranch}"
+          >
+            <GitBranch class="w-3 h-3 shrink-0" aria-hidden="true" />
+            <span class="truncate">{group.gitBranch}</span>
+          </span>
         {/if}
         <span class="flex-1 min-w-0 truncate text-sm">{group.name}</span>
         {#if !group.exists}

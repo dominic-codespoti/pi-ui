@@ -177,6 +177,13 @@
     <Search class="w-4 h-4 shrink-0 text-base-content/35" />
     <input
       type="search"
+      name="projects-sidebar-filter"
+      autocomplete="off"
+      spellcheck="false"
+      data-1p-ignore
+      data-lpignore="true"
+      data-bwignore
+      data-form-type="other"
       placeholder="Search projects, paths, sessions…"
       bind:value={ps.filter}
       class="focus-ring flex-1 bg-transparent outline-none text-sm placeholder-base-content/30 text-base-content/82 min-w-0"

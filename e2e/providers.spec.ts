@@ -9,7 +9,7 @@ const UNCONFIGURED_PROVIDERS = {
   type: 'providers_list',
   providers: [
     { id: 'openai', name: 'OpenAI', configured: true, source: 'environment', modelCount: 1 },
-    { id: 'anthropic', name: 'Anthropic', configured: false, modelCount: 1 },
+    { id: 'anthropic', name: 'Anthropic', configured: false, apiKeyLogin: true, modelCount: 1 },
   ],
 };
 
@@ -27,6 +27,23 @@ test.describe('Provider credentials', () => {
     login,
   }) => {
     let savedKey: string | undefined;
+    const unavailableModel = {
+      provider: 'anthropic',
+      id: 'claude-sonnet',
+      name: 'Claude Sonnet',
+      reasoning: true,
+      available: false,
+      authRequired: 'anthropic',
+      contextWindow: 200_000,
+    };
+    const connectedPayload = {
+      ...CONNECTED_PAYLOAD,
+      availableModels: [...CONNECTED_PAYLOAD.availableModels, unavailableModel],
+    };
+    const updatedCatalog = [
+      ...CONNECTED_PAYLOAD.availableModels,
+      { ...unavailableModel, available: true, authRequired: undefined },
+    ];
 
     await page.routeWebSocket('/ws', (ws) => {
       ws.onMessage((data) => {
@@ -39,27 +56,21 @@ test.describe('Provider credentials', () => {
           ws.send(
             JSON.stringify({
               type: 'available_models_changed',
-              availableModels: [
-                ...CONNECTED_PAYLOAD.availableModels,
-                {
-                  provider: 'anthropic',
-                  id: 'claude-sonnet',
-                  name: 'Claude Sonnet',
-                  reasoning: true,
-                  contextWindow: 200_000,
-                },
-              ],
+              availableModels: updatedCatalog,
             })
           );
         }
       });
-      ws.send(JSON.stringify(CONNECTED_PAYLOAD));
+      ws.send(JSON.stringify(connectedPayload));
       ws.send(JSON.stringify(PROJECTS_LIST_PAYLOAD));
       ws.send(JSON.stringify(ALL_SESSIONS_LIST_PAYLOAD));
     });
 
     await login(page, 'test-password');
     await page.getByRole('button', { name: 'Open model and provider panel' }).click();
+    await expect(page.getByText('Needs sign-in · anthropic')).toBeVisible();
+    await page.getByText('Needs sign-in · anthropic').click();
+    await expect(page.getByText('Claude Sonnet', { exact: true })).toBeVisible();
     await page.getByRole('tab', { name: /providers/ }).click();
 
     const keyInput = page.getByLabel('API key for Anthropic');
@@ -70,7 +81,10 @@ test.describe('Provider credentials', () => {
     await expect(page.getByRole('button', { name: 'remove key', exact: true })).toBeVisible();
     expect(savedKey).toBe('sk-test');
     await page.locator('button[data-value="models"]').click();
-    await expect(page.getByText('Claude Sonnet', { exact: true })).toBeVisible();
+    await expect(
+      page.getByRole('button', { name: /^Claude Sonnet (Image input )?200k/ })
+    ).toBeVisible();
+    await expect(page.getByText('Needs sign-in · anthropic')).toHaveCount(0);
   });
 
   test('derives thinking rungs from the selected model capabilities', async ({ page, login }) => {
@@ -83,6 +97,7 @@ test.describe('Provider credentials', () => {
       thinkingLevelMap: {
         off: 'off',
         minimal: null,
+        low: 'low',
         medium: 'medium',
         high: 'high',
         max: null,
@@ -117,7 +132,8 @@ test.describe('Provider credentials', () => {
           ...CONNECTED_PAYLOAD,
           model: modelA,
           availableModels: [modelA, modelB],
-          thinkingLevel: 'unknown',
+          availableThinkingLevels: ['off', 'low', 'medium', 'high'],
+          thinkingLevel: 'high',
         })
       );
       ws.send(JSON.stringify(PROJECTS_LIST_PAYLOAD));
@@ -139,7 +155,14 @@ test.describe('Provider credentials', () => {
     await expect(page.getByRole('button', { name: 'xhigh', exact: true })).toHaveCount(0);
 
     if (!sendWs) throw new Error('WebSocket did not open');
-    sendWs.send(JSON.stringify({ type: 'model_changed', model: modelB, thinkingLevel: 'xhigh' }));
+    sendWs.send(
+      JSON.stringify({
+        type: 'model_changed',
+        model: modelB,
+        thinkingLevel: 'xhigh',
+        availableThinkingLevels: ['off', 'minimal', 'low', 'xhigh'],
+      })
+    );
 
     await expect(page.getByRole('button', { name: 'minimal', exact: true })).toBeVisible();
     await expect(page.getByRole('button', { name: 'xhigh', exact: true })).toBeVisible();
@@ -187,8 +210,8 @@ test.describe('Provider credentials', () => {
 
     await login(page);
     await page.getByRole('button', { name: 'Open model and provider panel' }).click();
-    const gptRow = page.getByRole('button', { name: /^GPT-4o \d/ });
-    const claudeRow = page.getByRole('button', { name: /^Claude Sonnet 4 \d/ });
+    const gptRow = page.getByRole('button', { name: /^GPT-4o (Image input )?\d/ });
+    const claudeRow = page.getByRole('button', { name: /^Claude Sonnet 4 (Image input )?\d/ });
     await expect(gptRow).toBeVisible();
     await expect(claudeRow).toHaveCount(0);
 

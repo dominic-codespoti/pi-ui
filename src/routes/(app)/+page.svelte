@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy, tick, untrack } from 'svelte';
+  import { THEMES } from '#lib/themes.js';
   import { dev } from '$app/env';
   import { pushState, replaceState } from '$app/navigation';
   import { page } from '$app/state';
@@ -16,6 +17,7 @@
     ExtensionSummary,
     WidgetContent,
     ExtensionUiStatePayload,
+    ScopedModelInfo,
     TreeNode,
     UpdateStatus,
     UpdateTarget,
@@ -26,7 +28,9 @@
     PackageUpdateInfo,
     PackageProgress,
     SessionStats,
+    FooterStats,
     ContextUsage,
+    ResourceDiagnosticSummary,
   } from '#lib/ws/protocol.js';
   import type { PiEvent } from '#lib/ws/protocol.js';
   import { renderMarkdown, renderStreamingPreview, onLangRegistered } from '#lib/markdown.js';
@@ -60,7 +64,6 @@
   import { saveIdentity, loadIdentity, clearIdentity } from '#lib/session-identity.js';
   import { SPREADSHEET_EXTENSIONS, fileToBase64, xlsxToText } from '#lib/attachments.js';
   import type { NotificationPrefs } from '#lib/notification-prefs.js';
-  import { clampThinkingLevelForModel, getSupportedThinkingLevels } from '#lib/thinking-levels.js';
   import { encodeTerminalKey, wrapBracketedPaste } from '#lib/terminal-key-encoder.js';
   import { ComposerTerminalBridge } from '#lib/composer-terminal-bridge.js';
   import * as Tooltip from '#lib/components/ui/tooltip/index.js';
@@ -75,10 +78,15 @@
   import LiveElapsed from '#lib/components/chat/live-elapsed.svelte';
   import ConversationStatus from '#lib/components/chat/conversation-status.svelte';
   import ConversationViewport from '#lib/components/chat/conversation-viewport.svelte';
+  import SessionFooter from '#lib/components/chat/session-footer.svelte';
   import RightPanel from '#lib/components/panels/lazy-right-panel.svelte';
+  import SdkSettingsSection from '#lib/components/panels/sdk-settings-section.svelte';
   import ExtensionComponent from '#lib/components/ui/extension-component.svelte';
   import ConfirmDialog from '#lib/components/dialogs/confirm-dialog.svelte';
   import ExtensionOverlays from '#lib/components/dialogs/extension-overlays.svelte';
+  import CompactDialog from '#lib/components/dialogs/compact-dialog.svelte';
+  import ProviderLoginDialog from '#lib/components/dialogs/provider-login-dialog.svelte';
+  import ScopedModelsDialog from '#lib/components/dialogs/scoped-models-dialog.svelte';
   import ChevronRight from '@lucide/svelte/icons/chevron-right';
   import X from '@lucide/svelte/icons/x';
   import Keyboard from '@lucide/svelte/icons/keyboard';
@@ -93,25 +101,15 @@
 
   // ── Builtin slash commands ───────────────────────────────────────────────────
 
-  const SLASH_COMMANDS = [
-    { name: 'reload', description: 'Reload extensions, skills, prompts, and themes' },
-    { name: 'compact', description: 'Manually compact the session context' },
-    { name: 'name', description: 'Set session display name' },
-    { name: 'new', description: 'Start a new session' },
-    { name: 'fork', description: 'Create a new fork from a previous user message' },
-    { name: 'clone', description: 'Duplicate the current session at the current position' },
-    { name: 'resume', description: 'Resume a different session' },
-    { name: 'export', description: 'Export session (.html/.jsonl)' },
-    { name: 'share', description: 'Share session as a secret GitHub gist' },
-    { name: 'session', description: 'Show session info and stats' },
-    { name: 'login', description: 'Configure provider authentication' },
-    { name: 'logout', description: 'Remove provider authentication' },
-    { name: 'tree', description: 'Navigate session tree (switch branches)' },
-    { name: 'model', description: 'Select model' },
-    { name: 'copy', description: 'Copy last agent message to clipboard' },
-    { name: 'changelog', description: 'Show changelog entries' },
-    { name: 'hotkeys', description: 'Show all keyboard shortcuts' },
+  const WEB_SLASH_COMMANDS = [
+    { name: 'shell', description: 'Run a shell command directly' },
   ] as const;
+  const WEB_COMMAND_DESCRIPTION_OVERRIDES: Record<string, string> = {
+    import: 'Choose a JSONL session file from this browser and resume it',
+    share:
+      'Create a secret GitHub gist, or save a local HTML export when gh is unavailable or unauthenticated',
+    bug: 'Preview a redacted diagnostic report without the conversation transcript before uploading',
+  };
 
   type ShortcutTrigger = '/' | '@' | '!' | '#';
   type ComposerShortcut = {
@@ -734,12 +732,16 @@
         descriptionSearch?: string
       ) => candidates.push({ shortcut, invocation, category, order, descriptionSearch });
       let order = 0;
-      for (const command of SLASH_COMMANDS) {
+      for (const command of [
+        // The browser cannot meaningfully implement the SDK's process-exit command.
+        ...sdkBuiltinCommands.filter((candidate) => candidate.name !== 'quit'),
+        ...WEB_SLASH_COMMANDS,
+      ]) {
         add(
           {
             trigger: '/' as const,
             label: `/${command.name}`,
-            description: command.description,
+            description: WEB_COMMAND_DESCRIPTION_OVERRIDES[command.name] ?? command.description,
             insert: `/${command.name} `,
           },
           command.name,
@@ -780,7 +782,9 @@
         );
       }
       for (const prompt of resourcesPrompts) {
-        const description = prompt.description || prompt.argumentHint || `${prompt.scope} prompt`;
+        const description =
+          [prompt.description, prompt.argumentHint].filter(Boolean).join(' · ') ||
+          `${prompt.scope} prompt`;
         add(
           {
             trigger: '/' as const,
@@ -914,13 +918,12 @@
   let sessionId = $state<string | null>(null);
   let thinkingLevel = $state('off');
   let model = $state<ModelInfo | null>(null);
-  /** Thinking levels available for the current model — derived from model.thinkingLevelMap. */
-  let availableThinkingLevels = $derived(getSupportedThinkingLevels(model));
-  $effect(() => {
-    const clamped = clampThinkingLevelForModel(model, thinkingLevel);
-    if (clamped !== thinkingLevel) thinkingLevel = clamped;
-  });
+  let modelAcceptsImages = $derived(model?.input === undefined || model.input.includes('image'));
+  let availableThinkingLevels = $state<string[]>([]);
+  let scopedModels = $state<ScopedModelInfo[]>([]);
+  let showScopedModels = $state(false);
   let availableModels = $state<ModelInfo[]>([]);
+  let allModels = $state<ModelInfo[]>([]);
   /** Server working directory */
   let cwd = $state('');
   /** pi SDK version reported by server */
@@ -1020,6 +1023,8 @@
   let queuedSteering = $state<string[]>([]);
   /** Pending follow-up messages (queue_update) */
   let queuedFollowUp = $state<string[]>([]);
+  let queuedDeferred = $state<string[]>([]);
+  let showCompactDialog = $state(false);
   /** Whether context compaction is currently running */
   let isCompacting = $state(false);
   /** Unix ms when the current compaction began, for live elapsed display. */
@@ -1028,6 +1033,7 @@
   let autoCompactionEnabled = $state(true);
   /** Whether auto-retry on transient errors is enabled — persisted in localStorage */
   let autoRetryEnabled = $state(true);
+  let hideThinkingBlock = $state(false);
   /** STT: true while SpeechRecognition is active. */
   let isRecording = $state(false);
   /** STT: active SpeechRecognition instance (not reactive — plain ref). */
@@ -1041,6 +1047,10 @@
    * user can speak → send → listen → speak again without touching the UI.
    */
   let conversationMode = $state(false);
+  let sdkSettings = $state<Record<string, unknown>>({});
+  let sdkProjectOverrides = $state<Record<string, unknown>>({});
+  let sdkSettingDescriptions = $state<Record<string, string>>({});
+  let sdkSettingErrors = $state<Record<string, string>>({});
 
   /** Selected daisyUI theme — persisted in localStorage. */
   let selectedTheme = $state('pi');
@@ -1135,29 +1145,12 @@
     { id: 'about', label: 'About', icon: PiIcon },
   ] as const;
 
-  const THEMES: { id: string; name: string }[] = [
-    { id: 'pi', name: 'Pi' },
-    { id: 'night', name: 'Night' },
-    { id: 'dark', name: 'Dark' },
-    { id: 'dracula', name: 'Dracula' },
-    { id: 'synthwave', name: 'Synthwave' },
-    { id: 'forest', name: 'Forest' },
-    { id: 'luxury', name: 'Luxury' },
-    { id: 'coffee', name: 'Coffee' },
-    { id: 'sunset', name: 'Sunset' },
-    { id: 'dim', name: 'Dim' },
-    { id: 'black', name: 'Black' },
-    { id: 'nord', name: 'Nord' },
-    { id: 'abyss', name: 'Abyss' },
-    { id: 'winter', name: 'Winter' },
-    { id: 'emerald', name: 'Emerald' },
-  ];
-
   const SHORTCUTS = [
     { keys: 'Ctrl / Cmd + /', action: 'Toggle sessions' },
     { keys: 'Ctrl / Cmd + K', action: 'Toggle model picker' },
     { keys: 'Ctrl / Cmd + T', action: 'Open thinking level' },
-    { keys: 'Ctrl / Cmd + Shift + T', action: 'Cycle thinking level' },
+    { keys: 'Ctrl / Cmd + Alt + T', action: 'Cycle thinking level' },
+    { keys: 'Ctrl / Cmd + Alt + M', action: 'Cycle model' },
     { keys: 'Escape', action: 'Close modal or panel' },
     { keys: 'Enter', action: 'Send from composer' },
     { keys: 'Shift + Enter', action: 'New line in composer' },
@@ -1183,6 +1176,9 @@
   /** Registered slash commands from extensions */
   let extensionCommands = $state<
     { name: string; description?: string; source: string; hasArgumentCompletions?: boolean }[]
+  >([]);
+  let sdkBuiltinCommands = $state<
+    Array<{ name: string; description: string; argumentHint?: string }>
   >([]);
   /** Replace the extension command catalog + its precomputed per-keystroke indexes. */
   function applyExtensionCommands(
@@ -1309,6 +1305,8 @@
   let resourcesSkills = $state<SkillSummary[]>([]);
   /** Prompt templates returned by the server */
   let resourcesPrompts = $state<PromptSummary[]>([]);
+  let resourceDiagnostics = $state<ResourceDiagnosticSummary[]>([]);
+  let resourceContextFiles = $state<string[]>([]);
   /** True once resources_list has been received (distinguishes "loading" from "empty") */
   let resourcesLoaded = $state(false);
   /** Loaded extensions from the server */
@@ -1330,6 +1328,11 @@
   let packageProgress = $state<PackageProgress | null>(null);
   let extensionsLoaded = $state(false);
   let sessionStats = $state<SessionStats | null>(null);
+  let footerData = $state<{
+    gitBranch: string | null;
+    availableProviderCount: number;
+    stats?: FooterStats;
+  } | null>(null);
   let exportFeedback = $state<string | null>(null);
 
   /** Update tab state */
@@ -1356,6 +1359,7 @@
   let modelTab = $state<'models' | 'providers'>(
     urlParam('mt', 'models') === 'providers' ? 'providers' : 'models'
   );
+  let highlightProviderId = $state<string | null>(null);
   let providers = $state<ProviderInfo[]>([]);
   /** Staged key text per provider id — cleared on successful save */
   let providerKeyInputs = $state<Record<string, string>>({});
@@ -1369,6 +1373,29 @@
   let skillFilter = $state('');
   /** Last error from set/remove provider key operations */
   let providerError = $state<string | null>(null);
+  let providerLoginPending = $state<string | null>(null);
+  let providerLoginId = $state<string | null>(null);
+  type ProviderLoginEvent = Extract<ServerMessage, { type: 'provider_login_event' }>['event'];
+  type ProviderLoginDialogState = {
+    loginId: string;
+    provider: string;
+    providerName: string;
+    authType: 'oauth' | 'api_key';
+    status: 'started' | 'succeeded' | 'failed' | 'cancelled';
+    error?: string;
+    authUrl?: Extract<ProviderLoginEvent, { type: 'auth_url' }>;
+    authUrlReceivedAt?: number;
+    deviceCode?: Extract<ProviderLoginEvent, { type: 'device_code' }>;
+    deviceCodeReceivedAt?: number;
+    messages: Extract<ProviderLoginEvent, { type: 'info' | 'progress' }>[];
+    prompt?: {
+      promptId: string;
+      prompt: Extract<ServerMessage, { type: 'provider_login_prompt' }>['prompt'];
+    };
+    promptCancelled?: boolean;
+    subscription?: boolean;
+  };
+  let providerLoginDialog = $state<ProviderLoginDialogState | null>(null);
   let modelRefreshLoading = $state(false);
   let modelRefreshFeedback = $state<{ success: boolean; message: string } | null>(null);
   let modelRefreshFeedbackTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1381,6 +1408,10 @@
   let treeData = $state<TreeNode[]>([]);
   let showTreeModal = $state(false);
   let treeLoading = $state(false);
+  let treeNavigationInProgress = $state(false);
+  let treeBranchSummarySkipPrompt = $state(false);
+  let treeNavigationError = $state('');
+  let treeSummarizing = $state(false);
   /** Fork-able user message entries returned by the server */
   let forkPoints = $state<{ entryId: string; text: string }[]>([]);
   /** True while waiting for the server to return fork_points */
@@ -1544,6 +1575,8 @@
     providerKeyInputs = {};
     resourcesSkills = [];
     resourcesPrompts = [];
+    resourceDiagnostics = [];
+    resourceContextFiles = [];
     resourcesLoaded = false;
     extensionsList = [];
     extensionErrors = [];
@@ -1620,6 +1653,11 @@
   });
 
   // ── Load extensions when settings extensions tab is active ──────────────────
+  $effect(() => {
+    if (showSettingsPanel && settingsSection === 'session' && wsState === 'open' && sessionId) {
+      send({ type: 'get_sdk_settings', sessionId });
+    }
+  });
 
   $effect(() => {
     if (showSettingsPanel && settingsSection === 'extensions' && wsState === 'open' && sessionId) {
@@ -1962,6 +2000,7 @@
       contextUsage: currentContextUsage(),
       queuedSteering: queuedSteering.slice(),
       queuedFollowUp: queuedFollowUp.slice(),
+      queuedDeferred: queuedDeferred.slice(),
       scrollAtBottom: isAtBottom,
     };
   }
@@ -1972,6 +2011,7 @@
     setComposerInput(view.draft);
     queuedSteering = view.queuedSteering.slice();
     queuedFollowUp = view.queuedFollowUp.slice();
+    queuedDeferred = view.queuedDeferred.slice();
     contextUsageTokens = view.contextUsage?.tokens ?? null;
     contextUsageWindow = view.contextUsage?.contextWindow ?? 0;
     isAtBottom = view.scrollAtBottom;
@@ -2010,6 +2050,7 @@
     model = next.model;
     thinkingLevel = next.thinkingLevel;
     availableModels = next.availableModels;
+    allModels = next.allModels;
     cwd = next.cwd;
     sessionPath = next.sessionPath;
     sessionName = next.sessionName;
@@ -2017,6 +2058,7 @@
     contextUsageWindow = next.contextUsage?.contextWindow ?? 0;
     queuedSteering = next.queuedSteering;
     queuedFollowUp = next.queuedFollowUp;
+    queuedDeferred = next.queuedDeferred;
     isCompacting = next.isCompacting;
     compactionStartedAt = next.compactionStartedAt;
     autoCompactionEnabled = next.autoCompactionEnabled;
@@ -2058,6 +2100,12 @@
   }
 
   function applySessionState(payload: Record<string, unknown>) {
+    if (Array.isArray(payload.availableThinkingLevels)) {
+      availableThinkingLevels = payload.availableThinkingLevels as string[];
+    }
+    if (Array.isArray(payload.scopedModels)) {
+      scopedModels = payload.scopedModels as ScopedModelInfo[];
+    }
     const prevSessionId = sessionId;
     const sessionIdentityChanged =
       typeof payload.sessionId === 'string' && payload.sessionId !== prevSessionId;
@@ -2185,6 +2233,7 @@
       case 'connected': {
         _resyncInFlight = false;
         const c = msg as ConnectedMessage;
+        sdkBuiltinCommands = c.builtinCommands ?? [];
         const targetPath = bootResumePath;
         const serverPath = typeof c.sessionPath === 'string' ? c.sessionPath : undefined;
         const serverSessionId = typeof c.sessionId === 'string' ? c.sessionId : undefined;
@@ -2202,6 +2251,7 @@
           resetSessionPanelState();
           projectTrust = c.projectTrust ?? null;
           runtimeDiagnostics = c.diagnostics ?? [];
+          hideThinkingBlock = c.hideThinkingBlock ?? false;
           resyncEditorMirror();
           sessionStartTime = Date.now();
         }
@@ -2285,6 +2335,7 @@
         // A retired or foreign stamped response, and every unstamped
         // broadcast while a local operation is active, is not ours.
         if (!projectsState.shouldApplySessionLoaded(requestId)) break;
+        footerData = null;
         const pendingRequestId =
           projectsState.sessionOperation.kind === 'idle'
             ? null
@@ -2308,6 +2359,7 @@
         }
         _resyncInFlight = false;
         applySessionState(sl);
+        if (typeof sl.hideThinkingBlock === 'boolean') hideThinkingBlock = sl.hideThinkingBlock;
         if (sessionId ?? loadedSessionId) sendSessionFocus(sessionId ?? loadedSessionId ?? null);
         _lastVisibleSessionPath = loadedPath ?? sessionPath ?? undefined;
         _lastVisibleSessionId = sessionId ?? loadedSessionId;
@@ -2370,16 +2422,26 @@
       }
 
       case 'model_changed': {
+        const state = msg as {
+          model: ModelInfo | null;
+          thinkingLevel: string;
+          availableThinkingLevels: string[];
+          scopedModels: ScopedModelInfo[];
+        };
         applySessionState({
-          model: (msg as { type: string; model: ModelInfo | null }).model ?? null,
+          model: state.model ?? null,
+          thinkingLevel: state.thinkingLevel,
+          availableThinkingLevels: state.availableThinkingLevels,
+          scopedModels: state.scopedModels,
         });
         break;
       }
 
       case 'thinking_level_changed': {
-        const incoming = (msg as { type: string; level: string }).level ?? 'off';
+        const state = msg as { level: string; availableThinkingLevels: string[] };
         applySessionState({
-          thinkingLevel: clampThinkingLevelForModel(model, incoming),
+          thinkingLevel: state.level ?? 'off',
+          availableThinkingLevels: state.availableThinkingLevels,
         });
         break;
       }
@@ -2461,6 +2523,97 @@
       case 'providers_list': {
         providers = (msg as { type: string; providers: ProviderInfo[] }).providers ?? [];
         providerError = null; // clear any prior error on success
+        break;
+      }
+      case 'provider_login_state': {
+        const state = msg as Extract<ServerMessage, { type: 'provider_login_state' }>;
+        if (state.status === 'started') {
+          providerLoginId = state.loginId;
+          providerLoginPending = state.provider || 'pending';
+          providerLoginDialog = {
+            loginId: state.loginId,
+            provider: state.provider,
+            providerName: state.providerName || state.provider || 'Provider',
+            authType: state.authType,
+            status: state.status,
+            messages: [],
+            subscription: providers.find((provider) => provider.id === state.provider)
+              ?.oauthSubscription,
+          };
+        } else {
+          if (providerLoginId === state.loginId) {
+            providerLoginPending = null;
+            providerLoginId = null;
+          }
+          if (providerLoginDialog?.loginId === state.loginId) {
+            providerLoginDialog = { ...providerLoginDialog, ...state };
+            if (state.status === 'succeeded') {
+              setTimeout(() => {
+                if (providerLoginDialog?.loginId === state.loginId) providerLoginDialog = null;
+              }, 1500);
+            }
+          } else if (state.status === 'failed') {
+            providerLoginDialog = {
+              loginId: state.loginId,
+              provider: state.provider,
+              providerName: state.providerName || state.provider || 'Provider',
+              authType: state.authType,
+              status: 'failed',
+              error: state.error,
+              messages: [],
+              subscription: providers.find((provider) => provider.id === state.provider)
+                ?.oauthSubscription,
+            };
+          }
+        }
+        break;
+      }
+      case 'provider_login_event': {
+        const event = msg as Extract<ServerMessage, { type: 'provider_login_event' }>;
+        const login = providerLoginDialog;
+        if (login?.loginId === event.loginId) {
+          const receivedAt = Date.now();
+          if (event.event.type === 'auth_url') {
+            providerLoginDialog = {
+              ...login,
+              authUrl: event.event,
+            };
+          } else if (event.event.type === 'device_code') {
+            providerLoginDialog = {
+              ...login,
+              deviceCode: event.event,
+              deviceCodeReceivedAt: receivedAt,
+            };
+          } else {
+            providerLoginDialog = {
+              ...login,
+              messages: [...login.messages, event.event].slice(-5),
+            };
+          }
+        }
+        break;
+      }
+      case 'provider_login_prompt': {
+        const prompt = msg as Extract<ServerMessage, { type: 'provider_login_prompt' }>;
+        if (providerLoginDialog?.loginId === prompt.loginId)
+          providerLoginDialog = {
+            ...providerLoginDialog,
+            prompt: { promptId: prompt.promptId, prompt: prompt.prompt },
+            promptCancelled: false,
+          };
+        break;
+      }
+      case 'provider_login_prompt_cancel': {
+        const prompt = msg as Extract<ServerMessage, { type: 'provider_login_prompt_cancel' }>;
+        if (
+          providerLoginDialog?.loginId === prompt.loginId &&
+          providerLoginDialog.prompt?.promptId === prompt.promptId
+        )
+          providerLoginDialog = {
+            ...providerLoginDialog,
+            prompt: undefined,
+            promptCancelled: true,
+          };
         break;
       }
 
@@ -2550,14 +2703,15 @@
       }
 
       case 'message_end': {
-        const endMsg = msg.message as
-          { role?: string; stopReason?: string; errorMessage?: string } | undefined;
         reduceActiveSessionEvent(msg);
-        if (endMsg?.role === 'assistant' && endMsg.stopReason === 'error' && endMsg.errorMessage) {
-          showChatNotice(`Agent error: ${endMsg.errorMessage}`, 'error');
-        }
         break;
       }
+      case 'agent_settled':
+      case 'entry_appended':
+      case 'turn_start':
+      case 'turn_end':
+        reduceActiveSessionEvent(msg);
+        break;
 
       case 'tool_execution_start':
       case 'tool_execution_update':
@@ -2584,12 +2738,21 @@
         break;
       }
 
+      case 'extension_ui_cancel': {
+        const wasActive = extensionUiState.dismissModal(msg.id as string | undefined);
+        if (wasActive) modalInput = '';
+        if (msg.reason === 'timeout') showChatNotice('Dialog timed out', 'info');
+        break;
+      }
       case 'extension_ui_request': {
         const method = msg.method as string;
         extensionUiState.queueModalFromRequest(msg);
 
         // Non-blocking extension methods (fire-and-forget, no modal response needed):
-        if (method === 'notify') {
+        if (method === 'applyTheme') {
+          const themeName = msg.theme as string | undefined;
+          if (themeName && THEMES.some((theme) => theme.id === themeName)) setTheme(themeName);
+        } else if (method === 'notify') {
           showChatNotice(
             (msg.message as string | undefined) ?? '',
             (msg.notifyType as 'info' | 'warning' | 'error' | undefined) ?? 'info'
@@ -2644,8 +2807,10 @@
           sessionCoordinator.setToolsExpanded(exp);
         } else if (method === 'set_header') {
           extensionUiState.setHeader(msg.content as string | undefined);
+          extensionUiState.headerTree = (msg.tree as ParsedComponent | null) ?? null;
         } else if (method === 'set_footer') {
           extensionUiState.setFooter(msg.content as string | undefined);
+          extensionUiState.footerTree = (msg.tree as ParsedComponent | null) ?? null;
         } else if (method === 'set_editor_component') {
           extensionUiState.setEditorComponent((msg.parsed as ParsedComponent | null) ?? null);
         } else if (method === 'diagnostic') {
@@ -2730,6 +2895,9 @@
       case 'compaction_end':
       case 'auto_retry_start':
       case 'auto_retry_end':
+      case 'summarization_retry_scheduled':
+      case 'summarization_retry_attempt_start':
+      case 'summarization_retry_finished':
         reduceActiveSessionEvent(msg);
         break;
 
@@ -2741,7 +2909,22 @@
 
       case 'session_tree': {
         treeData = (msg.tree as TreeNode[] | undefined) ?? [];
+        treeBranchSummarySkipPrompt = msg.branchSummarySkipPrompt === true;
         treeLoading = false;
+        break;
+      }
+
+      case 'tree_navigated': {
+        treeNavigationInProgress = false;
+        treeSummarizing = false;
+        if (msg.ok) {
+          if (typeof msg.editorText === 'string') input = msg.editorText;
+          treeNavigationError = '';
+          showTreeModal = false;
+        } else {
+          treeNavigationError =
+            typeof msg.error === 'string' ? msg.error : 'Unable to navigate to that session entry.';
+        }
         break;
       }
 
@@ -2763,6 +2946,8 @@
       case 'resources_list': {
         resourcesSkills = (msg.skills as SkillSummary[] | undefined) ?? [];
         resourcesPrompts = (msg.prompts as PromptSummary[] | undefined) ?? [];
+        resourceDiagnostics = (msg.diagnostics as ResourceDiagnosticSummary[] | undefined) ?? [];
+        resourceContextFiles = (msg.contextFiles as string[] | undefined) ?? [];
         resourcesLoaded = true;
         break;
       }
@@ -2796,6 +2981,15 @@
         packageBusy = false;
         packageProgress = null;
         if (msg.success) send({ type: 'get_packages' });
+        break;
+      case 'footer_data':
+        if (msg.sessionId === sessionId) {
+          footerData = {
+            gitBranch: msg.gitBranch as string | null,
+            availableProviderCount: (msg.availableProviderCount as number | undefined) ?? 0,
+            ...(msg.stats ? { stats: msg.stats as FooterStats } : {}),
+          };
+        }
         break;
       case 'session_stats': {
         const stats = msg.stats as SessionStats | undefined;
@@ -2934,6 +3128,27 @@
           message: string;
           level?: 'info' | 'warning' | 'error';
         };
+        if (result.command === 'bug_preview') {
+          try {
+            const preview = JSON.parse(result.message) as { id: string; preview: string };
+            if (!preview.id || !preview.preview) throw new Error('Invalid report preview');
+            const previewSessionId = sessionId;
+            requestConfirm(
+              preview.preview,
+              () =>
+                send({
+                  type: 'run_builtin',
+                  ...(previewSessionId ? { sessionId: previewSessionId } : {}),
+                  command: 'bug_confirm',
+                  args: preview.id,
+                }),
+              { title: 'Preview Pi bug report', confirmLabel: 'Upload report', variant: 'warning' }
+            );
+          } catch {
+            showChatNotice('Could not prepare the bug-report preview.', 'error');
+          }
+          break;
+        }
         if (result.command === 'shell' && sessionId) {
           sessionCoordinator.updateTool(`shell-${sessionId}`, (shell) => {
             shell.streaming = false;
@@ -3103,6 +3318,47 @@
         break;
       }
 
+      case 'sdk_settings': {
+        const settingsMessage = msg as {
+          type: 'sdk_settings';
+          settings: Record<string, unknown>;
+          projectOverrides: Record<string, unknown>;
+          descriptions: Record<string, string>;
+        };
+        sdkSettings = settingsMessage.settings;
+        sdkProjectOverrides = settingsMessage.projectOverrides;
+        hideThinkingBlock = settingsMessage.settings.hideThinkingBlock === true;
+        sdkSettingDescriptions = settingsMessage.descriptions;
+        if (settingsMessage.settings.hideThinkingBlock === true) {
+          for (const message of messages) {
+            if (message.thinkingExpanded) {
+              message.thinkingExpanded = false;
+              bumpMessageRevision(message.id);
+            }
+          }
+        }
+        break;
+      }
+      case 'sdk_setting_result': {
+        const result = msg as {
+          type: 'sdk_setting_result';
+          key: string;
+          ok: boolean;
+          error?: string;
+        };
+        if (result.ok) {
+          const remaining = { ...sdkSettingErrors };
+          delete remaining[result.key];
+          sdkSettingErrors = remaining;
+          if (sessionId) send({ type: 'get_sdk_settings', sessionId });
+        } else {
+          sdkSettingErrors = {
+            ...sdkSettingErrors,
+            [result.key]: result.error ?? 'Invalid setting value.',
+          };
+        }
+        break;
+      }
       case 'settings': {
         const s = msg as { type: 'settings'; settings: Record<string, unknown> };
         if (s.settings) {
@@ -3266,12 +3522,6 @@
   }
 
   // ── Model & session actions ──────────────────────────────────────────────────
-
-  function pickThinkingLevel(level: string) {
-    const clamped = clampThinkingLevelForModel(model, level);
-    thinkingLevel = clamped; // optimistic
-    send({ type: 'set_thinking_level', level: clamped });
-  }
 
   function openTab(tab: 'models' | 'tools' | 'skills') {
     if (showRightPanel && rightPanelTab === tab) {
@@ -3581,10 +3831,39 @@
       overlayKeydown(e);
       return;
     }
+    const reservedKey = e.key.toLowerCase();
+    if ((e.ctrlKey || e.metaKey) && (reservedKey === 'w' || reservedKey === 't')) return;
+    const modifiers = [
+      ...(e.ctrlKey ? ['ctrl'] : []),
+      ...(e.metaKey ? ['meta'] : []),
+      ...(e.altKey ? ['alt'] : []),
+      ...(e.shiftKey ? ['shift'] : []),
+    ];
+    const pressed = [...modifiers, reservedKey].join('+');
+    if (!(e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) && inEditable() && e.key !== 'Escape')
+      return;
+    for (const extension of extensionsList) {
+      const shortcut = extension.shortcuts?.find(
+        (entry) => entry.shortcut.toLowerCase() === pressed
+      );
+      if (!shortcut) continue;
+      e.preventDefault();
+      send({
+        type: 'invoke_extension_shortcut',
+        shortcut: shortcut.shortcut,
+        ...(sessionId ? { sessionId } : {}),
+      });
+      return;
+    }
 
     // Escape — dismiss modal or close open panels
     if (e.key === 'Escape') {
       if (modal) return; // modal's own onkeydown handles this
+      if (showScopedModels) {
+        e.preventDefault();
+        showScopedModels = false;
+        return;
+      }
       if (showSessionPanel) {
         e.preventDefault();
         showSessionPanel = false;
@@ -3620,25 +3899,25 @@
     }
 
     // Ctrl+T — open thinking level selector
-    if (!inEditable() && (e.ctrlKey || e.metaKey) && !e.shiftKey && e.key === 't') {
+    if (!inEditable() && (e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && e.key === 't') {
       e.preventDefault();
       openTab('models');
       return;
     }
 
-    // Ctrl+Shift+T — cycle thinking level
-    if (
-      !inEditable() &&
-      (e.ctrlKey || e.metaKey) &&
-      e.shiftKey &&
-      (e.key === 't' || e.key === 'T')
-    ) {
+    // Ctrl/Cmd+Alt+T cycles thinking levels; Alt avoids browser tab shortcuts.
+    if (!inEditable() && (e.ctrlKey || e.metaKey) && e.altKey && (e.key === 't' || e.key === 'T')) {
       e.preventDefault();
-      const current = thinkingLevel;
-      const idx = (availableThinkingLevels as readonly string[]).indexOf(current);
-      const next = availableThinkingLevels[(idx + 1) % availableThinkingLevels.length];
-      pickThinkingLevel(next);
-      showChatNotice(`Thinking level: ${next}`, 'info');
+      if (availableThinkingLevels.length > 0) {
+        send({ type: 'cycle_thinking_level' });
+      }
+      return;
+    }
+
+    // Ctrl/Cmd+Alt+M cycles models within the SDK's active scope.
+    if (!inEditable() && (e.ctrlKey || e.metaKey) && e.altKey && (e.key === 'm' || e.key === 'M')) {
+      e.preventDefault();
+      send({ type: 'cycle_model', direction: 'forward' });
       return;
     }
 
@@ -3743,6 +4022,12 @@
     e.preventDefault();
     await processAttachmentFiles(imageFiles);
   }
+  function handleComposerDrop(e: DragEvent) {
+    const files = Array.from(e.dataTransfer?.files ?? []);
+    if (files.length === 0) return;
+    e.preventDefault();
+    void processAttachmentFiles(files);
+  }
 
   function removeAttachment(idx: number) {
     composerController.removeAttachment(idx);
@@ -3750,6 +4035,11 @@
 
   function removeFileAttachment(idx: number) {
     composerController.removeFileAttachment(idx);
+  }
+  function removeUnsupportedImages() {
+    while (composerController.current.attachedImages.length > 0) {
+      composerController.removeAttachment(0);
+    }
   }
   /** Shows a transient status/error message inline in the chat transcript
    *  instead of a corner toast. Client-only — never sent to the session, so
@@ -3879,13 +4169,60 @@
         else showChatNotice('No assistant message to copy yet.', 'warning');
         return true;
       }
-      case 'show_hotkeys':
-        showChatNotice(
-          'Shortcuts: Enter sends, Shift+Enter newline, Cmd/Ctrl+B opens sessions, Cmd/Ctrl+K opens model picker.',
-          'info'
+      case 'open_import': {
+        const picker = document.createElement('input');
+        picker.type = 'file';
+        picker.accept = '.jsonl,application/json';
+        picker.onchange = () => {
+          const file = picker.files?.[0];
+          if (!file) return;
+          if (!file.name.toLowerCase().endsWith('.jsonl')) {
+            showChatNotice('Choose a .jsonl session file.', 'warning');
+            return;
+          }
+          void file
+            .text()
+            .then((content) => {
+              send({ type: 'import_session', name: file.name, content });
+              showChatNotice(`Importing ${file.name}…`, 'info');
+            })
+            .catch((error) =>
+              showChatNotice(`Could not read session file: ${String(error)}`, 'error')
+            );
+        };
+        picker.click();
+        return true;
+      }
+      case 'confirm_share':
+        requestConfirm(
+          'This creates an unlisted GitHub gist containing an HTML export of the current conversation. Anyone with its URL can read it. Continue?',
+          () =>
+            send({
+              type: 'run_builtin',
+              ...(effect.sessionId ? { sessionId: effect.sessionId } : {}),
+              command: 'share',
+            }),
+          { title: 'Share conversation', confirmLabel: 'Create secret gist', variant: 'warning' }
         );
         return true;
+      case 'open_settings':
+        settingsSection = effect.section ?? 'session';
+        showSettingsPanel = true;
+        showRightPanel = false;
+        showSessionPanel = false;
+        return true;
+      case 'open_scoped_models':
+        showScopedModels = true;
+        return true;
+      case 'show_hotkeys':
+        settingsSection = 'shortcuts';
+        showSettingsPanel = true;
+        showRightPanel = false;
+        showSessionPanel = false;
+        return true;
       case 'open_tree_modal':
+        treeLoading = true;
+        treeNavigationError = '';
         send({ type: 'get_session_tree' });
         showTreeModal = true;
     }
@@ -3893,6 +4230,7 @@
   }
   function submitMessage(asFollowUp = false) {
     if (pageDestroyed || wsState !== 'open' || sessionLoading) return;
+    if (!modelAcceptsImages && attachedImages.length > 0) return;
     flushEditorMirror();
     const result = composerController.submit(asFollowUp);
     if (!result.accepted) return;
@@ -4083,8 +4421,11 @@
     send({ type: 'abort' });
   }
 
-  function compactSession() {
-    send({ type: 'compact' });
+  function compactSession(customInstructions = '') {
+    send({
+      type: 'compact',
+      ...(customInstructions ? { customInstructions } : {}),
+    });
   }
 
   function refreshUpdateStatus() {
@@ -4860,6 +5201,7 @@
         {projectTrust}
         {showNotifNudge}
         extensionHeader={extensionUiState.header}
+        extensionHeaderTree={extensionUiState.headerTree}
         onReconnect={connect}
         onTrustProject={() =>
           send({
@@ -4885,6 +5227,7 @@
         {sessionLoading}
         {wsState}
         {sessionId}
+        {hideThinkingBlock}
         {isMobile}
         {isStreaming}
         {copiedId}
@@ -4904,6 +5247,7 @@
         {isAtBottom}
         extensionFooter={visibleExtensionFooter}
         onScroll={handleScroll}
+        extensionFooterTree={extensionUiState.footerTree}
         onMessageAreaClick={handleMessageAreaClick}
         onCodeCopy={handleCodeCopy}
         onScrollToBottom={scrollToBottom}
@@ -4938,6 +5282,8 @@
         }}
         onEditMessage={editMessage}
         onDismissNotice={dismissChatNotice}
+        onAbortCompaction={() => send({ type: 'abort_compaction' })}
+        onAbortRetry={() => send({ type: 'abort_retry' })}
         onHaptic={haptic}
         onDismissFooter={() => extensionUiState.setFooter(undefined)}
       />
@@ -4950,43 +5296,58 @@
         <div
           class="w-full max-w-3xl lg:max-w-5xl xl:max-w-6xl 2xl:max-w-7xl mx-auto px-2.5 sm:px-3 md:px-6"
         >
-          {#if queuedSteering.length > 0 || queuedFollowUp.length > 0}
+          {#if sessionId}
+            <SessionFooter
+              gitBranch={footerData?.gitBranch ?? null}
+              availableProviderCount={footerData?.availableProviderCount ?? 0}
+              stats={footerData?.stats}
+            />
+          {/if}
+          {#if queuedSteering.length > 0 || queuedFollowUp.length > 0 || queuedDeferred.length > 0}
             <div class="flex flex-wrap gap-1.5 mb-2 px-1">
-              {#each queuedSteering as m (m)}
+              {#each queuedSteering as m, i (`steer:${i}`)}
                 <span
-                  class="inline-flex items-center gap-1 text-xs text-base-content/40 bg-base-content/6 px-2 py-1 rounded-lg max-w-[16rem] truncate"
+                  class="inline-flex items-center gap-1 text-xs text-base-content/40 bg-base-content/6 px-2 py-1 rounded-lg max-w-[16rem]"
                   title="Queued steer: {m}"
                 >
-                  <svg
-                    class="w-2.5 h-2.5 shrink-0"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="2.5"
-                    stroke-linecap="round"
-                    stroke-linejoin="round"><path d="M5 12h14M12 5l7 7-7 7"></path></svg
-                  >
                   <span class="truncate">{m}</span>
+                  <button
+                    class="shrink-0 opacity-60 hover:opacity-100"
+                    aria-label="Remove queued steer"
+                    onclick={() => send({ type: 'remove_queued', kind: 'steer', index: i })}
+                    >×</button
+                  >
                 </span>
               {/each}
-              {#each queuedFollowUp as m (m)}
+              {#each queuedFollowUp as m, i (`follow-up:${i}`)}
                 <span
-                  class="inline-flex items-center gap-1 text-xs text-base-content/35 bg-base-content/5 px-2 py-1 rounded-lg max-w-[16rem] truncate"
+                  class="inline-flex items-center gap-1 text-xs text-base-content/35 bg-base-content/5 px-2 py-1 rounded-lg max-w-[16rem]"
                   title="Queued follow-up: {m}"
                 >
-                  <svg
-                    class="w-2.5 h-2.5 shrink-0"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="2"
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                  >
-                    <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
-                  </svg>
-
                   <span class="truncate">{m}</span>
+                  <button
+                    class="shrink-0 opacity-60 hover:opacity-100"
+                    aria-label="Remove queued follow-up"
+                    onclick={() => send({ type: 'remove_queued', kind: 'followUp', index: i })}
+                    >×</button
+                  >
+                </span>
+              {/each}
+              {#each queuedDeferred as m, i (`deferred:${i}`)}
+                <span
+                  class="inline-flex items-center gap-1 text-xs text-warning/70 bg-warning/5 px-2 py-1 rounded-lg max-w-[16rem]"
+                  title="Waiting for run slot: {m}"
+                >
+                  <span class="text-[9px] uppercase tracking-wide shrink-0"
+                    >Waiting for run slot</span
+                  >
+                  <span class="truncate">{m}</span>
+                  <button
+                    class="shrink-0 opacity-60 hover:opacity-100"
+                    aria-label="Remove deferred run"
+                    onclick={() => send({ type: 'remove_queued', kind: 'deferred', index: i })}
+                    >×</button
+                  >
                 </span>
               {/each}
             </div>
@@ -5169,6 +5530,19 @@
             >
               {#if attachedImages.length > 0 || attachedFiles.length > 0}
                 <div class="flex gap-2 flex-wrap pt-1">
+                  {#if !modelAcceptsImages && attachedImages.length > 0}
+                    <div
+                      class="flex w-full items-center justify-between gap-3 rounded-lg border border-warning/25 bg-warning/10 px-3 py-2 text-xs text-warning"
+                      role="alert"
+                    >
+                      <span>Current model does not accept images. Remove images to send.</span>
+                      <button
+                        type="button"
+                        class="shrink-0 underline underline-offset-2 hover:text-warning/80"
+                        onclick={removeUnsupportedImages}>Remove images</button
+                      >
+                    </div>
+                  {/if}
                   {#each attachedImages as img, i (img.src)}
                     <div class="relative group/thumb">
                       <img
@@ -5226,6 +5600,10 @@
                 onkeydown={handleComposerKeydown}
                 oninput={handleComposerInput}
                 onpaste={handleComposerPaste}
+                ondragover={(e) => {
+                  if (e.dataTransfer?.types.includes('Files')) e.preventDefault();
+                }}
+                ondrop={handleComposerDrop}
                 rows={1}
                 placeholder={sessionLoading
                   ? 'Opening session…'
@@ -5299,8 +5677,10 @@
                           {...props}
                           onclick={() => fileInputEl?.click()}
                           disabled={wsState !== 'open' || sessionLoading}
-                          class="w-10 h-10 sm:w-8 sm:h-8 flex items-center justify-center text-base-content/45 hover:text-base-content/70 hover:bg-base-content/8 rounded-full transition-colors shrink-0 disabled:opacity-30 disabled:cursor-default"
-                          aria-label="Attach file"
+                          class="w-10 h-10 sm:w-8 sm:h-8 flex items-center justify-center {modelAcceptsImages
+                            ? 'text-base-content/45 hover:text-base-content/70 hover:bg-base-content/8'
+                            : 'text-base-content/25 hover:text-base-content/40 hover:bg-base-content/5'} rounded-full transition-colors shrink-0 disabled:opacity-30 disabled:cursor-default"
+                          aria-label={modelAcceptsImages ? 'Attach file' : 'Attach text file'}
                           ><svg
                             class="w-4 h-4"
                             viewBox="0 0 24 24"
@@ -5316,7 +5696,9 @@
                         </button>
                       {/snippet}
                     </Tooltip.Trigger>
-                    <Tooltip.Content>Attach file</Tooltip.Content>
+                    <Tooltip.Content>
+                      {modelAcceptsImages ? 'Attach file' : 'Current model does not accept images'}
+                    </Tooltip.Content>
                   </Tooltip.Root>
                   {#if isCompacting}
                     <span
@@ -5347,7 +5729,7 @@
                         {#snippet child({ props })}
                           <button
                             {...props}
-                            onclick={compactSession}
+                            onclick={() => (showCompactDialog = true)}
                             disabled={wsState !== 'open' || sessionLoading}
                             class="hidden md:flex w-8 h-8 items-center justify-center text-base-content/35 hover:text-base-content/60 hover:bg-base-content/8 rounded-full transition-colors shrink-0 disabled:opacity-30 disabled:cursor-default"
                             aria-label="Compact context"
@@ -5474,6 +5856,7 @@
                           disabled={(!hasComposerText &&
                             attachedImages.length === 0 &&
                             attachedFiles.length === 0) ||
+                            (!modelAcceptsImages && attachedImages.length > 0) ||
                             wsState !== 'open' ||
                             sessionLoading}
                           class="relative w-10 h-10 sm:w-8 sm:h-8 flex items-center justify-center rounded-full transition-all duration-200 shrink-0 {(hasComposerText ||
@@ -5533,7 +5916,9 @@
             <input
               bind:this={fileInputEl}
               type="file"
-              accept="image/*,.txt,.md,.json,.yaml,.yml,.xml,.html,.css,.js,.ts,.jsx,.tsx,.py,.rb,.go,.rs,.java,.kt,.swift,.c,.cpp,.h,.hpp,.cs,.sh,.bash,.zsh,.toml,.ini,.cfg,.conf,.env,.gitignore,.svelte,.vue,.sass,.scss,.less,.sql,.graphql,.r,.mjs,.cjs"
+              accept={modelAcceptsImages
+                ? 'image/*,.txt,.md,.json,.yaml,.yml,.xml,.html,.css,.js,.ts,.jsx,.tsx,.py,.rb,.go,.rs,.java,.kt,.swift,.c,.cpp,.h,.hpp,.cs,.sh,.bash,.zsh,.toml,.ini,.cfg,.conf,.env,.gitignore,.svelte,.vue,.sass,.scss,.less,.sql,.graphql,.r,.mjs,.cjs'
+                : '.txt,.md,.json,.yaml,.yml,.xml,.html,.css,.js,.ts,.jsx,.tsx,.py,.rb,.go,.rs,.java,.kt,.swift,.c,.cpp,.h,.hpp,.cs,.sh,.bash,.zsh,.toml,.ini,.cfg,.conf,.env,.gitignore,.svelte,.vue,.sass,.scss,.less,.sql,.graphql,.r,.mjs,.cjs'}
               multiple
               class="hidden"
               onchange={handleFileInput}
@@ -5671,15 +6056,19 @@
       resizing={rightResizing}
       tab={rightPanelTab}
       {modelTab}
+      {highlightProviderId}
       {model}
-      {availableModels}
+      {allModels}
       {modelRefreshLoading}
       {modelRefreshFeedback}
       {toolsList}
       {activeToolNames}
       {resourcesLoaded}
+      {resourceDiagnostics}
+      contextFiles={resourceContextFiles}
       {thinkingLevel}
       {availableThinkingLevels}
+      {scopedModels}
       {providers}
       bind:providerError
       bind:providerKeyInputs
@@ -5690,6 +6079,8 @@
       {filteredProviders}
       {configuredProviderCount}
       {filteredModelsByProvider}
+      {providerLoginPending}
+      onHighlightConsumed={() => (highlightProviderId = null)}
       {filteredTools}
       {filteredSkills}
       bind:skillInstallUrl
@@ -5708,9 +6099,9 @@
         showRightPanel = false;
       }}
       onPickThinkingLevel={(lvl) => {
-        thinkingLevel = lvl;
         send({ type: 'set_thinking_level', level: lvl });
       }}
+      onOpenScopedModels={() => (showScopedModels = true)}
       onToggleTool={(name) => {
         const next = activeToolNames.includes(name)
           ? activeToolNames.filter((n) => n !== name)
@@ -5727,9 +6118,9 @@
       }}
       onRemoveProviderKey={(id) =>
         requestConfirm(
-          `Remove API key for ${id}?`,
+          `Remove stored credentials for ${id}?`,
           () => send({ type: 'remove_provider_key', provider: id }),
-          { title: 'Remove API key', confirmLabel: 'Remove', variant: 'error' }
+          { title: 'Remove provider credentials', confirmLabel: 'Remove', variant: 'error' }
         )}
       onSetActiveTools={(names) => {
         activeToolNames = names;
@@ -5745,7 +6136,28 @@
         showRightPanel = false;
         tick().then(() => inputEl?.focus());
       }}
+      onUsePrompt={(name: string) => {
+        setComposerInput(`/${name} `);
+        showRightPanel = false;
+        tick().then(() => inputEl?.focus());
+      }}
+      onOpenResourceFile={(path: string) => openFileViewer(path)}
       onDismissProviderError={() => (providerError = null)}
+      onProviderLogin={(provider) => {
+        providerError = null;
+        send({
+          type: 'provider_login',
+          provider,
+          authType: 'oauth',
+          sessionId: sessionId ?? undefined,
+        });
+      }}
+      onOpenProviderKey={(provider) => {
+        showRightPanel = true;
+        rightPanelTab = 'models';
+        modelTab = 'providers';
+        highlightProviderId = provider;
+      }}
       onRefreshModels={requestModelRefresh}
     />
 
@@ -5753,7 +6165,7 @@
 
     <Dialog.Root bind:open={showSettingsPanel}>
       <Dialog.Content
-        class="p-0 overflow-hidden max-w-[calc(100vw-1rem)] sm:max-w-[min(68rem,calc(100vw-2rem))] h-[fit-content(calc(100dvh-2rem))] sm:h-[min(44rem,calc(100dvh-2rem))] bg-base-200 text-base-content border border-base-content/10 shadow-2xl shadow-black/40"
+        class="p-0 overflow-hidden max-w-[calc(100vw-1rem)] sm:max-w-[min(68rem,calc(100vw-2rem))] h-[calc(100dvh-2rem)] sm:h-[min(44rem,calc(100dvh-2rem))] bg-base-200 text-base-content border border-base-content/10 shadow-2xl shadow-black/40"
         showCloseButton={false}
       >
         <div class="flex h-full min-h-0">
@@ -5909,6 +6321,25 @@
                       </div>
                     </div>
                   </Card.Root>
+                  <SdkSettingsSection
+                    settings={sdkSettings}
+                    projectOverrides={sdkProjectOverrides}
+                    descriptions={sdkSettingDescriptions}
+                    busy={wsState !== 'open'}
+                    errors={sdkSettingErrors}
+                    onSet={(key, value, scope) => {
+                      const remaining = { ...sdkSettingErrors };
+                      delete remaining[key];
+                      sdkSettingErrors = remaining;
+                      send({
+                        type: 'set_sdk_setting',
+                        sessionId: sessionId ?? undefined,
+                        key,
+                        value,
+                        scope,
+                      });
+                    }}
+                  />
                   <Card.Root
                     size="sm"
                     class="py-0 overflow-hidden bg-base-100/60 border-base-content/10"
@@ -6045,6 +6476,13 @@
                         <div class="px-4 py-3">
                           <input
                             type="url"
+                            name="notification-webhook-url"
+                            autocomplete="off"
+                            spellcheck="false"
+                            data-1p-ignore
+                            data-lpignore="true"
+                            data-bwignore
+                            data-form-type="other"
                             class="w-full rounded-lg border border-base-content/12 bg-base-200/50 px-3 py-2 text-sm text-base-content/80 placeholder:text-base-content/25 outline-none focus:border-primary/50 transition-colors"
                             placeholder="https://ntfy.sh/my-pi-topic"
                             value={notificationWebhookUrl}
@@ -6074,6 +6512,17 @@
                             >{shortcut.keys}</kbd
                           >
                           <span class="text-sm text-base-content/70">{shortcut.action}</span>
+                        </div>
+                      {/each}
+                      {#each extensionsList.flatMap( (extension) => (extension.shortcuts ?? []).map( (shortcut) => ({ ...shortcut, extensionName: extension.source }) ) ) as shortcut (`${shortcut.extensionName}:${shortcut.shortcut}`)}
+                        <div class="flex items-center gap-4 px-4 py-3">
+                          <kbd
+                            class="min-w-32 rounded-lg border border-base-content/12 bg-base-content/[0.055] px-2 py-1 text-xs text-base-content/60 font-mono"
+                            >{shortcut.shortcut}</kbd
+                          >
+                          <span class="text-sm text-base-content/70">
+                            {shortcut.extensionName}: {shortcut.description ?? 'Extension shortcut'}
+                          </span>
                         </div>
                       {/each}
                     </div>
@@ -6283,6 +6732,13 @@
                                             />
                                           {:else}
                                             <input
+                                              name={`extension-flag-${flag.name}`}
+                                              autocomplete="off"
+                                              spellcheck="false"
+                                              data-1p-ignore
+                                              data-lpignore="true"
+                                              data-bwignore
+                                              data-form-type="other"
                                               class="w-36 rounded border border-base-content/12 bg-base-200/50 px-2 py-1 text-xs font-mono"
                                               value={String(flag.value ?? flag.default ?? '')}
                                               onchange={(event) =>
@@ -6339,6 +6795,13 @@
                         </div>
                         <div class="flex flex-col sm:flex-row gap-2">
                           <input
+                            name="extension-package-source"
+                            autocomplete="off"
+                            spellcheck="false"
+                            data-1p-ignore
+                            data-lpignore="true"
+                            data-bwignore
+                            data-form-type="other"
                             class="min-w-0 flex-1 rounded-lg border border-base-content/12 bg-base-200/50 px-3 py-2 text-xs font-mono outline-none focus:border-primary/50"
                             placeholder="npm package or git URL"
                             bind:value={packageSource}
@@ -6781,7 +7244,24 @@
     <SessionTreeModal
       open={showTreeModal}
       loading={treeLoading}
+      navigating={treeNavigationInProgress}
+      summarizing={treeSummarizing}
+      branchSummarySkipPrompt={treeBranchSummarySkipPrompt}
+      error={treeNavigationError}
       {treeData}
+      onNavigate={(entryId, summarize, customInstructions) => {
+        treeNavigationError = '';
+        treeNavigationInProgress = true;
+        treeSummarizing = summarize;
+        send({
+          type: 'navigate_tree',
+          entryId,
+          summarize,
+          customInstructions,
+        });
+      }}
+      onLabel={(entryId, label) => send({ type: 'set_entry_label', entryId, label })}
+      onAbort={() => send({ type: 'abort_branch_summary' })}
       onClose={() => (showTreeModal = false)}
     />
   {/await}
@@ -6819,3 +7299,20 @@
 <!-- ── Confirmation dialog (replaces window.confirm for delete/update/restart) ── -->
 
 <ConfirmDialog {pendingConfirm} onClose={() => (pendingConfirm = null)} />
+<CompactDialog bind:open={showCompactDialog} onCompact={compactSession} />
+<ProviderLoginDialog
+  login={providerLoginDialog}
+  onSubmit={(loginId: string, promptId: string, value: string) =>
+    send({ type: 'provider_login_response', loginId, promptId, value })}
+  onCancel={(loginId: string) => send({ type: 'provider_login_cancel', loginId })}
+  onClose={() => (providerLoginDialog = null)}
+  onRetry={(provider: string, authType: 'oauth' | 'api_key') =>
+    send({ type: 'provider_login', provider, authType })}
+/>
+<ScopedModelsDialog
+  open={showScopedModels}
+  models={availableModels}
+  {scopedModels}
+  onClose={() => (showScopedModels = false)}
+  onSave={(models) => send({ type: 'set_scoped_models', models })}
+/>

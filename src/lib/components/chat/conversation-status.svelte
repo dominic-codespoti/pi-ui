@@ -3,6 +3,8 @@
   import Bell from '@lucide/svelte/icons/bell';
   import ShieldQuestion from '@lucide/svelte/icons/shield-question';
   import type { ProjectTrustInfo } from '#lib/ws/protocol.js';
+  import type { ParsedComponent } from '#lib/tui-stubs.js';
+  import ExtensionComponent from '#lib/components/ui/extension-component.svelte';
   import { Button } from '#lib/components/ui/button/index.js';
 
   interface Props {
@@ -12,6 +14,7 @@
     projectTrust: ProjectTrustInfo | null;
     showNotifNudge: boolean;
     extensionHeader?: string;
+    extensionHeaderTree?: ParsedComponent | null;
     onReconnect: () => void;
     onTrustProject: () => void;
     onTrustSession: () => void;
@@ -27,6 +30,7 @@
     projectTrust,
     showNotifNudge,
     extensionHeader,
+    extensionHeaderTree,
     onReconnect,
     onTrustProject,
     onTrustSession,
@@ -112,11 +116,15 @@
   </div>
 {/if}
 
-{#if extensionHeader}
+{#if extensionHeaderTree || extensionHeader}
   <div
     class="shrink-0 min-w-0 px-3 py-1.5 text-xs text-base-content/60 bg-base-200/50 border-b border-base-content/10 font-mono whitespace-pre-wrap flex items-start gap-2"
   >
-    <span class="min-w-0 flex-1 break-words">{extensionHeader}</span>
+    <span class="min-w-0 flex-1 break-words">
+      {#if extensionHeaderTree}<ExtensionComponent
+          component={extensionHeaderTree}
+        />{:else}{extensionHeader}{/if}
+    </span>
     <Button variant="ghost" size="icon-xs" onclick={onDismissHeader} aria-label="Dismiss header"
       ><X class="w-3 h-3" /></Button
     >

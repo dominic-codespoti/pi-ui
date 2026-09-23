@@ -13,6 +13,11 @@ function apply(
 }
 
 describe('session reducer', () => {
+  it('marks the session streaming on agent_start so the abort control is available', () => {
+    const state = createSessionReducerState({ sessionId: 'session-1' });
+    expect(apply(state, { type: 'agent_start' }).isStreaming).toBe(true);
+  });
+
   it('replaces identity-owned transcript and context on a new snapshot', () => {
     const state = createSessionReducerState({
       sessionId: 'old',
@@ -122,11 +127,17 @@ describe('session reducer', () => {
         type: 'tool_execution_update',
         toolName: 'read',
         toolCallId: 'tool-1',
-        partialResult: { content: [{ type: 'text', text: 'partial' }] },
+        partialResult: {
+          content: [
+            { type: 'text', text: 'partial' },
+            { type: 'image', mimeType: 'image/png', data: 'aW1hZ2U=' },
+          ],
+        },
       },
       options
     );
     expect(state.messages[0]?.content).toBe('partial');
+    expect(state.messages[0]?.images).toEqual(['data:image/png;base64,aW1hZ2U=']);
     expect(state.activeToolName).toBe('read');
 
     apply(
@@ -143,15 +154,17 @@ describe('session reducer', () => {
     expect(state.messages[0]).toMatchObject({ content: 'complete', streaming: false, endMs: 100 });
   });
 
-  it('deduplicates queue updates while preserving their channel order', () => {
+  it('preserves queue order and duplicate entries so each item has a removable index', () => {
     const state = createSessionReducerState({ sessionId: 'session-1' });
     apply(state, {
       type: 'queue_update',
       steering: ['one', 'one', 'two'],
       followUp: ['next', 'next'],
+      deferred: ['waiting', 'waiting'],
     });
-    expect(state.queuedSteering).toEqual(['one', 'two']);
-    expect(state.queuedFollowUp).toEqual(['next']);
+    expect(state.queuedSteering).toEqual(['one', 'one', 'two']);
+    expect(state.queuedFollowUp).toEqual(['next', 'next']);
+    expect(state.queuedDeferred).toEqual(['waiting', 'waiting']);
   });
 
   it('records compaction progress and final status with context usage', () => {
@@ -261,6 +274,60 @@ describe('session reducer', () => {
     expect(end.state.messages).toHaveLength(0);
   });
 
+  it('renders streamed tool arguments before execution and merges the real start row', () => {
+    let nextId = 0;
+    const state = createSessionReducerState({ sessionId: 'session-1' });
+    const options = { createId: () => `generated-${++nextId}` };
+    apply(
+      state,
+      {
+        type: 'message_update',
+        assistantMessageEvent: {
+          type: 'toolcall_start',
+          contentIndex: 2,
+          id: 'tool-call-1',
+          toolName: 'read',
+        },
+      },
+      options
+    );
+    apply(
+      state,
+      {
+        type: 'message_update',
+        assistantMessageEvent: { type: 'toolcall_delta', contentIndex: 2, delta: '{"path":"src/' },
+      },
+      options
+    );
+    const pendingId = state.messages[0]?.id;
+    expect(state.messages[0]).toMatchObject({
+      role: 'tool',
+      toolName: 'read',
+      toolCallId: 'tool-call-1',
+      toolArgsPreview: '{"path":"src/',
+      streaming: true,
+    });
+
+    apply(
+      state,
+      {
+        type: 'tool_execution_start',
+        toolName: 'read',
+        toolCallId: 'tool-call-1',
+        args: { path: 'src/main.ts' },
+      },
+      options
+    );
+    expect(state.messages).toHaveLength(1);
+    expect(state.messages[0]).toMatchObject({
+      id: pendingId,
+      toolCallId: 'tool-call-1',
+      toolInput: 'main.ts',
+      toolArgs: { path: 'src/main.ts' },
+      streaming: true,
+    });
+    expect(state.messages[0]?.toolArgsPreview).toBeUndefined();
+  });
   it('counts bash output lines across delta boundaries', () => {
     const state = createSessionReducerState({ sessionId: 'session-1' });
     apply(state, { type: 'bash_execution_update', id: 'bash-1', delta: 'one\n' });
@@ -269,6 +336,90 @@ describe('session reducer', () => {
     expect(state.messages[0]).toMatchObject({
       content: 'one\ntwo\nthree',
       lineCount: 3,
+    });
+  });
+  it('keeps streamed assistant text and ordered blocks when the final response is aborted', () => {
+    const state = createSessionReducerState({ sessionId: 'session-1' });
+    apply(
+      state,
+      { type: 'message_start', message: { role: 'assistant' } },
+      { createId: () => 'assistant' }
+    );
+    apply(state, {
+      type: 'message_update',
+      assistantMessageEvent: { type: 'text_delta', delta: 'partial answer' },
+    });
+    apply(state, {
+      type: 'message_update',
+      assistantMessageEvent: { type: 'thinking_delta', delta: 'reasoning' },
+    });
+    apply(state, {
+      type: 'message_end',
+      message: {
+        role: 'assistant',
+        content: [
+          { type: 'text', text: 'partial answer' },
+          { type: 'thinking', thinking: 'reasoning' },
+        ],
+        stopReason: 'aborted',
+        errorMessage: 'Cancelled by user',
+      },
+    });
+    expect(state.messages[0]).toMatchObject({
+      content: 'partial answer',
+      thinking: 'reasoning',
+      stopReason: 'aborted',
+      errorMessage: 'Cancelled by user',
+      aborted: true,
+      streaming: false,
+      blocks: [
+        { type: 'text', text: 'partial answer' },
+        { type: 'thinking', text: 'reasoning' },
+      ],
+    });
+  });
+
+  it('appends streamed compaction summaries to the transcript', () => {
+    const state = createSessionReducerState({ sessionId: 'session-1' });
+    apply(state, {
+      type: 'message_end',
+      message: { role: 'compactionSummary', summary: 'important context', tokensBefore: 1200 },
+    });
+    apply(state, {
+      type: 'agent_end',
+      messages: [{ role: 'branchSummary', summary: 'branch context', fromId: 'entry-7' }],
+    });
+    expect(state.messages[0]).toMatchObject({
+      role: 'compaction_summary',
+      summary: 'important context',
+      tokensBefore: 1200,
+    });
+    expect(state.messages[1]).toMatchObject({
+      role: 'branch_summary',
+      summary: 'branch context',
+      fromId: 'entry-7',
+    });
+  });
+
+  it('appends live diagnostic custom messages to the transcript', () => {
+    const state = createSessionReducerState({ sessionId: 'session-1' });
+
+    apply(state, {
+      type: 'message_end',
+      message: {
+        role: 'custom',
+        customType: 'pi-ui:diagnostic',
+        content: 'Something happened',
+        details: { level: 'warning', source: 'test' },
+      },
+    });
+
+    expect(state.messages).toHaveLength(1);
+    expect(state.messages[0]).toMatchObject({
+      role: 'diagnostic',
+      content: 'Something happened',
+      level: 'warning',
+      source: 'test',
     });
   });
 });

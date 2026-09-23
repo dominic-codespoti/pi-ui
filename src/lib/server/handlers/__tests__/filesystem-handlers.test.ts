@@ -14,11 +14,12 @@ function cache(): FilesystemCompletionCache {
   return { file: new Map(), dir: new Map() };
 }
 
-function target(root: string): FilesystemResidentTarget {
+function target(root: string, messages: readonly unknown[] = []): FilesystemResidentTarget {
   return {
     session: {
       sessionManager: { getCwd: () => root },
       extensionRunner: { getCommand: () => undefined },
+      messages,
     },
   };
 }
@@ -41,6 +42,19 @@ describe('dispatchFilesystemMessage', () => {
       autocompleteProviderFor: () => null,
       getCommandCompletions: async () => [],
       isInsideWorkspace: (path) => path === root || path.startsWith(root + sep),
+      isKnownToolOutputPath: (sessionId, path) => {
+        if (sessionId !== 'session-1') return false;
+        return resident.session.messages.some((message) => {
+          if (!message || typeof message !== 'object') return false;
+          const record = message as Record<string, unknown>;
+          const details = record.details as Record<string, unknown> | undefined;
+          return (
+            record.role === 'toolResult' &&
+            record.toolName === 'bash' &&
+            details?.fullOutputPath === path
+          );
+        });
+      },
       resolveUploadTarget: (requestedSessionId, focusedSessionId) => {
         const sessionId = requestedSessionId ?? focusedSessionId;
         return {
@@ -129,6 +143,25 @@ describe('dispatchFilesystemMessage', () => {
       type: 'file_saved',
       path: resolve(outside, 'escape.txt'),
       error: 'Path escapes workspace root',
+    });
+  });
+
+  it('opens only a bash output file referenced by the focused resident session', async () => {
+    const outputPath = join(outside, 'pi-bash-0123456789abcdef.log');
+    await writeFile(outputPath, 'complete shell output');
+    resident = target(root, [
+      { role: 'toolResult', toolName: 'bash', details: { fullOutputPath: outputPath } },
+    ]);
+    await dispatchFilesystemMessage(
+      { type: 'read_file', path: outputPath },
+      { send, data: { focusedSessionId: 'session-1' } },
+      dependencies
+    );
+
+    expect(JSON.parse(send.mock.calls[0][0])).toEqual({
+      type: 'file_content',
+      path: outputPath,
+      content: 'complete shell output',
     });
   });
 

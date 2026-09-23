@@ -3,6 +3,8 @@
   import MessageList from '#lib/components/chat/message-list.svelte';
   import { Button } from '#lib/components/ui/button/index.js';
   import X from '@lucide/svelte/icons/x';
+  import type { ParsedComponent } from '#lib/tui-stubs.js';
+  import ExtensionComponent from '#lib/components/ui/extension-component.svelte';
 
   interface Props {
     messages: UIMessage[];
@@ -18,6 +20,7 @@
     truncatedUserMsgs?: Record<string, boolean>;
     workingVisible: boolean;
     hiddenThinkingLabel: string;
+    hideThinkingBlock: boolean;
     workingIndicatorFrames: string[];
     workingFrameIndex: number;
     workingMessage: string | undefined;
@@ -28,6 +31,7 @@
     activeProjectName: string;
     isAtBottom: boolean;
     extensionFooter?: string;
+    extensionFooterTree?: ParsedComponent | null;
     scrollEl?: HTMLElement;
     onScroll: () => void;
     onMessageAreaClick: (event: MouseEvent) => void;
@@ -44,6 +48,8 @@
     onInsertShortcut: (text: string) => void;
     onEditMessage: (originalText: string, newText: string) => void;
     onDismissNotice: (id: string) => void;
+    onAbortCompaction: () => void;
+    onAbortRetry: () => void;
     onHaptic?: () => void;
     onDismissFooter: () => void;
   }
@@ -62,6 +68,7 @@
     truncatedUserMsgs = $bindable<Record<string, boolean>>({}),
     workingVisible,
     hiddenThinkingLabel,
+    hideThinkingBlock,
     workingIndicatorFrames,
     workingFrameIndex,
     workingMessage,
@@ -69,6 +76,7 @@
     totalRawMessagesLoaded,
     totalMessageCount,
     projectPickerOpen,
+    extensionFooterTree,
     activeProjectName,
     isAtBottom,
     extensionFooter,
@@ -88,6 +96,8 @@
     onInsertShortcut,
     onEditMessage,
     onDismissNotice,
+    onAbortCompaction,
+    onAbortRetry,
     onHaptic,
     onDismissFooter,
   }: Props = $props();
@@ -120,6 +130,7 @@
     bind:truncatedUserMsgs
     {workingVisible}
     {hiddenThinkingLabel}
+    {hideThinkingBlock}
     {workingIndicatorFrames}
     {workingFrameIndex}
     {workingMessage}
@@ -139,15 +150,21 @@
     {onInsertShortcut}
     {onEditMessage}
     {onDismissNotice}
+    {onAbortCompaction}
+    {onAbortRetry}
     {onHaptic}
   />
 </main>
 
-{#if extensionFooter}
+{#if extensionFooter || extensionFooterTree}
   <div
     class="shrink-0 min-w-0 px-3 py-1.5 text-xs text-base-content/60 bg-base-200/50 border-t border-base-content/10 font-mono whitespace-pre-wrap flex items-start gap-2"
   >
-    <span class="min-w-0 flex-1 break-words">{extensionFooter}</span>
+    <span class="min-w-0 flex-1 break-words">
+      {#if extensionFooterTree}<ExtensionComponent
+          component={extensionFooterTree}
+        />{:else}{extensionFooter}{/if}
+    </span>
     <Button variant="ghost" size="icon-xs" onclick={onDismissFooter} aria-label="Dismiss footer"
       ><X class="w-3 h-3" /></Button
     >

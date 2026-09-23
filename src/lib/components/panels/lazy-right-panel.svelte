@@ -1,5 +1,12 @@
 <script lang="ts">
-  import type { ModelInfo, ProviderInfo, SkillSummary, PromptSummary } from '#lib/ws/protocol.js';
+  import type {
+    ModelInfo,
+    ProviderInfo,
+    SkillSummary,
+    PromptSummary,
+    ResourceDiagnosticSummary,
+    ScopedModelInfo,
+  } from '#lib/ws/protocol.js';
 
   /**
    * Lazy-mounting wrapper for the right panel — the real component (and its
@@ -16,14 +23,17 @@
     tab,
     modelTab = $bindable(),
     model,
-    availableModels,
+    allModels,
     modelRefreshLoading,
     modelRefreshFeedback,
     toolsList,
     activeToolNames,
     resourcesLoaded,
+    resourceDiagnostics,
+    contextFiles,
     thinkingLevel,
     availableThinkingLevels,
+    scopedModels,
     providers,
     providerError = $bindable(),
     providerKeyInputs = $bindable(),
@@ -34,8 +44,12 @@
     filteredProviders,
     configuredProviderCount,
     filteredModelsByProvider,
+    providerLoginPending,
+    highlightProviderId,
     filteredTools,
     filteredSkills,
+    onUsePrompt,
+    onOpenResourceFile,
     skillInstallUrl = $bindable(),
     skillInstallScope = $bindable(),
     skillInstalling,
@@ -47,6 +61,10 @@
     onTabChange,
     onSelectModel,
     onPickThinkingLevel,
+    onOpenScopedModels,
+    onProviderLogin,
+    onOpenProviderKey,
+    onHighlightConsumed,
     onToggleTool,
     onSetProviderKey,
     onRemoveProviderKey,
@@ -63,14 +81,19 @@
     tab: 'models' | 'tools' | 'skills';
     modelTab: 'models' | 'providers';
     model: ModelInfo | null;
-    availableModels: ModelInfo[];
+    allModels: ModelInfo[];
     modelRefreshLoading: boolean;
     modelRefreshFeedback: { success: boolean; message: string } | null;
     toolsList: { name: string; description: string; isBuiltin: boolean; origin?: string }[];
     activeToolNames: string[];
     resourcesLoaded: boolean;
+    resourceDiagnostics: ResourceDiagnosticSummary[];
+    contextFiles: string[];
+    onUsePrompt: (name: string) => void;
+    onOpenResourceFile: (path: string) => void;
     thinkingLevel: string;
     availableThinkingLevels: readonly string[];
+    scopedModels: ScopedModelInfo[];
     providers: ProviderInfo[];
     providerError: string | null;
     providerKeyInputs: Record<string, string>;
@@ -81,6 +104,8 @@
     filteredProviders: ProviderInfo[];
     configuredProviderCount: number;
     filteredModelsByProvider: [string, ModelInfo[]][];
+    highlightProviderId: string | null;
+    providerLoginPending: string | null;
     filteredTools: { name: string; description: string; isBuiltin: boolean; origin?: string }[];
     filteredSkills: { skills: SkillSummary[]; prompts: PromptSummary[] };
     skillInstallUrl: string;
@@ -94,6 +119,10 @@
     onTabChange: (tab: 'models' | 'tools' | 'skills') => void;
     onSelectModel: (m: ModelInfo) => void;
     onPickThinkingLevel: (level: string) => void;
+    onOpenScopedModels: () => void;
+    onProviderLogin: (id: string) => void;
+    onOpenProviderKey: (id: string) => void;
+    onHighlightConsumed: () => void;
     onToggleTool: (name: string) => void;
     onSetProviderKey: (id: string) => void;
     onRemoveProviderKey: (id: string) => void;
@@ -122,14 +151,17 @@
     {tab}
     bind:modelTab
     {model}
-    {availableModels}
+    {allModels}
     {modelRefreshLoading}
     {modelRefreshFeedback}
     {toolsList}
     {activeToolNames}
     {resourcesLoaded}
+    {resourceDiagnostics}
+    {contextFiles}
     {thinkingLevel}
     {availableThinkingLevels}
+    {scopedModels}
     {providers}
     bind:providerError
     bind:providerKeyInputs
@@ -139,9 +171,13 @@
     bind:skillFilter
     {filteredProviders}
     {configuredProviderCount}
+    {highlightProviderId}
+    {providerLoginPending}
     {filteredModelsByProvider}
     {filteredTools}
     {filteredSkills}
+    {onUsePrompt}
+    {onOpenResourceFile}
     bind:skillInstallUrl
     bind:skillInstallScope
     {skillInstalling}
@@ -149,10 +185,14 @@
     {onClose}
     {onResizeStart}
     {onResizeMove}
+    {onProviderLogin}
+    {onOpenProviderKey}
+    {onHighlightConsumed}
     {onResizeStop}
     {onTabChange}
     {onSelectModel}
     {onPickThinkingLevel}
+    {onOpenScopedModels}
     {onToggleTool}
     {onSetProviderKey}
     {onRemoveProviderKey}

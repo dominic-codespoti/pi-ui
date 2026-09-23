@@ -25,6 +25,7 @@ function view(id: string, overrides: Partial<SessionView> = {}): SessionView {
     contextUsage: { tokens: 12, contextWindow: 100, percent: 12 },
     queuedSteering: [`steer-${id}`],
     queuedFollowUp: [`follow-${id}`],
+    queuedDeferred: [`deferred-${id}`],
     scrollAtBottom: false,
     ...overrides,
   };
@@ -130,6 +131,7 @@ describe('SessionViewCache', () => {
       contextUsage: { tokens: 12, contextWindow: 100, percent: 12 },
       queuedSteering: ['steer-resident'],
       queuedFollowUp: ['follow-resident'],
+      queuedDeferred: ['deferred-resident'],
       scrollAtBottom: false,
     };
     expect(ui).toEqual(expected);
