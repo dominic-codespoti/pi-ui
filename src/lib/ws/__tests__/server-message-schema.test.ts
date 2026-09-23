@@ -85,6 +85,39 @@ describe('server-message-schema', () => {
     }
   });
 
+  it('preserves stamped session_loaded responses and rejects malformed request IDs', () => {
+    const loaded = parseServerMessage({
+      type: 'session_loaded',
+      sessionId: 'sess-5678',
+      requestId: 'req-load-1',
+      thinkingLevel: 'off',
+      model: null,
+      availableModels: [],
+      messages: [],
+    });
+    expect(loaded.ok).toBe(true);
+    if (loaded.ok) expect(loaded.value.requestId).toBe('req-load-1');
+
+    expect(
+      parseServerMessage({
+        type: 'session_loaded',
+        sessionId: 'sess-5678',
+        requestId: '',
+        thinkingLevel: 'off',
+        model: null,
+        availableModels: [],
+        messages: [],
+      }).ok
+    ).toBe(false);
+    expect(
+      parseServerMessage({
+        type: 'sessions_error',
+        message: 'failed',
+        requestId: 42,
+      }).ok
+    ).toBe(false);
+  });
+
   it('validates newly registered custom event payloads', () => {
     const validEvents = [
       {
@@ -106,7 +139,7 @@ describe('server-message-schema', () => {
         type: 'extension_error',
         error: { extensionPath: '/tmp/example.ts', event: 'load' },
       }).ok
-    ).toBe(true);
+    ).toBe(false);
     expect(
       parseServerMessage({
         type: 'extension_error',
@@ -165,6 +198,17 @@ describe('server-message-schema', () => {
     }
   });
 
+  it.each(['toString', 'constructor', 'hasOwnProperty'])(
+    'passes inherited event type %s through as SDK without throwing',
+    (type) => {
+      const raw = { type, payload: 'future SDK data' };
+
+      expect(() => parseServerMessage(raw)).not.toThrow();
+      const parsed = parseServerMessage(raw);
+      expect(parsed).toEqual({ ok: true, kind: 'sdk', value: raw });
+    }
+  );
+
   it('parses available_models_changed with sessionId', () => {
     const raw = {
       type: 'available_models_changed',
@@ -186,6 +230,59 @@ describe('server-message-schema', () => {
       expect(parsed.value.sessionId).toBe('sess-active');
       expect(parsed.value.availableModels).toHaveLength(1);
     }
+  });
+
+  it('parses resources and commands catalogs as typed custom events', () => {
+    expect(
+      parseServerMessage({
+        type: 'resources_list',
+        skills: [
+          {
+            name: 'build',
+            description: 'Build project',
+            scope: 'project',
+            isBuiltin: false,
+            source: '/tmp/build.md',
+          },
+        ],
+        prompts: [],
+        sessionId: 'sess-1',
+      })
+    ).toMatchObject({ ok: true, kind: 'custom' });
+    expect(
+      parseServerMessage({
+        type: 'commands_list',
+        commands: [{ name: 'deploy', source: 'extension' }],
+        sessionId: 'sess-1',
+      })
+    ).toMatchObject({ ok: true, kind: 'custom' });
+    expect(
+      parseServerMessage({
+        type: 'commands_list',
+        commands: [{ name: 'deploy', source: 42 }],
+      }).ok
+    ).toBe(false);
+  });
+
+  it('rejects drift from required shared wire fields', () => {
+    expect(
+      parseServerMessage({
+        type: 'model_changed',
+        model: { provider: 'openai', id: 'gpt', reasoning: false },
+      }).ok
+    ).toBe(false);
+    expect(
+      parseServerMessage({
+        type: 'project_trust',
+        trust: { cwd: '/tmp/project', requiresDecision: true },
+      }).ok
+    ).toBe(false);
+    expect(
+      parseServerMessage({
+        type: 'package_progress',
+        progress: { phase: 'start' },
+      }).ok
+    ).toBe(false);
   });
 
   it('parses other custom server events correctly', () => {

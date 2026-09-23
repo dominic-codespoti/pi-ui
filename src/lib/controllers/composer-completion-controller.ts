@@ -13,6 +13,7 @@ export type CompletionControllerState = {
   fileCompletions: string[];
   extensionCompletions: CompletionItem[];
   commandArgCompletions: CompletionItem[];
+  commandArgResultsPrefix: string;
   lastFileQuery: string;
   lastExtensionTrigger: string;
   lastExtensionQuery: string;
@@ -64,6 +65,7 @@ export type CompletionResponse =
 
 export type CompletionControllerOptions = {
   debounceMs?: number;
+  commandDebounceMs?: number;
   setTimeout?: (callback: () => void, delay: number) => ReturnType<typeof globalThis.setTimeout>;
   clearTimeout?: (timer: ReturnType<typeof globalThis.setTimeout>) => void;
 };
@@ -72,6 +74,7 @@ const initialState = (sessionId: string | null = null): CompletionControllerStat
   fileCompletions: [],
   extensionCompletions: [],
   commandArgCompletions: [],
+  commandArgResultsPrefix: '',
   lastFileQuery: '',
   lastExtensionTrigger: '',
   lastExtensionQuery: '',
@@ -95,6 +98,7 @@ export class ComposerCompletionController {
   private state: CompletionControllerState;
   private readonly send: (message: ClientMessage) => boolean | void;
   private readonly debounceMs: number;
+  private readonly commandDebounceMs: number;
   private readonly schedule: NonNullable<CompletionControllerOptions['setTimeout']>;
   private readonly cancel: NonNullable<CompletionControllerOptions['clearTimeout']>;
   private timers: Partial<Record<CompletionChannel, ReturnType<typeof globalThis.setTimeout>>> = {};
@@ -116,6 +120,7 @@ export class ComposerCompletionController {
     this.state = initialState();
     this.send = send;
     this.debounceMs = options.debounceMs ?? 200;
+    this.commandDebounceMs = options.commandDebounceMs ?? 100;
     this.schedule =
       options.setTimeout ?? ((callback, delay) => globalThis.setTimeout(callback, delay));
     this.cancel = options.clearTimeout ?? ((timer) => globalThis.clearTimeout(timer));
@@ -164,10 +169,11 @@ export class ComposerCompletionController {
 
   private arm(channel: CompletionChannel, callback: () => void): void {
     this.clearTimer(channel);
+    const delay = channel === 'command' ? this.commandDebounceMs : this.debounceMs;
     this.timers[channel] = this.schedule(() => {
       delete this.timers[channel];
       callback();
-    }, this.debounceMs);
+    }, delay);
   }
   private nextRequestId(): string {
     this.requestSequence += 1;
@@ -269,14 +275,16 @@ export class ComposerCompletionController {
 
     const mode = view.commandArgMode;
     if (usable && mode) {
-      const needsFetch =
-        mode.command !== this.state.commandArgCommand ||
-        mode.prefix !== this.state.commandArgPrefix;
+      const commandChanged = mode.command !== this.state.commandArgCommand;
+      const needsFetch = commandChanged || mode.prefix !== this.state.commandArgPrefix;
       if (needsFetch) {
         this.state.commandArgCommand = mode.command;
         this.state.commandArgPrefix = mode.prefix;
         this.state.commandCompletionsPending = true;
-        this.state.commandArgCompletions = [];
+        if (commandChanged) {
+          this.state.commandArgCompletions = [];
+          this.state.commandArgResultsPrefix = '';
+        }
         this.state.latestCommandRequestId = null;
         const requestSessionId = sessionId;
         const requestCommand = mode.command;
@@ -297,6 +305,7 @@ export class ComposerCompletionController {
     } else {
       this.clearTimer('command');
       this.state.commandArgCompletions = [];
+      this.state.commandArgResultsPrefix = '';
       this.state.commandArgCommand = '';
       this.state.commandArgPrefix = '';
       this.state.commandCompletionsPending = false;
@@ -355,6 +364,7 @@ export class ComposerCompletionController {
         mode.prefix === response.prefix
       ) {
         this.state.commandArgCompletions = response.items ?? [];
+        this.state.commandArgResultsPrefix = response.prefix;
         this.state.commandCompletionsPending = false;
         this.publish();
         return true;

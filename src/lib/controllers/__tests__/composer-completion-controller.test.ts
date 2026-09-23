@@ -162,6 +162,7 @@ describe('ComposerCompletionController', () => {
         },
         {
           debounceMs: 1,
+          commandDebounceMs: 1,
         }
       );
       const commandMode = {
@@ -214,6 +215,132 @@ describe('ComposerCompletionController', () => {
           view({ trigger: '/', query: 'de', commandArgMode: commandMode })
         )
       ).toBe(false);
+      controller.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('retains command results while a new prefix is pending and ignores stale responses', () => {
+    vi.useFakeTimers();
+    try {
+      const sent: ClientMessage[] = [];
+      const controller = new ComposerCompletionController(
+        (message): void => {
+          sent.push(message);
+        },
+        { commandDebounceMs: 1 }
+      );
+      const firstMode = { command: 'deploy', prefix: ' prod' };
+      controller.update(view({ trigger: '/', commandArgMode: firstMode }));
+      vi.advanceTimersByTime(1);
+      const firstRequest = sent.find(
+        (message): message is Extract<ClientMessage, { type: 'get_command_completions' }> =>
+          message.type === 'get_command_completions'
+      )!;
+      const firstItems = [{ value: 'prod', label: 'prod' }];
+      expect(
+        controller.handleResponse(
+          {
+            type: 'command_completions',
+            sessionId: 'session-1',
+            requestId: firstRequest.requestId,
+            command: 'deploy',
+            prefix: ' prod',
+            items: firstItems,
+          },
+          view({ trigger: '/', commandArgMode: firstMode })
+        )
+      ).toBe(true);
+
+      const nextMode = { command: 'deploy', prefix: ' prod staging' };
+      controller.update(view({ trigger: '/', commandArgMode: nextMode }));
+      expect(controller.current.commandArgCompletions).toEqual(firstItems);
+      expect(controller.current.commandArgResultsPrefix).toBe(' prod');
+      expect(controller.current.commandCompletionsPending).toBe(true);
+      expect(
+        controller.handleResponse(
+          {
+            type: 'command_completions',
+            sessionId: 'session-1',
+            requestId: firstRequest.requestId,
+            command: 'deploy',
+            prefix: ' prod',
+            items: [{ value: 'old', label: 'old' }],
+          },
+          view({ trigger: '/', commandArgMode: nextMode })
+        )
+      ).toBe(false);
+      expect(controller.current.commandArgCompletions).toEqual(firstItems);
+      expect(controller.current.commandArgResultsPrefix).toBe(' prod');
+      controller.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('clears command results when the command changes', () => {
+    vi.useFakeTimers();
+    try {
+      const sent: ClientMessage[] = [];
+      const controller = new ComposerCompletionController(
+        (message): void => {
+          sent.push(message);
+        },
+        { commandDebounceMs: 1 }
+      );
+      const mode = { command: 'deploy', prefix: ' prod' };
+      controller.update(view({ trigger: '/', commandArgMode: mode }));
+      vi.advanceTimersByTime(1);
+      const request = sent.find(
+        (message): message is Extract<ClientMessage, { type: 'get_command_completions' }> =>
+          message.type === 'get_command_completions'
+      )!;
+      controller.handleResponse(
+        {
+          type: 'command_completions',
+          sessionId: 'session-1',
+          requestId: request.requestId,
+          command: 'deploy',
+          prefix: ' prod',
+          items: [{ value: 'prod', label: 'prod' }],
+        },
+        view({ trigger: '/', commandArgMode: mode })
+      );
+      controller.update(
+        view({ trigger: '/', commandArgMode: { command: 'build', prefix: ' target' } })
+      );
+      expect(controller.current.commandArgCompletions).toEqual([]);
+      expect(controller.current.commandArgResultsPrefix).toBe('');
+      expect(controller.current.commandCompletionsPending).toBe(true);
+      controller.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('uses a separate debounce for command completion requests', () => {
+    vi.useFakeTimers();
+    try {
+      const sent: ClientMessage[] = [];
+      const controller = new ComposerCompletionController(
+        (message): void => {
+          sent.push(message);
+        },
+        { debounceMs: 20, commandDebounceMs: 5 }
+      );
+      controller.update(
+        view({
+          trigger: '/',
+          query: 'bu',
+          commandArgMode: { command: 'build', prefix: ' target' },
+        })
+      );
+      vi.advanceTimersByTime(5);
+      expect(sent.some((message) => message.type === 'get_command_completions')).toBe(true);
+      expect(sent.some((message) => message.type === 'get_extension_autocomplete')).toBe(false);
+      vi.advanceTimersByTime(15);
+      expect(sent.some((message) => message.type === 'get_extension_autocomplete')).toBe(true);
       controller.dispose();
     } finally {
       vi.useRealTimers();

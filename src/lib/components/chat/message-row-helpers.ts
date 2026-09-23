@@ -140,3 +140,28 @@ export function compactionSavings(before?: number, after?: number): number | und
 export function cleanDetail(detail: string): string {
   return detail.startsWith('$ ') ? detail.slice(2) : detail;
 }
+export function messageElementId(kind: string, messageId: string): string {
+  const safeId = messageId.replace(/[^A-Za-z0-9_-]/g, '_');
+  const safeKind = kind.replace(/[^A-Za-z0-9_-]/g, '_');
+  return `message-${safeKind}-${safeId}`;
+}
+
+export type ToolRowData = {
+  meta: ToolMetaEntry;
+  detail: string;
+  hasOutput: boolean;
+};
+
+export function getToolRowData(message: UIMessage): ToolRowData {
+  return {
+    meta: getToolMeta(message.toolName),
+    detail: cleanDetail(message.toolInput ?? ''),
+    hasOutput: !!(
+      message.content ||
+      message.diff ||
+      message.images?.length ||
+      message.renderedResultHtml?.length ||
+      message.outputElided
+    ),
+  };
+}

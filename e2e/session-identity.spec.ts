@@ -40,7 +40,6 @@ test.describe('Device session identity', () => {
       },
       [IDENTITY_KEY, REMEMBERED_PATH] as const
     );
-    await login(page, 'test-password');
 
     const switchRequests: string[] = [];
     await page.routeWebSocket('/ws', (ws) => {
@@ -67,6 +66,7 @@ test.describe('Device session identity', () => {
       // Server defaults to a different session than the one this device remembers.
       ws.send(JSON.stringify(connectedPayload('server-default-id', SERVER_DEFAULT_PATH)));
     });
+    await login(page, 'test-password');
 
     await page.goto('/');
 
@@ -78,12 +78,11 @@ test.describe('Device session identity', () => {
     page,
     login,
   }) => {
-    await login(page, 'test-password');
-
     await page.routeWebSocket('/ws', (ws) => {
       ws.onMessage(() => {});
       ws.send(JSON.stringify(connectedPayload('server-default-id', SERVER_DEFAULT_PATH)));
     });
+    await login(page, 'test-password');
 
     await page.goto('/');
 
@@ -108,7 +107,6 @@ test.describe('Device session identity', () => {
       },
       [IDENTITY_KEY, '/home/user/project-a/deleted.jsonl'] as const
     );
-    await login(page, 'test-password');
 
     await page.routeWebSocket('/ws', (ws) => {
       ws.onMessage((data) => {
@@ -125,6 +123,7 @@ test.describe('Device session identity', () => {
       });
       ws.send(JSON.stringify(connectedPayload('server-default-id', SERVER_DEFAULT_PATH)));
     });
+    await login(page, 'test-password');
 
     await page.goto('/');
 

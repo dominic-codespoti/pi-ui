@@ -126,6 +126,11 @@ export type ComposerControllerOptions = {
   maxTextFileSize?: number;
 };
 
+export type ComposerAttachmentContext = {
+  sessionId: string | null;
+  generation: number;
+};
+
 const STREAMING_BLOCKED_COMMANDS: Record<string, true> = {
   compact: true,
   reload: true,
@@ -251,6 +256,8 @@ export class ComposerController {
     extensionCommands: [],
   };
   private pendingNewSessionDraft: ComposerDraft | null = null;
+  private attachmentGeneration = 0;
+  private disposed = false;
   private readonly prepare: (file: File) => Promise<PreparedImage | null>;
   private readonly readText: (file: File) => Promise<string>;
   private readonly send?: (message: ClientMessage) => boolean | void;
@@ -281,6 +288,7 @@ export class ComposerController {
   }
 
   subscribe(listener: (state: ComposerState) => void): () => void {
+    if (this.disposed) return () => {};
     this.listener = listener;
     listener(this.current);
     return () => {
@@ -289,16 +297,24 @@ export class ComposerController {
   }
 
   private publish(): void {
-    this.listener?.(this.current);
+    if (!this.disposed) this.listener?.(this.current);
+  }
+
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.attachmentGeneration++;
+    this.listener = undefined;
   }
 
   setInput(input: string): void {
-    if (this.state.input === input) return;
+    if (this.disposed || this.state.input === input) return;
     this.state.input = input;
     this.publish();
   }
 
   setDraft(draft: ComposerDraft): void {
+    if (this.disposed) return;
     this.state = cloneDraft(draft);
     this.publish();
   }
@@ -321,15 +337,21 @@ export class ComposerController {
     this.state = { input: '', attachedImages: [], attachedFiles: [] };
     this.publish();
   }
-
   /** Reconcile page-owned lifecycle context and preserve drafts around new-session transitions. */
   updateContext(next: ComposerContext): void {
     const wasPending = this.context.pendingNewSession === true;
+    const isPending = next.pendingNewSession === true;
+    if (
+      this.context.sessionId !== next.sessionId ||
+      wasPending !== isPending ||
+      (!this.context.loading && next.loading)
+    ) {
+      this.attachmentGeneration++;
+    }
     this.context = {
       ...next,
       extensionCommands: [...(next.extensionCommands ?? [])],
     };
-    const isPending = next.pendingNewSession === true;
     if (isPending && !wasPending) {
       if (!this.pendingNewSessionDraft) this.pendingNewSessionDraft = this.captureDraft();
       // Keep staged attachments during the optimistic transition, matching the page's
@@ -343,6 +365,18 @@ export class ComposerController {
     }
   }
 
+  captureAttachmentContext(): ComposerAttachmentContext {
+    return { sessionId: this.context.sessionId, generation: this.attachmentGeneration };
+  }
+
+  isAttachmentContextCurrent(context: ComposerAttachmentContext): boolean {
+    return (
+      !this.disposed &&
+      context.generation === this.attachmentGeneration &&
+      context.sessionId === this.context.sessionId
+    );
+  }
+
   restorePendingNewSessionDraft(): boolean {
     if (!this.pendingNewSessionDraft) return false;
     this.restoreDraft(this.pendingNewSessionDraft);
@@ -351,6 +385,8 @@ export class ComposerController {
   }
 
   clearAttachments(): void {
+    if (this.disposed) return;
+    this.attachmentGeneration++;
     if (this.state.attachedImages.length === 0 && this.state.attachedFiles.length === 0) return;
     this.state.attachedImages = [];
     this.state.attachedFiles = [];
@@ -376,15 +412,22 @@ export class ComposerController {
   }
   /** Ingest images and accepted text extensions; spreadsheet and binary files are page-owned. */
   async processAttachmentFiles(files: readonly File[]): Promise<AttachmentIngestionResult> {
+    const attachmentContext = this.captureAttachmentContext();
     const accepted: Array<AttachedImage | AttachedFile> = [];
     const rejected: Array<{ name: string; reason: string }> = [];
     const unsupported: File[] = [];
     const notices: ComposerNotice[] = [];
     for (const file of files) {
+      if (!this.isAttachmentContextCurrent(attachmentContext)) {
+        return { accepted: [], rejected: [], unsupported: [], notices: [] };
+      }
       const name = file.name || 'clipboard image';
       if (file.type.startsWith('image/')) {
         try {
           const prepared = await this.prepare(file);
+          if (!this.isAttachmentContextCurrent(attachmentContext)) {
+            return { accepted: [], rejected: [], unsupported: [], notices: [] };
+          }
           if (!prepared) {
             const reason = `Could not prepare image: ${name}`;
             rejected.push({ name, reason });
@@ -405,6 +448,9 @@ export class ComposerController {
           this.state.attachedImages.push(image);
           accepted.push({ ...image });
         } catch {
+          if (!this.isAttachmentContextCurrent(attachmentContext)) {
+            return { accepted: [], rejected: [], unsupported: [], notices: [] };
+          }
           const reason = `Could not prepare image: ${name}`;
           rejected.push({ name, reason });
           notices.push({ message: reason, level: 'warning' });
@@ -423,14 +469,17 @@ export class ComposerController {
         continue;
       }
       try {
-        const textFile: AttachedFile = {
-          name,
-          content: await this.readText(file),
-          size: file.size,
-        };
+        const content = await this.readText(file);
+        if (!this.isAttachmentContextCurrent(attachmentContext)) {
+          return { accepted: [], rejected: [], unsupported: [], notices: [] };
+        }
+        const textFile: AttachedFile = { name, content, size: file.size };
         this.state.attachedFiles.push(textFile);
         accepted.push({ ...textFile });
       } catch {
+        if (!this.isAttachmentContextCurrent(attachmentContext)) {
+          return { accepted: [], rejected: [], unsupported: [], notices: [] };
+        }
         const reason = `Could not read file: ${name}`;
         rejected.push({ name, reason });
         notices.push({ message: reason, level: 'warning' });

@@ -5,13 +5,22 @@
 
   let password = $state('');
   let loading = $state(false);
+
+  $effect(() => {
+    if (!form?.error) return;
+    requestAnimationFrame(() => document.getElementById('password')?.focus());
+  });
 </script>
 
 <svelte:head>
   <title>pi UI | Login</title>
 </svelte:head>
 
-<div class="aurora flex min-h-dvh w-full items-center justify-center bg-base-100 px-4">
+<main
+  id="main-content"
+  tabindex="-1"
+  class="aurora flex min-h-dvh w-full items-center justify-center bg-base-100 px-4"
+>
   <div class="w-full max-w-sm font-mono text-sm text-base-content msg-in">
     <!-- Glyph + wordmark -->
     <div class="mb-10 flex flex-col items-center gap-3 select-none">
@@ -48,6 +57,8 @@
             bind:value={password}
             autocomplete="current-password"
             required
+            aria-invalid={form?.error ? 'true' : undefined}
+            aria-describedby={form?.error ? 'login-error' : undefined}
             class="w-full bg-transparent border-b border-base-content/15 pb-2 pl-6 outline-none focus:border-primary/60 transition-colors placeholder-base-content/30 text-base"
             placeholder="········"
           />
@@ -55,7 +66,12 @@
       </div>
 
       {#if form?.error}
-        <p class="text-error text-xs flex items-center gap-1.5">
+        <p
+          id="login-error"
+          role="alert"
+          aria-live="assertive"
+          class="text-error text-xs flex items-center gap-1.5"
+        >
           <span class="w-1 h-1 rounded-full bg-error inline-block"></span>
           {form.error}
         </p>
@@ -77,4 +93,4 @@
       set via <span class="text-base-content/60">PI_PASSWORD</span> at server start
     </p>
   </div>
-</div>
+</main>

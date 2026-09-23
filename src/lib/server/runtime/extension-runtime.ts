@@ -2,7 +2,7 @@ import type { TerminalInputHandler } from '@earendil-works/pi-coding-agent';
 import type { AutocompleteProvider } from '@earendil-works/pi-tui';
 import type { ExtensionUiStatePayload, ServerMessage, WidgetPayload } from '../../ws/protocol.ts';
 
-import type { ParsedComponent, StubTui } from '../../tui-stubs.ts';
+import { WIDGET_REFRESH_MS, type ParsedComponent, type StubTui } from '../../tui-stubs.ts';
 
 export type RuntimeTimer = number | Timer;
 
@@ -419,7 +419,7 @@ export class ExtensionRuntime {
             tick(key, sid);
             const current = ui.widgets.get(key);
             if (current !== entry || current.factory !== factory) continue;
-            factory.intervalId = setInterval(() => tick(key, sid), 250);
+            factory.intervalId = setInterval(() => tick(key, sid), WIDGET_REFRESH_MS);
           }
         } else if (factory.intervalId) {
           clearInterval(factory.intervalId);

@@ -15,6 +15,7 @@ Bun server bridges pi SDK events to browser over WebSocket. Key flow: CLI → se
 - Pi as near-pass-through — SDK events forwarded with a `sessionId` tag; `message_update` is stripped of its full partial message (only `assistantMessageEvent` + role forwarded) to avoid quadratic WS traffic on long reasoning turns
 - Lazy SDK load (~136 MB) on first WS connect; lazy SvelteKit handler (~30 MB) on first HTTP
 - Background `bindRpcHost` — extensions and tools are bound asynchronously on session initialization, broadcasting updated `tools_list` and `commands_list` without blocking early socket connection or session creation
+- Pi UI bundles a generated `pi-ui-extension-ui` skill teaching agents how extension UI renders; `createSdkSession` passes it through `resourceLoaderOptions.additionalSkillPaths` (`src/lib/server/bundled-resources.ts`). It is generated from `src/lib/extension-ui-capabilities/`, whose examples are verified against the real parser in Vitest; `check:skill` enforces freshness. Changes to extension UI behavior in `server.ts` or `extension-component.svelte` must update the catalog and regenerate the skill.
 - The server retains a resident `Map<sessionId, ManagedSession>` rather than a singleton session runtime. `selectedSessionId` is the server default and each socket has a `focusedSessionId`; switching changes selection without disposing the previous resident. Residency is capped by count (`PI_UI_MAX_RESIDENT_SESSIONS`, default 4) and estimated parsed-history bytes (`PI_UI_MAX_RESIDENT_HISTORY_MB`, default 48 MiB), with both limits env-overridable and bounded. Running sessions, sessions with an active tool or pending extension dialog, and sessions in `awaiting-input` are pinned, while least-recently-active (LRU) unpinned residents are evicted (project outliers are preferred to reduce extension-cache churn). Admission keeps one resident per `.jsonl` path because the SDK has no session-file locking. Residents own per-session services and all resident events are forwarded with their `sessionId`; a separate concurrent-run cap (`PI_UI_MAX_CONCURRENT_RUNS`, default 2) queues work beyond the limit. Non-resident sessions remain disk-backed catalog entries, with idle sidebar status until resident again.
 - Optimistic new-chat stash — when creating a new session, previous messages are stashed and cleared immediately for instant UI feedback, restoring on watchdog timeout or error
 - Extension UI requests block session until response (5 min timeout); terminal input flow bridges browser key events to headless extension TUI handlers with optimistic/awaited key classification
@@ -40,6 +41,8 @@ Bun server bridges pi SDK events to browser over WebSocket. Key flow: CLI → se
 | `src/lib/server/`              | Server-side helpers: session catalog, project catalog, wire bounding, watcher, extension tools/completions, webhooks, push                 |
 | `src/lib/state/`               | Runes-based shared stores: `projects-state.svelte.ts`, `extension-ui-state.svelte.ts`                                                      |
 | `src/lib/components/chat/`     | Chat components: `message-list.svelte`, `chat-header.svelte`, `status-banners.svelte` (reconnection/read-only alerts, context meter)       |
+| `src/lib/extension-ui-capabilities/` | Typed catalog of how each `ctx.ui` capability renders in Pi UI, with executable examples and a pure skill renderer; source of truth for the bundled skill |
+| `skills/pi-ui-extension-ui/`        | GENERATED bundled Pi skill, loaded into every Pi UI session through `additionalSkillPaths`; do not edit by hand                           |
 | `src/lib/components/panels/`   | Panel components: `right-panel.svelte`, `settings-panel.svelte` (theme, notifications, UI options), lazy panel wrappers                    |
 | `src/lib/components/dialogs/`  | Dialogs: `confirm-dialog.svelte`, `fork-dialog.svelte`, `session-tree-modal.svelte`, `extension-overlays.svelte`, `toast-container.svelte` |
 | `src/lib/components/projects/` | Project management: `projects-sidebar.svelte`, `project-picker.svelte`, `directory-picker.svelte`                                          |
@@ -79,6 +82,8 @@ bun run check:sw          # tsc --noEmit on the service-worker project (src/serv
 bun run check:server      # tsc --noEmit on server.ts + bin/
 bun run lint              # eslint (flat config)
 bun run format            # prettier --write .
+bun run generate:skill   # regenerate skills/pi-ui-extension-ui from the capability catalog
+bun run check:skill      # fail if the committed skill is stale (part of test:ci)
 
 # Tests
 bun test src/lib/auth     # Bun-native test runner for auth/rate-limiter (timeout 15s)
@@ -91,7 +96,7 @@ bun run test:e2e:live     # playwright test -c playwright.live.config.ts (live a
 bun run test:e2e:debug    # playwright test --debug
 
 # CI
-bun run test:ci           # check + check:sw + check:server + lint + test:unit + test:e2e
+bun run test:ci           # check + check:sw + check:server + check:skill + lint + test:unit + test:e2e
 ```
 
 > **Note on builds & test setup:**
@@ -221,6 +226,7 @@ bun run test:ci           # check + check:sw + check:server + lint + test:unit +
 | `src/lib/components/dialogs/extension-overlays.svelte` | Modal dialogs and overlay renderer for extension interactions                                       |
 | `src/lib/markdown.ts`                                  | Configured marked + hljs + LaTeX renderer + FNV-1a LRU memoization                                  |
 | `src/lib/tui-stubs.ts`                                 | Server-side pi-tui stub bridge, component tree parser, markdown transformer runner                  |
+| `src/lib/extension-ui-capabilities/catalog.ts`           | Typed source of truth for extension UI capability rendering and bundled skill content      |
 | `src/lib/diff-parser.ts`                               | Unified diff parser                                                                                 |
 | `e2e/fixtures.ts`                                      | Playwright custom fixtures — `mockWs`, `login`                                                      |
 | `e2e/global-setup.ts`                                  | E2E test suite scratch directory initialization and fake LLM config                                 |
@@ -238,7 +244,7 @@ bun run test:ci           # check + check:sw + check:server + lint + test:unit +
 - **Runtime**: Bun ≥1.0.0 (Node.js NOT supported)
 - **Package manager**: Bun (bun install, bun run, bun add)
 - **Module system**: ESM only (`"type": "module"`)
-- **Adapter**: vendored `svelte-adapter-bun` at `adapters/svelte-adapter-bun` (NOT `@sveltejs/adapter-node` — incompatible with WS). Vendored because upstream peers on kit ^2 and is unmaintained. Two local changes: `builder.config.kit.paths.base` → `builder.config.paths?.base ?? ''` for SvelteKit 3, and a rewritten post-build patch for the `websocket` hook (`dist/index.js`, function `X`) — kit ≥ `3.0.0-next.25` keeps hooks in a module-level store instead of `this.#options.hooks`, so the upstream regexes silently missed and still injected `websocket() { return this.#options.hooks.websocket }` against an undeclared private field, making `build/server/index.js` a SyntaxError and every production HTTP request a 500. The patch now declares a module-level `__sk_websocket_hook`, fills it after `get_hooks()`, and returns it from the injected accessor. Keep the `vite` `overrides` entry in package.json — vitest bundles its own nested Vite otherwise, and kit 3's `isRunnableDevEnvironment` instanceof check fails across instances.
+- **Adapter**: vendored `svelte-adapter-bun` at `adapters/svelte-adapter-bun` (NOT `@sveltejs/adapter-node` — incompatible with WS). Vendored because upstream peers on kit ^2 and is unmaintained. It uses the SvelteKit 3 builder configuration (`config.paths?.base`, `config.appDir`) and `generateServerInstance`; the handler treats the server's websocket hook as optional because Kit 3 no longer exposes one. Keep the `vite` `overrides` entry in package.json — vitest bundles its own nested Vite otherwise, and kit 3's `isRunnableDevEnvironment` instanceof check fails across instances.
 - **PWA**: Custom minimal service worker (`src/service-worker/index.ts` + `src/service-worker/tsconfig.json`, excluded from the root tsconfig) — no Workbox, no chat-data caching
   - Install: precaches immutable build chunks + static files (versioned cache `pi-ui-shell-<version>` using `$app/env` version), `self.skipWaiting()`
   - Activate: drops old-version caches, `clients.claim()`
@@ -248,10 +254,10 @@ bun run test:ci           # check + check:sw + check:server + lint + test:unit +
 - **Cold-start resume**: `src/lib/session-snapshot.ts` persists a text-only tail (≤50 msgs, ≤200 KB) of the conversation to localStorage (saved on `agent_end`/`connected`/`session_loaded` + page-hidden); `+page.svelte` hydrates it on boot before the WS connects, so a discarded PWA repaints instantly instead of showing the connecting splash. Live `connected`/`session_loaded` state replaces it wholesale.
 - **Auth library**: `crypto.subtle` (no `jose`, no external JWT library)
 - **Dependencies & DevDeps**:
-  - `@earendil-works/pi-coding-agent` (0.85.1) & `@earendil-works/pi-tui` (0.85.1) — pi SDK, ESM-only
-  - `svelte` (^5.57.0), `@sveltejs/kit` (3.0.0-next.23)
-  - `@lucide/svelte` (^1.37.0) — UI icons
-  - `valibot` (^1.4.2) — schema validation
+  - `@earendil-works/pi-coding-agent` & `@earendil-works/pi-tui` (0.87.1) — pi SDK, ESM-only
+  - `svelte` (^5.57.1), `@sveltejs/kit` (3.0.0-next.27)
+  - `@lucide/svelte` (^1.47.0) — UI icons
+  - `valibot` (^1.5.0) — schema validation
   - `msw` (^2.15.0) — API & network mocking for testing
 - **Key env vars**: `PI_PASSWORD` (required), `PORT` (default 3000), `PI_CWD` (optional working dir)
 

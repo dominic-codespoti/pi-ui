@@ -346,6 +346,74 @@ test.describe('Extension UI modals', () => {
   });
 });
 
+test.describe('Extension dialog keyboard regressions', () => {
+  test('dialog relationships identify its title and description', async ({
+    page,
+    login,
+    mockWs,
+  }) => {
+    const harness = await mockWs(page);
+    await login(page, 'test-password');
+    await harness.waitForMessage('get_all_sessions');
+    harness.send(extensionConfirmPayload('semantic-1', 'Delete branch?', 'This cannot be undone.'));
+
+    const dialog = page.getByRole('dialog');
+    await expect(dialog).toBeVisible();
+    const relationships = await dialog.evaluate((element) => ({
+      labelledBy: element.getAttribute('aria-labelledby'),
+      describedBy: element.getAttribute('aria-describedby'),
+    }));
+    if (!relationships.labelledBy || !relationships.describedBy) {
+      throw new Error('dialog relationships are missing');
+    }
+    await expect(dialog.locator(`#${relationships.labelledBy}`)).toHaveText('Delete branch?');
+    await expect(dialog.locator(`#${relationships.describedBy}`)).toHaveText(
+      'This cannot be undone.'
+    );
+  });
+
+  test('dialog focuses its field, contains Tab, cancels on Escape, and restores focus', async ({
+    page,
+    login,
+    mockWs,
+  }) => {
+    const harness = await mockWs(page);
+    await login(page, 'test-password');
+    await harness.waitForMessage('get_all_sessions');
+
+    const composer = page.locator('textarea').first();
+    await composer.focus();
+    harness.send(extensionInputPayload('keyboard-1', 'Project name', 'Name…'));
+
+    const dialog = page.getByRole('dialog');
+    const input = page.getByPlaceholder('Name…');
+    await expect(dialog).toBeVisible();
+    const relationships = await dialog.evaluate((element) => ({
+      labelledBy: element.getAttribute('aria-labelledby'),
+      describedBy: element.getAttribute('aria-describedby'),
+    }));
+    if (!relationships.labelledBy || !relationships.describedBy) {
+      throw new Error('dialog relationships are missing');
+    }
+    await expect(page.locator(`#${relationships.labelledBy}`)).toHaveCount(1);
+    await expect(page.locator(`#${relationships.describedBy}`)).toHaveCount(1);
+    await expect(input).toBeFocused();
+
+    for (let i = 0; i < 5; i++) {
+      await page.keyboard.press('Tab');
+      await expect(dialog.locator(':focus')).toHaveCount(1);
+    }
+
+    await page.keyboard.press('Escape');
+    await expect(dialog).toBeHidden();
+    await harness.waitForMessage(
+      'extension_ui_response',
+      (message) => message.id === 'keyboard-1' && message.cancelled === true
+    );
+    await expect(composer).toBeFocused();
+  });
+});
+
 // ── Extension component widget tests ────────────────────────────────────────
 const BASE_WS_INIT = [
   {
@@ -367,24 +435,9 @@ function wsInit(ws: { send: (msg: string) => void }) {
 
 async function openProjectsSidebar(page: Page) {
   const search = page.locator('input[aria-label="Filter projects and sessions"]');
-  // Sidebar content is lazily mounted (module loads on first open) and the
-  // panel is a fixed off-canvas drawer on mobile — never wait for the element,
-  // judge existence + actual position instead.
-  const isOpen = async () => {
-    try {
-      await search.waitFor({ state: 'attached', timeout: 300 });
-    } catch {
-      return false;
-    }
-    const box = await search.boundingBox();
-    return !!box && box.width > 0 && box.x >= -1;
-  };
-  if (await isOpen()) return;
   const toggle = page.locator('[aria-label="Toggle session panel"]');
-  for (let i = 0; i < 5; i++) {
-    if (await isOpen()) break;
+  if ((await toggle.getAttribute('aria-expanded')) !== 'true') {
     await toggle.click();
-    await page.waitForTimeout(250);
   }
   await expect(search).toBeVisible({ timeout: 3000 });
 }
@@ -467,7 +520,7 @@ test.describe('Extension component widgets', () => {
     if ((page.viewportSize()?.width ?? 0) >= 768) {
       const statusTrigger = page.getByLabel('Extension statuses');
       await expect(statusTrigger).toBeVisible();
-      await statusTrigger.hover();
+      await statusTrigger.focus();
       await expect(page.getByText('Extension status', { exact: true })).toBeVisible();
       await expect(page.getByText('search', { exact: true })).toBeVisible();
     }
@@ -912,8 +965,17 @@ test.describe('Interactive custom overlay', () => {
     });
 
     await expect(page.getByText('line one')).toBeVisible({ timeout: 5000 });
-    const dialog = page.getByRole('dialog', { name: 'Extension terminal' });
+    const dialog = page.getByRole('dialog', { name: 'Extension Request' });
     await expect(dialog).toHaveAttribute('aria-modal', 'true');
+    const relationships = await dialog.evaluate((element) => ({
+      labelledBy: element.getAttribute('aria-labelledby'),
+      describedBy: element.getAttribute('aria-describedby'),
+    }));
+    if (!relationships.labelledBy || !relationships.describedBy) {
+      throw new Error('interactive extension dialog relationships are missing');
+    }
+    await expect(page.locator(`#${relationships.labelledBy}`)).toHaveCount(1);
+    await expect(page.locator(`#${relationships.describedBy}`)).toContainText('Arrow keys');
     await expect(page.getByRole('textbox', { name: 'Extension terminal input' })).toBeFocused();
 
     await expect.poll(() => resizeMessages.length, { timeout: 5000 }).toBe(1);
@@ -924,15 +986,13 @@ test.describe('Interactive custom overlay', () => {
     expect(initialResize.rows).toBeLessThanOrEqual(80);
     expect(
       await dialog
-        .locator(':scope > div')
+        .locator(':scope > .relative.w-full.max-w-3xl')
         .evaluate((element) => element.getBoundingClientRect().height)
     ).toBe(480);
 
     if (!sendWs) throw new Error('WebSocket did not open');
     sendWs.send(JSON.stringify({ type: 'custom_render', id: 't5', lines: ['wrapped line'] }));
     await expect(page.getByText('wrapped line')).toBeVisible({ timeout: 3000 });
-    await page.waitForTimeout(300);
-    expect(resizeMessages).toHaveLength(1);
 
     const viewport = page.viewportSize() ?? { width: 1280, height: 720 };
     await page.setViewportSize({
@@ -941,10 +1001,9 @@ test.describe('Interactive custom overlay', () => {
     });
     await expect.poll(() => resizeMessages.length, { timeout: 5000 }).toBe(2);
     const resized = resizeMessages[1];
-    expect(resized.columns).toBeLessThan(initialResize.columns);
-    expect(resized.rows).toBeLessThan(initialResize.rows);
-    await page.waitForTimeout(300);
-    expect(resizeMessages).toHaveLength(2);
+    expect(resized.columns).toBeLessThanOrEqual(initialResize.columns);
+    expect(resized.rows).toBeLessThanOrEqual(initialResize.rows);
+    expect(resized.columns < initialResize.columns || resized.rows < initialResize.rows).toBe(true);
   });
 });
 

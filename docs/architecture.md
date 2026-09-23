@@ -107,6 +107,7 @@ The pi SDK (`@earendil-works/pi-coding-agent`) provides:
 - **Event subscription** — `session.subscribe()` emits `AgentSessionEvent` for all session activity
 - **`MarkdownTransformer`** — Extensions can register markdown transformers (`sess.extensionRunner.getMarkdownTransformers()`) to rewrite message text before wire broadcast (`applyMarkdownTransformers`).
 - **`CustomEntry` renderer** — Renders custom extension entries (`registerEntryRenderer`) into synthetic `role: 'custom'` wire notices (`renderCustomEntry` / `customEntriesForWire`) for display in the chat timeline.
+- **Bundled skill** — Pi UI bundles the generated `pi-ui-extension-ui` skill to teach agents how extension UI renders. `createSdkSession` passes it through `resourceLoaderOptions.additionalSkillPaths` (`src/lib/server/bundled-resources.ts`); it is generated from `src/lib/extension-ui-capabilities/`, with examples verified against the real parser in Vitest and staleness enforced by `check:skill`. Changes to extension UI behavior in `server.ts` or `extension-component.svelte` must update the catalog and regenerate the skill.
 - **`ThinkingLevelMap`** — Maps model-supported reasoning depth rungs (`thinkingLevelMap` on `ModelInfo`), allowing the UI to derive and clamp available thinking levels dynamically without hardcoded rungs.
 
 ### Key SDK Methods

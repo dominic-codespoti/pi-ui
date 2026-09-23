@@ -8,11 +8,30 @@ import * as v from 'valibot';
 
 import type { TreeNode } from './protocol.js';
 
+export const ToolSummarySchema = v.looseObject({
+  name: v.string(),
+  description: v.string(),
+  isBuiltin: v.boolean(),
+  origin: v.optional(v.string()),
+});
+
+export const CommandSummarySchema = v.looseObject({
+  name: v.string(),
+  description: v.optional(v.string()),
+  source: v.string(),
+  hasArgumentCompletions: v.optional(v.boolean()),
+});
+
+export const CompletionItemSchema = v.looseObject({
+  value: v.string(),
+  label: v.string(),
+  description: v.optional(v.string()),
+});
 export const ModelInfoSchema = v.looseObject({
   provider: v.string(),
   id: v.string(),
-  name: v.optional(v.string()),
-  reasoning: v.optional(v.boolean()),
+  name: v.string(),
+  reasoning: v.boolean(),
   contextWindow: v.optional(v.number()),
   thinkingLevelMap: v.optional(v.record(v.string(), v.nullable(v.string()))),
 });
@@ -20,7 +39,7 @@ export const ModelInfoSchema = v.looseObject({
 export const ContextUsageSchema = v.looseObject({
   tokens: v.nullable(v.number()),
   contextWindow: v.number(),
-  percent: v.optional(v.nullable(v.number())),
+  percent: v.nullable(v.number()),
 });
 
 export const SessionSummarySchema = v.looseObject({
@@ -33,7 +52,7 @@ export const SessionSummarySchema = v.looseObject({
   messageCount: v.number(),
   turns: v.optional(v.number()),
   parentSession: v.optional(v.string()),
-  firstMessage: v.optional(v.string()),
+  firstMessage: v.string(),
 });
 
 export const ProjectInfoSchema = v.looseObject({
@@ -56,7 +75,7 @@ export const ProviderInfoSchema = v.looseObject({
 
 export const SkillSummarySchema = v.looseObject({
   name: v.string(),
-  description: v.optional(v.string()),
+  description: v.string(),
   scope: v.string(),
   isBuiltin: v.boolean(),
   source: v.string(),
@@ -64,7 +83,7 @@ export const SkillSummarySchema = v.looseObject({
 
 export const PromptSummarySchema = v.looseObject({
   name: v.string(),
-  description: v.optional(v.string()),
+  description: v.string(),
   argumentHint: v.optional(v.string()),
   scope: v.string(),
   isBuiltin: v.boolean(),
@@ -90,6 +109,17 @@ export const ExtensionDiagnosticSchema = v.looseObject({
   message: v.string(),
   path: v.optional(v.string()),
 });
+export const ExtensionSummarySchema = v.looseObject({
+  source: v.string(),
+  path: v.string(),
+  scope: v.union([v.literal('user'), v.literal('project'), v.literal('temporary')]),
+  origin: v.union([v.literal('package'), v.literal('top-level')]),
+  tools: v.array(v.looseObject({ name: v.string(), description: v.string() })),
+  commands: v.array(v.looseObject({ name: v.string(), description: v.string() })),
+  flags: v.optional(v.array(ExtensionFlagInfoSchema)),
+  shortcuts: v.optional(v.array(ExtensionShortcutInfoSchema)),
+  diagnostics: v.optional(v.array(ExtensionDiagnosticSchema)),
+});
 
 export const ProjectTrustDecisionSchema = v.union([
   v.literal('trusted'),
@@ -97,30 +127,12 @@ export const ProjectTrustDecisionSchema = v.union([
   v.literal('session'),
   v.literal('ask'),
 ]);
-
 export const ProjectTrustInfoSchema = v.looseObject({
   cwd: v.string(),
+  decision: ProjectTrustDecisionSchema,
   requiresDecision: v.boolean(),
-  persisted: v.optional(v.boolean()),
+  persisted: v.boolean(),
 });
-
-export const RuntimeDiagnosticSchema = v.looseObject({
-  type: v.union([v.literal('info'), v.literal('warning'), v.literal('error')]),
-  message: v.string(),
-});
-
-export const ExtensionSummarySchema = v.looseObject({
-  source: v.string(),
-  path: v.string(),
-  scope: v.union([v.literal('user'), v.literal('project'), v.literal('temporary')]),
-  origin: v.union([v.literal('package'), v.literal('top-level')]),
-  tools: v.array(v.looseObject({ name: v.string(), description: v.optional(v.string()) })),
-  commands: v.array(v.looseObject({ name: v.string(), description: v.optional(v.string()) })),
-  flags: v.optional(v.array(ExtensionFlagInfoSchema)),
-  shortcuts: v.optional(v.array(ExtensionShortcutInfoSchema)),
-  diagnostics: v.optional(v.array(ExtensionDiagnosticSchema)),
-});
-
 export const SessionStatsSchema = v.looseObject({
   sessionId: v.string(),
   sessionFile: v.optional(v.string()),
@@ -130,10 +142,10 @@ export const SessionStatsSchema = v.looseObject({
   toolResults: v.number(),
   totalMessages: v.number(),
   tokens: v.looseObject({
-    input: v.optional(v.number()),
-    output: v.optional(v.number()),
-    cacheRead: v.optional(v.number()),
-    cacheWrite: v.optional(v.number()),
+    input: v.number(),
+    output: v.number(),
+    cacheRead: v.number(),
+    cacheWrite: v.number(),
     total: v.number(),
   }),
   cost: v.number(),
@@ -293,32 +305,31 @@ const ExtensionUiStatePayloadSchema = v.looseObject({
 });
 
 const ExtensionErrorNoticeSchema = v.looseObject({
-  extensionPath: v.optional(v.string()),
-  event: v.optional(v.string()),
-  error: v.optional(v.string()),
+  extensionPath: v.string(),
+  event: v.string(),
+  error: v.string(),
   stack: v.optional(v.string()),
 });
 
 const PackageProgressSchema = v.looseObject({
-  phase: v.union([
-    v.literal('start'),
-    v.literal('progress'),
-    v.literal('complete'),
-    v.literal('error'),
-  ]),
-  action: v.optional(
-    v.union([
-      v.literal('install'),
-      v.literal('remove'),
-      v.literal('update'),
-      v.literal('clone'),
-      v.literal('pull'),
-    ])
+  phase: v.optional(
+    v.union([v.literal('start'), v.literal('progress'), v.literal('complete'), v.literal('error')])
   ),
-  source: v.optional(v.string()),
+  action: v.union([
+    v.literal('install'),
+    v.literal('remove'),
+    v.literal('update'),
+    v.literal('clone'),
+    v.literal('pull'),
+  ]),
+  source: v.string(),
   message: v.optional(v.string()),
 });
 
+export const RuntimeDiagnosticSchema = v.looseObject({
+  type: v.union([v.literal('info'), v.literal('warning'), v.literal('error')]),
+  message: v.string(),
+});
 // ── Connected Message Schema ──────────────────────────────────────────────────
 
 export const ConnectedMessageSchema = v.looseObject({
@@ -348,26 +359,9 @@ export const ConnectedMessageSchema = v.looseObject({
   projectTrust: v.optional(ProjectTrustInfoSchema),
   diagnostics: v.optional(v.array(RuntimeDiagnosticSchema)),
   modelFallbackMessage: v.optional(v.string()),
-  tools: v.optional(
-    v.array(
-      v.looseObject({
-        name: v.string(),
-        description: v.optional(v.string()),
-        isBuiltin: v.boolean(),
-        origin: v.optional(v.string()),
-      })
-    )
-  ),
+  tools: v.optional(v.array(ToolSummarySchema)),
   activeToolNames: v.optional(v.array(v.string())),
-  commands: v.optional(
-    v.array(
-      v.looseObject({
-        name: v.string(),
-        description: v.optional(v.string()),
-        source: v.string(),
-      })
-    )
-  ),
+  commands: v.optional(v.array(CommandSummarySchema)),
 });
 
 export const BashExecutionUpdateSchema = v.looseObject({
@@ -404,6 +398,7 @@ export const ToolOutputSchema = v.looseObject({
 export const SessionLoadedSchema = v.looseObject({
   type: v.literal('session_loaded'),
   sessionId: v.string(),
+  // Legacy session switch snapshots may omit this field.
   isStreaming: v.optional(v.boolean()),
   activeToolName: v.optional(v.string()),
   thinkingLevel: v.string(),
@@ -424,36 +419,20 @@ export const SessionLoadedSchema = v.looseObject({
   uiVersion: v.optional(v.string()),
   sessionMode: v.optional(v.union([v.literal('in-memory'), v.literal('persisted')])),
   sessionPath: v.optional(v.string()),
-  requestId: v.optional(v.string()),
+  requestId: v.optional(v.pipe(v.string(), v.minLength(1))),
   projectTrust: v.optional(ProjectTrustInfoSchema),
   diagnostics: v.optional(v.array(RuntimeDiagnosticSchema)),
   modelFallbackMessage: v.optional(v.string()),
   contextUsage: v.optional(v.nullable(ContextUsageSchema)),
-  tools: v.optional(
-    v.array(
-      v.looseObject({
-        name: v.string(),
-        description: v.optional(v.string()),
-        isBuiltin: v.boolean(),
-        origin: v.optional(v.string()),
-      })
-    )
-  ),
+  extensionUiState: v.optional(ExtensionUiStatePayloadSchema),
+  tools: v.optional(v.array(ToolSummarySchema)),
   activeToolNames: v.optional(v.array(v.string())),
-  commands: v.optional(
-    v.array(
-      v.looseObject({
-        name: v.string(),
-        description: v.optional(v.string()),
-        source: v.string(),
-      })
-    )
-  ),
+  commands: v.optional(v.array(CommandSummarySchema)),
 });
 export const SessionsErrorSchema = v.looseObject({
   type: v.literal('sessions_error'),
   message: v.string(),
-  requestId: v.optional(v.string()),
+  requestId: v.optional(v.pipe(v.string(), v.minLength(1))),
 });
 
 export const ModelChangedSchema = v.looseObject({
@@ -529,8 +508,10 @@ export const FileSavedSchema = v.looseObject({
 
 export const FileStagedSchema = v.looseObject({
   type: v.literal('file_staged'),
+  uploadId: v.string(),
   name: v.string(),
   path: v.string(),
+  sessionId: v.nullable(v.string()),
   error: v.optional(v.string()),
 });
 
@@ -571,6 +552,31 @@ export const ProjectsListSchema = v.looseObject({
   type: v.literal('projects_list'),
   projects: v.array(ProjectInfoSchema),
 });
+export const ResourcesListSchema = v.looseObject({
+  type: v.literal('resources_list'),
+  skills: v.array(SkillSummarySchema),
+  prompts: v.array(PromptSummarySchema),
+  sessionId: v.optional(v.string()),
+});
+
+export const CommandsListSchema = v.looseObject({
+  type: v.literal('commands_list'),
+  commands: v.array(CommandSummarySchema),
+  sessionId: v.optional(v.string()),
+});
+
+export const ProvidersErrorSchema = v.looseObject({
+  type: v.literal('providers_error'),
+  message: v.string(),
+  sessionId: v.optional(v.string()),
+});
+
+export const QueueUpdateSchema = v.looseObject({
+  type: v.literal('queue_update'),
+  steering: v.array(v.string()),
+  followUp: v.array(v.string()),
+  sessionId: v.optional(v.string()),
+});
 
 export const DirCompletionsSchema = v.looseObject({
   type: v.literal('dir_completions'),
@@ -598,17 +604,9 @@ export const ForkPointsSchema = v.looseObject({
   entries: v.array(v.looseObject({ entryId: v.string(), text: v.string() })),
   sessionId: v.optional(v.string()),
 });
-
 export const ToolsListSchema = v.looseObject({
   type: v.literal('tools_list'),
-  tools: v.array(
-    v.looseObject({
-      name: v.string(),
-      description: v.string(),
-      isBuiltin: v.boolean(),
-      origin: v.optional(v.string()),
-    })
-  ),
+  tools: v.array(ToolSummarySchema),
   activeToolNames: v.array(v.string()),
   sessionId: v.optional(v.string()),
 });
@@ -658,6 +656,7 @@ export const PackagesListSchema = v.looseObject({
 export const SessionStatsEventSchema = v.looseObject({
   type: v.literal('session_stats'),
   stats: SessionStatsSchema,
+  sessionId: v.optional(v.string()),
 });
 
 export const UpdateStatusEventSchema = v.looseObject({
@@ -742,13 +741,7 @@ export const CommandCompletionsSchema = v.looseObject({
   requestId: v.string(),
   command: v.string(),
   prefix: v.string(),
-  items: v.array(
-    v.looseObject({
-      value: v.string(),
-      label: v.string(),
-      description: v.optional(v.string()),
-    })
-  ),
+  items: v.array(CompletionItemSchema),
   error: v.optional(v.string()),
 });
 
@@ -758,13 +751,7 @@ export const ExtensionCompletionsSchema = v.looseObject({
   requestId: v.string(),
   trigger: v.string(),
   query: v.string(),
-  items: v.array(
-    v.looseObject({
-      value: v.string(),
-      label: v.string(),
-      description: v.optional(v.string()),
-    })
-  ),
+  items: v.array(CompletionItemSchema),
   error: v.optional(v.string()),
 });
 
@@ -858,7 +845,6 @@ export const customEventSchemas = {
   session_loaded: SessionLoadedSchema,
   sessions_error: SessionsErrorSchema,
   model_changed: ModelChangedSchema,
-  thinking_level_changed: ThinkingLevelChangedSchema,
   available_models_changed: AvailableModelsChangedSchema,
   models_refresh_result: ModelsRefreshResultSchema,
   older_messages: OlderMessagesSchema,
@@ -874,11 +860,15 @@ export const customEventSchemas = {
   all_sessions_list: AllSessionsListSchema,
   session_updated: SessionUpdatedSchema,
   projects_list: ProjectsListSchema,
+  resources_list: ResourcesListSchema,
+  commands_list: CommandsListSchema,
   dir_completions: DirCompletionsSchema,
   file_completions: FileCompletionsSchema,
   providers_list: ProvidersListSchema,
+  providers_error: ProvidersErrorSchema,
   fork_points: ForkPointsSchema,
   tools_list: ToolsListSchema,
+  queue_update: QueueUpdateSchema,
   project_trust: ProjectTrustSchema,
   runtime_diagnostics: RuntimeDiagnosticsSchema,
   extensions_list: ExtensionsListSchema,
@@ -944,7 +934,7 @@ export function parseServerMessage(raw: unknown): ParsedServerMessage {
     return { ok: false, issues: formatIssues(res.issues) };
   }
 
-  if (rawType in customEventSchemas) {
+  if (Object.prototype.hasOwnProperty.call(customEventSchemas, rawType)) {
     const schema = customEventSchemas[rawType as CustomEventType];
     const res = v.safeParse(schema, raw);
     if (res.success) {

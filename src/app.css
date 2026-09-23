@@ -139,7 +139,7 @@ body {
 }
 
 /* ── Make Tailwind dark: variants fire on our daisyUI themes ──────────────── */
-@custom-variant dark (&[data-theme]);
+@custom-variant dark (&:where([data-theme], [data-theme] *));
 
 /* ── Wire shadcn color names into Tailwind v4's --color-* namespace ─────── */
 /*
@@ -156,7 +156,7 @@ body {
   --color-popover-foreground: var(--popover-foreground);
   --color-card: var(--card);
   --color-card-foreground: var(--card-foreground);
-  --color-border: var(--border);
+  --color-border: var(--border-color);
   --color-input: var(--input);
   --color-ring: var(--ring);
   --color-destructive: var(--destructive);
@@ -177,7 +177,7 @@ body {
   --popover-foreground: var(--color-base-content);
   --card: var(--color-base-200);
   --card-foreground: var(--color-base-content);
-  --border: color-mix(in oklch, var(--color-base-content) 15%, transparent);
+  --border-color: color-mix(in oklch, var(--color-base-content) 15%, transparent);
   --input: color-mix(in oklch, var(--color-base-content) 20%, transparent);
   --ring: var(--color-primary);
   --primary: var(--color-primary);
@@ -666,77 +666,84 @@ select,
   font-family: ui-monospace, 'Cascadia Code', 'Fira Code', monospace;
 }
 
-/* ── highlight.js syntax colour palette (neutral dark, works on dark themes) */
+/* ── highlight.js syntax palette — theme-derived for light and dark themes */
 .hljs {
-  color: color-mix(in oklch, var(--color-base-content) 78%, transparent);
+  --hljs-foreground: color-mix(in oklch, var(--color-base-content) 80%, var(--color-base-100));
+  --hljs-keyword: color-mix(in oklch, var(--color-secondary) 64%, var(--color-base-content));
+  --hljs-built-in: color-mix(in oklch, var(--color-info) 64%, var(--color-base-content));
+  --hljs-type: color-mix(in oklch, var(--color-warning) 60%, var(--color-base-content));
+  --hljs-function: color-mix(in oklch, var(--color-primary) 64%, var(--color-base-content));
+  --hljs-string: color-mix(in oklch, var(--color-success) 64%, var(--color-base-content));
+  --hljs-number: color-mix(in oklch, var(--color-error) 64%, var(--color-base-content));
+  --hljs-variable: color-mix(in oklch, var(--color-error) 58%, var(--color-base-content));
+  --hljs-muted: color-mix(in oklch, var(--color-base-content) 68%, var(--color-base-100));
+  color: var(--hljs-foreground);
 }
 .hljs-keyword,
 .hljs-selector-tag {
-  color: #c792ea;
-} /* purple — keywords */
+  color: var(--hljs-keyword);
+} /* secondary — keywords */
 .hljs-built_in,
 .hljs-builtin-name {
-  color: #82aaff;
-} /* blue — builtins */
+  color: var(--hljs-built-in);
+} /* info — builtins */
 .hljs-type,
 .hljs-class .hljs-title {
-  color: #ffcb6b;
-} /* yellow — types/classes */
+  color: var(--hljs-type);
+} /* warning — types/classes */
 .hljs-function .hljs-title,
 .hljs-title.function_ {
-  color: #82aaff;
-} /* blue — function names */
+  color: var(--hljs-function);
+} /* primary — function names */
 .hljs-string {
-  color: #c3e88d;
-} /* green — strings */
+  color: var(--hljs-string);
+} /* success — strings */
 .hljs-number,
 .hljs-literal {
-  color: #f78c6c;
-} /* orange — numbers/true/false/null */
+  color: var(--hljs-number);
+} /* error — numbers/true/false/null */
 .hljs-comment {
-  color: color-mix(in oklch, var(--color-base-content) 30%, transparent);
+  color: var(--hljs-muted);
   font-style: italic;
 }
 .hljs-attr,
 .hljs-attribute {
-  color: #ffcb6b;
-} /* yellow — attributes */
+  color: var(--hljs-type);
+} /* warning — attributes */
 .hljs-variable,
 .hljs-template-variable {
-  color: #f07178;
-} /* red — variables */
-.hljs-tag {
-  color: #f07178;
-}
+  color: var(--hljs-variable);
+} /* error — variables */
+.hljs-tag,
 .hljs-name {
-  color: #f07178;
+  color: var(--hljs-variable);
 }
 .hljs-operator,
 .hljs-punctuation {
-  color: color-mix(in oklch, var(--color-base-content) 50%, transparent);
+  color: color-mix(in oklch, var(--color-base-content) 72%, var(--color-base-100));
 }
 .hljs-params {
-  color: color-mix(in oklch, var(--color-base-content) 70%, transparent);
+  color: color-mix(in oklch, var(--color-base-content) 86%, var(--color-base-100));
 }
 .hljs-meta {
-  color: color-mix(in oklch, var(--color-base-content) 40%, transparent);
+  color: color-mix(in oklch, var(--color-base-content) 62%, var(--color-base-100));
 }
 .hljs-section,
 .hljs-selector-id {
-  color: #82aaff;
+  color: var(--hljs-built-in);
   font-weight: 600;
 }
 .hljs-symbol,
 .hljs-bullet {
-  color: #f78c6c;
+  color: var(--hljs-number);
 }
 .hljs-addition {
-  color: #c3e88d;
-  background: rgba(195, 232, 141, 0.08);
+  color: var(--hljs-string);
+  background: color-mix(in oklch, var(--color-success) 12%, transparent);
 }
 .hljs-deletion {
-  color: #f07178;
-  background: rgba(240, 113, 120, 0.08);
+  color: var(--hljs-variable);
+  background: color-mix(in oklch, var(--color-error) 12%, transparent);
 }
 .hljs-emphasis {
   font-style: italic;
@@ -745,7 +752,7 @@ select,
   font-weight: bold;
 }
 .hljs-link {
-  color: #80cbc4;
+  color: color-mix(in oklch, var(--color-accent) 64%, var(--color-base-content));
   text-decoration: underline;
 }
 
@@ -814,6 +821,12 @@ select,
   border-radius: 0 0 0.5rem 0;
   transition: top 0.15s ease;
 }
+/* Main landmarks are programmatically focusable for the global skip link. */
+#main-content:focus {
+  outline: 2px solid color-mix(in oklch, var(--color-primary) 80%, var(--color-base-content));
+  outline-offset: -2px;
+}
+
 .skip-link:focus {
   top: 0;
 }

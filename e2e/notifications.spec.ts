@@ -1,4 +1,5 @@
 import { test, expect } from './fixtures';
+import type { Worker } from '@playwright/test';
 import { generateKeyPairSync } from 'node:crypto';
 import {
   ALL_SESSIONS_LIST_PAYLOAD,
@@ -40,7 +41,10 @@ type SwScope = typeof globalThis & {
   PushEvent: new (type: string, init: { data?: string }) => Event;
 };
 
-type NotifCall = { title: string; options?: NotificationOptions };
+type TestNotificationOptions = Pick<NotificationOptions, 'tag' | 'requireInteraction'> & {
+  actions?: Array<{ action: string; title: string }>;
+};
+type NotifCall = { title: string; options?: TestNotificationOptions };
 
 test.describe('PWA notifications', () => {
   test('subscribe flow, SW surface, click routing, and push visibility gate', async ({
@@ -145,23 +149,20 @@ test.describe('PWA notifications', () => {
       expect(subMsg.keys?.auth).toBe('auth-key');
     });
 
-    let sw: ServiceWorker;
     /** Resolve the currently running worker; Chromium may respawn it at any time. */
-    const refreshSw = async (): Promise<void> => {
+    const refreshSw = async (): Promise<Worker> => {
       await page.evaluate(() => navigator.serviceWorker.ready);
       const workers = context.serviceWorkers();
-      if (workers.length > 0) sw = workers[workers.length - 1];
-      else sw = await context.waitForEvent('serviceworker', { timeout: 10_000 });
+      return workers.length > 0
+        ? workers[workers.length - 1]
+        : context.waitForEvent('serviceworker', { timeout: 10_000 });
     };
     /** Re-resolve once when Chromium replaces the worker between operations. */
-    const evaluateSw = async <T, A = undefined>(
-      pageFunction: (arg: A) => T | Promise<T>,
-      arg?: A
-    ): Promise<T> => {
+    const runSw = async <T>(operation: (worker: Worker) => Promise<T>): Promise<T> => {
       for (let attempt = 0; attempt < 2; attempt++) {
-        await refreshSw();
+        const worker = await refreshSw();
         try {
-          return (await sw.evaluate(pageFunction, arg as A)) as T;
+          return await operation(worker);
         } catch (error) {
           if (
             attempt === 1 ||
@@ -175,6 +176,13 @@ test.describe('PWA notifications', () => {
       }
       throw new Error('Service worker evaluation did not complete');
     };
+    const evaluateSw = <T>(pageFunction: () => T | Promise<T>): Promise<T> =>
+      runSw((worker) => worker.evaluate(pageFunction));
+    type PushArgs = { title: string; visible: boolean };
+    const evaluateSwWithArg = <T>(
+      pageFunction: (arg: PushArgs) => T | Promise<T>,
+      arg: PushArgs
+    ): Promise<T> => runSw((worker) => worker.evaluate(pageFunction, arg));
 
     await page.evaluate(() => {
       const holder = globalThis as Record<string, unknown>;
@@ -279,10 +287,9 @@ test.describe('PWA notifications', () => {
         )
         .toBe(true);
     });
-
     await test.step('5 push visibility gate', async () => {
       const firePush = (title: string, visible: boolean) =>
-        evaluateSw(
+        evaluateSwWithArg(
           async ({ title: pushTitle, visible: pushVisible }) => {
             const scope = globalThis as unknown as SwScope;
             const testScope = scope as SwScope & { __piTestClients?: SwClient[] };

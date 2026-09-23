@@ -49,6 +49,50 @@ describe('session reducer', () => {
     expect(result.state.contextUsage).toMatchObject({ tokens: 20, contextWindow: 200 });
     expect(result.effects).toContainEqual({ type: 'scroll_bottom' });
   });
+  it('clears explicit null context usage in full snapshots with model-window fallback', () => {
+    const state = createSessionReducerState({
+      model: {
+        provider: 'test',
+        id: 'model',
+        name: 'Test model',
+        reasoning: false,
+        contextWindow: 4000,
+      },
+      contextUsage: { tokens: 900, contextWindow: 4000, percent: 22.5 },
+    });
+
+    reduceSession(state, {
+      type: 'snapshot',
+      payload: { type: 'session_loaded', contextUsage: null },
+    });
+
+    expect(state.contextUsage).toEqual({ tokens: null, contextWindow: 4000, percent: null });
+  });
+
+  it('clears explicit null and preserves absent context usage in partial snapshots', () => {
+    const state = createSessionReducerState({
+      model: {
+        provider: 'test',
+        id: 'model',
+        name: 'Test model',
+        reasoning: false,
+        contextWindow: 4000,
+      },
+      contextUsage: { tokens: 900, contextWindow: 4000, percent: 22.5 },
+    });
+
+    reduceSession(state, {
+      type: 'snapshot',
+      payload: { type: 'session_update' },
+    });
+    expect(state.contextUsage).toEqual({ tokens: 900, contextWindow: 4000, percent: 22.5 });
+
+    reduceSession(state, {
+      type: 'snapshot',
+      payload: { type: 'session_update', contextUsage: null },
+    });
+    expect(state.contextUsage).toEqual({ tokens: null, contextWindow: 4000, percent: null });
+  });
 
   it('tracks active tools across start, update, and end transitions', () => {
     let id = 0;

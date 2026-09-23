@@ -21,6 +21,19 @@ export default [
     },
   },
   {
+    files: ['e2e/**/*.ts', 'playwright*.ts'],
+    languageOptions: {
+      globals: {
+        ...globals.browser,
+        ...globals.node,
+      },
+      parserOptions: {
+        ecmaVersion: 'latest',
+        sourceType: 'module',
+      },
+    },
+  },
+  {
     files: ['**/*.svelte', '**/*.svelte.ts', '**/*.svelte.js'],
     languageOptions: {
       parserOptions: {
@@ -39,8 +52,6 @@ export default [
       '.pi/',
       '.playwright-mcp/',
       'vitest.config.ts',
-      'playwright.config.ts',
-      'e2e/',
       'benchmark.ts',
       'server.bundle.js',
       'adapters/',

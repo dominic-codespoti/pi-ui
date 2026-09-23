@@ -11,7 +11,7 @@
 
 import { untrack } from 'svelte';
 import { SvelteMap, SvelteSet } from 'svelte/reactivity';
-import { goto } from '$app/navigation';
+import { replaceState } from '$app/navigation';
 import { page } from '$app/state';
 import type { ClientMessage, ProjectInfo, SessionSummary } from '#lib/ws/protocol.js';
 
@@ -154,6 +154,18 @@ function loadCollapsed(): string[] {
 export function pathBasename(p: string): string {
   return p.split('/').filter(Boolean).pop() ?? p;
 }
+export type SessionOperation =
+  | { kind: 'idle' }
+  | { kind: 'creating'; requestId: string; waiting: boolean }
+  | {
+      kind: 'switching';
+      requestId: string;
+      path: string;
+      waiting: boolean;
+      urlParamBeforeSwitch: string | null;
+      urlRevert: boolean;
+    }
+  | { kind: 'resyncing'; requestId: string; reason: 'new-timeout' | 'recovery' };
 
 class ProjectsState {
   /** Wired by the page to the live WebSocket sender. Returns true if the message was sent. */
@@ -244,10 +256,27 @@ class ProjectsState {
   cwd = $state('');
   /** Active session id (synced from the page). */
   activeSessionId = $state<string | null>(null);
-  /** Whether the active session is currently streaming (synced from the page). */
-  isStreaming = $state(false);
-  /** Name of the active session's running tool (if any). */
-  activeToolName = $state<string | undefined>(undefined);
+  /** Whether the active session is currently streaming, derived from runtime. */
+  get isStreaming(): boolean {
+    const active = this.activeSessionId;
+    return active !== null && (this.runtime.get(active)?.isRunning ?? false);
+  }
+  /**
+   * Compatibility write path for existing page reducers. All writes update the
+   * active runtime record rather than maintaining a second streaming mirror.
+   */
+  set isStreaming(value: boolean) {
+    this.updateActiveRuntime({ isRunning: value });
+  }
+  /** Name of the active session's running tool, derived from runtime. */
+  get activeToolName(): string | undefined {
+    const active = this.activeSessionId;
+    return active === null ? undefined : this.runtime.get(active)?.activeToolName;
+  }
+  /** Compatibility write path; runtime remains the sole source of truth. */
+  set activeToolName(value: string | undefined) {
+    this.updateActiveRuntime({ activeToolName: value });
+  }
   /** Authoritative liveness for every session currently resident on the server. */
   runtime = new SvelteMap<string, SessionRuntimeStatus>();
   /** Highest-priority activity in any non-active session. */
@@ -274,24 +303,36 @@ class ProjectsState {
   filter = $state('');
   /** Last error from session/project operations. */
   error = $state<string | null>(null);
-  /** True while waiting for the server to answer new_session. */
-  pendingNewSession = $state(false);
+  /**
+   * Exactly one local session operation owns correlated snapshots/errors.
+   * Superseding an operation replaces this record and retires its request id.
+   */
+  sessionOperation = $state<SessionOperation>({ kind: 'idle' });
+  /** Narrow compatibility getters used by existing templates during migration. */
+  get pendingNewSession(): boolean {
+    return this.sessionOperation.kind === 'creating';
+  }
+  get sessionLoading(): boolean {
+    const operation = this.sessionOperation;
+    return (
+      (operation.kind === 'creating' && operation.waiting) ||
+      (operation.kind === 'switching' && operation.waiting)
+    );
+  }
+  get pendingRequestId(): string | null {
+    return this.sessionOperation.kind === 'idle' ? null : this.sessionOperation.requestId;
+  }
+  get pendingResync(): boolean {
+    return this.sessionOperation.kind === 'resyncing';
+  }
+  get pendingSwitchPath(): string | null {
+    return this.sessionOperation.kind === 'switching' ? this.sessionOperation.path : null;
+  }
+  get pendingUrlRevert(): boolean {
+    return this.sessionOperation.kind === 'switching' && this.sessionOperation.urlRevert;
+  }
   /** Directory completions for the directory picker inputs. */
   dirCompletions = $state<string[]>([]);
-
-  /** Session path from the most recent switch_session — consumed by the page for URL sync. */
-  pendingSwitchPath: string | null = null;
-  /** Optimistic ?session= URL updates are revertible until confirmed: set by
-   * switchSession after its shallow goto, consumed by the page on success
-   * (param rewritten from pendingSwitchPath), reverted on failure/timeout. */
-  pendingUrlRevert = false;
-  private urlParamBeforeSwitch: string | null = null;
-  /** True while a session switch is in flight — shows skeleton instead of stale chat. */
-  sessionLoading = $state(false);
-  /** Correlation token for the in-flight new_session/switch_session request. */
-  pendingRequestId = $state<string | null>(null);
-  /** True while recovering from a timed-out new_session via resync_session. */
-  pendingResync = $state(false);
   /** Watchdog for in-flight new_session/switch_session — see SESSION_OP_TIMEOUT_MS. */
   private opTimeout: ReturnType<typeof setTimeout> | null = null;
   /** Request ids whose responses can no longer change the visible session. */
@@ -303,12 +344,12 @@ class ProjectsState {
   /** Nested session branches expanded in the sidebar; intentionally ephemeral. */
   expandedSubsessions = new SvelteSet<string>();
   /**
-   * When the server last pushed a full list (all_sessions_list/projects_list).
-   * Guards `refresh()`: the server now pushes coalesced session_updated
-   * deltas during turns, so re-requesting both full lists on every sidebar
-   * open is redundant — skip when a full list arrived recently.
+   * Full-list freshness is tracked independently. A projects response cannot
+   * satisfy the sessions response (or vice versa), so a partial refresh
+   * always retries the missing list.
    */
-  private lastFullListAt = 0;
+  private projectsListAt = 0;
+  private sessionsListAt = 0;
 
   /** Projects merged with their sessions. Pinned first, then recent. */
   groups = $derived.by<ProjectGroup[]>(() => {
@@ -501,13 +542,45 @@ class ProjectsState {
     }
   }
 
+  /**
+   * Route legacy active-session writes through the runtime map. This keeps
+   * existing page reducers source-compatible while preventing a second
+   * writable streaming/tool state from drifting away from `runtime`.
+   */
+  private updateActiveRuntime(patch: {
+    isRunning?: boolean;
+    activeToolName?: string | undefined;
+  }): void {
+    const sessionId = this.activeSessionId;
+    if (sessionId === null) return;
+
+    const previous = this.runtime.get(sessionId);
+    const isRunning = patch.isRunning ?? previous?.isRunning ?? false;
+    const phase =
+      patch.isRunning === undefined
+        ? (previous?.phase ?? (isRunning ? 'running' : 'idle'))
+        : isRunning
+          ? 'running'
+          : previous?.phase === 'running'
+            ? 'idle'
+            : (previous?.phase ?? 'idle');
+    const hasToolPatch = Object.prototype.hasOwnProperty.call(patch, 'activeToolName');
+    const activeToolName = hasToolPatch ? patch.activeToolName : previous?.activeToolName;
+    this.applyRuntime({
+      sessionId,
+      phase,
+      isRunning,
+      ...(activeToolName === undefined ? {} : { activeToolName }),
+      lastActivity: previous?.lastActivity ?? Date.now(),
+      unread: previous?.unread ?? false,
+      needsAttention: previous?.needsAttention ?? false,
+      resident: previous?.resident ?? true,
+    });
+  }
+
   /** Upsert the latest server-authoritative runtime snapshot for a session. */
   applyRuntime(status: SessionRuntimeStatus): void {
     this.runtime.set(status.sessionId, status);
-    if (status.sessionId === this.activeSessionId) {
-      this.isStreaming = status.isRunning;
-      this.activeToolName = status.activeToolName;
-    }
   }
 
   // ── Server message intake ────────────────────────────────────────────────
@@ -524,16 +597,21 @@ class ProjectsState {
       this.pruneRuntimeState(previousSessionIds);
     }
   }
-
-  /** Refresh both lists — called on connect (force) and when the sidebar opens. */
+  /** Refresh each list independently; a missing response is retried. */
   refresh(opts?: { force?: boolean }): void {
-    const fresh =
+    const now = Date.now();
+    const projectsFresh =
       !opts?.force &&
-      Date.now() - this.lastFullListAt < 2000 &&
-      (this.projects.length > 0 || this.allSessions.length > 0);
-    if (fresh) return;
-    this.send({ type: 'get_projects' });
-    this.send({ type: 'get_all_sessions' });
+      this.projectsListAt > 0 &&
+      now - this.projectsListAt < 2000 &&
+      this.projects.length > 0;
+    const sessionsFresh =
+      !opts?.force &&
+      this.sessionsListAt > 0 &&
+      now - this.sessionsListAt < 2000 &&
+      this.allSessions.length > 0;
+    if (!projectsFresh) this.send({ type: 'get_projects' });
+    if (!sessionsFresh) this.send({ type: 'get_all_sessions' });
   }
 
   /**
@@ -544,11 +622,11 @@ class ProjectsState {
     switch (msg.type) {
       case 'projects_list':
         this.applyState({ projects: (msg.projects as ProjectInfo[]) ?? [] });
-        this.lastFullListAt = Date.now();
+        this.projectsListAt = Date.now();
         return true;
       case 'all_sessions_list':
         this.applyState({ sessions: (msg.sessions as SessionSummary[]) ?? [] });
-        this.lastFullListAt = Date.now();
+        this.sessionsListAt = Date.now();
         return true;
       case 'session_updated': {
         const session = msg.session as SessionSummary | undefined;
@@ -561,26 +639,20 @@ class ProjectsState {
         return true;
       case 'sessions_error': {
         const requestId = typeof msg.requestId === 'string' ? msg.requestId : undefined;
-        // Only a correlated in-flight operation may settle the current
-        // operation. Retired responses are late duplicates; an unstamped error
-        // with no operation has no safe owner.
+        // Structural operation errors are always correlated. An unstamped
+        // error, a retired response, or a response for another operation is
+        // a foreign notification and cannot settle this tab.
         if (
-          (requestId !== undefined && this.isRetiredRequest(requestId)) ||
-          (requestId === undefined && !this.pendingNewSession && !this.sessionLoading) ||
-          (this.pendingRequestId !== null && requestId !== this.pendingRequestId)
+          requestId === undefined ||
+          this.isRetiredRequest(requestId) ||
+          this.pendingRequestId !== requestId
         ) {
           return false;
         }
         this.clearOpTimeout();
         this.error = (msg.message as string) ?? 'Unknown error';
-        this.pendingNewSession = false;
-        this.sessionLoading = false;
-        this.pendingSwitchPath = null;
-        this.pendingResync = false;
-        this.retirePendingRequest();
-        // A rejected switch must not leave the optimistically-set ?session=
-        // param pointing at a session that was never actually opened.
         this.revertOptimisticSessionUrl();
+        this.retireCurrentOperation();
         return true;
       }
       case 'dir_completions':
@@ -612,7 +684,7 @@ class ProjectsState {
 
   // ── Actions ──────────────────────────────────────────────────────────────
 
-  private nextRequestId(): string {
+  nextRequestId(): string {
     this.requestSequence++;
     return `${Date.now().toString(36)}-${this.requestSequence}-${Math.random().toString(36).slice(2)}`;
   }
@@ -622,40 +694,60 @@ class ProjectsState {
     return this.retiredRequestIds.has(requestId);
   }
 
-  private retirePendingRequest(): void {
-    if (this.pendingRequestId) {
-      this.retiredRequestIds.add(this.pendingRequestId);
-      // Keep this bounded for long-lived tabs while retaining enough history
-      // to reject duplicate/late frames from recent operations.
+  private retireCurrentOperation(): void {
+    const requestId = this.pendingRequestId;
+    if (requestId !== null) {
+      this.retiredRequestIds.add(requestId);
       if (this.retiredRequestIds.size > 64) {
         const oldest = this.retiredRequestIds.values().next().value;
         if (typeof oldest === 'string') this.retiredRequestIds.delete(oldest);
       }
     }
-    this.pendingRequestId = null;
+    this.sessionOperation = { kind: 'idle' };
+  }
+
+  /** Whether a stamped response belongs to the operation currently owning this tab. */
+  isCurrentRequest(requestId: string): boolean {
+    return this.pendingRequestId === requestId && !this.isRetiredRequest(requestId);
+  }
+
+  /**
+   * Gate session snapshots before the page mutates its visible transcript.
+   * While an operation is active, unstamped broadcasts are never local
+   * responses; when idle, an unstamped snapshot is a same-session resync.
+   */
+  shouldApplySessionLoaded(requestId?: string): boolean {
+    if (requestId !== undefined) {
+      return this.isCurrentRequest(requestId);
+    }
+    return this.sessionOperation.kind === 'idle';
   }
 
   /** Clear the current operation token when its request can no longer settle this tab. */
   clearPendingRequest(): void {
-    this.retirePendingRequest();
+    this.clearOpTimeout();
+    this.retireCurrentOperation();
   }
 
-  /** Arm the in-flight-op watchdog — clears the loading flags if no reply comes. */
   private startOpTimeout(): void {
     this.clearOpTimeout();
-    const kind = this.pendingNewSession ? 'new' : 'switch';
+    const operation = this.sessionOperation;
+    if (operation.kind !== 'creating' && operation.kind !== 'switching') return;
+    const requestId = operation.requestId;
     this.opTimeout = setTimeout(() => {
       this.opTimeout = null;
-      if (this.pendingNewSession || this.sessionLoading) {
-        if (kind === 'new') this.error = 'New chat timed out — server did not respond in time';
-        else this.error = 'Session switch timed out';
-        if (kind === 'new') this.pendingResync = this.send({ type: 'resync_session' });
-        this.pendingNewSession = false;
-        this.sessionLoading = false;
-        this.pendingSwitchPath = null;
-        this.retirePendingRequest();
+      const current = this.sessionOperation;
+      if (current.kind === 'idle' || current.requestId !== requestId) return;
+      if (current.kind === 'creating') {
+        this.error = 'New chat timed out — server did not respond in time';
+        this.retireCurrentOperation();
         this.revertOptimisticSessionUrl();
+        this.startResync('new-timeout');
+        return;
       }
+      this.error = 'Session switch is taking longer than expected…';
+      if (current.kind !== 'switching') return;
+      this.sessionOperation = { ...current, waiting: false };
     }, SESSION_OP_TIMEOUT_MS);
   }
 
@@ -666,81 +758,85 @@ class ProjectsState {
     }
   }
 
+  private startResync(reason: 'new-timeout' | 'recovery'): boolean {
+    const requestId = this.nextRequestId();
+    if (this.sessionOperation.kind === 'switching') this.revertOptimisticSessionUrl();
+    this.retireCurrentOperation();
+    this.sessionOperation = { kind: 'resyncing', requestId, reason };
+    const sent = this.send({ type: 'resync_session', requestId });
+    if (!sent) {
+      this.retireCurrentOperation();
+      return false;
+    }
+    return true;
+  }
+
+  /** Request an authoritative snapshot, superseding any older local operation. */
+  resyncSession(): boolean {
+    return this.startResync('recovery');
+  }
+
   /**
-   * Abort any in-flight session open. Called when the socket reconnects: the
-   * old request is orphaned (its reply would land on the dead socket), and the
-   * connected payload carries the authoritative session state — so any
-   * half-applied flags and a stale pending switch path must not survive.
+   * Abort any in-flight session operation. Called when the socket reconnects:
+   * old replies are orphaned and the connected payload is authoritative.
    */
   cancelPendingOps(): void {
     this.clearOpTimeout();
-    this.pendingNewSession = false;
-    this.sessionLoading = false;
-    this.pendingResync = false;
-    this.pendingSwitchPath = null;
-    this.retirePendingRequest();
+    this.retireCurrentOperation();
     // Context unknown (disconnect/reset) — drop any revert intent silently.
-    this.pendingUrlRevert = false;
   }
 
   /**
    * Accept an authoritative session snapshot and clear any pending operation.
-   * Returns true when an operation was settled so callers can close
-   * operation-specific UI such as the session drawer.
-   *
-   * The server always stamps the requester's snapshot with `requestId`.
-   * Unstamped snapshots are foreign-switch broadcasts from other tabs and
-   * never settle a pending operation.
+   * Unstamped snapshots never settle an operation.
    */
   onSessionLoaded(requestId?: string): boolean {
-    const hadPendingOperation = this.pendingNewSession || this.sessionLoading;
-    if (this.pendingRequestId !== null) {
-      if (requestId === undefined || requestId !== this.pendingRequestId) return false;
-    }
+    if (!this.shouldApplySessionLoaded(requestId)) return false;
+    const hadPendingOperation = this.sessionOperation.kind !== 'idle';
+    if (!hadPendingOperation) return false;
     this.clearOpTimeout();
-    this.pendingNewSession = false;
-    this.sessionLoading = false;
-    this.pendingResync = false;
     this.error = null;
-    this.pendingUrlRevert = false;
-    this.urlParamBeforeSwitch = null;
-    this.retirePendingRequest();
-    return hadPendingOperation;
+    this.retireCurrentOperation();
+    return true;
   }
 
   switchSession(path: string): 'ok' | 'busy' | 'offline' {
-    if (this.pendingNewSession || this.sessionLoading) return 'busy';
+    if (this.sessionOperation.kind === 'creating') return 'busy';
     const requestId = this.nextRequestId();
-    this.pendingResync = false;
-    this.pendingRequestId = requestId;
-    this.pendingSwitchPath = path;
-    this.sessionLoading = true;
-    this.startOpTimeout();
+    this.clearOpTimeout();
+    this.retireCurrentOperation();
+    this.sessionOperation = {
+      kind: 'switching',
+      requestId,
+      path,
+      waiting: true,
+      urlParamBeforeSwitch: null,
+      urlRevert: false,
+    };
     const sent = this.send({ type: 'switch_session', path, requestId });
     if (!sent) {
-      this.clearOpTimeout();
-      this.sessionLoading = false;
-      this.pendingSwitchPath = null;
-      this.retirePendingRequest();
+      this.retireCurrentOperation();
       return 'offline';
     }
     // Optimistic URL update is revertible: remember the previous ?session=
     // param so a rejected switch restores it instead of leaving a dead link.
     try {
-      this.urlParamBeforeSwitch = new URL(window.location.href).searchParams.get('session');
+      this.sessionOperation = {
+        ...this.sessionOperation,
+        ...(this.sessionOperation.kind === 'switching'
+          ? {
+              urlParamBeforeSwitch: new URL(window.location.href).searchParams.get('session'),
+              urlRevert: true,
+            }
+          : {}),
+      } as SessionOperation;
     } catch {
-      this.urlParamBeforeSwitch = null;
+      if (this.sessionOperation.kind === 'switching') {
+        this.sessionOperation = { ...this.sessionOperation, urlRevert: true };
+      }
     }
-    this.pendingUrlRevert = true;
     const url = new URL(window.location.href);
     url.searchParams.set('session', path);
-    // Shallow navigation — updates the URL bar (and page.state) without
-    // navigating or re-running load. `replace` keeps a single history entry
-    // per session switch; `state` preserves the current page state (e.g. the
-    // mobile drawer marker) instead of resetting it — read untracked so
-    // effect-driven callers don't subscribe to page.state. The read is also
-    // guarded because the server/test variant of `$app/state` throws outside
-    // request context.
     let state: App.PageState = {};
     try {
       state = untrack(() => page.state);
@@ -754,68 +850,55 @@ class ProjectsState {
         /* non-fatal */
       }
     }
-    goto(url, {
-      shallow: true,
-      replace: true,
-      state: { ...state, piUiOptimisticSession: path },
-    }).catch(() => {
+    replaceState(url, { ...state, piUiOptimisticSession: path }).catch(() => {
       /* best-effort URL sync — never block session switching */
     });
+    this.startOpTimeout();
     return 'ok';
   }
 
   /** Restore the pre-switch ?session= param after a failed/rejected switch. */
   revertOptimisticSessionUrl(): void {
-    if (!this.pendingUrlRevert) return;
-    this.pendingUrlRevert = false;
+    const operation = this.sessionOperation;
+    if (operation.kind !== 'switching' || !operation.urlRevert) return;
+    this.sessionOperation = { ...operation, urlRevert: false };
     try {
       const url = new URL(window.location.href);
-      if (this.urlParamBeforeSwitch === null) url.searchParams.delete('session');
-      else url.searchParams.set('session', this.urlParamBeforeSwitch);
+      if (operation.urlParamBeforeSwitch === null) url.searchParams.delete('session');
+      else url.searchParams.set('session', operation.urlParamBeforeSwitch);
       let state: App.PageState = {};
       try {
         state = untrack(() => page.state);
       } catch {
         /* not in a browser context */
       }
-      const maybePromise = goto(url, {
-        shallow: true,
-        replace: true,
-        state: { ...state, piUiOptimisticSession: null },
-      }) as unknown;
-      if (maybePromise && typeof (maybePromise as Promise<unknown>).catch === 'function') {
-        (maybePromise as Promise<unknown>).catch(() => {});
-      }
+      replaceState(url, { ...state, piUiOptimisticSession: null }).catch(() => {});
     } catch {
-      /* no window (SSR/test env) or goto unavailable */
+      /* no window (SSR/test env) or replaceState unavailable */
     }
   }
 
   newSession(targetCwd?: string): void {
-    if (this.pendingNewSession || this.sessionLoading) return;
+    if (this.sessionOperation.kind === 'creating') return;
     const requestId = this.nextRequestId();
-    this.pendingResync = false;
-    this.pendingRequestId = requestId;
-    this.pendingNewSession = true;
-    this.sessionLoading = true;
+    this.clearOpTimeout();
+    if (this.sessionOperation.kind === 'switching') this.revertOptimisticSessionUrl();
+    this.retireCurrentOperation();
+    this.sessionOperation = { kind: 'creating', requestId, waiting: true };
     this.startOpTimeout();
     const sent = this.send(
       targetCwd ? { type: 'new_session', targetCwd, requestId } : { type: 'new_session', requestId }
     );
     if (!sent) {
       this.clearOpTimeout();
-      this.pendingNewSession = false;
-      this.sessionLoading = false;
-      this.retirePendingRequest();
+      this.retireCurrentOperation();
     }
     this.dirCompletions = [];
   }
-
   addProject(path: string): void {
     this.send({ type: 'add_project', path });
     this.dirCompletions = [];
   }
-
   removeProject(cwd: string): void {
     this.send({ type: 'remove_project', cwd });
   }
@@ -837,11 +920,11 @@ class ProjectsState {
   }
 
   renameSession(sessionId: string, name: string): void {
-    this.send({ type: 'rename_session', sessionId, name });
+    this.send({ type: 'rename_session', sessionId, name, requestId: this.nextRequestId() });
   }
 
   deleteSession(sessionId: string): void {
-    this.send({ type: 'delete_session', sessionId });
+    this.send({ type: 'delete_session', sessionId, requestId: this.nextRequestId() });
   }
 
   requestDirCompletions(prefix: string): void {

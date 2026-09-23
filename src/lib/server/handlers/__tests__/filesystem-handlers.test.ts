@@ -41,6 +41,13 @@ describe('dispatchFilesystemMessage', () => {
       autocompleteProviderFor: () => null,
       getCommandCompletions: async () => [],
       isInsideWorkspace: (path) => path === root || path.startsWith(root + sep),
+      resolveUploadTarget: (requestedSessionId, focusedSessionId) => {
+        const sessionId = requestedSessionId ?? focusedSessionId;
+        return {
+          workspaceRoot: root,
+          sessionId: sessionId === 'session-1' ? sessionId : null,
+        };
+      },
       uploadStagingDir: (workspaceRoot) => join(workspaceRoot, '.pi-ui-uploads'),
       readFile: (path) => readFile(path, 'utf8'),
       writeFile: (path, data) => writeFile(path, data),
@@ -149,38 +156,58 @@ describe('dispatchFilesystemMessage', () => {
 
   it('rejects an invalid upload and stages a valid base64 upload', async () => {
     await dispatchFilesystemMessage(
-      { type: 'upload_file', name: 'bad\0name.txt', data: 'aGVsbG8=' },
+      {
+        type: 'upload_file',
+        uploadId: 'upload-1',
+        sessionId: 'session-1',
+        name: 'bad\0name.txt',
+        data: 'aGVsbG8=',
+      },
       { send },
       dependencies
     );
     expect(JSON.parse(send.mock.calls[0][0])).toEqual({
       type: 'file_staged',
+      uploadId: 'upload-1',
       name: 'bad\0name.txt',
       path: 'bad\0name.txt',
+      sessionId: 'session-1',
       error: 'Error: Invalid filename',
     });
 
     send.mockClear();
     await dispatchFilesystemMessage(
-      { type: 'upload_file', name: 'invalid.txt', data: 'not base64' },
+      {
+        type: 'upload_file',
+        uploadId: 'upload-2',
+        name: 'invalid.txt',
+        data: 'not base64',
+      },
       { send },
       dependencies
     );
     expect(JSON.parse(send.mock.calls[0][0])).toEqual({
       type: 'file_staged',
+      uploadId: 'upload-2',
       name: 'invalid.txt',
       path: 'invalid.txt',
+      sessionId: null,
       error: 'Error: Invalid base64 data',
     });
 
     send.mockClear();
     await dispatchFilesystemMessage(
-      { type: 'upload_file', name: 'nested\\hello.txt', data: 'aGVsbG8=' },
-      { send },
+      { type: 'upload_file', uploadId: 'upload-3', name: 'nested\\hello.txt', data: 'aGVsbG8=' },
+      { send, data: { focusedSessionId: 'session-1' } },
       dependencies
     );
     const frame = JSON.parse(send.mock.calls[0][0]);
-    expect(frame).toMatchObject({ type: 'file_staged', name: 'nested\\hello.txt' });
+    expect(frame).toMatchObject({
+      type: 'file_staged',
+      uploadId: 'upload-3',
+      name: 'nested\\hello.txt',
+      sessionId: 'session-1',
+    });
     expect(frame.path).toMatch(/^\.pi-ui-uploads\/\d+-[a-f0-9]{6}-hello\.txt$/);
     expect(await readFile(join(root, frame.path), 'utf8')).toBe('hello');
   });

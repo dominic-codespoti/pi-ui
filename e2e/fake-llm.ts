@@ -15,7 +15,7 @@ const PORT = Number(process.env.FAKE_LLM_PORT || 8787);
  *  default, so a spec can hold a turn open long enough to navigate away
  *  from and back to the streaming session before it completes. */
 const SLOW_STREAM_MARKER = 'SLOW_STREAM:';
-const SLOW_STREAM_CHUNKS = 24;
+const SLOW_STREAM_CHUNKS = 64;
 const SLOW_STREAM_CHUNK_DELAY_MS = 350;
 
 const encoder = new TextEncoder();

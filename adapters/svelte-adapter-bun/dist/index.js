@@ -1,4 +1,96 @@
-// @bun
-import{readFileSync as E,writeFileSync as G}from"fs";import{fileURLToPath as N}from"url";import{rolldown as O}from"rolldown";var Q=N(new URL("./files",import.meta.url).href);function V(B={}){let{out:q="build",precompress:C=!0,envPrefix:I="",serveAssets:J=!0}=B;return{name:"svelte-adapter-bun",async adapt(j){let z=j.getBuildDirectory("adapter-bun");if(j.rimraf(q),j.rimraf(z),j.mkdirp(z),j.log.minor("Copying assets"),j.writeClient(`${q}/client${j.config.kit.paths.base}`),j.writePrerendered(`${q}/prerendered${j.config.kit.paths.base}`),C)j.log.minor("Compressing assets"),await Promise.all([j.compress(`${q}/client`),j.compress(`${q}/prerendered`)]);j.log.minor("Building server"),j.writeServer(z),G(`${z}/manifest.js`,[`export const manifest = ${j.generateManifest({relativePath:"./"})};`,`export const prerendered = new Set(${JSON.stringify(j.prerendered.paths)});`,`export const base = ${JSON.stringify(j.config.kit.paths.base)};`].join(`
+import { readFileSync, writeFileSync } from 'fs';
+import { fileURLToPath } from 'url';
+import { rolldown } from 'rolldown';
 
-`));let K=JSON.parse(E("package.json","utf-8")),D={index:`${z}/index.js`,manifest:`${z}/manifest.js`};if(j.hasServerInstrumentationFile?.())D["instrumentation.server"]=`${z}/instrumentation.server.js`;if(await(await O({input:D,external:[...Object.keys(K.dependencies||{}).map((M)=>new RegExp(`^${M}(\\/.*)?$`)),/^node:/]})).write({dir:`${q}/server`,format:"esm",sourcemap:!0,chunkFileNames:"chunks/[name]-[hash].js"}),await X(`${q}/server/index.js`),j.copy(Q,q,{replace:{ENV:"./env.js",HANDLER:"./handler.js",MANIFEST:"./server/manifest.js",SERVER:"./server/index.js",ENV_PREFIX:JSON.stringify(I),BUILD_OPTIONS:JSON.stringify({serveAssets:J})}}),j.hasServerInstrumentationFile?.())j.instrument?.({entrypoint:`${q}/index.js`,instrumentation:`${q}/server/instrumentation.server.js`,module:{exports:["path","host","port","server"]}})},supports:{read:()=>!0,instrumentation:()=>!0}}}async function X(B){let C=E(B,"utf-8").replace(/(const (.*?) = await get_hooks\(\);)/,"$1__sk_websocket_hook=$2.websocket||null;").replace(/((?:var Server = class|export class Server)\s*{)/,"let __sk_websocket_hook=null;\n$1\nwebsocket() {return __sk_websocket_hook}");G(B,C)}export{V as default};
+const files = fileURLToPath(new URL('./files', import.meta.url).href);
+
+export default function adapter(options = {}) {
+  const { out = 'build', precompress = true, envPrefix = '', serveAssets = true } = options;
+
+  return {
+    name: 'svelte-adapter-bun',
+    async adapt(builder) {
+      const adapterDirectory = builder.getBuildDirectory('adapter-bun');
+      const base = builder.config.paths?.base ?? '';
+      const appDir = builder.config.appDir ?? '_app';
+
+      builder.rimraf(out);
+      builder.rimraf(adapterDirectory);
+      builder.mkdirp(adapterDirectory);
+      builder.log.minor('Copying assets');
+      builder.writeClient(`${out}/client${base}`);
+      builder.writePrerendered(`${out}/prerendered${base}`);
+
+      if (precompress) {
+        builder.log.minor('Compressing assets');
+        await Promise.all([
+          builder.compress(`${out}/client`),
+          builder.compress(`${out}/prerendered`)
+        ]);
+      }
+
+      builder.log.minor('Building server');
+      builder.writeServer(adapterDirectory);
+      await builder.generateServerInstance(`${adapterDirectory}/instance.js`);
+      writeFileSync(
+        `${adapterDirectory}/manifest.js`,
+        [
+          `export const appDir = ${JSON.stringify(appDir)};`,
+          `export const prerendered = new Set(${JSON.stringify(builder.prerendered.paths)});`,
+          `export const base = ${JSON.stringify(base)};`
+        ].join('\n\n')
+      );
+
+      const packageJson = JSON.parse(readFileSync('package.json', 'utf-8'));
+      const entries = {
+        index: `${adapterDirectory}/index.js`,
+        instance: `${adapterDirectory}/instance.js`,
+        manifest: `${adapterDirectory}/manifest.js`
+      };
+      if (builder.hasServerInstrumentationFile?.()) {
+        entries['instrumentation.server'] = `${adapterDirectory}/instrumentation.server.js`;
+      }
+
+      await rolldown({
+        input: entries,
+        external: [
+          ...Object.keys(packageJson.dependencies || {}).map(
+            (name) => new RegExp(`^${name}(\\/.*)?$`)
+          ),
+          /^node:/
+        ]
+      }).then((bundle) =>
+        bundle.write({
+          dir: `${out}/server`,
+          format: 'esm',
+          sourcemap: true,
+          chunkFileNames: 'chunks/[name]-[hash].js'
+        })
+      );
+
+      builder.copy(files, out, {
+        replace: {
+          ENV: './env.js',
+          HANDLER: './handler.js',
+          MANIFEST: './server/manifest.js',
+          SERVER: './server/instance.js',
+          ENV_PREFIX: JSON.stringify(envPrefix),
+          BUILD_OPTIONS: JSON.stringify({ serveAssets })
+        }
+      });
+
+      if (builder.hasServerInstrumentationFile?.()) {
+        builder.instrument?.({
+          entrypoint: `${out}/index.js`,
+          instrumentation: `${out}/server/instrumentation.server.js`,
+          module: { exports: ['path', 'host', 'port', 'server'] }
+        });
+      }
+    },
+    supports: {
+      read: () => true,
+      instrumentation: () => true
+    }
+  };
+}
+

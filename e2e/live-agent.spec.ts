@@ -128,7 +128,7 @@ test.describe('Live agent', () => {
     await openSidebar();
     const backgroundRow = page
       .locator('button')
-      .filter({ has: page.getByLabel('Running in background') });
+      .filter({ has: page.getByText('Running in background', { exact: true }) });
     await expect(backgroundRow).toHaveCount(1);
     await backgroundRow.click();
     await expect(page.getByText('Session not found', { exact: false })).toHaveCount(0);

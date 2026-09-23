@@ -1,8 +1,6 @@
-import { test, expect } from './fixtures';
+import { test, expect, type MockWsHarness } from './fixtures';
 import {
   ALL_SESSIONS_LIST_PAYLOAD,
-  CONNECTED_PAYLOAD,
-  PROJECTS_LIST_PAYLOAD,
   assistantMessageEndPayload,
   assistantMessageStartPayload,
   sessionRuntimePayload,
@@ -14,12 +12,6 @@ const S1_PATH = '/home/user/project-a/s1.jsonl';
 const S2_PATH = '/home/user/project-a/s2.jsonl';
 const BACKGROUND_TEXT = 'Background-only response';
 
-const PROJECTS = {
-  ...PROJECTS_LIST_PAYLOAD,
-  projects: PROJECTS_LIST_PAYLOAD.projects.filter(
-    (project) => project.cwd === '/home/user/project-a'
-  ),
-};
 const SESSIONS = {
   ...ALL_SESSIONS_LIST_PAYLOAD,
   sessions: ALL_SESSIONS_LIST_PAYLOAD.sessions.filter(
@@ -29,21 +21,9 @@ const SESSIONS = {
 
 async function openProjectsSidebar(page: Page) {
   const search = page.locator('input[aria-label="Filter projects and sessions"]');
-  const isOpen = async () => {
-    try {
-      await search.waitFor({ state: 'attached', timeout: 300 });
-    } catch {
-      return false;
-    }
-    const box = await search.boundingBox();
-    return !!box && box.width > 0 && box.x >= -1;
-  };
-  if (await isOpen()) return;
   const toggle = page.locator('[aria-label="Toggle session panel"]');
-  for (let i = 0; i < 5; i++) {
-    if (await isOpen()) break;
+  if ((await toggle.getAttribute('aria-expanded')) !== 'true') {
     await toggle.click();
-    await page.waitForTimeout(250);
   }
   await expect(search).toBeVisible({ timeout: 3000 });
 }
@@ -82,38 +62,10 @@ function assistantHistoryMessage(text: string) {
 
 async function setupMockSession(
   page: Page,
-  mockWs: (page: Page, opts?: { autoInit?: boolean }) => Promise<void>
+  mockWs: (page: Page, opts?: { autoInit?: boolean; strict?: boolean }) => Promise<MockWsHarness>
 ) {
-  await mockWs(page, { autoInit: false });
-  const outbound: Record<string, unknown>[] = [];
-  let emit: (payload: unknown) => void = () => {
-    throw new Error('WebSocket is not connected');
-  };
-
-  await page.routeWebSocket('/ws', (ws) => {
-    emit = (payload) => ws.send(JSON.stringify(payload));
-    ws.onMessage((data) => {
-      const message = JSON.parse(String(data)) as Record<string, unknown>;
-      outbound.push(message);
-      if (message.type === 'get_projects') {
-        emit(PROJECTS);
-      } else if (message.type === 'get_all_sessions') {
-        emit(SESSIONS);
-      } else if (message.type === 'switch_session') {
-        const path = String(message.path);
-        const sessionId = path === S2_PATH ? 's2' : 's1';
-        const messages = sessionId === 's2' ? [assistantHistoryMessage(BACKGROUND_TEXT)] : [];
-        emit(sessionLoaded(sessionId, path, String(message.requestId), messages));
-        emit(sessionRuntimePayload(sessionId, { phase: 'idle' }));
-      }
-    });
-    emit({ ...CONNECTED_PAYLOAD, sessionId: 's1', sessionPath: S1_PATH, messages: [] });
-  });
-
-  return {
-    outbound,
-    emit: (payload: unknown) => emit(payload),
-  };
+  const harness = await mockWs(page, { autoInit: true });
+  return { harness };
 }
 
 test.describe('Multi-session runtime and view routing', () => {
@@ -122,7 +74,7 @@ test.describe('Multi-session runtime and view routing', () => {
     login,
     mockWs,
   }) => {
-    const { outbound, emit } = await setupMockSession(page, mockWs);
+    const { harness } = await setupMockSession(page, mockWs);
     await login(page, 'test-password');
     await openProjectsSidebar(page);
 
@@ -130,44 +82,50 @@ test.describe('Multi-session runtime and view routing', () => {
     await expect(page.getByText('Add tests')).toBeVisible({ timeout: 3000 });
 
     // The visible s1 remains idle while a runtime delta marks non-visible s2 running.
-    emit(sessionRuntimePayload('s2', { phase: 'running' }));
+    harness.send(sessionRuntimePayload('s2', { phase: 'running' }));
     const s1Row = page.getByRole('button', { name: /Bug fix/ });
     const s2Row = page.getByRole('button', { name: /Add tests/ });
-    await expect(s2Row.getByLabel('Running in background')).toBeVisible();
-    await expect(s1Row.getByLabel('Streaming')).toHaveCount(0);
+    await expect(s2Row.getByText('Running in background', { exact: true })).toHaveCount(1);
+    await expect(s1Row.getByText('Streaming', { exact: true })).toHaveCount(0);
 
     // Tool activity takes precedence over the running orb, then disappears on a delta
     // that omits activeToolName.
-    emit(sessionRuntimePayload('s2', { phase: 'running', activeToolName: 'example_tool' }));
-    await expect(s2Row.getByLabel('Running tool in background')).toBeVisible();
-    emit(sessionRuntimePayload('s2', { phase: 'running' }));
-    await expect(s2Row.getByLabel('Running tool in background')).toHaveCount(0);
-    await expect(s2Row.getByLabel('Running in background')).toBeVisible();
+    harness.send(sessionRuntimePayload('s2', { phase: 'running', activeToolName: 'example_tool' }));
+    await expect(s2Row.getByText('Running tool in background', { exact: true })).toHaveCount(1);
+    harness.send(sessionRuntimePayload('s2', { phase: 'running' }));
+    await expect(s2Row.getByText('Running tool in background', { exact: true })).toHaveCount(0);
+    await expect(s2Row.getByText('Running in background', { exact: true })).toHaveCount(1);
 
     // Awaiting input exposes the attention affordance, while a later idle delta
     // records an unread result for the still-background session.
-    emit(sessionRuntimePayload('s2', { phase: 'awaiting-input', needsAttention: true }));
-    await expect(s2Row.getByLabel('Session needs attention')).toBeVisible();
-    emit(sessionRuntimePayload('s2', { phase: 'idle', unread: true }));
-    await expect(s2Row.getByLabel('Unchecked result')).toBeVisible();
+    harness.send(sessionRuntimePayload('s2', { phase: 'awaiting-input', needsAttention: true }));
+    await expect(s2Row.getByText('Session needs attention', { exact: true })).toHaveCount(1);
+    harness.send(sessionRuntimePayload('s2', { phase: 'idle', unread: true }));
+    await expect(s2Row.getByText('Unchecked result', { exact: true })).toHaveCount(1);
 
     // Streaming events stamped for s2 must not leak into the visible s1 view.
-    emit({ ...assistantMessageStartPayload(), sessionId: 's2' });
-    emit({ ...textDeltaPayload(BACKGROUND_TEXT), sessionId: 's2' });
-    emit({ ...assistantMessageEndPayload(), sessionId: 's2' });
-    emit({ type: 'agent_end', sessionId: 's2', willRetry: false });
+    harness.send({ ...assistantMessageStartPayload(), sessionId: 's2' });
+    harness.send({ ...textDeltaPayload(BACKGROUND_TEXT), sessionId: 's2' });
+    harness.send({ ...assistantMessageEndPayload(), sessionId: 's2' });
+    harness.send({ type: 'agent_end', sessionId: 's2', willRetry: false });
     await expect(page.getByText(BACKGROUND_TEXT)).toHaveCount(0);
 
     // Switching answers with s2's snapshot, clears its unread marker, and must
     // announce the newly focused session on the wire.
     await s2Row.click();
+    const switchMessage = await harness.waitForMessage(
+      'switch_session',
+      (message) => message.path === S2_PATH
+    );
+    harness.send(
+      sessionLoaded('s2', S2_PATH, String(switchMessage.requestId), [
+        assistantHistoryMessage(BACKGROUND_TEXT),
+      ])
+    );
+    harness.send(sessionRuntimePayload('s2', { phase: 'idle' }));
     await expect(page.getByText(BACKGROUND_TEXT)).toBeVisible({ timeout: 3000 });
-    await expect(s2Row.getByLabel('Unchecked result')).toHaveCount(0);
-    await expect
-      .poll(() =>
-        outbound.some((message) => message.type === 'session_focus' && message.sessionId === 's2')
-      )
-      .toBe(true);
+    await expect(s2Row.getByText('Unchecked result', { exact: true })).toHaveCount(0);
+    await harness.waitForMessage('session_focus', (message) => message.sessionId === 's2');
   });
 
   test('keeps runtime status live while applying meaningful session summary changes', async ({
@@ -175,19 +133,19 @@ test.describe('Multi-session runtime and view routing', () => {
     login,
     mockWs,
   }) => {
-    const { emit } = await setupMockSession(page, mockWs);
+    const { harness } = await setupMockSession(page, mockWs);
     await login(page, 'test-password');
     await openProjectsSidebar(page);
 
     const s2Row = page.getByRole('button', { name: /Add tests/ });
     await expect(s2Row).toBeVisible({ timeout: 3000 });
 
-    emit(sessionRuntimePayload('s2', { phase: 'running' }));
-    await expect(s2Row.getByLabel('Running in background')).toBeVisible();
+    harness.send(sessionRuntimePayload('s2', { phase: 'running' }));
+    await expect(s2Row.getByText('Running in background', { exact: true })).toHaveCount(1);
 
     const s2 = SESSIONS.sessions.find((session) => session.id === 's2');
     if (!s2) throw new Error('Missing s2 test session');
-    emit({
+    harness.send({
       type: 'session_updated',
       session: {
         ...s2,
@@ -198,5 +156,37 @@ test.describe('Multi-session runtime and view routing', () => {
     });
     await expect(page.getByText('Renamed background task')).toBeVisible();
     await expect(page.getByRole('button', { name: /Renamed background task/ })).toHaveCount(1);
+  });
+  test('ignores a stale foreign snapshot after a correlated switch', async ({
+    page,
+    login,
+    mockWs,
+  }) => {
+    const { harness } = await setupMockSession(page, mockWs);
+    await login(page, 'test-password');
+    await openProjectsSidebar(page);
+
+    const s2Row = page.getByRole('button', { name: /Add tests/ });
+    await expect(s2Row).toBeVisible({ timeout: 3000 });
+    await s2Row.click();
+    const switchMessage = await harness.waitForMessage(
+      'switch_session',
+      (message) => message.path === S2_PATH
+    );
+    const requestId = String(switchMessage.requestId);
+    harness.send(
+      sessionLoaded('s2', S2_PATH, requestId, [assistantHistoryMessage('Active transcript')])
+    );
+    await expect(page.getByText('Active transcript')).toBeVisible({ timeout: 3000 });
+    await expect(page).toHaveURL(/session=%2Fhome%2Fuser%2Fproject-a%2Fs2\.jsonl/);
+
+    harness.send(
+      sessionLoaded('s1', S1_PATH, 'stale-foreign-request', [
+        assistantHistoryMessage('Stale foreign transcript'),
+      ])
+    );
+    await expect(page).toHaveURL(/session=%2Fhome%2Fuser%2Fproject-a%2Fs2\.jsonl/);
+    await expect(page.getByText('Active transcript')).toBeVisible();
+    await expect(page.getByText('Stale foreign transcript')).toHaveCount(0);
   });
 });

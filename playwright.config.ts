@@ -1,5 +1,19 @@
 import { defineConfig, devices } from '@playwright/test';
 
+// Reuse is an explicit opt-in: trusting a caller-owned server identity is
+// useful locally, while the default prevents silently testing a port occupant.
+const reuseExistingServer = process.env.PI_UI_E2E_REUSE_SERVER === '1';
+
+const configuredPort = process.env.PI_UI_E2E_PORT ?? '3000';
+if (!/^\d+$/.test(configuredPort)) {
+  throw new Error('PI_UI_E2E_PORT must be a TCP port number between 1 and 65535');
+}
+const port = Number(configuredPort);
+if (!Number.isInteger(port) || port < 1 || port > 65535) {
+  throw new Error('PI_UI_E2E_PORT must be a TCP port number between 1 and 65535');
+}
+const appUrl = `http://127.0.0.1:${port}`;
+
 export default defineConfig({
   testDir: './e2e',
   globalSetup: './e2e/global-setup.ts',
@@ -15,7 +29,7 @@ export default defineConfig({
   // serially through playwright.live.config.ts (`bun run test:e2e` chains it).
   testIgnore: ['e2e/live-agent.spec.ts', 'e2e/live-widget.spec.ts'],
   use: {
-    baseURL: 'http://127.0.0.1:3000',
+    baseURL: appUrl,
     trace: process.env.CI ? 'on-first-retry' : 'off',
     screenshot: process.env.CI ? 'only-on-failure' : 'off',
   },
@@ -35,7 +49,7 @@ export default defineConfig({
       // this instead of a paid provider. See e2e/fake-llm.ts.
       command: 'bun e2e/fake-llm.ts',
       url: 'http://127.0.0.1:8787/health',
-      reuseExistingServer: true,
+      reuseExistingServer,
       timeout: 30_000,
     },
     {
@@ -46,10 +60,9 @@ export default defineConfig({
       // e2e/global-setup.ts: a fake-model-only agent dir (no leftover
       // sessions) and an empty working dir (no trust gate, no project
       // extensions). Live-agent specs never touch real ~/.pi state.
-      command:
-        'mkdir -p /tmp/pi-ui-e2e-workspace /tmp/pi-ui-e2e-agent && bun scripts/maybe-build.ts && PI_PASSWORD=test-password PI_UI_JWT_SECRET=test-e2e-jwt-secret-0123456789abcdef PI_CODING_AGENT_DIR=/tmp/pi-ui-e2e-agent PI_CWD=/tmp/pi-ui-e2e-workspace PORT=3000 bun run start',
-      url: 'http://127.0.0.1:3000',
-      reuseExistingServer: !process.env.CI,
+      command: `mkdir -p /tmp/pi-ui-e2e-workspace /tmp/pi-ui-e2e-agent && bun scripts/maybe-build.ts && PI_PASSWORD=test-password PI_UI_JWT_SECRET=test-e2e-jwt-secret-0123456789abcdef PI_CODING_AGENT_DIR=/tmp/pi-ui-e2e-agent PI_CWD=/tmp/pi-ui-e2e-workspace PORT=${port} bun run start`,
+      url: appUrl,
+      reuseExistingServer,
       timeout: 120_000,
       cwd: '.',
     },

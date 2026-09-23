@@ -1,6 +1,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 // Vitest resolves SvelteKit's navigation module through its server condition.
-vi.mock('$app/navigation', () => ({ goto: vi.fn(() => Promise.resolve()) }));
+vi.mock('$app/navigation', () => ({
+  goto: vi.fn(() => Promise.resolve()),
+  replaceState: vi.fn(() => Promise.resolve()),
+}));
 import type { SessionSummary } from '#lib/ws/protocol.js';
 import {
   buildSessionRows,
@@ -141,13 +144,10 @@ describe('ProjectsState', () => {
     projectsState.allSessions = [];
     projectsState.cwd = '';
     projectsState.activeSessionId = null;
-    projectsState.isStreaming = false;
-    projectsState.activeToolName = undefined;
     projectsState.runtime.clear();
     projectsState.filter = '';
     projectsState.error = null;
-    projectsState.pendingNewSession = false;
-    projectsState.sessionLoading = false;
+    projectsState.cancelPendingOps();
     projectsState.dirCompletions = [];
     projectsState.collapsed.clear();
     projectsState.expandedGroups.clear();
@@ -437,17 +437,19 @@ describe('ProjectsState', () => {
       expect(projectsState.allSessions).toHaveLength(1);
     });
 
-    it('handles sessions_error', () => {
-      projectsState.sessionLoading = true;
-      projectsState.pendingNewSession = true;
-      projectsState.handleMessage({ type: 'sessions_error', message: 'oops' } as {
-        type: string;
-      } & Record<string, unknown>);
+    it('handles a matching sessions_error', () => {
+      const send = vi.fn().mockReturnValue(true);
+      projectsState.send = send;
+      projectsState.newSession();
+      const requestId = projectsState.pendingRequestId;
+      projectsState.handleMessage({
+        type: 'sessions_error',
+        message: 'oops',
+        requestId,
+      } as { type: string } & Record<string, unknown>);
       expect(projectsState.error).toBe('oops');
-      expect(projectsState.pendingNewSession).toBe(false);
-      expect(projectsState.sessionLoading).toBe(false);
+      expect(projectsState.sessionOperation.kind).toBe('idle');
     });
-
     it('handles dir_completions', () => {
       projectsState.handleMessage({ type: 'dir_completions', entries: ['/a/', '/b/'] } as {
         type: string;
@@ -601,14 +603,26 @@ describe('ProjectsState', () => {
       expect(projectsState.groups[0].sessions.map((r) => r.session.id)).toEqual(['older', 'newer']);
     });
 
-    it('keeps the list fresh-guarded after a full list arrives', () => {
+    it('retries the missing project list when only sessions are fresh', () => {
       const send = vi.fn().mockReturnValue(true);
       projectsState.send = send;
       projectsState.handleMessage({ type: 'all_sessions_list', sessions: [{ id: 's1' }] } as {
         type: string;
       } & Record<string, unknown>);
-      projectsState.refresh(); // fresh — must not re-request
-      expect(send).not.toHaveBeenCalled();
+      projectsState.refresh();
+      expect(send).toHaveBeenCalledWith({ type: 'get_projects' });
+      expect(send).not.toHaveBeenCalledWith({ type: 'get_all_sessions' });
+    });
+
+    it('retries the missing session list when only projects are fresh', () => {
+      const send = vi.fn().mockReturnValue(true);
+      projectsState.send = send;
+      projectsState.handleMessage({ type: 'projects_list', projects: [{ cwd: '/p' }] } as {
+        type: string;
+      } & Record<string, unknown>);
+      projectsState.refresh();
+      expect(send).toHaveBeenCalledWith({ type: 'get_all_sessions' });
+      expect(send).not.toHaveBeenCalledWith({ type: 'get_projects' });
     });
 
     it('refresh() skips when fresh and has data, force bypasses', () => {
@@ -718,6 +732,7 @@ describe('ProjectsState', () => {
         type: 'rename_session',
         sessionId: 'session-2',
         name: 'New Name',
+        requestId: expect.any(String),
       });
     });
 
@@ -725,7 +740,11 @@ describe('ProjectsState', () => {
       const send = vi.fn().mockReturnValue(true);
       projectsState.send = send;
       projectsState.deleteSession('session-2');
-      expect(send).toHaveBeenCalledWith({ type: 'delete_session', sessionId: 'session-2' });
+      expect(send).toHaveBeenCalledWith({
+        type: 'delete_session',
+        sessionId: 'session-2',
+        requestId: expect.any(String),
+      });
     });
 
     it('uses distinct IDs for pooled sessions that share a path', () => {
@@ -742,15 +761,16 @@ describe('ProjectsState', () => {
       projectsState.send = send;
       projectsState.renameSession(pooledSessions[1].id, 'Only second');
       projectsState.deleteSession(pooledSessions[0].id);
-
       expect(send).toHaveBeenNthCalledWith(1, {
         type: 'rename_session',
         sessionId: 'mem-2',
         name: 'Only second',
+        requestId: expect.any(String),
       });
       expect(send).toHaveBeenNthCalledWith(2, {
         type: 'delete_session',
         sessionId: 'mem-1',
+        requestId: expect.any(String),
       });
     });
 
@@ -768,6 +788,7 @@ describe('ProjectsState', () => {
       projectsState.send = vi.fn().mockReturnValue(true);
       expect(projectsState.switchSession('/s2')).toBe('ok');
       expect(projectsState.pendingSwitchPath).toBe('/s2');
+      expect(projectsState.shouldApplySessionLoaded()).toBe(false);
       expect(projectsState.onSessionLoaded()).toBe(false);
       expect(projectsState.sessionLoading).toBe(true);
     });
@@ -787,6 +808,32 @@ describe('ProjectsState', () => {
       expect(projectsState.onSessionLoaded(requestId)).toBe(true);
       expect(projectsState.pendingRequestId).toBeNull();
     });
+    it('superseded switch responses cannot settle the newer operation', () => {
+      const send = vi.fn().mockReturnValue(true);
+      projectsState.send = send;
+      projectsState.switchSession('/first');
+      const firstRequestId = send.mock.calls[0][0].requestId as string;
+      projectsState.switchSession('/second');
+      const secondRequestId = send.mock.calls[1][0].requestId as string;
+      expect(projectsState.onSessionLoaded(firstRequestId)).toBe(false);
+      expect(projectsState.pendingRequestId).toBe(secondRequestId);
+      expect(projectsState.onSessionLoaded(secondRequestId)).toBe(true);
+    });
+
+    it('a timed-out new-session resync cannot overwrite a newer switch', () => {
+      vi.useFakeTimers();
+      const send = vi.fn().mockReturnValue(true);
+      projectsState.send = send;
+      projectsState.newSession();
+      vi.advanceTimersByTime(SESSION_OP_TIMEOUT_MS + 1);
+      const resyncRequestId = projectsState.pendingRequestId;
+      expect(resyncRequestId).toEqual(expect.any(String));
+      projectsState.switchSession('/newer');
+      const switchRequestId = projectsState.pendingRequestId;
+      expect(switchRequestId).not.toBe(resyncRequestId);
+      expect(projectsState.onSessionLoaded(resyncRequestId ?? undefined)).toBe(false);
+      expect(projectsState.pendingRequestId).toBe(switchRequestId);
+    });
 
     it('clears optimistic URL rollback after a confirmed session load', () => {
       projectsState.send = vi.fn().mockReturnValue(true);
@@ -798,15 +845,21 @@ describe('ProjectsState', () => {
       expect(projectsState.pendingUrlRevert).toBe(false);
     });
 
-    it('newSession arms a watchdog that re-enables the UI when unanswered', () => {
+    it('newSession timeout enters a correlated resync operation', () => {
       vi.useFakeTimers();
-      projectsState.send = vi.fn().mockReturnValue(true);
+      const send = vi.fn().mockReturnValue(true);
+      projectsState.send = send;
       projectsState.newSession();
       expect(projectsState.pendingNewSession).toBe(true);
       expect(projectsState.sessionLoading).toBe(true);
       vi.advanceTimersByTime(SESSION_OP_TIMEOUT_MS + 1);
       expect(projectsState.pendingNewSession).toBe(false);
       expect(projectsState.sessionLoading).toBe(false);
+      expect(projectsState.pendingResync).toBe(true);
+      expect(projectsState.sessionOperation.kind).toBe('resyncing');
+      expect(send).toHaveBeenLastCalledWith(
+        expect.objectContaining({ type: 'resync_session', requestId: expect.any(String) })
+      );
       expect(projectsState.error).toBe('New chat timed out — server did not respond in time');
     });
     it('watchdog is cancelled by session_loaded', () => {
@@ -822,14 +875,24 @@ describe('ProjectsState', () => {
       expect(projectsState.error).toBeNull();
     });
 
-    it('switchSession arms the same watchdog', () => {
+    it('switchSession timeout un-sticks the UI but keeps honoring a late reply', () => {
       vi.useFakeTimers();
       projectsState.send = vi.fn().mockReturnValue(true);
       projectsState.switchSession('/s1');
+      const requestId = projectsState.pendingRequestId;
+      expect(requestId).toEqual(expect.any(String));
       expect(projectsState.sessionLoading).toBe(true);
       vi.advanceTimersByTime(SESSION_OP_TIMEOUT_MS + 1);
+      // UI unblocks so the sidebar/composer are usable again...
       expect(projectsState.sessionLoading).toBe(false);
-      expect(projectsState.error).toBe('Session switch timed out');
+      expect(projectsState.error).toBeTruthy();
+      // ...but the request is not discarded: the server may still answer it.
+      expect(projectsState.pendingRequestId).toBe(requestId);
+      expect(projectsState.isRetiredRequest(requestId ?? '')).toBe(false);
+      // A late reply for that exact request is still honored, not dropped.
+      expect(projectsState.onSessionLoaded(requestId ?? undefined)).toBeDefined();
+      expect(projectsState.error).toBeNull();
+      expect(projectsState.pendingRequestId).toBeNull();
     });
 
     it('sessions_error cancels the watchdog', () => {
@@ -872,6 +935,21 @@ describe('ProjectsState', () => {
       expect(projectsState.activeSessionId).toBe('active');
       expect(projectsState.isStreaming).toBe(false);
       expect(projectsState.activeToolName).toBeUndefined();
+    });
+
+    it('routes compatibility writes through the active runtime record', () => {
+      projectsState.reconcileActiveRuntime('active', true, 'bash');
+
+      projectsState.isStreaming = false;
+      projectsState.activeToolName = 'grep';
+
+      expect(projectsState.runtime.get('active')).toMatchObject({
+        isRunning: false,
+        phase: 'idle',
+        activeToolName: 'grep',
+      });
+      expect(projectsState.isStreaming).toBe(false);
+      expect(projectsState.activeToolName).toBe('grep');
     });
     it('upserts runtime snapshots by session id', () => {
       const first = mkRuntime('s1', { phase: 'running', isRunning: true, lastActivity: 10 });

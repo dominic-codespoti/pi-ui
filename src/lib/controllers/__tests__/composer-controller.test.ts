@@ -98,6 +98,63 @@ describe('ComposerController', () => {
     ]);
     expect(result.notices.map(({ level }) => level)).toEqual(['warning', 'warning', 'warning']);
   });
+  it('discards image and text completions that finish after a session transition', async () => {
+    let resolveImage!: (value: { data: string; mimeType: string }) => void;
+    let resolveText!: (value: string) => void;
+    const controller = new ComposerController({
+      prepareImage: () =>
+        new Promise((resolve) => {
+          resolveImage = resolve;
+        }),
+      fileToText: () =>
+        new Promise((resolve) => {
+          resolveText = resolve;
+        }),
+    });
+    controller.updateContext(context());
+    const imageResult = controller.processAttachmentFiles([file('old.png', 'image/png')]);
+    const textResult = controller.processAttachmentFiles([file('old.md', 'text/markdown')]);
+
+    controller.updateContext(context({ sessionId: 'session-2' }));
+    resolveImage({ data: 'late', mimeType: 'image/png' });
+    resolveText('late text');
+
+    await expect(imageResult).resolves.toEqual({
+      accepted: [],
+      rejected: [],
+      unsupported: [],
+      notices: [],
+    });
+    await expect(textResult).resolves.toEqual({
+      accepted: [],
+      rejected: [],
+      unsupported: [],
+      notices: [],
+    });
+    expect(controller.current).toEqual({ input: '', attachedImages: [], attachedFiles: [] });
+  });
+  it('invalidates attachment work as soon as a new-session transition begins', async () => {
+    let resolveText!: (value: string) => void;
+    const controller = new ComposerController({
+      fileToText: () =>
+        new Promise((resolve) => {
+          resolveText = resolve;
+        }),
+    });
+    controller.updateContext(context());
+    const result = controller.processAttachmentFiles([file('old.md', 'text/markdown')]);
+
+    controller.updateContext(context({ pendingNewSession: true }));
+    resolveText('stale');
+
+    await expect(result).resolves.toEqual({
+      accepted: [],
+      rejected: [],
+      unsupported: [],
+      notices: [],
+    });
+    expect(controller.current.attachedFiles).toEqual([]);
+  });
 
   it('removes individual image and file attachments independently and clears both collections', async () => {
     const controller = new ComposerController({

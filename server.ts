@@ -63,6 +63,7 @@ import {
   setLastSession,
   updateSettings,
 } from './src/lib/server/ui-settings.ts';
+import { BUNDLED_SKILL_NAME, bundledSkillPaths } from './src/lib/server/bundled-resources.ts';
 import { log } from './src/lib/server/logger.ts';
 import { terminalInputRegistry } from './src/lib/server/terminal-input.ts';
 import { boundMessagesForWire } from './src/lib/server/wire-messages.ts';
@@ -77,6 +78,11 @@ import {
   createWebSocketTransport,
   type WSData,
 } from './src/lib/server/runtime/websocket-transport.ts';
+import {
+  createSessionOperationGate,
+  type SessionOperationGate,
+  type SessionOperationToken,
+} from './src/lib/server/runtime/session-operation-gate.ts';
 import {
   dispatchSystemMessage,
   type SystemHandlerDependencies,
@@ -110,12 +116,15 @@ import { SessionCatalog } from './src/lib/server/session-catalog.ts';
 import { startSessionWatch } from './src/lib/server/session-watcher.ts';
 import {
   EXTENSION_UI_SCHEMA_VERSION,
+  type ServerCustomEvent,
+  type PiEvent,
   type ServerMessage,
   type ModelInfo,
   type ProviderInfo,
   type SkillSummary,
   type PromptSummary,
   type ExtensionSummary,
+  type ExtensionErrorNotice,
   type ProjectTrustInfo,
   type ProjectTrustDecision,
   type RuntimeDiagnostic,
@@ -134,6 +143,7 @@ import {
   boundTerminalLines,
   boundedAnsiToHtmlLines,
   boundParsedComponentTree,
+  CUSTOM_DIALOG_REFRESH_MS,
   callFactoryAndParse,
   customEntriesForWire,
   parseComponentTree,
@@ -147,12 +157,17 @@ import {
   renderToolCallHtml,
   renderToolResultHtml,
   renderCustomMessage,
+  WIDGET_REFRESH_MS,
   renderCustomMessagesForWire,
   type ParsedComponent,
 } from './src/lib/tui-stubs.ts';
 import ownPkgJson from './package.json' with { type: 'json' };
 
 const APP_ROOT = dirname(fileURLToPath(import.meta.url));
+const BUNDLED_SKILL_PATHS = bundledSkillPaths(APP_ROOT);
+if (BUNDLED_SKILL_PATHS.length === 0) {
+  log.warn(`[pifrontier] Bundled skill '${BUNDLED_SKILL_NAME}' is missing.`);
+}
 
 /** pi-ui version baked in at startup. */
 const UI_VERSION: string = (ownPkgJson as { version: string }).version;
@@ -368,11 +383,12 @@ function activeCwd(): string {
 }
 
 /**
- * True when an already-resolved absolute path is inside the ACTIVE project
- * root (the current session's cwd). Separator-suffixed comparison prevents
- * sibling-prefix bypasses (e.g. `/home/x/proj-evil` matching `/home/x/proj`).
+ * True when an already-resolved absolute path is inside the supplied project
+ * root (or the active session's cwd when omitted). Separator-suffixed
+ * comparison prevents sibling-prefix bypasses (e.g. `/home/x/proj-evil`
+ * matching `/home/x/proj`).
  */
-function isInsideWorkspace(resolvedPath: string): boolean {
+function isInsideWorkspace(resolvedPath: string, workspaceRoot = activeCwd()): boolean {
   // Resolve symlinks so a symlink inside the workspace pointing outside is caught.
   let realPath: string;
   try {
@@ -385,7 +401,7 @@ function isInsideWorkspace(resolvedPath: string): boolean {
       realPath = resolve(resolvedPath);
     }
   }
-  const root = resolve(activeCwd());
+  const root = resolve(workspaceRoot);
   const realRoot = realpathSync(root);
   return realPath === realRoot || realPath.startsWith(realRoot + sep);
 }
@@ -940,7 +956,12 @@ function refreshSessionSummary(sess: AgentSession): void {
   sessionCatalog.apply({ kind: 'upsert', session: liveSummary(sess, entry) });
 }
 
-type WireExtensionCommand = { name: string; description?: string; source: string };
+type WireExtensionCommand = {
+  name: string;
+  description?: string;
+  source: string;
+  hasArgumentCompletions?: boolean;
+};
 
 /** Read the already-bound session command catalog without reloading resources. */
 function extensionCommandsFor(sess: AgentSession): WireExtensionCommand[] {
@@ -948,6 +969,7 @@ function extensionCommandsFor(sess: AgentSession): WireExtensionCommand[] {
     name: command.invocationName || command.name,
     description: command.description,
     source: command.sourceInfo.source,
+    hasArgumentCompletions: typeof command.getArgumentCompletions === 'function',
   }));
 }
 
@@ -1007,11 +1029,15 @@ function flattenParsedText(parsed: ParsedComponent | null): string {
   return '';
 }
 
-// Broadcast is supplied by the live Bun server after startup; extension runtime
-// state remains independent of the server transport.
-let broadcast: (payload: ServerMessage) => void = () => {};
+// Application broadcasts are typed against the explicit custom-event union.
+// SDK forwarding uses broadcastSdk and keeps its deliberate loose fallback.
+let broadcast: (payload: ServerCustomEvent) => void = () => {};
+let broadcastSdk: (payload: PiEvent) => void = () => {};
+let broadcastAny: (payload: ServerMessage) => void = () => {};
 const extensionRuntime = new ExtensionRuntime({
-  broadcast: (payload) => broadcast(payload),
+  // Extension UI requests intentionally retain their open SDK-compatible
+  // payload shape; all server-authored catalog/control frames use broadcast.
+  broadcast: (payload) => broadcastAny(payload),
   scheduleSessionRuntimeBroadcast: (sid) => scheduleSessionRuntimeBroadcast(sid),
   activeSessionId: () => activeSessionId(),
   terminalInput: terminalInputRegistry,
@@ -1043,6 +1069,7 @@ function flushInteractiveRender(id: string): void {
   extensionRuntime.flushInteractiveRender(id, (component) => renderTerminalLines(component));
 }
 
+// Behavior changes here must be reflected in src/lib/extension-ui-capabilities/catalog.ts; then run `bun run generate:skill`.
 type ServerExtensionUIContext = Omit<
   ExtensionUIContext,
   | 'getEditorText'
@@ -1279,7 +1306,7 @@ const uiContext: ServerExtensionUIContext = {
 
             // Poll render every 200ms as a safety net for updates that do not
             // trigger requestRender() or a terminal resize.
-            const pollId = setInterval(() => flushInteractiveRender(id), 200);
+            const pollId = setInterval(() => flushInteractiveRender(id), CUSTOM_DIALOG_REFRESH_MS);
             extensionRuntime.setInteractiveRenderInterval(id, pollId, owner);
 
             const rawLines = tui.render();
@@ -1343,7 +1370,7 @@ const uiContext: ServerExtensionUIContext = {
               } catch {
                 /* component may be disposed */
               }
-            }, 200);
+            }, CUSTOM_DIALOG_REFRESH_MS);
             ui.activeCustomDialogs.set(id, {
               root: component,
               nodeMap,
@@ -1569,7 +1596,7 @@ const uiContext: ServerExtensionUIContext = {
       ui.widgets.set(key, entry);
       tickWidgetFactory(key, owner);
       if (owner === activeSessionId() && ui.widgets.get(key) === entry) {
-        factory.intervalId = setInterval(() => tickWidgetFactory(key, owner), 250);
+        factory.intervalId = setInterval(() => tickWidgetFactory(key, owner), WIDGET_REFRESH_MS);
       }
     }
   },
@@ -1711,14 +1738,13 @@ const uiContext: ServerExtensionUIContext = {
     return undefined;
   },
 
-  // TUI-only stubs — no meaningful web equivalent
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  theme: undefined as any,
+  // Web extensions receive the same ANSI-capable theme stub used by widget factories.
+  theme: stubTheme as unknown as ExtensionUIContext['theme'],
   getAllThemes() {
     return [];
   },
   getTheme() {
-    return undefined;
+    return stubTheme as unknown as ExtensionUIContext['theme'];
   },
   setTheme() {
     return { success: true };
@@ -1902,10 +1928,10 @@ function tickWidgetFactory(key: string, owner: string | null): void {
       ...stampOwner(owner),
       ...payload,
     });
-  } catch {
+  } catch (err) {
     entry.failures++;
     if (entry.failures >= 5) {
-      log.warn(`[pifrontier] Widget factory '${key}' failed 5 times — tearing down`);
+      log.warn(`[pifrontier] Widget factory '${key}' failed 5 times — tearing down`, err);
       teardownWidget(key, owner);
     }
   }
@@ -2025,6 +2051,8 @@ interface ManagedSession extends ResidentEntry {
   hostBound: boolean;
   /** True while asynchronous extension binding is in flight. */
   bindingPending: boolean;
+  /** Shared promise for the in-flight extension host bind, if any. */
+  bindingPromise?: Promise<void>;
   /** Whether an extension/resource reload is waiting for the session to go idle. */
   pendingReload: boolean;
   /** Cached first user/assistant text for O(1) session-list updates. */
@@ -2282,6 +2310,29 @@ function disposeSession(sid: string, reason: string): void {
 
 // Promise lock — prevents concurrent first-connection races from creating duplicate sessions.
 let _sessionInitPromise: Promise<AgentSession> | null = null;
+/**
+ * Dedupe concurrent `switch_session` resumes of the same on-disk session.
+ * `SessionManager.open()` + `createSdkSession()` (full history parse,
+ * extension load) is the expensive part of a cold switch — tens of seconds
+ * is routine on a large history. Without this, a reclick (or a boot-resume
+ * racing a manual click) after a client-side timeout starts a second,
+ * fully redundant parse of the same file instead of joining the one
+ * already in flight.
+ */
+const pendingResumeByPath = new Map<string, Promise<CreatedSdkSession>>();
+
+const disposedColdSessions = new WeakSet<object>();
+
+function disposeCreatedSession(created: CreatedSdkSession, reason: string): void {
+  const session = created.session as unknown as object;
+  if (disposedColdSessions.has(session)) return;
+  disposedColdSessions.add(session);
+  try {
+    created.session.dispose();
+  } catch (err) {
+    log.error(`[pifrontier] Failed to dispose ${reason} session:`, err);
+  }
+}
 
 async function invokeRun(
   entry: ManagedSession,
@@ -2542,6 +2593,7 @@ async function createSdkSession(
     cwd: targetCwd,
     agentDir: sdk.getAgentDir(),
     extensionFlagValues: extensionFlagValuesFor(),
+    resourceLoaderOptions: { additionalSkillPaths: BUNDLED_SKILL_PATHS },
     resourceLoaderReloadOptions: {
       resolveProjectTrust: async () => resolveProjectTrust(targetCwd, settingsManager),
     },
@@ -2614,19 +2666,32 @@ async function activateResidentSession(
     send(data: string): unknown;
     publish(topic: string, data: string): unknown;
   },
-  onActivated?: (session: AgentSession) => Promise<void> | void
+  onActivated?: (session: AgentSession) => Promise<void> | void,
+  selectionIntentCurrent?: () => boolean
 ): Promise<boolean> {
   const sid = entry.session.sessionId;
-  return residentStore.withActivationPin(sid, () =>
-    residentStore.withSessionLock(sid, async () => {
-      if (residentStore.get(sid) !== entry) return false;
+  return residentStore.withActivationPin(sid, async () => {
+    let activated = false;
+    await residentStore.withGlobalLock(async () => {
+      if (residentStore.get(sid) !== entry) return;
+      if (selectionIntentCurrent && !selectionIntentCurrent()) return;
       entry.unread = false;
       broadcastSessionRuntime(sid, entry);
-      await setActiveSession(entry.session, entry.cwd, undefined, requestId, true, requester);
-      await onActivated?.(entry.session);
-      return true;
-    })
-  );
+      await setActiveSession(
+        entry.session,
+        entry.cwd,
+        undefined,
+        requestId,
+        true,
+        requester,
+        selectionIntentCurrent
+      );
+      activated = true;
+    });
+    if (!activated) return false;
+    await onActivated?.(entry.session);
+    return true;
+  });
 }
 
 function commandContextActionsFor(
@@ -2737,32 +2802,39 @@ async function bindRpcHost(session: AgentSession): Promise<void> {
     },
     shutdownHandler: () => requestExtensionShutdown(sid),
     onError: (error: ExtensionError) => {
-      broadcast({ type: 'extension_error', error, ...stampOwner(sid) });
+      const raw = error as unknown as Record<string, unknown>;
+      const notice: ExtensionErrorNotice = {
+        extensionPath: typeof raw.extensionPath === 'string' ? raw.extensionPath : '',
+        event: typeof raw.event === 'string' ? raw.event : 'unknown',
+        error: typeof raw.error === 'string' ? raw.error : String(raw.error ?? error),
+        ...(typeof raw.stack === 'string' ? { stack: raw.stack } : {}),
+      };
+      broadcast({ type: 'extension_error', error: notice, ...stampOwner(sid) });
       uiContext.diagnostic(
-        error.error,
+        notice.error,
         'error',
-        error.stack,
-        `${error.extensionPath}:${error.event}`,
+        notice.stack,
+        `${notice.extensionPath}:${notice.event}`,
         sid
       );
     },
   });
 }
 /** Start extension binding without making session creation wait. */
-function startHostBinding(sid: string, session: AgentSession): void {
+function startHostBinding(sid: string, session: AgentSession): Promise<void> {
   const entry = residentStore.get(sid);
-  if (!entry || entry.hostBound || entry.bindingPending) return;
+  if (!entry || entry.session !== session || entry.hostBound) return Promise.resolve();
+  if (entry.bindingPromise) return entry.bindingPromise;
+
   entry.bindingPending = true;
   const startedAt = Date.now();
-  void bindRpcHost(session)
+  const bindingPromise: Promise<void> = bindRpcHost(session)
     .then(() => {
       if (residentStore.get(sid)?.session !== session) return;
       entry.bindingPending = false;
       entry.hostBound = true;
       log.info(`[pifrontier] bindRpcHost ${sid} done in ${Date.now() - startedAt}ms`);
-      if (wsTransport.connectedClients === 0) {
-        return;
-      }
+      if (wsTransport.connectedClients === 0) return;
       broadcast({ type: 'tools_list', ...toolsPayloadFor(session), ...stampOwner(sid) });
       broadcast({
         type: 'commands_list',
@@ -2778,7 +2850,13 @@ function startHostBinding(sid: string, session: AgentSession): void {
     .catch((err) => {
       if (residentStore.get(sid)?.session === session) entry.bindingPending = false;
       log.error(`[pifrontier] bindRpcHost for ${sid} failed:`, err);
+      throw err;
+    })
+    .finally(() => {
+      if (entry.bindingPromise === bindingPromise) entry.bindingPromise = undefined;
     });
+  entry.bindingPromise = bindingPromise;
+  return bindingPromise;
 }
 
 async function reloadSessionHost(
@@ -2797,6 +2875,8 @@ async function reloadSessionHost(
     entry.pendingReload = true;
     return 'deferred';
   }
+  if (entry.bindingPromise) await entry.bindingPromise;
+  if (residentStore.get(sid) !== entry) return 'applied';
   entry.pendingReload = false;
   clearTimeout(entry.pendingReloadTimer);
   entry.pendingReloadTimer = undefined;
@@ -2936,7 +3016,7 @@ async function ensureSession(): Promise<AgentSession> {
       selectedSessionId = entry.session.sessionId;
       rememberActiveSession(entry.session);
       syncWidgetFactories(entry.session.sessionId);
-      startHostBinding(entry.session.sessionId, entry.session);
+      void startHostBinding(entry.session.sessionId, entry.session).catch(() => {});
       projectCatalog.apply({ kind: 'touch', path: entry.session.sessionManager.getCwd() || cwd });
       log.info(
         `[pifrontier] Pi session ready: ${sess.sessionId} (${sm.isPersisted() ? 'persisted' : 'in-memory'}) in ${Date.now() - start}ms (bind in background)`
@@ -2992,7 +3072,7 @@ function makeEventForwarder(sid: string, sess: AgentSession): EventForwarder {
           true
         );
         const wirePartialResult = boundMessagesForWire([event.partialResult])[0];
-        broadcast({
+        broadcastSdk({
           ...event,
           partialResult: wirePartialResult,
           sessionId: sid,
@@ -3031,18 +3111,18 @@ function makeEventForwarder(sid: string, sess: AgentSession): EventForwarder {
         return;
       }
       if (event.type === 'message_update') {
-        broadcast({ ...event, sessionId: sid, message: { role: event.message.role } });
+        broadcastSdk({ ...event, sessionId: sid, message: { role: event.message.role } });
       } else if (event.type === 'message_end') {
         const wireMessage = boundMessagesForWire([event.message])[0];
         try {
-          broadcast({
+          broadcastSdk({
             ...event,
             message: wireMessage,
             sessionId: sid,
             contextUsage: sess.getContextUsage(),
           });
         } catch {
-          broadcast({ ...event, message: wireMessage, sessionId: sid });
+          broadcastSdk({ ...event, message: wireMessage, sessionId: sid });
         }
       } else if (event.type === 'tool_execution_start') {
         pendingToolArgs.set(event.toolCallId, event.args);
@@ -3052,7 +3132,11 @@ function makeEventForwarder(sid: string, sess: AgentSession): EventForwarder {
           event.args,
           event.toolCallId
         );
-        broadcast({ ...event, sessionId: sid, ...(renderedCallHtml ? { renderedCallHtml } : {}) });
+        broadcastSdk({
+          ...event,
+          sessionId: sid,
+          ...(renderedCallHtml ? { renderedCallHtml } : {}),
+        });
       } else if (event.type === 'tool_execution_update') {
         toolPartialCoalescer.enqueue(event.toolCallId, event);
       } else if (event.type === 'tool_execution_end') {
@@ -3067,7 +3151,7 @@ function makeEventForwarder(sid: string, sess: AgentSession): EventForwarder {
           false
         );
         const wireResult = boundMessagesForWire([event.result])[0];
-        broadcast({
+        broadcastSdk({
           ...event,
           result: wireResult,
           sessionId: sid,
@@ -3077,12 +3161,12 @@ function makeEventForwarder(sid: string, sess: AgentSession): EventForwarder {
         const messages = Array.isArray(event.messages)
           ? boundMessagesForWire(event.messages)
           : event.messages;
-        broadcast({ ...event, messages, sessionId: sid });
+        broadcastSdk({ ...event, messages, sessionId: sid });
       } else if (event.type === 'queue_update') {
         const state = queuedStateFor(sess);
-        broadcast({ ...event, ...state, sessionId: sid });
+        broadcastSdk({ ...event, ...state, sessionId: sid });
       } else {
-        broadcast({ ...event, sessionId: sid });
+        broadcastSdk({ ...event, sessionId: sid });
       }
     } catch (err) {
       log.warn(`[pifrontier] event forwarder failed for session ${sid}:`, err);
@@ -3464,7 +3548,7 @@ function broadcastSessionLoaded(
 ): void {
   const entry = residentStore.get(sess.sessionId);
   const init = initialMessages(sess.messages, sess);
-  const payload: ServerMessage = {
+  const payload: ServerCustomEvent = {
     type: 'session_loaded',
     sessionId: sess.sessionId,
     isStreaming: sess.isStreaming,
@@ -3534,7 +3618,7 @@ async function refreshSessionLists(): Promise<void> {
   if (wsTransport.connectedClients === 0) return;
   try {
     const all = await sessionCatalog.list();
-    const payload: ServerMessage = {
+    const payload: ServerCustomEvent = {
       type: 'all_sessions_list',
       sessions: all.map(serializeSession),
     };
@@ -3561,7 +3645,7 @@ function scheduleProjectsRefresh(): void {
       if (wsTransport.connectedClients === 0) return;
       try {
         const projects = await projectCatalog.list();
-        const payload: ServerMessage = { type: 'projects_list', projects };
+        const payload: ServerCustomEvent = { type: 'projects_list', projects };
         const json = JSON.stringify(payload);
         if (json === _lastProjectsListJson) return;
         _lastProjectsListJson = json;
@@ -3590,8 +3674,10 @@ async function setActiveSession(
   requester?: {
     send(data: string): unknown;
     publish(topic: string, data: string): unknown;
-  }
+  },
+  selectionIntentCurrent?: () => boolean
 ): Promise<void> {
+  if (selectionIntentCurrent && !selectionIntentCurrent()) return;
   const newId = newSession.sessionId;
   const path = newSession.sessionManager.getSessionFile() ?? null;
   const existing = path ? residentStore.getByPath(path) : undefined;
@@ -3693,8 +3779,20 @@ const wsTransport = createWebSocketTransport<WSData>({
   onScheduleOrphanCleanup: (delayMs) => extensionRuntime.scheduleOrphanCleanup(delayMs),
 });
 
+/** Selection operations are socket-owned: only the newest intent may commit. */
+const selectionOperationGates = new WeakMap<object, SessionOperationGate>();
+
+function selectionOperationGateFor(socket: object): SessionOperationGate {
+  let gate = selectionOperationGates.get(socket);
+  if (!gate) {
+    gate = createSessionOperationGate();
+    selectionOperationGates.set(socket, gate);
+  }
+  return gate;
+}
+
 const systemHandlerDependencies: SystemHandlerDependencies = {
-  broadcast: (payload) => broadcast(payload),
+  broadcast: (payload) => broadcastAny(payload),
   readSettings,
   updateSettings,
   addPushSubscription,
@@ -3709,6 +3807,14 @@ const filesystemHandlerDependencies: FilesystemHandlerDependencies = {
   getCommandCompletions: (target, command, prefix) =>
     getCommandArgumentCompletions(target.session.extensionRunner, command, prefix),
   isInsideWorkspace,
+  resolveUploadTarget: (requestedSessionId, focusedSessionId) => {
+    const sessionId = requestedSessionId ?? focusedSessionId;
+    const target = sessionId ? residentStore.get(sessionId) : undefined;
+    return {
+      workspaceRoot: target?.session.sessionManager.getCwd() || activeCwd(),
+      sessionId: target?.session.sessionId ?? null,
+    };
+  },
   uploadStagingDir: (workspaceRoot) => resolve(workspaceRoot, '.pi-ui-uploads'),
   readFile: (path) => Bun.file(path).text(),
   writeFile: async (path, data) => {
@@ -3736,7 +3842,7 @@ const projectHandlerDependencies: ProjectHandlerDependencies = {
   },
   activeCwd,
   disposeSession,
-  broadcast: (payload) => broadcast(payload),
+  broadcast: (payload) => broadcastAny(payload),
   mkdir: async (path, options) => {
     await mkdir(path, options);
   },
@@ -3774,7 +3880,7 @@ const extensionUiHandlerDependencies: ExtensionUiHandlerDependencies = {
   teardownWidget,
   flushInteractiveRender,
   terminalInputDispatch: (owner, data) => terminalInputRegistry.dispatch(owner, data),
-  broadcast,
+  broadcast: (payload) => broadcastAny(payload),
   stampOwner,
   parseComponentTree: (component, width, path, nodeMap) =>
     parseComponentTree(component, width, path, nodeMap),
@@ -4311,115 +4417,181 @@ try {
             }
 
             case 'resync_session': {
+              const selectionGate = selectionOperationGateFor(ws);
+              const selectionToken: SessionOperationToken = selectionGate.begin();
+              const selectionIntentCurrent = () => selectionGate.isCurrent(selectionToken);
               const target = targetEntry(ws.data, msg, (data) => ws.send(data));
-              if (!target) break;
+              if (!target || !selectionIntentCurrent()) break;
               broadcastSessionLoaded(target.session, msg.requestId, ws, true);
               break;
             }
 
             case 'new_session': {
               const requestId = msg.requestId;
-              await residentStore.withGlobalLock(async () => {
-                try {
-                  const rawTargetCwd =
-                    (msg as { type: 'new_session'; targetCwd?: string }).targetCwd ?? cwd;
-                  const targetCwd = resolve(expandTilde(rawTargetCwd));
-                  // Create the directory if it doesn't exist (brand new folder).
-                  await mkdir(targetCwd, { recursive: true });
-                  const sm = _sdk!.SessionManager.create(targetCwd);
-                  const created = await createSdkSession(
+              const selectionGate = selectionOperationGateFor(ws);
+              const selectionToken: SessionOperationToken = selectionGate.begin();
+              const selectionIntentCurrent = () => selectionGate.isCurrent(selectionToken);
+              let created: CreatedSdkSession | undefined;
+              let committed = false;
+              try {
+                const rawTargetCwd =
+                  (msg as { type: 'new_session'; targetCwd?: string }).targetCwd ?? cwd;
+                const targetCwd = resolve(expandTilde(rawTargetCwd));
+                // Directory creation and SDK/session loading are intentionally
+                // outside the global commit lock.
+                await mkdir(targetCwd, { recursive: true });
+                const sm = _sdk!.SessionManager.create(targetCwd);
+                created = await createSdkSession(
+                  targetCwd,
+                  sm,
+                  'new',
+                  activeSessionOrNull()?.sessionFile
+                );
+                await residentStore.withGlobalLock(async () => {
+                  if (!selectionIntentCurrent()) {
+                    disposeCreatedSession(created!, 'stale new');
+                    return;
+                  }
+                  await setActiveSession(
+                    created!.session,
                     targetCwd,
-                    sm,
-                    'new',
-                    activeSessionOrNull()?.sessionFile
+                    created,
+                    requestId,
+                    false,
+                    ws,
+                    selectionIntentCurrent
                   );
-                  await setActiveSession(created.session, targetCwd, created, requestId, false, ws);
-                } catch (err) {
-                  log.error('[pifrontier] new_session error:', err);
-                  ws.send(
-                    JSON.stringify({ type: 'sessions_error', requestId, message: String(err) })
-                  );
-                }
-              });
+                  committed = true;
+                });
+              } catch (err) {
+                if (created && !committed) disposeCreatedSession(created, 'failed new');
+                log.error('[pifrontier] new_session error:', err);
+                ws.send(
+                  JSON.stringify({ type: 'sessions_error', requestId, message: String(err) })
+                );
+              }
               break;
             }
 
             case 'switch_session': {
               const requestId = msg.requestId;
-              const directResident = residentStore.getByPath(msg.path);
-              if (
-                directResident &&
-                (await activateResidentSession(directResident, requestId, ws))
-              ) {
-                break;
-              }
-              await residentStore.withGlobalLock(async () => {
-                try {
-                  const resolvedPath = resolve(cwd, expandTilde(msg.path));
-                  const current = activeSessionOrNullEntry();
-                  if (current?.path === resolvedPath) {
-                    current.unread = false;
-                    broadcastSessionRuntime(current.session.sessionId, current);
-                    // Nothing changed, so the authoritative snapshot is enough;
-                    // sidebar refresh scheduling can remain skipped.
-                    broadcastSessionLoaded(current.session, requestId, ws);
-                    return;
-                  }
-                  // A resident session is already validated in memory — its
-                  // .jsonl may not exist on disk yet (the SDK persists the
-                  // first turn only on completion), so checking residency
-                  // before the disk guard lets navigating back to a session
-                  // that is still streaming its first turn succeed instead
-                  // of spuriously failing "Session not found" and leaving
-                  // this socket's focus stuck on whatever it switched from.
-                  const existing = residentStore.getByPath(resolvedPath);
-                  if (existing) {
-                    existing.unread = false;
-                    await setActiveSession(
+              const selectionGate = selectionOperationGateFor(ws);
+              const selectionToken: SessionOperationToken = selectionGate.begin();
+              const selectionIntentCurrent = () => selectionGate.isCurrent(selectionToken);
+              let created: CreatedSdkSession | undefined;
+              let committed = false;
+              try {
+                const directResident = residentStore.getByPath(msg.path);
+                if (directResident) {
+                  const activated = await activateResidentSession(
+                    directResident,
+                    requestId,
+                    ws,
+                    undefined,
+                    selectionIntentCurrent
+                  );
+                  if (activated || !selectionIntentCurrent()) break;
+                }
+                const resolvedPath = resolve(cwd, expandTilde(msg.path));
+                if (!selectionIntentCurrent()) break;
+                const current = activeSessionOrNullEntry();
+                if (current?.path === resolvedPath) {
+                  current.unread = false;
+                  broadcastSessionRuntime(current.session.sessionId, current);
+                  // Nothing changed, so the authoritative snapshot is enough;
+                  // sidebar refresh scheduling can remain skipped.
+                  broadcastSessionLoaded(current.session, requestId, ws);
+                  break;
+                }
+                // A resident session is already validated in memory — its
+                // .jsonl may not exist on disk yet (the SDK persists the
+                // first turn only on completion), so checking residency
+                // before the disk guard lets navigating back to a session
+                // that is still streaming its first turn succeed instead
+                // of spuriously failing "Session not found".
+                const existing = residentStore.getByPath(resolvedPath);
+                if (existing) {
+                  existing.unread = false;
+                  await residentStore.withGlobalLock(() =>
+                    setActiveSession(
                       existing.session,
                       existing.cwd,
                       undefined,
                       requestId,
                       true,
-                      ws
-                    );
-                    return;
-                  }
-                  // Security: only open known session files — never raw client paths.
-                  // hasFile parses the exact target and preserves that guarantee
-                  // without forcing a cold scan of every project directory.
-                  if (!(await sessionCatalog.hasFile(resolvedPath))) {
-                    ws.send(
-                      JSON.stringify({
-                        type: 'sessions_error',
-                        requestId,
-                        message: 'Session not found.',
-                      })
-                    );
-                    return;
-                  }
-                  const sm = _sdk!.SessionManager.open(resolvedPath);
-                  const created = await createSdkSession(
-                    sm.getCwd() || cwd,
-                    sm,
-                    'resume',
-                    activeSessionOrNull()?.sessionFile
+                      ws,
+                      selectionIntentCurrent
+                    )
                   );
+                  break;
+                }
+                // Security: only open known session files — never raw client paths.
+                if (!(await sessionCatalog.hasFile(resolvedPath))) {
+                  if (!selectionIntentCurrent()) break;
+                  ws.send(
+                    JSON.stringify({
+                      type: 'sessions_error',
+                      requestId,
+                      message: 'Session not found.',
+                    })
+                  );
+                  break;
+                }
+                // SessionManager.open + createSdkSession is the expensive part
+                // of a cold switch. Keep it unlocked and dedupe by path.
+                let resumePromise = pendingResumeByPath.get(resolvedPath);
+                if (!resumePromise) {
+                  resumePromise = (async () => {
+                    const sm = _sdk!.SessionManager.open(resolvedPath);
+                    return createSdkSession(
+                      sm.getCwd() || cwd,
+                      sm,
+                      'resume',
+                      activeSessionOrNull()?.sessionFile
+                    );
+                  })();
+                  pendingResumeByPath.set(resolvedPath, resumePromise);
+                  const cleanupResume = () => {
+                    if (pendingResumeByPath.get(resolvedPath) === resumePromise) {
+                      pendingResumeByPath.delete(resolvedPath);
+                    }
+                  };
+                  void resumePromise.then(cleanupResume, cleanupResume);
+                }
+                created = await resumePromise;
+                await residentStore.withGlobalLock(async () => {
+                  // Deletion is authoritative even if this load became stale:
+                  // revalidate catalog ownership under the commit lock, then
+                  // dispose a cold object that can no longer be registered.
+                  const ownsPath = (await sessionCatalog.list({ fresh: true })).some(
+                    (session) =>
+                      session.path === resolvedPath && session.id === created!.session.sessionId
+                  );
+                  if (!ownsPath) {
+                    disposeCreatedSession(created!, 'deleted cold-resume');
+                    throw new Error('Session not found.');
+                  }
+                  if (!selectionIntentCurrent()) return;
                   await setActiveSession(
-                    created.session,
-                    sm.getCwd() || cwd,
+                    created!.session,
+                    created!.session.sessionManager.getCwd() || cwd,
                     created,
                     requestId,
                     false,
-                    ws
+                    ws,
+                    selectionIntentCurrent
                   );
-                } catch (err) {
-                  log.error('[pifrontier] switch_session error:', err);
-                  ws.send(
-                    JSON.stringify({ type: 'sessions_error', requestId, message: String(err) })
-                  );
+                  committed = true;
+                });
+              } catch (err) {
+                if (created && !committed && selectionIntentCurrent()) {
+                  disposeCreatedSession(created, 'failed cold-resume');
                 }
-              });
+                log.error('[pifrontier] switch_session error:', err);
+                ws.send(
+                  JSON.stringify({ type: 'sessions_error', requestId, message: String(err) })
+                );
+              }
               break;
             }
             case 'get_providers': {
@@ -4529,6 +4701,7 @@ try {
               break;
             }
             case 'rename_session': {
+              const requestId = msg.requestId;
               await residentStore.withGlobalLock(async () => {
                 const sessionId = msg.sessionId;
                 try {
@@ -4539,6 +4712,7 @@ try {
                     ws.send(
                       JSON.stringify({
                         type: 'sessions_error',
+                        requestId,
                         message: 'Session not found.',
                       })
                     );
@@ -4549,6 +4723,7 @@ try {
                     ws.send(
                       JSON.stringify({
                         type: 'sessions_error',
+                        requestId,
                         message: 'Session is not resident.',
                       })
                     );
@@ -4559,13 +4734,20 @@ try {
                   ws.send(JSON.stringify({ type: 'sessions_list', sessions: [] }));
                 } catch (err) {
                   log.error('[pifrontier] rename_session error:', err);
-                  ws.send(JSON.stringify({ type: 'sessions_error', message: String(err) }));
+                  ws.send(
+                    JSON.stringify({
+                      type: 'sessions_error',
+                      requestId,
+                      message: String(err),
+                    })
+                  );
                 }
               });
               break;
             }
 
             case 'delete_session': {
+              const requestId = msg.requestId;
               await residentStore.withGlobalLock(async () => {
                 const sessionId = msg.sessionId;
                 try {
@@ -4574,7 +4756,11 @@ try {
                   const target = (await sessionCatalog.list()).find((s) => s.id === sessionId);
                   if (!target) {
                     ws.send(
-                      JSON.stringify({ type: 'sessions_error', message: 'Session not found.' })
+                      JSON.stringify({
+                        type: 'sessions_error',
+                        requestId,
+                        message: 'Session not found.',
+                      })
                     );
                     return;
                   }
@@ -4582,6 +4768,7 @@ try {
                     ws.send(
                       JSON.stringify({
                         type: 'sessions_error',
+                        requestId,
                         message: 'Cannot delete an in-memory session.',
                       })
                     );
@@ -4591,6 +4778,7 @@ try {
                     ws.send(
                       JSON.stringify({
                         type: 'sessions_error',
+                        requestId,
                         message: 'Cannot delete the active session.',
                       })
                     );
@@ -4601,6 +4789,7 @@ try {
                     ws.send(
                       JSON.stringify({
                         type: 'sessions_error',
+                        requestId,
                         message: 'Cannot delete a running or busy resident session.',
                       })
                     );
@@ -4626,7 +4815,13 @@ try {
                   ws.send(JSON.stringify({ type: 'sessions_list', sessions: [] }));
                 } catch (err) {
                   log.error('[pifrontier] delete_session error:', err);
-                  ws.send(JSON.stringify({ type: 'sessions_error', message: String(err) }));
+                  ws.send(
+                    JSON.stringify({
+                      type: 'sessions_error',
+                      requestId,
+                      message: String(err),
+                    })
+                  );
                 }
               });
               break;
@@ -4893,22 +5088,27 @@ try {
                       if (!newPath) {
                         // Fallback — create a fresh persisted session
                         const clonedSm = _sdk!.SessionManager.create(cwd);
-                        const { session: clonedSession } = await _sdk!.createAgentSession({
+                        const created = await createSdkSession(
                           cwd,
-                          sessionManager: clonedSm,
-                          model: session.model,
-                        });
-                        await setActiveSession(clonedSession);
+                          clonedSm,
+                          'new',
+                          session.sessionFile
+                        );
+                        if (session.model) await created.session.setModel(session.model);
+                        await setActiveSession(created.session, cwd, created);
                         sendSlashResult(ws, command, 'Cloned to a fresh session.');
                         return;
                       }
                       const clonedSm = _sdk!.SessionManager.open(newPath);
-                      const { session: clonedSession } = await _sdk!.createAgentSession({
-                        cwd: clonedSm.getCwd() || cwd,
-                        sessionManager: clonedSm,
-                        model: session.model,
-                      });
-                      await setActiveSession(clonedSession);
+                      const clonedCwd = clonedSm.getCwd() || cwd;
+                      const created = await createSdkSession(
+                        clonedCwd,
+                        clonedSm,
+                        'fork',
+                        session.sessionFile
+                      );
+                      if (session.model) await created.session.setModel(session.model);
+                      await setActiveSession(created.session, clonedCwd, created);
                       sendSlashResult(ws, command, `Cloned current branch to ${newPath}.`);
                     });
                     break;
@@ -5045,19 +5245,28 @@ try {
                     break;
                   }
                   case 'extension':
-                    // Extension commands — route through prompt() which handles them via _tryExecuteExtensionCommand
-                    // Use prompt() even during streaming (SDK handles extension commands during streaming)
+                    // Extension commands route through prompt(), which handles
+                    // them via _tryExecuteExtensionCommand.
+                    // Keep them outside the session mutation lock: SDK extension
+                    // commands are explicitly allowed while a turn streams,
+                    // and UI callbacks may await another socket message.
                     try {
-                      await residentStore.withSessionLock(session.sessionId, async () => {
-                        const sid = session.sessionId;
-                        _promptsInFlight.add(sid);
-                        try {
-                          await session.prompt(args);
-                        } finally {
-                          _promptsInFlight.delete(sid);
-                          scheduleQueuedRuns();
-                        }
-                      });
+                      const sid = session.sessionId;
+                      const current = residentStore.get(sid);
+                      if (!current || current.session !== session) {
+                        throw new Error('Session is no longer current.');
+                      }
+                      await startHostBinding(sid, session);
+                      if (residentStore.get(sid)?.session !== session) {
+                        throw new Error('Session is no longer current.');
+                      }
+                      _promptsInFlight.add(sid);
+                      try {
+                        await session.prompt(args);
+                      } finally {
+                        _promptsInFlight.delete(sid);
+                        scheduleQueuedRuns();
+                      }
                     } catch (e) {
                       sendSlashResult(ws, command, String(e), 'error');
                     }
@@ -5352,7 +5561,7 @@ try {
                   ...(reloadResult === 'deferred'
                     ? { message: 'Project trust update applies when idle.' }
                     : {}),
-                } as ServerMessage);
+                });
               } catch (err) {
                 log.error('[pifrontier] set_project_trust error:', err);
                 ws.send(
@@ -5728,6 +5937,7 @@ try {
             }
 
             case 'fork_session': {
+              const requestId = msg.requestId;
               const target = targetEntry(ws.data, msg, (data) => ws.send(data));
               if (!target) break;
               await residentStore.withGlobalLock(async () => {
@@ -5748,11 +5958,20 @@ try {
                   await setActiveSession(
                     created.session,
                     source.sessionManager.getCwd() || cwd,
-                    created
+                    created,
+                    requestId,
+                    false,
+                    ws
                   );
                 } catch (err) {
                   log.error('[pifrontier] fork_session error:', err);
-                  ws.send(JSON.stringify({ type: 'sessions_error', message: String(err) }));
+                  ws.send(
+                    JSON.stringify({
+                      type: 'sessions_error',
+                      requestId,
+                      message: String(err),
+                    })
+                  );
                 }
               });
               break;
@@ -5990,16 +6209,14 @@ try {
   }
   process.exit(1);
 }
-
-// ── 6. Wire up broadcast ──────────────────────────────────────────────────────
-// Session subscription is set up inside ensureSession() on first WS connection.
-
-broadcast = (payload) => {
+broadcastAny = (payload) => {
   // No subscribers — skip stringify/publish entirely. The open handler replays
   // full state snapshots to the next client that connects.
   if (wsTransport.connectedClients === 0) return;
   server.publish(WS_TOPIC, JSON.stringify(payload));
 };
+broadcast = (payload) => broadcastAny(payload);
+broadcastSdk = (payload) => broadcastAny(payload);
 // Hydrate session summaries from the previous run — sidebar loads become
 // stat-calls-only; files are fully read at most once per change.
 initSessionScanCache(join(homedir(), '.pi', 'agent', 'pi-ui-session-scan.json'));

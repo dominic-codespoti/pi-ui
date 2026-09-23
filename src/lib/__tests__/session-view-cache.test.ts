@@ -66,16 +66,45 @@ describe('SessionViewCache', () => {
       images: ['data:image/png;base64,AAAA'],
       toolArgs: {
         image: { data: 'data:image/jpeg;base64,BBBB', src: 'data:image/jpeg;base64,BBBB' },
+        values: ['keep', 'data:image/gif;base64,CCCC', 'also-keep'],
         keep: 'text',
       },
+      renderedCallHtml: ['keep', 'data:image/png;base64,DDDD'],
     });
-    cache.save('images', view('images', { messages: [attached], activeStreamMsg: attached }));
+    cache.save(
+      'images',
+      view('images', {
+        messages: [attached],
+        activeStreamMsg: attached,
+        toolsById: new Map([['call-1', attached]]),
+      })
+    );
 
     const restored = cache.restore('images');
     expect(restored?.messages[0].images).toBeUndefined();
-    expect(restored?.messages[0].toolArgs).toEqual({ image: {}, keep: 'text' });
+    expect(restored?.messages[0].toolArgs).toEqual({
+      image: {},
+      values: ['keep', 'also-keep'],
+      keep: 'text',
+    });
+    expect(restored?.messages[0].renderedCallHtml).toEqual(['keep', '']);
+    expect(restored?.toolsById.get('call-1')).toBe(restored?.messages[0]);
   });
 
+  it('keeps cached messages isolated across restore and later saves', () => {
+    const cache = new SessionViewCache();
+    const original = view('isolated');
+    cache.save('isolated', original);
+
+    const restored = cache.restore('isolated');
+    restored!.messages[0].content = 'caller mutation';
+    restored!.queuedSteering.push('caller mutation');
+    expect(cache.restore('isolated')?.messages[0].content).toBe('message-isolated');
+
+    original.messages[0].content = 'updated';
+    cache.save('isolated', original);
+    expect(cache.restore('isolated')?.messages[0].content).toBe('updated');
+  });
   it('restores an equivalent view without sharing mutable containers', () => {
     const cache = new SessionViewCache();
     const original = view('roundtrip');

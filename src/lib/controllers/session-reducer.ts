@@ -128,16 +128,7 @@ function rebuildToolIndex(state: SessionReducerState): void {
 }
 
 function findTool(state: SessionReducerState, toolCallId: string): UIMessage | undefined {
-  const indexed = state.toolsById.get(toolCallId);
-  if (indexed) return indexed;
-  for (let i = state.messages.length - 1; i >= 0; i--) {
-    const message = state.messages[i];
-    if (message.role === 'tool' && message.toolCallId === toolCallId) {
-      state.toolsById.set(toolCallId, message);
-      return message;
-    }
-  }
-  return undefined;
+  return state.toolsById.get(toolCallId);
 }
 
 function createTool(
@@ -150,7 +141,9 @@ function createTool(
 ): UIMessage | undefined {
   if (!toolCallId) return undefined;
   const existing = findTool(state, toolCallId);
-  if (existing) return existing;
+  if (existing) {
+    return existing;
+  }
   const created: UIMessage = {
     id: options.createId(),
     role: 'tool',
@@ -170,6 +163,13 @@ function createTool(
 }
 
 function lastStreaming(state: SessionReducerState, role: UIMessage['role']): UIMessage | undefined {
+  if (role === 'tool') {
+    for (let i = state.messages.length - 1; i >= 0; i--) {
+      const message = state.messages[i];
+      if (message.role === 'tool' && message.streaming) return message;
+    }
+    return undefined;
+  }
   for (let i = state.messages.length - 1; i >= 0; i--) {
     const message = state.messages[i];
     if (message.role === role && message.streaming) return message;
@@ -225,7 +225,6 @@ function applySnapshot(
     state.isCompacting = false;
     transcriptReplaced = true;
   }
-
   const isFullSnapshot = payload.type === 'connected' || payload.type === 'session_loaded';
   if ('isStreaming' in payload) state.isStreaming = Boolean(payload.isStreaming);
   if ('activeToolName' in payload) {
@@ -291,11 +290,15 @@ function applySnapshot(
 
   let window = 0;
   if (state.model?.contextWindow) window = state.model.contextWindow;
-  if ('contextUsage' in payload && payload.contextUsage) {
-    const incoming = contextUsage(payload.contextUsage, window);
-    if (incoming) {
-      state.contextUsage = incoming;
-      if (incoming.contextWindow > 0) window = incoming.contextWindow;
+  if ('contextUsage' in payload) {
+    if (payload.contextUsage === null) {
+      state.contextUsage = null;
+    } else {
+      const incoming = contextUsage(payload.contextUsage, window);
+      if (incoming) {
+        state.contextUsage = incoming;
+        if (incoming.contextWindow > 0) window = incoming.contextWindow;
+      }
     }
   }
   if (state.contextUsage === null && window > 0) {
@@ -557,7 +560,6 @@ function applyEvent(
       state.activeToolName = 'bash';
       const delta = frame.delta as string | undefined;
       if (bash && delta) {
-        bash.content += delta;
         bash.streaming = true;
         bash.lineCount = bash.content.split('\n').length;
         delete bash.renderedResultHtml;

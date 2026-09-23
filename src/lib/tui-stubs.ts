@@ -178,7 +178,7 @@ export function ansiToHtml(line: string): string {
  * (typos, extension-invented names) fall back to the base text color rather
  * than throwing or silently dropping styling.
  */
-const FG_PALETTE: Record<string, string> = {
+export const FG_PALETTE: Readonly<Record<string, string>> = {
   text: '#d7d6df',
   userMessageText: '#d7d6df',
   customMessageText: '#d7d6df',
@@ -620,10 +620,15 @@ export type ParsedComponent =
   | ParsedMarkdown
   | ParsedSettings;
 
-const MAX_PARSED_COMPONENT_NODES = 256;
+export const MAX_PARSED_COMPONENT_NODES = 256;
 // Bounds per-node item arrays during the authoritative bounding pass.
-const MAX_PARSED_COMPONENT_ITEMS = 256;
-const MAX_COMPONENT_TREE_DEPTH = 128;
+export const MAX_PARSED_COMPONENT_ITEMS = 256;
+export const MAX_COMPONENT_TREE_DEPTH = 128;
+
+/** How often a live `setWidget` factory is re-rendered while its session is active. */
+export const WIDGET_REFRESH_MS = 250;
+/** How often an open `custom()` dialog is re-parsed (rich) or re-rendered (terminal fallback). */
+export const CUSTOM_DIALOG_REFRESH_MS = 200;
 
 /**
  * Copy a parsed extension component tree into a bounded wire-safe shape.

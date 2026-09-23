@@ -7,11 +7,27 @@ test.describe('Auth flow', () => {
     await expect(page.getByText('password', { exact: true })).toBeVisible();
   });
 
-  test('wrong password shows error message', async ({ page }) => {
+  test('wrong password associates and announces the error', async ({ page }) => {
     await page.goto('/login');
     await page.fill('input[name="password"]', 'wrong-password');
     await page.click('button[type="submit"]');
-    await expect(page.locator('text=Incorrect password')).toBeVisible();
+
+    const password = page.locator('#password');
+    const error = page.getByRole('alert');
+    await expect(error).toHaveText(/Incorrect password/);
+    await expect(error).toHaveAttribute('aria-live', 'assertive');
+    await expect(password).toHaveAttribute('aria-invalid', 'true');
+    await expect(password).toHaveAttribute('aria-describedby', 'login-error');
+    await expect.poll(() => page.evaluate(() => document.activeElement?.id)).toBe('password');
+  });
+
+  test('skip link moves focus to the login landmark', async ({ page }) => {
+    await page.goto('/login');
+    const skipLink = page.getByRole('link', { name: 'Skip to content' });
+    await skipLink.focus();
+    await expect(skipLink).toBeFocused();
+    await page.keyboard.press('Enter');
+    await expect(page.locator('#main-content')).toBeFocused();
   });
 
   test('correct password redirects to app', async ({ page, login }) => {

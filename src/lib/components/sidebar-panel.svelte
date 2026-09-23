@@ -68,9 +68,12 @@
     : 'relative shrink-0 overflow-hidden'}
   style={panelStyle}
   aria-hidden={!open}
+  inert={!open}
 >
   <div
-    class="w-full h-full {surfaceClass} {isMobile ? mobileRoundClass : ''} flex flex-col overflow-hidden"
+    class="w-full h-full {surfaceClass} {isMobile
+      ? mobileRoundClass
+      : ''} flex flex-col overflow-hidden"
   >
     {#if header}
       {@render header()}

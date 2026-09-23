@@ -1,7 +1,7 @@
 // @bun
 // src/handler.ts
-import { manifest, base, prerendered } from "MANIFEST";
-import { Server } from "SERVER";
+import { appDir, base, prerendered } from "MANIFEST";
+import { server } from "SERVER";
 import { env } from "ENV";
 import { existsSync } from "fs";
 
@@ -636,7 +636,6 @@ function src_default(dir, opts = {}) {
 }
 
 // src/handler.ts
-var server = new Server(manifest);
 var { serveAssets } = BUILD_OPTIONS;
 var origin = env("ORIGIN", undefined);
 var xff_depth = parseInt(env("XFF_DEPTH", "1"), 10);
@@ -656,7 +655,7 @@ function serve(path, client = false) {
       gzip: true,
       brotli: true,
       setHeaders: client ? (headers, pathname) => {
-        if (pathname.startsWith(`/${manifest.appDir}/immutable/`)) {
+        if (pathname.startsWith(`/${appDir}/immutable/`)) {
           headers.set("cache-control", "public,max-age=31536000,immutable");
         }
         return headers;
@@ -713,7 +712,7 @@ var ssr = async (request, bunServer) => {
   });
 };
 var getHandler = () => {
-  const websocket = server.websocket();
+  const websocket = server.websocket?.();
   const staticHandlers = [
     serveAssets && serve(`${import.meta.dir}/client${base}`, true),
     serveAssets && serve_prerendered()

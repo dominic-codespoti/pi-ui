@@ -1,4 +1,5 @@
 <script lang="ts">
+  // Behavior changes here must be reflected in src/lib/extension-ui-capabilities/catalog.ts; then run `bun run generate:skill`.
   import type { ParsedComponent } from '#lib/tui-stubs.js';
   import { Button } from '#lib/components/ui/button/index.js';
   import { renderMarkdown } from '#lib/markdown.js';

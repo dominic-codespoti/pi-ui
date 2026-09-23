@@ -54,6 +54,7 @@ function countStringChars(value: unknown, seen = new Set<object>()): number {
 }
 
 function toolOutputChars(message: Record<string, unknown>): number {
+  const seen = new Set<object>();
   const content = message.content;
   const contentChars =
     typeof content === 'string'
@@ -61,7 +62,12 @@ function toolOutputChars(message: Record<string, unknown>): number {
       : Array.isArray(content)
         ? content.reduce((total, block) => total + getBlockContentChars(block), 0)
         : 0;
-  return contentChars + countStringChars(message.details);
+  return (
+    contentChars +
+    countStringChars(message.details, seen) +
+    countStringChars(message.diff, seen) +
+    countStringChars(message.renderedResultHtml, seen)
+  );
 }
 
 function isToolResult(message: object): boolean {

@@ -353,8 +353,17 @@ test.describe('Projects sidebar', () => {
     await expect
       .poll(() => mutations)
       .toEqual([
-        { type: 'rename_session', sessionId: 'mem-1', name: 'First renamed' },
-        { type: 'delete_session', sessionId: 'mem-2' },
+        {
+          type: 'rename_session',
+          sessionId: 'mem-1',
+          name: 'First renamed',
+          requestId: expect.stringMatching(/\S+/),
+        },
+        {
+          type: 'delete_session',
+          sessionId: 'mem-2',
+          requestId: expect.stringMatching(/\S+/),
+        },
       ]);
   });
 
@@ -572,15 +581,20 @@ test.describe('Projects sidebar', () => {
     await openProjectsSidebar(page);
     const switchButton = page.getByRole('button', { name: 'Add tests' });
     await switchButton.evaluate((button) => {
+      if (!(button instanceof HTMLElement)) {
+        throw new Error('Expected a session switch button');
+      }
       button.click();
       const textarea = document.querySelector('textarea');
       textarea?.dispatchEvent(
         new KeyboardEvent('keydown', { key: 'a', bubbles: true, cancelable: true })
       );
     });
-    // Session rows lock while the switch is in flight instead of silently
-    // swallowing further clicks (the reply is still delayed by 1s here).
-    await expect(switchButton).toBeDisabled();
+    // Session rows stay clickable while a switch is in flight — a switch can
+    // legitimately take a long time (large history resume), and the user
+    // must be able to redirect to a different session instead of being
+    // frozen out until the first one resolves.
+    await expect(switchButton).toBeEnabled();
     await expect.poll(() => terminalInputCount).toBe(0);
 
     await expect(composer).toBeEnabled();

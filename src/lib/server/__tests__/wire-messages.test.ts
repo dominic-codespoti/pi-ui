@@ -43,13 +43,44 @@ describe('boundMessagesForWire', () => {
     expect(result[0]).toBe(atLimit);
     expect(result[1]).not.toBe(oversized);
     expect(bounded.outputElided).toBe(true);
-    expect(bounded.outputBytes).toBe(MAX_WIRE_TOOL_OUTPUT_CHARS + 1 + 'large details'.length);
+    expect(bounded.outputBytes).toBe(
+      MAX_WIRE_TOOL_OUTPUT_CHARS +
+        1 +
+        'large details'.length +
+        'diff'.length +
+        '<pre>result</pre>'.length
+    );
     expect(bounded.content).toBeUndefined();
     expect(bounded.details).toBeUndefined();
     expect(bounded.diff).toBeUndefined();
     expect(bounded.renderedResultHtml).toBeUndefined();
     expect(oversized.content[0].text).toHaveLength(MAX_WIRE_TOOL_OUTPUT_CHARS + 1);
     expect(oversized.details).toBe('large details');
+  });
+
+  test('elides oversized top-level diff and rendered output fields', () => {
+    const diff = 'd'.repeat(MAX_WIRE_TOOL_OUTPUT_CHARS + 1);
+    const renderedResultHtml = ['r'.repeat(MAX_WIRE_TOOL_OUTPUT_CHARS + 1)];
+    const message = {
+      role: 'toolResult',
+      toolCallId: 'top-level-output',
+      content: 'tiny',
+      diff,
+      renderedResultHtml,
+    };
+
+    const result = boundMessagesForWire([message]);
+    const bounded = result[0] as Record<string, unknown>;
+
+    expect(result[0]).not.toBe(message);
+    expect(bounded.outputElided).toBe(true);
+    expect(bounded.outputBytes).toBe('tiny'.length + diff.length + renderedResultHtml[0].length);
+    expect(bounded.content).toBeUndefined();
+    expect(bounded.diff).toBeUndefined();
+    expect(bounded.renderedResultHtml).toBeUndefined();
+    expect(message.content).toBe('tiny');
+    expect(message.diff).toBe(diff);
+    expect(message.renderedResultHtml).toBe(renderedResultHtml);
   });
 
   test('can preserve full tool output when elision is disabled', () => {

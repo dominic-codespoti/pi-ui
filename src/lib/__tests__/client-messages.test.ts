@@ -273,6 +273,75 @@ describe('agentMsgToUI', () => {
     expect(agentMsgToUI(null)).toEqual([]);
     expect(agentMsgToUI(undefined)).toEqual([]);
   });
+
+  it('keeps timestamp-less history IDs deterministic across reconversion', () => {
+    const history = [
+      { role: 'user', content: 'same' },
+      { role: 'assistant', content: [{ type: 'text', text: 'reply' }] },
+      { role: 'user', content: 'same' },
+    ];
+    const first = rawMessagesToUI(history).map((message) => message.id);
+    const second = rawMessagesToUI(history).map((message) => message.id);
+    expect(second).toEqual(first);
+    expect(new Set(first).size).toBe(first.length);
+
+    const pageHistory = [
+      { role: 'user', content: 'first' },
+      { role: 'assistant', content: [{ type: 'text', text: 'reply' }] },
+      { role: 'user', content: 'last' },
+    ];
+    const full = rawMessagesToUI(pageHistory);
+    const paged = [
+      ...rawMessagesToUI(pageHistory.slice(0, 2), 0),
+      ...rawMessagesToUI(pageHistory.slice(2), 2),
+    ];
+    expect(paged.map((message) => message.id)).toEqual(full.map((message) => message.id));
+  });
+
+  it('ignores malformed content blocks without throwing', () => {
+    expect(() =>
+      rawMessagesToUI([
+        null,
+        'scalar',
+        { role: 'user', content: [null, 'bad', 42, { text: 'missing type' }] },
+        { role: 'assistant', content: [null, 'bad', { type: 'text' }] },
+        { role: 'tool_result', content: [null, 'bad', { type: 'text', text: 'ok' }] },
+        { role: 'custom', customType: 'status', content: [null, 42] },
+      ])
+    ).not.toThrow();
+  });
+
+  it('collects tool calls from legacy ai messages', () => {
+    const [tool] = rawMessagesToUI([
+      {
+        role: 'ai',
+        content: [
+          { type: 'toolCall', id: 'legacy-call', name: 'read', arguments: { path: 'a.ts' } },
+        ],
+      },
+      {
+        role: 'tool_result',
+        toolCallId: 'legacy-call',
+        content: [{ type: 'text', text: 'contents' }],
+      },
+    ]).filter((message) => message.role === 'tool');
+    expect(tool).toMatchObject({ toolName: 'read', toolInput: 'a.ts' });
+  });
+
+  it('resolves tool result IDs through precomputed suffix aliases', () => {
+    const [tool] = rawMessagesToUI([
+      {
+        role: 'assistant',
+        content: [{ type: 'toolCall', id: 'call-1', name: 'bash', arguments: { command: 'pwd' } }],
+      },
+      {
+        role: 'tool_result',
+        toolCallId: 'provider-call-1',
+        content: [{ type: 'text', text: 'ok' }],
+      },
+    ]).filter((message) => message.role === 'tool');
+    expect(tool).toMatchObject({ toolName: 'bash', toolInput: '$ pwd' });
+  });
 });
 
 describe('reconnectDelay', () => {

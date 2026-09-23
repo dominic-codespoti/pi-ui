@@ -133,6 +133,17 @@
   const visibleMessages = $derived(
     messages.length > mountedLimit ? messages.slice(-mountedLimit) : messages
   );
+  const turns = $derived.by(() => {
+    const result: { key: string; messages: UIMessage[] }[] = [];
+    for (const msg of visibleMessages) {
+      if (msg.role === 'user' || result.length === 0) {
+        result.push({ key: msg.id, messages: [msg] });
+      } else {
+        result[result.length - 1].messages.push(msg);
+      }
+    }
+    return result;
+  });
 </script>
 
 {#if sessionLoading}
@@ -282,31 +293,35 @@
       </div>
     {/if}
 
-    {#each visibleMessages as msg, i (msg.id)}
-      <MessageRow
-        {msg}
-        isNewest={i === visibleMessages.length - 1}
-        isLastInTurn={isLastInTurnMap[msg.id] ?? false}
-        {copiedId}
-        {copiedTurnId}
-        {isMobile}
-        {isStreaming}
-        {expandedUserMsgs}
-        {truncatedUserMsgs}
-        {workingVisible}
-        {hiddenThinkingLabel}
-        {workingIndicatorFrames}
-        {workingFrameIndex}
-        {workingMessage}
-        {onCopyMessage}
-        {onCopyTurn}
-        {onExpandUserMsg}
-        {onToggleThinking}
-        {onToggleTool}
-        {onEditMessage}
-        {onDismissNotice}
-        {onHaptic}
-      />
+    {#each turns as turn (turn.key)}
+      <div class="flex flex-col gap-1 min-w-0">
+        {#each turn.messages as msg (msg.id)}
+          <MessageRow
+            {msg}
+            isNewest={msg === visibleMessages[visibleMessages.length - 1]}
+            isLastInTurn={isLastInTurnMap[msg.id] ?? false}
+            {copiedId}
+            {copiedTurnId}
+            {isMobile}
+            {isStreaming}
+            {expandedUserMsgs}
+            {truncatedUserMsgs}
+            {workingVisible}
+            {hiddenThinkingLabel}
+            {workingIndicatorFrames}
+            {workingFrameIndex}
+            {workingMessage}
+            {onCopyMessage}
+            {onCopyTurn}
+            {onExpandUserMsg}
+            {onToggleThinking}
+            {onToggleTool}
+            {onEditMessage}
+            {onDismissNotice}
+            {onHaptic}
+          />
+        {/each}
+      </div>
     {/each}
   </div>
 {/if}

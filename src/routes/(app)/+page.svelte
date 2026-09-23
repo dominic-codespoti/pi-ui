@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy, tick, untrack } from 'svelte';
   import { dev } from '$app/env';
-  import { goto } from '$app/navigation';
+  import { pushState, replaceState } from '$app/navigation';
   import { page } from '$app/state';
   import { resolve } from '$app/paths';
   import { SvelteMap } from 'svelte/reactivity';
@@ -34,10 +34,10 @@
   import type { ParsedComponent } from '#lib/tui-stubs.js';
   import { projectsState } from '#lib/state/projects-state.svelte.js';
   import { extensionUiState } from '#lib/state/extension-ui-state.svelte.js';
-  import { rawMessagesToUI, uid, type UIMessage } from '#lib/client-messages.js';
+  import { uid, type UIMessage } from '#lib/client-messages.js';
   import { extensionOptionParts } from '#lib/extension-modals.js';
   import { saveSnapshot, loadSnapshot } from '#lib/session-snapshot.js';
-  import { SessionViewCache, type SessionViewUiState } from '#lib/session-view-cache.js';
+  import type { SessionViewUiState } from '#lib/session-view-cache.js';
   import {
     ClientWebSocketController,
     type ClientWebSocketCloseInfo,
@@ -53,12 +53,8 @@
     ComposerCompletionController,
     type CompletionControllerState,
   } from '#lib/controllers/composer-completion-controller.js';
-  import {
-    createSessionReducerState,
-    reduceSession,
-    type SessionEffect,
-    type SessionReducerState,
-  } from '#lib/controllers/session-reducer.js';
+  import { SessionCoordinator } from '#lib/controllers/session-coordinator.js';
+  import type { SessionEffect, SessionReducerState } from '#lib/controllers/session-reducer.js';
   import { NotificationController } from '#lib/controllers/notification-controller.js';
   import { ToolOutputController } from '#lib/controllers/tool-output-controller.js';
   import { saveIdentity, loadIdentity, clearIdentity } from '#lib/session-identity.js';
@@ -77,10 +73,12 @@
   import SidebarPanel from '#lib/components/sidebar-panel.svelte';
   import ProjectsSidebar from '#lib/components/projects/lazy-projects-sidebar.svelte';
   import LiveElapsed from '#lib/components/chat/live-elapsed.svelte';
-  import MessageList from '#lib/components/chat/message-list.svelte';
+  import ConversationStatus from '#lib/components/chat/conversation-status.svelte';
+  import ConversationViewport from '#lib/components/chat/conversation-viewport.svelte';
   import RightPanel from '#lib/components/panels/lazy-right-panel.svelte';
   import ExtensionComponent from '#lib/components/ui/extension-component.svelte';
   import ConfirmDialog from '#lib/components/dialogs/confirm-dialog.svelte';
+  import ExtensionOverlays from '#lib/components/dialogs/extension-overlays.svelte';
   import ChevronRight from '@lucide/svelte/icons/chevron-right';
   import X from '@lucide/svelte/icons/x';
   import Keyboard from '@lucide/svelte/icons/keyboard';
@@ -92,7 +90,6 @@
   import Bell from '@lucide/svelte/icons/bell';
   import Wrench from '@lucide/svelte/icons/wrench';
   import BookOpen from '@lucide/svelte/icons/book-open';
-  import ShieldQuestion from '@lucide/svelte/icons/shield-question';
 
   // ── Builtin slash commands ───────────────────────────────────────────────────
 
@@ -155,10 +152,11 @@
     return candidate;
   }
 
-  function commandCompletionInsert(mode: CommandArgMode, value: string): string {
+  function commandCompletionInsert(mode: CommandArgMode, value: string, label?: string): string {
     const replacement = completionToken(value, mode);
     const args = `${mode.parentPrefix}${replacement}`;
-    return `/${mode.command}${args ? ` ${args}` : ''} `;
+    const insert = `/${mode.command}${args ? ` ${args}` : ''}`;
+    return `${insert}${label?.endsWith('/') || value.endsWith('/') ? '' : ' '}`;
   }
 
   const SHELL_SHORTCUTS = [
@@ -195,52 +193,6 @@
   // (MsgUsage and UIMessage types imported from #lib/client-messages)
 
   // ── Extension UI modal state ─────────────────────────────────────────────────
-
-  function parsedComponentHasAction(comp: ParsedComponent | undefined): boolean {
-    if (!comp) return false;
-    if (comp.kind === 'select' || comp.kind === 'button' || comp.kind === 'checkbox') return true;
-    if (comp.kind === 'settings') return comp.items.some((it) => !!it.values?.length);
-    if (comp.kind === 'container') return comp.children.some(parsedComponentHasAction);
-    return false;
-  }
-
-  function parsedComponentHasInput(comp: ParsedComponent | undefined): boolean {
-    if (!comp) return false;
-    if (comp.kind === 'input') return true;
-    if (comp.kind === 'container') return comp.children.some(parsedComponentHasInput);
-    return false;
-  }
-  function parsedComponentHasCheckbox(comp: ParsedComponent | undefined): boolean {
-    if (!comp) return false;
-    if (comp.kind === 'checkbox') return true;
-    if (comp.kind === 'container') return comp.children.some(parsedComponentHasCheckbox);
-    return false;
-  }
-
-  function parsedComponentIsDisplayOnly(comp: ParsedComponent | undefined): boolean {
-    if (!comp) return false;
-    if (comp.kind === 'container') return comp.children.every(parsedComponentIsDisplayOnly);
-
-    return (
-      comp.kind === 'text' ||
-      comp.kind === 'markdown' ||
-      comp.kind === 'progress' ||
-      comp.kind === 'loader' ||
-      comp.kind === 'image' ||
-      (comp.kind === 'settings' && !comp.items.some((it) => !!it.values?.length))
-    );
-  }
-
-  function customModalNeedsTextInput(comp: ParsedComponent | undefined): boolean {
-    if (!comp) return true;
-    if (
-      parsedComponentHasInput(comp) ||
-      parsedComponentHasAction(comp) ||
-      parsedComponentIsDisplayOnly(comp)
-    )
-      return false;
-    return true;
-  }
 
   let modal = $derived(extensionUiState.modalQueue[0] ?? null);
   let modalInput = $state('');
@@ -406,6 +358,8 @@
   // ── Mobile detection ──────────────────────────────────────────────────────
 
   let isMobile = $state(false);
+  /** Confirmed session switches must not let drawer-marker cleanup rewind the URL. */
+  let _skipDrawerHistoryBack = false;
 
   /** autocorrect is a real attribute but missing from Svelte's HTML typings. */
   function autoCorrectOff(node: HTMLElement) {
@@ -516,15 +470,20 @@
       // Shallow navigation pushes a same-URL history entry carrying the
       // marker; Android back pops it and the listener above swallows the
       // pop by closing the drawer. SvelteKit reapplies page.state on the
-      // pop, which clears the marker.
-      goto(window.location.href, {
-        shallow: true,
-        state: { ...page.state, piUiDrawer: true },
-      }).catch(() => {
+      const markerUrl = new URL(window.location.href);
+      pushState(markerUrl, { ...page.state, piUiDrawer: true }).catch(() => {
         /* marker is best-effort — the drawer still opens without it */
       });
     } else if (!anyOpen && marked) {
-      history.back();
+      if (_skipDrawerHistoryBack) {
+        _skipDrawerHistoryBack = false;
+        const markerUrl = new URL(window.location.href);
+        replaceState(markerUrl, { ...page.state, piUiDrawer: undefined }).catch(() => {
+          /* marker cleanup is best-effort */
+        });
+      } else {
+        history.back();
+      }
     }
   });
 
@@ -604,30 +563,33 @@
   /** Long runtime diagnostics (e.g. absolute-path dumps) collapse to a
    * preview by default in the settings panel — keyed by message text. */
   let expandedDiagnostics = $state<Record<string, boolean>>({});
-  /** Direct pointer to the currently-streaming assistant message — avoids O(n) transcript scans. */
+  /** Direct pointer to the currently-streaming assistant message. */
   let activeStreamMsg = $state<UIMessage | null>(null);
-  // Non-reactive index for high-frequency tool updates. Rebuilt when history
-  // is replaced and updated incrementally for live tool events.
-  // eslint-disable-next-line svelte/prefer-svelte-reactivity -- non-reactive lookup index
-  const toolMessagesById = new Map<string, UIMessage>();
-  /** Inactive session transcripts and UI-only state, bounded by the cache's LRU cap. */
-  const sessionViewCache = new SessionViewCache();
   let input = $state('');
   /** Non-empty trimmed composer — one derived instead of input.trim() per template read. */
   const hasComposerText = $derived(input.trim().length > 0);
   /** Extension commands grouped by source — precomputed on commands_list, not per keystroke. */
-  let extCommandsBySource = $state<Record<string, { name: string; description?: string }[]>>({});
-  /** Lowercase extension command names — O(1) arg-mode lookup instead of .find per keystroke. */
-  let extCommandNames = $state<Set<string>>(new Set());
+  let extCommandsBySource = $state<
+    Record<string, { name: string; description?: string; hasArgumentCompletions?: boolean }[]>
+  >({});
+  /** Invocation names indexed by lowercase form for case-insensitive argument-mode lookup. */
+  let extCommandNames = $state<Map<string, { name: string; hasArgumentCompletions: boolean }>>(
+    new Map()
+  );
   /** Images staged for the next prompt (base64 data + display src). */
   let attachedImages = $state<Array<{ data: string; mimeType: string; name: string; src: string }>>(
     []
   );
   /** Text files staged for the next prompt (content read as text). */
   let attachedFiles = $state<Array<{ name: string; content: string; size: number }>>([]);
-  /** Original files awaiting their server staging response, keyed by name. */
+  /** Original files awaiting their server staging response, keyed by upload id. */
+  type PendingUpload = {
+    name: string;
+    sessionId: string | null;
+    generation: number;
+  };
   // eslint-disable-next-line svelte/prefer-svelte-reactivity -- response correlation map
-  const pendingUploads = new Map<string, File>();
+  const pendingUploads = new Map<string, PendingUpload>();
   let fileInputEl = $state<HTMLInputElement | undefined>(undefined);
 
   // ── Extension UI state ───────────────────────────────────────────────────────
@@ -661,14 +623,17 @@
   /** Current frame index for the working indicator animation. */
   let workingFrameIndex = $state(0);
   /** Global tool output expansion state (setToolsExpanded). */
-  let toolsExpandedGlobal = $state(false);
+  const sessionCoordinator = new SessionCoordinator();
+  let unsubscribeSessionCoordinator: (() => void) | null = null;
   /** Argument completions for the current extension command (subcommands). */
   let commandArgCompletions = $state<{ value: string; label: string; description?: string }[]>([]);
+  let commandArgResultsPrefix = $state('');
   let commandArgCommand = $state('');
   let commandArgPrefix = $state('');
   let commandCompletionsPending = $state(false);
   /** Whether the composer shortcut menu is open. */
   let showSlashMenu = $state(false);
+  let dismissedSlashMenuInput = $state<string | null>(null);
   /** Currently highlighted index in the composer shortcut menu (-1 = none). */
   let slashMenuIndex = $state(-1);
   const shortcutTrigger = $derived.by<ShortcutTrigger | null>(() => {
@@ -685,8 +650,15 @@
     const commandText = input.slice(1).trimStart();
     const commandEnd = commandText.search(/\s/);
     if (commandEnd < 0) return null;
-    const cmdName = commandText.slice(0, commandEnd).toLowerCase();
-    if (!extCommandNames.has(cmdName)) return null;
+    const typedName = commandText.slice(0, commandEnd);
+    const exactCommand = extensionCommands.find((command) => command.name === typedName);
+    const commandInfo = exactCommand
+      ? {
+          name: exactCommand.name,
+          hasArgumentCompletions: exactCommand.hasArgumentCompletions !== false,
+        }
+      : extCommandNames.get(typedName.toLowerCase());
+    if (!commandInfo?.hasArgumentCompletions) return null;
     // The separator belongs to the command name, not the raw argument prefix.
     // Keep every subsequent character, including internal and trailing whitespace.
     const prefix = commandText.slice(commandEnd).replace(/^\s+/, '');
@@ -696,7 +668,7 @@
     while (tokenStart > 0 && !/\s/.test(prefix[tokenStart - 1] ?? '')) tokenStart--;
     const hasTrailingWhitespace = tokenEnd < prefix.length;
     return {
-      command: cmdName,
+      command: commandInfo.name,
       prefix,
       parentPrefix: hasTrailingWhitespace ? prefix : prefix.slice(0, tokenStart),
       currentToken: hasTrailingWhitespace ? '' : prefix.slice(tokenStart, tokenEnd),
@@ -712,24 +684,29 @@
       if (commandArgMode) {
         const cmdName = commandArgMode.command;
         const currentToken = commandArgMode.currentToken.toLowerCase();
-        const filtered = commandArgCompletions
-          .filter(
-            (c) =>
-              !currentToken ||
-              completionToken(c.value, commandArgMode).toLowerCase().startsWith(currentToken)
-          )
-          .map((c) => ({
-            trigger: '/' as const,
-            label: c.label || c.value,
-            description: c.description ?? `/${cmdName} subcommand`,
-            insert: commandCompletionInsert(commandArgMode, c.value),
-          }))
-          .slice(0, 14);
-        if (filtered.length > 0) return filtered;
+        const fresh = commandArgResultsPrefix === commandArgMode.prefix;
+        const visibleCompletions = fresh
+          ? commandArgCompletions
+          : commandArgCompletions.filter((completion) => {
+              if (!currentToken) return true;
+              return (
+                completionToken(completion.value, commandArgMode)
+                  .toLowerCase()
+                  .includes(currentToken) || completion.label.toLowerCase().includes(currentToken)
+              );
+            });
+        const filtered = visibleCompletions.map((completion) => ({
+          trigger: '/' as const,
+          label: completion.label || completion.value,
+          description: completion.description ?? `/${cmdName} subcommand`,
+          insert: commandCompletionInsert(commandArgMode, completion.value, completion.label),
+        }));
+        if (filtered.length > 0) return filtered.slice(0, 30);
+        if (!commandCompletionsPending) return [];
         return [
           {
             trigger: '/' as const,
-            label: commandCompletionsPending ? 'Loading subcommands…' : 'No subcommands found',
+            label: 'Loading…',
             description: `/${cmdName}${commandArgMode.prefix ? ` ${commandArgMode.prefix}` : ''}`,
             insert: input,
             muted: true,
@@ -737,54 +714,125 @@
           },
         ];
       }
-      const commands = SLASH_COMMANDS.filter((c) => !q || c.name.startsWith(q)).map((c) => ({
-        trigger: '/' as const,
-        label: `/${c.name}`,
-        description: c.description,
-        insert: `/${c.name} `,
-      }));
-      // Grouped on commands_list receipt (extCommandsBySource) — no per-keystroke groupBy.
-      const extCmds: ComposerShortcut[] = [];
-      for (const [source, cmds] of Object.entries(extCommandsBySource)) {
-        if (!cmds) continue;
-        const matching = q ? cmds.filter((c) => c.name.startsWith(q)) : cmds;
-        for (const c of matching.slice(0, 6)) {
-          extCmds.push({
+
+      type SlashCandidate = {
+        shortcut: ComposerShortcut;
+        invocation: string;
+        descriptionSearch?: string;
+        category: number;
+        order: number;
+      };
+      const candidates: SlashCandidate[] = [];
+      const add = (
+        shortcut: ComposerShortcut,
+        invocation: string,
+        category: number,
+        order: number,
+        descriptionSearch?: string
+      ) => candidates.push({ shortcut, invocation, category, order, descriptionSearch });
+      let order = 0;
+      for (const command of SLASH_COMMANDS) {
+        add(
+          {
             trigger: '/' as const,
-            label: `/${c.name}`,
-            description: c.description || `${source} command`,
-            insert: `/${c.name} `,
-            section: source,
-          });
+            label: `/${command.name}`,
+            description: command.description,
+            insert: `/${command.name} `,
+          },
+          command.name,
+          0,
+          order++
+        );
+      }
+      for (const [source, commands] of Object.entries(extCommandsBySource)) {
+        for (const command of commands ?? []) {
+          add(
+            {
+              trigger: '/' as const,
+              label: `/${command.name}`,
+              description: command.description || `${source} command`,
+              insert: `/${command.name} `,
+              section: source,
+            },
+            command.name,
+            1,
+            order++
+          );
         }
       }
-      const skills = resourcesSkills
-        .filter((s) => !q || match(s.name) || match(s.description))
-        .slice(0, 8)
-        .map((s) => ({
-          trigger: '/' as const,
-          label: `/skill:${s.name}`,
-          description: s.description || `${s.scope} skill`,
-          insert: `/skill:${s.name} `,
-          muted: s.isBuiltin,
-        }));
-      const prompts = resourcesPrompts
-        .filter((p) => !q || match(p.name) || match(p.description))
-        .slice(0, 8)
-        .map((p) => ({
-          trigger: '/' as const,
-          label: `/${p.name}`,
-          description: p.description || p.argumentHint || `${p.scope} prompt`,
-          insert: `/${p.name} `,
-          muted: p.isBuiltin,
-        }));
-      const extAuto = extensionCompletions.slice(0, 8).map((c) => ({
-        trigger: '/' as const,
-        label: `/${c.label}`,
-        description: c.description ?? 'extension',
-        insert: `/${c.value} `,
-      }));
-      return [...commands, ...extCmds, ...skills, ...prompts, ...extAuto].slice(0, 14);
+      for (const skill of resourcesSkills) {
+        const description = skill.description || `${skill.scope} skill`;
+        add(
+          {
+            trigger: '/' as const,
+            label: `/skill:${skill.name}`,
+            description,
+            insert: `/skill:${skill.name} `,
+            muted: skill.isBuiltin,
+          },
+          `skill:${skill.name}`,
+          2,
+          order++,
+          description
+        );
+      }
+      for (const prompt of resourcesPrompts) {
+        const description = prompt.description || prompt.argumentHint || `${prompt.scope} prompt`;
+        add(
+          {
+            trigger: '/' as const,
+            label: `/${prompt.name}`,
+            description,
+            insert: `/${prompt.name} `,
+            muted: prompt.isBuiltin,
+          },
+          prompt.name,
+          3,
+          order++,
+          description
+        );
+      }
+      for (const completion of extensionCompletions) {
+        add(
+          {
+            trigger: '/' as const,
+            label: `/${completion.label}`,
+            description: completion.description ?? 'extension',
+            insert: `/${completion.value} `,
+          },
+          completion.value,
+          4,
+          order++
+        );
+      }
+      const query = q.toLowerCase();
+      const ranked = candidates.flatMap((candidate) => {
+        const name = candidate.invocation.toLowerCase();
+        const tier = !query
+          ? 1
+          : name === query
+            ? 0
+            : name.startsWith(query)
+              ? 1
+              : name.includes(query)
+                ? 2
+                : candidate.category >= 2 &&
+                    candidate.descriptionSearch?.toLowerCase().includes(query)
+                  ? 3
+                  : -1;
+        return tier < 0 ? [] : [{ ...candidate, tier }];
+      });
+      ranked.sort((a, b) => a.tier - b.tier || a.category - b.category || a.order - b.order);
+      // eslint-disable-next-line svelte/prefer-svelte-reactivity -- derived-local dedupe set
+      const seen = new Set<string>();
+      const results: ComposerShortcut[] = [];
+      for (const candidate of ranked) {
+        if (seen.has(candidate.shortcut.insert)) continue;
+        seen.add(candidate.shortcut.insert);
+        results.push(candidate.shortcut);
+        if (results.length === 30) break;
+      }
+      return results;
     }
 
     if (shortcutTrigger === '@') {
@@ -914,86 +962,36 @@
   let _bootServerSnapshot: ConnectedMessage | null = null;
   /** Request token for the remembered-session boot switch. */
   let _bootResumeRequestId: string | null = null;
-  /** Boot identity restore must not wait for the general 20 s op watchdog. */
-  const BOOT_RESUME_TIMEOUT_MS = 4_000;
-  let _bootResumeTimer: ReturnType<typeof setTimeout> | null = null;
-  function clearBootResumeTimer(): void {
-    if (_bootResumeTimer !== null) {
-      clearTimeout(_bootResumeTimer);
-      _bootResumeTimer = null;
-    }
-  }
-  function releaseBootResumeFallback(): void {
-    if (bootResumePath === null || _bootResumeRequestId === null) return;
-    // The timer handles a still-pending request; the effect below handles the
-    // store's normal timeout verdict. Ignore an already-settled operation.
-    if (!projectsState.sessionLoading && projectsState.error !== 'Session switch timed out') return;
-
-    const fallback = _bootServerSnapshot;
-    clearBootResumeTimer();
-    projectsState.cancelPendingOps();
-    projectsState.error = null;
-    bootResumePath = null;
-    _bootResumeRequestId = null;
-    _bootServerSnapshot = null;
-    clearIdentity();
-    if (fallback) {
-      applySessionState(fallback as unknown as Record<string, unknown>);
-      _lastVisibleSessionPath =
-        typeof fallback.sessionPath === 'string' ? fallback.sessionPath : undefined;
-      _lastVisibleSessionId =
-        typeof fallback.sessionId === 'string' ? fallback.sessionId : undefined;
-      resetSessionPanelState();
-      projectTrust = fallback.projectTrust ?? null;
-      runtimeDiagnostics = fallback.diagnostics ?? [];
-      resyncEditorMirror();
-      sessionStartTime = Date.now();
-      if (fallback.piVersion) piVersion = fallback.piVersion;
-      if (fallback.uiVersion) uiVersion = fallback.uiVersion;
-      if (fallback.sessionMode) sessionMode = fallback.sessionMode;
-      loadWebhookUrlFromServer(fallback.webhookUrl);
-      sessionLoading = false;
-      if (sessionPath) {
-        setSessionParam(sessionPath);
-        saveIdentity(sessionPath, sessionId ?? undefined, sessionName);
-        saveSnapshot(sessionPath, sessionName, messages);
-      } else {
-        clearIdentity();
-      }
-    } else {
-      sessionLoading = false;
-    }
-    showChatNotice('Session switch timed out', 'warning');
-  }
   /** Last path rendered from an authoritative full snapshot. */
   let _lastVisibleSessionPath: string | undefined;
   /** Last session id rendered from an authoritative full snapshot. */
   let _lastVisibleSessionId: string | undefined;
-  /** The optimistic new-chat reset already saved this outgoing view. */
-  let _optimisticViewSavedSessionId: string | null = null;
   let _pendingEdit: { messages: UIMessage[]; input: string } | null = null;
   $effect(() => {
-    if (projectsState.pendingNewSession && !_optimisticPrevMessages) {
-      if (sessionId) {
-        saveVisibleSessionView(sessionId);
-        _optimisticViewSavedSessionId = sessionId;
-      }
+    // A manual switch/resync supersedes boot resume. Never let the old
+    // connected fallback be revealed by the newer operation's response.
+    const bootRequestId = _bootResumeRequestId;
+    if (
+      bootRequestId !== null &&
+      (projectsState.sessionOperation.kind === 'idle' ||
+        projectsState.sessionOperation.requestId !== bootRequestId)
+    ) {
+      bootResumePath = null;
+      _bootResumeRequestId = null;
+      _bootServerSnapshot = null;
+    }
+  });
+  $effect(() => {
+    if (projectsState.sessionOperation.kind === 'creating' && !_optimisticPrevMessages) {
+      if (sessionId) sessionCoordinator.saveActiveView(activeSessionViewUiState());
       sessionSwitchDraft = null;
       composerBridge.discard();
+      pendingUploads.clear();
       _optimisticPrevMessages = messages.slice();
       if (_optimisticPrevInput === null) _optimisticPrevInput = input;
-      messages = [];
-      toolMessagesById.clear();
+      sessionCoordinator.clearTranscript();
       setComposerInput('');
-      totalRawMessagesLoaded = 0;
-      totalMessageCount = 0;
-      messagesTruncated = false;
       olderMessagesLoading = false;
-      activeStreamMsg = null;
-      isStreaming = false;
-      activeToolName = undefined;
-      projectsState.isStreaming = false;
-      compactionStartedAt = null;
       sessionName = undefined;
       // Keep cwd until server confirms targetCwd; don't wipe model etc.
     }
@@ -1003,31 +1001,19 @@
   // session successfully, so wait for resync_session's authoritative snapshot.
   $effect(() => {
     if (
-      !projectsState.pendingNewSession &&
+      projectsState.sessionOperation.kind !== 'creating' &&
       _optimisticPrevMessages &&
       projectsState.error &&
       projectsState.error !== 'New chat timed out — server did not respond in time'
     ) {
-      messages = _optimisticPrevMessages;
-      rebuildToolMessageIndex();
+      const previous = _optimisticPrevMessages;
+      sessionCoordinator.replaceMessages(previous);
       if (_optimisticPrevInput !== null) setComposerInput(_optimisticPrevInput);
       _optimisticPrevMessages = null;
       _optimisticPrevInput = null;
-      _optimisticViewSavedSessionId = null;
     }
   });
-  $effect(() => {
-    if (
-      bootResumePath === null ||
-      _bootResumeRequestId === null ||
-      projectsState.sessionLoading ||
-      projectsState.error !== 'Session switch timed out'
-    )
-      return;
-    releaseBootResumeFallback();
-  });
   let sessionStartTime = $state(0);
-  /** Pending steered messages (queue_update) */
   let queuedSteering = $state<string[]>([]);
   /** Pending follow-up messages (queue_update) */
   let queuedFollowUp = $state<string[]>([]);
@@ -1043,6 +1029,8 @@
   let isRecording = $state(false);
   /** STT: active SpeechRecognition instance (not reactive — plain ref). */
   let speechRec: { stop(): void } | null = null;
+  let sttSubmitTimer: ReturnType<typeof setTimeout> | null = null;
+  let pageDestroyed = false;
   /** STT: true when the user manually stopped recording (so onend does NOT auto-submit). */
   let sttManualStop = false;
   /**
@@ -1117,6 +1105,8 @@
       extensionCompletions = next.extensionCompletions;
     if (commandArgCompletions !== next.commandArgCompletions)
       commandArgCompletions = next.commandArgCompletions;
+    if (commandArgResultsPrefix !== next.commandArgResultsPrefix)
+      commandArgResultsPrefix = next.commandArgResultsPrefix;
     if (commandArgCommand !== next.commandArgCommand) commandArgCommand = next.commandArgCommand;
     if (commandArgPrefix !== next.commandArgPrefix) commandArgPrefix = next.commandArgPrefix;
     if (commandCompletionsPending !== next.commandCompletionsPending)
@@ -1188,18 +1178,33 @@
   /** Names of currently active/enabled tools */
   let activeToolNames = $state<string[]>([]);
   /** Registered slash commands from extensions */
-  let extensionCommands = $state<{ name: string; description?: string; source: string }[]>([]);
+  let extensionCommands = $state<
+    { name: string; description?: string; source: string; hasArgumentCompletions?: boolean }[]
+  >([]);
   /** Replace the extension command catalog + its precomputed per-keystroke indexes. */
   function applyExtensionCommands(
-    commands: { name: string; description?: string; source: string }[]
+    commands: {
+      name: string;
+      description?: string;
+      source: string;
+      hasArgumentCompletions?: boolean;
+    }[]
   ): void {
     extensionCommands = commands;
     // Precompute once here — the per-keystroke slash-menu derived only reads it.
     extCommandsBySource = Object.groupBy(
       extensionCommands.filter((c) => typeof c.name === 'string'),
       (c) => c.source
-    ) as Record<string, { name: string; description?: string }[]>;
-    extCommandNames = new Set(extensionCommands.map((c) => c.name.toLowerCase()));
+    ) as Record<string, { name: string; description?: string; hasArgumentCompletions?: boolean }[]>;
+    extCommandNames = new Map(
+      extensionCommands.map((command) => [
+        command.name.toLowerCase(),
+        {
+          name: command.name,
+          hasArgumentCompletions: command.hasArgumentCompletions !== false,
+        },
+      ])
+    );
   }
   /** PWA install prompt (beforeinstallprompt event). Non-reactive — event fires once. */
   let deferredInstallPrompt: Event | null = null;
@@ -1509,8 +1514,11 @@
   let isAtBottom = $state(true);
   /** The message id whose copy action is in the "copied" confirmation state */
   let copiedId = $state<string | null>(null);
+  let copiedIdTimer: ReturnType<typeof setTimeout> | null = null;
   /** The message id whose "copy turn" action is in the "copied" confirmation state */
   let copiedTurnId = $state<string | null>(null);
+  let copiedTurnIdTimer: ReturnType<typeof setTimeout> | null = null;
+  let codeCopyTimer: ReturnType<typeof setTimeout> | null = null;
 
   // ── Refresh project/session lists when the sidebar opens ────────────────────
 
@@ -1640,8 +1648,7 @@
       showChatNotice('Received an invalid server update; refreshing the session.', 'warning');
     }
     if (_resyncInFlight || now - _resyncRequestedAt < 5_000) return;
-    _resyncRequestedAt = now;
-    if (send({ type: 'resync_session' })) _resyncInFlight = true;
+    if (projectsState.resyncSession()) _resyncInFlight = true;
   }
 
   function handleSocketMessage(message: ServerMessage): void {
@@ -1667,10 +1674,7 @@
     composerBridge.flush();
     // Seal any streaming notices (compaction, retry) that would otherwise
     // stay stuck with streaming=true indefinitely after a disconnect.
-    for (const m of messages) {
-      if (m.streaming) m.streaming = false;
-    }
-    activeStreamMsg = null;
+    sessionCoordinator.clearStreamingFlags();
   }
 
   function handleSocketClose(info: ClientWebSocketCloseInfo): void {
@@ -1735,7 +1739,7 @@
     composerController.updateContext({
       websocketOpen: wsState === 'open',
       loading: sessionLoading || projectsState.sessionLoading,
-      pendingNewSession: projectsState.pendingNewSession,
+      pendingNewSession: projectsState.sessionOperation.kind === 'creating',
       streaming: isStreaming,
       sessionId,
       extensionCommands: extensionCommands.map((command) => command.name),
@@ -1784,19 +1788,13 @@
 
   /** Persist the active session path to URL params without navigation. */
   function setSessionParam(path: string): void {
-    const url = new URL(window.location.href);
-    url.searchParams.set('session', path);
-    // Confirmed URL writes clear the optimistic marker used to distinguish a
-    // stale app-written query from a genuine deep link on the next boot.
-    goto(url, {
-      shallow: true,
-      replace: true,
-      state: { ...untrack(() => page.state), piUiOptimisticSession: null },
-    }).catch(() => {
-      /* best-effort URL sync — never fail the WS flow */
+    _confirmedSessionPath = path;
+    queueUrlWrite((url) => {
+      url.searchParams.set('session', path);
     });
   }
-
+  let _confirmedSessionPath: string | null = null;
+  let urlWriteChain: Promise<unknown> = Promise.resolve();
   /** Read a URL param with a default fallback. */
   function urlParam(key: string, fallback: string): string {
     try {
@@ -1806,26 +1804,28 @@
     }
   }
 
-  /** Set one or more URL params without navigation. */
-  function setUrlParams(entries: Record<string, string | null>): void {
-    const url = new URL(window.location.href);
-    for (const [key, value] of Object.entries(entries)) {
-      if (value == null) url.searchParams.delete(key);
-      else url.searchParams.set(key, value);
-    }
-    // See setSessionParam() for the goto rationale. `untrack` is required:
-    // this runs from a layout-sync $effect, and reading `page.state` there
-    // would subscribe the effect to it — goto's state write then re-triggers
-    // the effect, looping forever.
-    goto(url, { shallow: true, replace: true, state: untrack(() => page.state) }).catch(() => {
-      /* best-effort URL sync */
-    });
+  function queueUrlWrite(update: (url: URL) => void): void {
+    urlWriteChain = urlWriteChain
+      .catch(() => {})
+      .then(() => {
+        const url = new URL(window.location.href);
+        update(url);
+        history.replaceState(history.state, '', url);
+      });
   }
 
-  $effect(() => {
-    void projectsState.unreadCount;
-    notificationController.updateBadge(projectsState.unreadCount);
-  });
+  /** Set one or more URL params without navigation. */
+  function setUrlParams(entries: Record<string, string | null>): void {
+    queueUrlWrite((url) => {
+      for (const [key, value] of Object.entries(entries)) {
+        if (value == null) url.searchParams.delete(key);
+        else url.searchParams.set(key, value);
+      }
+      const operation = projectsState.sessionOperation;
+      const sessionPath = operation.kind === 'switching' ? operation.path : _confirmedSessionPath;
+      if (sessionPath !== null) url.searchParams.set('session', sessionPath);
+    });
+  }
 
   /** Screen Wake Lock — keeps the display on during agent responses. */
   let wakeLock: WakeLockSentinel | null = null;
@@ -1873,7 +1873,7 @@
       _wsHandshakeComplete &&
       sessionId &&
       !sessionLoading &&
-      !projectsState.pendingNewSession
+      projectsState.sessionOperation.kind !== 'creating'
     ) {
       send({ type: 'extension_editor_text_change', text: input, sessionId });
     }
@@ -1893,11 +1893,11 @@
       _wsHandshakeComplete &&
       sid &&
       !sessionLoading &&
-      !projectsState.pendingNewSession
+      projectsState.sessionOperation.kind !== 'creating'
     ) {
       _editorMirrorTimer = setTimeout(() => {
         _editorMirrorTimer = null;
-        send({ type: 'extension_editor_text_change', text, sessionId: sid });
+        if (!pageDestroyed) send({ type: 'extension_editor_text_change', text, sessionId: sid });
       }, 150);
     }
   });
@@ -1927,32 +1927,26 @@
     };
   }
 
-  /** Save the visible session before its state is replaced by another snapshot. */
-  function saveVisibleSessionView(sid: string): void {
-    const expanded = new Set(
-      Object.entries(expandedUserMsgs)
-        .filter(([, value]) => value)
-        .map(([id]) => id)
-    );
-    const truncated = new Set(
-      Object.entries(truncatedUserMsgs)
-        .filter(([, value]) => value)
-        .map(([id]) => id)
-    );
-    sessionViewCache.save(sid, {
-      messages,
-      activeStreamMsg,
-      toolsById: new Map(toolMessagesById),
-      expandedUserMsgs: expanded,
-      truncatedUserMsgs: truncated,
+  function activeSessionViewUiState(): SessionViewUiState {
+    return {
+      expandedUserMsgs: new Set(
+        Object.entries(expandedUserMsgs)
+          .filter(([, value]) => value)
+          .map(([id]) => id)
+      ),
+      truncatedUserMsgs: new Set(
+        Object.entries(truncatedUserMsgs)
+          .filter(([, value]) => value)
+          .map(([id]) => id)
+      ),
       draft: input,
       contextUsage: currentContextUsage(),
-      queuedSteering,
-      queuedFollowUp,
+      queuedSteering: queuedSteering.slice(),
+      queuedFollowUp: queuedFollowUp.slice(),
       scrollAtBottom: isAtBottom,
-    });
+    };
   }
-  /** Apply retained UI-only state without replacing the authoritative transcript. */
+
   function restoreSessionViewUiState(view: SessionViewUiState): void {
     expandedUserMsgs = Object.fromEntries([...view.expandedUserMsgs].map((id) => [id, true]));
     truncatedUserMsgs = Object.fromEntries([...view.truncatedUserMsgs].map((id) => [id, true]));
@@ -1963,44 +1957,10 @@
     contextUsageWindow = view.contextUsage?.contextWindow ?? 0;
     isAtBottom = view.scrollAtBottom;
   }
-  // ── Server event handling ────────────────────────────────────────────────────
-  function pageSessionReducerState(): SessionReducerState {
-    return createSessionReducerState({
-      sessionId,
-      isStreaming,
-      activeToolName,
-      model,
-      thinkingLevel,
-      availableModels,
-      cwd,
-      sessionPath,
-      sessionName,
-      messages,
-      activeStreamMsg,
-      toolsById: new Map(toolMessagesById),
-      contextUsage: currentContextUsage(),
-      queuedSteering,
-      queuedFollowUp,
-      isCompacting,
-      compactionStartedAt,
-      autoCompactionEnabled,
-      autoRetryEnabled,
-      totalRawMessagesLoaded,
-      totalMessageCount,
-      messagesTruncated,
-      toolsExpanded: toolsExpandedGlobal,
-    });
-  }
+
   function applyPageSessionReducerState(next: SessionReducerState): void {
     messages = next.messages;
-    activeStreamMsg = next.activeStreamMsg
-      ? (messages.find((message) => message.id === next.activeStreamMsg?.id) ?? null)
-      : null;
-    toolMessagesById.clear();
-    for (const [toolCallId, message] of next.toolsById) {
-      const reactive = messages.find((candidate) => candidate.id === message.id);
-      if (reactive) toolMessagesById.set(toolCallId, reactive);
-    }
+    activeStreamMsg = next.activeStreamMsg;
     sessionId = next.sessionId;
     isStreaming = next.isStreaming;
     activeToolName = next.activeToolName;
@@ -2022,51 +1982,65 @@
     totalMessageCount = next.totalMessageCount;
     messagesTruncated = next.messagesTruncated;
   }
+
   function executeSessionEffects(effects: SessionEffect[]): void {
     for (const effect of effects) {
       if (effect.type === 'scroll_bottom') {
         scrollBottom();
         continue;
       }
-      const message = messages.find((candidate) => candidate.id === effect.messageId);
+      const message =
+        effect.messageId === activeStreamMsg?.id
+          ? activeStreamMsg
+          : sessionCoordinator.state.messages.find(
+              (candidate) => candidate.id === effect.messageId
+            );
       if (message) scheduleContentRender(message, effect.scroll);
     }
   }
+
+  unsubscribeSessionCoordinator = sessionCoordinator.subscribe(({ state, effects }) => {
+    applyPageSessionReducerState(state);
+    executeSessionEffects(effects);
+  });
+
   function reduceActiveSessionEvent(message: ServerMessage | Record<string, unknown>): void {
-    const result = reduceSession(pageSessionReducerState(), { type: 'event', message });
-    applyPageSessionReducerState(result.state);
-    executeSessionEffects(result.effects);
+    sessionCoordinator.applyEvent(message);
+    if (sessionId) projectsState.reconcileActiveRuntime(sessionId, isStreaming, activeToolName);
   }
+
   function applySessionState(payload: Record<string, unknown>) {
     const prevSessionId = sessionId;
     const sessionIdentityChanged =
       typeof payload.sessionId === 'string' && payload.sessionId !== prevSessionId;
     if (sessionIdentityChanged && typeof payload.sessionId === 'string') {
-      // Completion results are scoped to one resident; discard the previous
-      // request generation before accepting the new snapshot.
       completionController.setSession(payload.sessionId);
     }
+
     if (sessionIdentityChanged) {
-      // Preserve drafts and cheap UI state around an authoritative identity
-      // transition; the reducer owns transcript/context replacement below.
-      const draftWhileSwitching = !projectsState.pendingNewSession
-        ? (sessionSwitchDraft ?? (!projectsState.sessionLoading ? input : null))
-        : null;
+      const draftWhileSwitching =
+        projectsState.sessionOperation.kind !== 'creating'
+          ? (sessionSwitchDraft ?? (!projectsState.sessionLoading ? input : null))
+          : null;
       const sharedDraft = shareTargetDraft;
-      if (
-        prevSessionId &&
-        _optimisticViewSavedSessionId !== prevSessionId &&
-        !projectsState.pendingNewSession
-      ) {
-        saveVisibleSessionView(prevSessionId);
-      }
-      const restoredUi = !projectsState.pendingNewSession
-        ? sessionViewCache.restoreUiState(payload.sessionId as string)
-        : null;
+      const creating = projectsState.sessionOperation.kind === 'creating';
+      pendingUploads.clear();
       composerController.clearAttachments();
-      if (projectsState.pendingNewSession) {
+      if (creating) {
         expandedUserMsgs = {};
         truncatedUserMsgs = {};
+      }
+      const result = sessionCoordinator.applySnapshot(payload, {
+        activeView: creating ? undefined : activeSessionViewUiState(),
+        preserveActiveView: !creating,
+        restoreCachedUi: !creating,
+      });
+      const restoredUi = result.restoredUi;
+      if (creating) {
+        // Keep text entered while the optimistic new-session operation was
+        // pending. The old pre-transition draft is only restored on failure.
+        setComposerInput(input);
+        sessionSwitchDraft = null;
       } else if (restoredUi) {
         restoreSessionViewUiState(restoredUi);
         if (sharedDraft !== null) setComposerInput(sharedDraft);
@@ -2077,13 +2051,12 @@
         truncatedUserMsgs = {};
       }
       shareTargetDraft = null;
-      _optimisticViewSavedSessionId = null;
       composerBridge.discard();
+    } else {
+      sessionCoordinator.applySnapshot(payload);
     }
 
-    const result = reduceSession(pageSessionReducerState(), { type: 'snapshot', payload });
-    applyPageSessionReducerState(result.state);
-    if (result.transcriptReplaced) {
+    if (sessionIdentityChanged || 'messages' in payload) {
       olderMessagesLoading = false;
       pruneUnresolvedLangs();
     }
@@ -2099,24 +2072,23 @@
     if (payload.commands !== undefined) {
       applyExtensionCommands(
         (payload.commands as
-          { name: string; description?: string; source: string }[] | undefined) ?? []
+          | {
+              name: string;
+              description?: string;
+              source: string;
+              hasArgumentCompletions?: boolean;
+            }[]
+          | undefined) ?? []
       );
     }
     if (payload.extensionUiState && typeof payload.extensionUiState === 'object') {
       extensionUiState.applySnapshot(payload.extensionUiState as ExtensionUiStatePayload);
     } else if (sessionIdentityChanged) {
-      // Defensive: a session change without a snapshot must never keep the
-      // previous session's extension UI behind.
       extensionUiState.reset();
       if (typeof payload.sessionName === 'string') extensionUiState.setTitle(payload.sessionName);
     }
     projectsState.cwd = cwd;
-    if ('sessionId' in payload && typeof payload.sessionId === 'string') {
-      projectsState.reconcileActiveRuntime(payload.sessionId, isStreaming, activeToolName);
-    } else {
-      projectsState.isStreaming = isStreaming;
-      projectsState.activeToolName = activeToolName;
-    }
+    if (sessionId) projectsState.reconcileActiveRuntime(sessionId, isStreaming, activeToolName);
     if ('autoCompactionEnabled' in payload) {
       try {
         localStorage.setItem(
@@ -2136,33 +2108,8 @@
     }
   }
 
-  /** Apply a session-scoped live event to an inactive resident view. This path
-   * intentionally never invokes markdown rendering, scroll handling, or any
-   * page-level reactive state; it uses the same reducer as the active session.
-   */
   function applyBackgroundFrame(msg: ServerMessage, sid: string): boolean {
-    const view = sessionViewCache.restore(sid);
-    if (!view) return false;
-    const result = reduceSession(
-      createSessionReducerState({
-        sessionId: sid,
-        messages: view.messages,
-        activeStreamMsg: view.activeStreamMsg,
-        toolsById: view.toolsById,
-        contextUsage: view.contextUsage,
-        queuedSteering: view.queuedSteering,
-        queuedFollowUp: view.queuedFollowUp,
-        toolsExpanded: toolsExpandedGlobal,
-      }),
-      { type: 'event', message: msg }
-    );
-    view.messages = result.state.messages;
-    view.activeStreamMsg = result.state.activeStreamMsg;
-    view.toolsById = result.state.toolsById;
-    view.contextUsage = result.state.contextUsage;
-    view.queuedSteering = result.state.queuedSteering;
-    view.queuedFollowUp = result.state.queuedFollowUp;
-    return true;
+    return sessionCoordinator.applyBackgroundFrame(sid, msg);
   }
 
   function handleServer(msg: ServerMessage) {
@@ -2195,10 +2142,7 @@
         const serverSessionId = typeof c.sessionId === 'string' ? c.sessionId : undefined;
         const shouldResumeTarget = !!targetPath && targetPath !== serverPath;
         const hadOrphanedSessionState =
-          projectsState.pendingNewSession ||
-          projectsState.sessionLoading ||
-          _optimisticPrevMessages !== null;
-
+          projectsState.sessionOperation.kind !== 'idle' || _optimisticPrevMessages !== null;
         if (shouldResumeTarget) {
           // Keep the hydrated boot target visible until its switch response
           // arrives; the server's current session is only a fallback.
@@ -2247,16 +2191,11 @@
           // semantics as the manual action it replaces.
           const result = projectsState.switchSession(targetPath);
           if (result === 'ok') {
-            _bootResumeRequestId = projectsState.pendingRequestId;
-            clearBootResumeTimer();
-            _bootResumeTimer = setTimeout(() => {
-              _bootResumeTimer = null;
-              releaseBootResumeFallback();
-            }, BOOT_RESUME_TIMEOUT_MS);
+            _bootResumeRequestId =
+              projectsState.sessionOperation.kind === 'switching'
+                ? projectsState.sessionOperation.requestId
+                : null;
           } else {
-            // The socket was open for connected, so this is only a defensive
-            // fallback for a race with another local operation.
-            _bootResumeRequestId = null;
             bootResumePath = null;
             _bootServerSnapshot = null;
             applySessionState(c as unknown as Record<string, unknown>);
@@ -2295,23 +2234,19 @@
       case 'session_loaded': {
         const sl = msg as Record<string, unknown>;
         const requestId = typeof sl.requestId === 'string' ? sl.requestId : undefined;
-        // A response whose operation has already settled (or timed out) is
-        // stale and must not clobber the newer visible session.
-        if (requestId && projectsState.isRetiredRequest(requestId)) break;
-        const pendingRequestId = projectsState.pendingRequestId;
+        // A retired or foreign stamped response, and every unstamped
+        // broadcast while a local operation is active, is not ours.
+        if (!projectsState.shouldApplySessionLoaded(requestId)) break;
+        const pendingRequestId =
+          projectsState.sessionOperation.kind === 'idle'
+            ? null
+            : projectsState.sessionOperation.requestId;
         const previousPath = _lastVisibleSessionPath;
         const previousSessionId = _lastVisibleSessionId;
         const loadedPath = typeof sl.sessionPath === 'string' ? sl.sessionPath : undefined;
         const loadedSessionId = typeof sl.sessionId === 'string' ? sl.sessionId : undefined;
-        // The server always stamps the requester's snapshot. Unstamped
-        // snapshots are foreign-switch broadcasts from other tabs — applied
-        // as foreign below, never as this tab's own response.
         const ownResponse = pendingRequestId !== null && requestId === pendingRequestId;
-        // A requestId is authoritative when present. A stamped snapshot for
-        // another operation belongs to another tab (or an abandoned request),
-        // never this tab, even when its session path differs.
-        if (requestId !== undefined && !ownResponse) break;
-        const resyncResponse = projectsState.pendingResync;
+        const resyncResponse = projectsState.sessionOperation.kind === 'resyncing';
         const foreignPathChange =
           !ownResponse &&
           !resyncResponse &&
@@ -2338,13 +2273,13 @@
         if (sl.sessionMode) sessionMode = sl.sessionMode as string;
         const authoritativePath = loadedPath ?? sessionPath ?? undefined;
         const settled = projectsState.onSessionLoaded(ownResponse ? requestId : undefined);
-        sessionLoading = projectsState.sessionLoading;
-        if (settled) showSessionPanel = false;
-        projectPickerOpen = false;
+        if (settled) {
+          if (isMobile && showSessionPanel) _skipDrawerHistoryBack = true;
+          showSessionPanel = false;
+        }
 
         if (ownResponse) {
-          if (_bootResumeRequestId !== null) {
-            clearBootResumeTimer();
+          if (_bootResumeRequestId !== null && requestId === _bootResumeRequestId) {
             bootResumePath = null;
             _bootResumeRequestId = null;
             _bootServerSnapshot = null;
@@ -2426,7 +2361,6 @@
           sessionSwitchDraft = null;
         }
         if (wasIdentityRestore) {
-          clearBootResumeTimer();
           // The remembered path is unavailable. Drop that dead pointer, then
           // reveal the connected session that was held back during boot.
           clearIdentity();
@@ -2454,16 +2388,16 @@
 
         // Restore optimistic new-chat if it failed — don't leave empty chat or draft.
         if (_optimisticPrevMessages) {
-          messages = _optimisticPrevMessages;
+          const previous = _optimisticPrevMessages;
+          sessionCoordinator.replaceMessages(previous);
           _optimisticPrevMessages = null;
         }
         if (_optimisticPrevInput !== null) {
           setComposerInput(_optimisticPrevInput);
           _optimisticPrevInput = null;
         }
-        rebuildToolMessageIndex();
         sessionLoading = false;
-        projectsState.sessionLoading = false;
+        // Operation state is owned by projectsState; the local mirror updates reactively.
         if (wasIdentityRestore && fallback) {
           if (sessionPath) {
             setSessionParam(sessionPath);
@@ -2511,7 +2445,6 @@
         // The first agent_start proves the server accepted the edit rewind;
         // keep the optimistic history and stop retaining its rollback copy.
         _pendingEdit = null;
-        projectsState.isStreaming = true;
         requestWakeLock();
         break;
 
@@ -2524,7 +2457,6 @@
       case 'agent_end': {
         const { willRetry } = msg as { type: 'agent_end'; willRetry?: boolean };
         reduceActiveSessionEvent(msg);
-        projectsState.isStreaming = false;
         if (conversationMode && !willRetry && wsState === 'open') {
           toggleSTT();
         }
@@ -2537,28 +2469,28 @@
 
       case 'agent_error': {
         // Server-side error during prompt/steer/followUp — unfreeze the UI.
-        projectsState.isStreaming = false;
+        reduceActiveSessionEvent(msg);
         const errMsg = (msg as { error?: string }).error ?? 'Unknown error';
         // unhandled rejection refires while its owner (stale ctx timer, wedged
         // extension) lives. Collapse repeats so one looping fault renders one
         // notice instead of a stack; legitimately distinct errors still show.
         const last = [...messages].reverse().find((m) => m.role === 'notice');
         const sameAsLast = last?.role === 'notice' && last.content === `Agent error: ${errMsg}`;
-        if (_optimisticPrevMessages || projectsState.pendingNewSession) {
+        if (_optimisticPrevMessages || projectsState.sessionOperation.kind === 'creating') {
           if (_optimisticPrevMessages) {
-            messages = _optimisticPrevMessages;
+            const previous = _optimisticPrevMessages;
+            sessionCoordinator.replaceMessages(previous);
             _optimisticPrevMessages = null;
           }
           if (_optimisticPrevInput !== null) setComposerInput(_optimisticPrevInput);
           _optimisticPrevInput = null;
-          rebuildToolMessageIndex();
           projectsState.cancelPendingOps();
           sessionLoading = false;
         }
         if (restorePendingEdit()) {
           // The error may be unrelated to the edit because edit_message has
           // no request token. Resync so the authoritative server history wins.
-          send({ type: 'resync_session' });
+          projectsState.resyncSession();
         }
         if (!sameAsLast) showChatNotice(`Agent error: ${errMsg}`, 'error');
         break;
@@ -2624,7 +2556,7 @@
         } else if (method === 'setTitle') {
           extensionUiState.setTitle(msg.title as string | undefined);
         } else if (method === 'set_editor_text') {
-          if (!projectsState.pendingNewSession) {
+          if (projectsState.sessionOperation.kind !== 'creating') {
             setComposerInput((msg.text as string | undefined) ?? '');
             tick().then(() => {
               autoResizeTextarea();
@@ -2632,7 +2564,7 @@
             });
           }
         } else if (method === 'paste_to_editor') {
-          if (!projectsState.pendingNewSession) {
+          if (projectsState.sessionOperation.kind !== 'creating') {
             const textToInsert = (msg.text as string | undefined) ?? '';
             if (inputEl) {
               const start = inputEl.selectionStart ?? input.length;
@@ -2661,10 +2593,7 @@
           extensionUiState.setHiddenThinkingLabel(msg.label as string | undefined);
         } else if (method === 'setToolsExpanded') {
           const exp = (msg.expanded as boolean | undefined) ?? false;
-          toolsExpandedGlobal = exp;
-          for (const m of messages) {
-            if (m.role === 'tool' && !m.streaming) m.expanded = exp;
-          }
+          sessionCoordinator.setToolsExpanded(exp);
         } else if (method === 'set_header') {
           extensionUiState.setHeader(msg.content as string | undefined);
         } else if (method === 'set_footer') {
@@ -2672,7 +2601,7 @@
         } else if (method === 'set_editor_component') {
           extensionUiState.setEditorComponent((msg.parsed as ParsedComponent | null) ?? null);
         } else if (method === 'diagnostic') {
-          messages.push({
+          sessionCoordinator.appendDiagnostic({
             id: uid(),
             role: 'diagnostic',
             content: (msg.message as string) ?? '',
@@ -2683,8 +2612,6 @@
             createdAt: (msg.timestamp as number | undefined) ?? Date.now(),
           });
         }
-
-        // Blocking request — pi is waiting on the user. Ping when the tab is
         // hidden so the blocking question isn't discovered on return.
         if (
           document.hidden &&
@@ -2837,8 +2764,14 @@
 
       case 'commands_list': {
         applyExtensionCommands(
-          (msg.commands as { name: string; description?: string; source: string }[] | undefined) ??
-            []
+          (msg.commands as
+            | {
+                name: string;
+                description?: string;
+                source: string;
+                hasArgumentCompletions?: boolean;
+              }[]
+            | undefined) ?? []
         );
         break;
       }
@@ -2920,8 +2853,7 @@
       case 'file_completions':
       case 'extension_completions':
       case 'command_completions': {
-        const accepted = completionController.handleResponse(msg, currentCompletionView());
-        if (accepted && msg.type === 'extension_completions') showSlashMenu = true;
+        completionController.handleResponse(msg, currentCompletionView());
         break;
       }
 
@@ -2955,22 +2887,16 @@
           level?: 'info' | 'warning' | 'error';
         };
         if (result.command === 'shell' && sessionId) {
-          const shell = findToolMessage(`shell-${sessionId}`);
-          if (shell) {
+          sessionCoordinator.updateTool(`shell-${sessionId}`, (shell) => {
             shell.streaming = false;
             shell.endMs = Date.now();
             shell.isError = result.level === 'error';
             if (!shell.content && result.message) shell.content = result.message;
-          }
+          });
         }
-        messages.push({
-          id: uid(),
-          role: 'notice',
-          content: result.message,
+        sessionCoordinator.appendNotice(result.message, result.level ?? 'info', {
           noticeKind: result.level === 'error' ? 'retry' : undefined,
           customType: 'slash_result',
-          streaming: false,
-          createdAt: Date.now(),
         });
         break;
       }
@@ -3000,12 +2926,11 @@
         };
         if (older.sessionId && older.sessionId !== sessionId) break;
         olderMessagesLoading = false;
-        const olderUi = rawMessagesToUI(older.messages);
-        messages.unshift(...olderUi);
-        for (let i = 0; i < olderUi.length; i++) indexToolMessage(messages[i]);
-        totalRawMessagesLoaded += older.messages.length;
-        totalMessageCount = older.totalMessageCount;
-        messagesTruncated = older.messagesTruncated;
+        sessionCoordinator.prependOlderMessages(
+          older.messages,
+          older.totalMessageCount,
+          older.messagesTruncated
+        );
         break;
       }
 
@@ -3022,11 +2947,22 @@
       case 'file_staged': {
         const staged = msg as {
           type: 'file_staged';
+          uploadId: string;
+          sessionId: string | null;
           name: string;
           path: string;
           error?: string;
         };
-        pendingUploads.delete(staged.name);
+        const pending = pendingUploads.get(staged.uploadId);
+        if (
+          !pending ||
+          pending.sessionId !== staged.sessionId ||
+          pending.name !== staged.name ||
+          !composerController.isAttachmentContextCurrent(pending)
+        ) {
+          break;
+        }
+        pendingUploads.delete(staged.uploadId);
         if (staged.error) {
           showChatNotice(`Failed to stage ${staged.name}: ${staged.error}`, 'error');
         } else {
@@ -3036,6 +2972,7 @@
             'info'
           );
           void tick().then(() => {
+            if (!composerController.isAttachmentContextCurrent(pending)) return;
             autoResizeTextarea();
             inputEl?.focus();
           });
@@ -3307,7 +3244,7 @@
   }
 
   function forkAt(entryId: string) {
-    send({ type: 'fork_session', entryId });
+    send({ type: 'fork_session', entryId, requestId: projectsState.nextRequestId() });
     showForkDialog = false;
   }
   function cloneMessagesForEdit(source: UIMessage[]): UIMessage[] {
@@ -3324,10 +3261,10 @@
   }
   function restorePendingEdit(): boolean {
     if (!_pendingEdit) return false;
-    messages = _pendingEdit.messages;
+    const previous = _pendingEdit.messages;
+    sessionCoordinator.replaceMessages(previous);
     setComposerInput(_pendingEdit.input);
     _pendingEdit = null;
-    rebuildToolMessageIndex();
     return true;
   }
   function editMessage(originalText: string, newText: string) {
@@ -3338,12 +3275,13 @@
     _pendingEdit = { messages: cloneMessagesForEdit(messages), input };
     // Update content first, then truncate after this message without mutating
     // the objects retained by the rollback snapshot.
-    messages = messages
-      .slice(0, idx + 1)
-      .map((message, messageIndex) =>
-        messageIndex === idx ? { ...message, content: newText } : message
-      );
-    rebuildToolMessageIndex();
+    sessionCoordinator.replaceMessages(
+      messages
+        .slice(0, idx + 1)
+        .map((message, messageIndex) =>
+          messageIndex === idx ? { ...message, content: newText } : message
+        )
+    );
     // Send to server — server rewinds session and resends
     if (!send({ type: 'edit_message', originalMessage: originalText, newMessage: newText })) {
       restorePendingEdit();
@@ -3358,6 +3296,7 @@
   // eslint-disable-next-line svelte/prefer-svelte-reactivity -- internal throttle buffer, never read reactively
   let _pendingRenderSet = new Set<UIMessage>();
   let _renderScheduled = false;
+  let _renderRaf: number | null = null;
   /** A text delta asked for bottom-stick this frame — consumed by the render rAF. */
   let _scrollPending = false;
 
@@ -3393,7 +3332,13 @@
     if (scroll) _scrollPending = true;
     if (_renderScheduled) return;
     _renderScheduled = true;
-    requestAnimationFrame(async () => {
+    _renderRaf = requestAnimationFrame(async () => {
+      _renderRaf = null;
+      if (pageDestroyed) {
+        _renderScheduled = false;
+        _pendingRenderSet.clear();
+        return;
+      }
       for (const m of _pendingRenderSet) {
         if (!messages.includes(m)) continue; // stale — evicted or replaced
         if (m.streaming) {
@@ -3422,33 +3367,10 @@
         _scrollPending = false;
         if (isAtBottom && scrollEl) {
           await tick();
-          if (isAtBottom && scrollEl) scrollEl.scrollTop = scrollEl.scrollHeight;
+          if (!pageDestroyed && isAtBottom && scrollEl) scrollEl.scrollTop = scrollEl.scrollHeight;
         }
       }
     });
-  }
-
-  function indexToolMessage(message: UIMessage): void {
-    if (message.role === 'tool' && message.toolCallId) {
-      toolMessagesById.set(message.toolCallId, message);
-    }
-  }
-
-  function rebuildToolMessageIndex(): void {
-    toolMessagesById.clear();
-    for (const message of messages) indexToolMessage(message);
-  }
-  function findToolMessage(toolCallId: string): UIMessage | undefined {
-    const indexed = toolMessagesById.get(toolCallId);
-    if (indexed) return indexed;
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const message = messages[i];
-      if (message.role === 'tool' && message.toolCallId === toolCallId) {
-        toolMessagesById.set(toolCallId, message);
-        return message;
-      }
-    }
-    return undefined;
   }
 
   /** One pending scroll per frame — token deltas and WS frames call this often. */
@@ -3460,8 +3382,9 @@
     if (_scrollRaf !== null || !isAtBottom || !scrollEl) return;
     _scrollRaf = requestAnimationFrame(async () => {
       _scrollRaf = null;
+      if (pageDestroyed) return;
       await tick();
-      if (!isAtBottom || !scrollEl) return;
+      if (pageDestroyed || !isAtBottom || !scrollEl) return;
       // Instant (not smooth) — a smooth animation restarts every frame while
       // streaming and never settles; the bottom button stays smooth below.
       scrollEl.scrollTop = scrollEl.scrollHeight;
@@ -3501,8 +3424,10 @@
     try {
       await navigator.clipboard.writeText(text);
       copiedId = msg.id;
-      setTimeout(() => {
-        copiedId = null;
+      if (copiedIdTimer) clearTimeout(copiedIdTimer);
+      copiedIdTimer = setTimeout(() => {
+        copiedIdTimer = null;
+        if (!pageDestroyed) copiedId = null;
       }, 2000);
     } catch {
       // clipboard failed — for large content offer download instead
@@ -3536,8 +3461,10 @@
     try {
       await navigator.clipboard.writeText(parts.join('\n\n'));
       copiedTurnId = msg.id;
-      setTimeout(() => {
-        copiedTurnId = null;
+      if (copiedTurnIdTimer) clearTimeout(copiedTurnIdTimer);
+      copiedTurnIdTimer = setTimeout(() => {
+        copiedTurnIdTimer = null;
+        if (!pageDestroyed) copiedTurnId = null;
       }, 2000);
     } catch {
       // clipboard not available
@@ -3555,8 +3482,10 @@
     navigator.clipboard.writeText(code).catch(() => {});
     const prev = btn.textContent;
     btn.textContent = 'Copied!';
-    setTimeout(() => {
-      btn.textContent = prev;
+    if (codeCopyTimer) clearTimeout(codeCopyTimer);
+    codeCopyTimer = setTimeout(() => {
+      codeCopyTimer = null;
+      if (!pageDestroyed) btn.textContent = prev;
     }, 2000);
   }
 
@@ -3662,13 +3591,13 @@
       inputEl?.focus();
     }
   }
-
-  // ── User input ───────────────────────────────────────────────────────────────
-
   async function processAttachmentFiles(files: File[]) {
+    const attachmentContext = composerController.captureAttachmentContext();
     const result = await composerController.processAttachmentFiles(files);
+    if (!composerController.isAttachmentContextCurrent(attachmentContext)) return;
     for (const notice of result.notices) showChatNotice(notice.message, notice.level);
     for (const file of result.unsupported) {
+      if (!composerController.isAttachmentContextCurrent(attachmentContext)) return;
       const name = file.name || 'attachment';
       const ext = name.split('.').pop()?.toLowerCase() ?? '';
       if (SPREADSHEET_EXTENSIONS.has(ext)) {
@@ -3678,13 +3607,16 @@
         }
         try {
           const content = await xlsxToText(await file.arrayBuffer());
+          if (!composerController.isAttachmentContextCurrent(attachmentContext)) return;
           const draft = composerController.current;
           composerController.setDraft({
             ...draft,
             attachedFiles: [...draft.attachedFiles, { name, content, size: file.size }],
           });
         } catch {
-          showChatNotice(`Could not read spreadsheet: ${name}`, 'warning');
+          if (composerController.isAttachmentContextCurrent(attachmentContext)) {
+            showChatNotice(`Could not read spreadsheet: ${name}`, 'warning');
+          }
         }
         continue;
       }
@@ -3695,20 +3627,39 @@
         showChatNotice(`File too large: ${name} (max ~3MB staged)`, 'warning');
         continue;
       }
-      pendingUploads.set(name, file);
+      const uploadId = uid();
+      pendingUploads.set(uploadId, {
+        name,
+        sessionId: attachmentContext.sessionId,
+        generation: attachmentContext.generation,
+      });
       showChatNotice(`Uploading ${name}…`, 'info');
       try {
         const data = await fileToBase64(file);
+        if (!composerController.isAttachmentContextCurrent(attachmentContext)) {
+          pendingUploads.delete(uploadId);
+          return;
+        }
         if (data.length > 4190000) {
-          pendingUploads.delete(name);
+          pendingUploads.delete(uploadId);
           showChatNotice(`File too large: ${name} (max ~3MB staged)`, 'warning');
-        } else if (!send({ type: 'upload_file', name, data })) {
-          pendingUploads.delete(name);
+        } else if (
+          !send({
+            type: 'upload_file',
+            uploadId,
+            ...(attachmentContext.sessionId ? { sessionId: attachmentContext.sessionId } : {}),
+            name,
+            data,
+          })
+        ) {
+          pendingUploads.delete(uploadId);
           showChatNotice(`Failed to upload ${name}: not connected`, 'error');
         }
       } catch {
-        pendingUploads.delete(name);
-        showChatNotice(`Failed to upload ${name}`, 'error');
+        pendingUploads.delete(uploadId);
+        if (composerController.isAttachmentContextCurrent(attachmentContext)) {
+          showChatNotice(`Failed to upload ${name}`, 'error');
+        }
       }
     }
   }
@@ -3749,17 +3700,9 @@
    *  instead of a corner toast. Client-only — never sent to the session, so
    *  it does not persist past a reload. */
   function showChatNotice(message: string, level: 'info' | 'warning' | 'error' = 'info') {
-    messages.push({
-      id: uid(),
-      role: 'notice',
-      content: message,
-      noticeKind: 'toast',
-      level,
-      streaming: false,
-      createdAt: Date.now(),
-    });
+    if (pageDestroyed) return;
+    sessionCoordinator.appendNotice(message, level);
   }
-
   function dismissChatNotice(id: string) {
     const idx = messages.findIndex((m) => m.id === id);
     if (idx >= 0) messages.splice(idx, 1);
@@ -3770,12 +3713,11 @@
     setComposerInput(shortcut.insert);
     showSlashMenu = false;
     tick().then(() => {
+      if (pageDestroyed) return;
       autoResizeTextarea();
       inputEl?.focus();
     });
   }
-
-  // ── STT ──────────────────────────────────────────────────────────────────────
 
   function toggleSTT() {
     if (isRecording) {
@@ -3798,6 +3740,7 @@
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     rec.onresult = (e: any) => {
+      if (pageDestroyed) return;
       let text = '';
       for (let i = 0; i < e.results.length; i++) {
         const r = e.results[i];
@@ -3813,9 +3756,13 @@
       isRecording = false;
       speechRec = null;
       // Auto-submit when silence gap ended recognition and we got a final transcript
-      if (!sttManualStop && hadFinalResult && input.trim()) {
+      if (!pageDestroyed && !sttManualStop && hadFinalResult && input.trim()) {
         // Tiny delay so Svelte flushes the input state update before submitMessage reads it
-        setTimeout(() => submitMessage(), 50);
+        if (sttSubmitTimer) clearTimeout(sttSubmitTimer);
+        sttSubmitTimer = setTimeout(() => {
+          sttSubmitTimer = null;
+          if (!pageDestroyed) submitMessage();
+        }, 50);
       }
     };
 
@@ -3890,9 +3837,8 @@
     }
     return true;
   }
-
   function submitMessage(asFollowUp = false) {
-    if (wsState !== 'open' || sessionLoading) return;
+    if (pageDestroyed || wsState !== 'open' || sessionLoading) return;
     flushEditorMirror();
     const result = composerController.submit(asFollowUp);
     if (!result.accepted) return;
@@ -3906,7 +3852,7 @@
         queuedSteering = [...queuedSteering, message.message];
       }
     }
-    if (result.userMessage) messages.push(result.userMessage);
+    if (result.userMessage) sessionCoordinator.appendUserMessage(result.userMessage);
     resetTextareaHeight();
     scrollBottom();
   }
@@ -3917,6 +3863,7 @@
     if (sendHoldTimer) clearTimeout(sendHoldTimer);
     sendHolding = true;
     sendHoldTimer = setTimeout(() => {
+      if (pageDestroyed) return;
       sendHoldSubmitted = true;
       sendHolding = false;
       submitMessage(true);
@@ -3939,12 +3886,26 @@
     submitMessage();
   }
 
+  function scrollSlashOptionIntoView(index: number): void {
+    tick().then(() => {
+      if (pageDestroyed) return;
+      document.getElementById(`slash-option-${index}`)?.scrollIntoView({ block: 'nearest' });
+    });
+  }
+
   function handleComposerKey(e: KeyboardEvent): boolean {
+    if (showSlashMenu && e.key === 'Escape') {
+      e.preventDefault();
+      dismissedSlashMenuInput = input;
+      showSlashMenu = false;
+      return true;
+    }
     if (showSlashMenu) {
       if (e.key === 'ArrowDown') {
         e.preventDefault();
         if (filteredSlashCommands.length === 0) return true;
         slashMenuIndex = (slashMenuIndex + 1) % filteredSlashCommands.length;
+        scrollSlashOptionIntoView(slashMenuIndex);
         return true;
       }
       if (e.key === 'ArrowUp') {
@@ -3952,6 +3913,7 @@
         if (filteredSlashCommands.length === 0) return true;
         slashMenuIndex =
           (slashMenuIndex - 1 + filteredSlashCommands.length) % filteredSlashCommands.length;
+        scrollSlashOptionIntoView(slashMenuIndex);
         return true;
       }
       if (e.key === 'Enter' && slashMenuIndex >= 0) {
@@ -3973,7 +3935,8 @@
     }
     // Keep Enter available as a newline while the session is opening. The
     // eventual session_loaded path enables submission without losing the draft.
-    if ((sessionLoading || projectsState.pendingNewSession) && e.key === 'Enter') return false;
+    if ((sessionLoading || projectsState.sessionOperation.kind === 'creating') && e.key === 'Enter')
+      return false;
     if (e.key === 'Enter' && (isMobile ? e.shiftKey : !e.shiftKey)) {
       e.preventDefault();
       submitMessage();
@@ -4011,8 +3974,11 @@
     // The bridge only tracks native-edit seqs while engaged; otherwise this
     // is a plain input event (draft save + resize).
     composerController.setInput(value);
-    if (composerBridgeActive) composerBridge.noteInput();
-    if ((sessionLoading || projectsState.sessionLoading) && !projectsState.pendingNewSession) {
+    if (composerBridgeActive) composerBridge.noteInput(e as InputEvent);
+    if (
+      (sessionLoading || projectsState.sessionLoading) &&
+      projectsState.sessionOperation.kind !== 'creating'
+    ) {
       sessionSwitchDraft = value;
     }
     autoResizeTextarea();
@@ -4021,8 +3987,7 @@
     // Session/handshake guards stay local — never route keys for a stale session.
     if (
       sessionLoading ||
-      projectsState.sessionLoading ||
-      projectsState.pendingNewSession ||
+      projectsState.sessionOperation.kind !== 'idle' ||
       !_wsHandshakeComplete ||
       e.isComposing
     ) {
@@ -4039,7 +4004,7 @@
     if (!inputEl || _resizeRaf !== null) return;
     _resizeRaf = requestAnimationFrame(() => {
       _resizeRaf = null;
-      if (!inputEl) return;
+      if (pageDestroyed || !inputEl) return;
       inputEl.style.height = 'auto';
       inputEl.style.height = `${Math.min(inputEl.scrollHeight, 192)}px`;
     });
@@ -4060,7 +4025,6 @@
     // reconcile afterwards (idempotent: reducer finalization, isStreaming=false).
     // Reuse the same pure finalization path as agent_end/agent_error.
     reduceActiveSessionEvent({ type: 'agent_end' });
-    projectsState.isStreaming = false;
     releaseWakeLock();
     send({ type: 'abort' });
   }
@@ -4125,9 +4089,10 @@
   });
 
   $effect(() => {
+    const dismissed = dismissedSlashMenuInput === input;
+    if (!dismissed && dismissedSlashMenuInput !== null) dismissedSlashMenuInput = null;
     const commandLike = !!shortcutTrigger && !input.slice(1).includes('\n');
-    showSlashMenu =
-      !isStreaming && commandLike && (filteredSlashCommands.length > 0 || !!commandArgMode);
+    showSlashMenu = !dismissed && commandLike && filteredSlashCommands.length > 0;
     if (
       (shortcutTrigger === '/' || shortcutTrigger === '#') &&
       !resourcesLoaded &&
@@ -4139,7 +4104,11 @@
   });
 
   $effect(() => {
-    if (!showSlashMenu) slashMenuIndex = -1;
+    if (!showSlashMenu || filteredSlashCommands.length === 0) {
+      slashMenuIndex = -1;
+    } else if (slashMenuIndex >= filteredSlashCommands.length) {
+      slashMenuIndex = filteredSlashCommands.length - 1;
+    }
   });
 
   let _installPromptHandler: ((e: Event) => void) | null = null;
@@ -4171,8 +4140,9 @@
     const snap = loadSnapshot(bootResumePath);
     if (snap) _lastVisibleSessionPath = bootResumePath ?? undefined;
     if (snap) {
-      messages = snap.messages;
-      rebuildToolMessageIndex();
+      sessionCoordinator.replaceMessages(snap.messages, {
+        sessionName: snap.sessionName ?? undefined,
+      });
       if (snap.sessionName) sessionName = snap.sessionName;
     }
     // Web Share Target (static/manifest.webmanifest → share_target, method GET,
@@ -4207,6 +4177,7 @@
       }
     };
     idlePrefetch(() => {
+      if (pageDestroyed) return;
       import('#lib/components/panels/right-panel.svelte').catch(() => {});
       import('#lib/components/projects/projects-sidebar.svelte').catch(() => {});
     });
@@ -4280,9 +4251,41 @@
   });
 
   onDestroy(() => {
+    pageDestroyed = true;
+    if (unsubscribeSessionCoordinator) unsubscribeSessionCoordinator();
     releaseWakeLock();
     completionController.dispose();
-    clearBootResumeTimer();
+    notificationController.setConnectionOpen(false);
+    pendingUploads.clear();
+    composerBridge.discard();
+    composerController.dispose();
+    if (speechRec) {
+      try {
+        speechRec.stop();
+      } catch {
+        /* recognition may already be stopped */
+      }
+      speechRec = null;
+    }
+    isRecording = false;
+    if (sttSubmitTimer) {
+      clearTimeout(sttSubmitTimer);
+      sttSubmitTimer = null;
+    }
+    if (_renderRaf !== null) {
+      cancelAnimationFrame(_renderRaf);
+      _renderRaf = null;
+    }
+    _pendingRenderSet.clear();
+    _renderScheduled = false;
+    if (_scrollRaf !== null) {
+      cancelAnimationFrame(_scrollRaf);
+      _scrollRaf = null;
+    }
+    if (_resizeRaf !== null) {
+      cancelAnimationFrame(_resizeRaf);
+      _resizeRaf = null;
+    }
     if (_editorMirrorTimer) {
       clearTimeout(_editorMirrorTimer);
       _editorMirrorTimer = null;
@@ -4294,6 +4297,18 @@
     if (sendHoldTimer) {
       clearTimeout(sendHoldTimer);
       sendHoldTimer = null;
+    }
+    if (copiedIdTimer) {
+      clearTimeout(copiedIdTimer);
+      copiedIdTimer = null;
+    }
+    if (copiedTurnIdTimer) {
+      clearTimeout(copiedTurnIdTimer);
+      copiedTurnIdTimer = null;
+    }
+    if (codeCopyTimer) {
+      clearTimeout(codeCopyTimer);
+      codeCopyTimer = null;
     }
     wsController.dispose();
     document.removeEventListener('visibilitychange', _onVisibilityChange);
@@ -4784,215 +4799,87 @@
           </Tooltip.Root>
         </div>
       </header>
+      <ConversationStatus
+        {wsState}
+        {reconnectCountdown}
+        {trustPromptVisible}
+        {projectTrust}
+        {showNotifNudge}
+        extensionHeader={extensionUiState.header}
+        onReconnect={connect}
+        onTrustProject={() =>
+          send({
+            type: 'set_project_trust',
+            cwd: projectTrust?.cwd ?? '',
+            decision: 'trusted',
+          })}
+        onTrustSession={() =>
+          send({
+            type: 'set_project_trust',
+            cwd: projectTrust?.cwd ?? '',
+            decision: 'session',
+          })}
+        onEnableNotifications={() => notificationController.enableNotifications()}
+        onDismissNotifications={() => notificationController.dismissNotificationsNudge()}
+        onDismissHeader={() => extensionUiState.setHeader(undefined)}
+      />
 
-      {#if wsState === 'closed'}
-        <div
-          class="shrink-0 flex items-center justify-center gap-3 px-3 py-2 text-xs bg-error/10 text-error/80 border-b border-error/15"
-          role="status"
-          aria-live="polite"
-        >
-          <span class="w-1.5 h-1.5 rounded-full bg-error animate-pulse"></span>
-
-          <span
-            >disconnected{reconnectCountdown > 0
-              ? ` — reconnecting in ${reconnectCountdown}s`
-              : ''}</span
-          >
-
-          <button
-            onclick={connect}
-            class="ml-auto shrink-0 px-2 py-0.5 rounded-md font-semibold text-error/90 hover:text-error hover:bg-error/15 transition-colors"
-            >Reconnect now</button
-          >
-        </div>
-      {:else if wsState === 'connecting'}
-        <div
-          class="shrink-0 flex items-center justify-center gap-2 px-3 py-2 text-xs bg-warning/10 text-warning/80 border-b border-warning/15"
-          role="status"
-          aria-live="polite"
-        >
-          <span class="w-1.5 h-1.5 rounded-full bg-warning animate-pulse"></span>
-          <span class="flex items-center gap-1">
-            reconnecting
-            {#if reconnectCountdown > 0}
-              <span class="tabular-nums ml-0.5">({reconnectCountdown}s)</span>
-            {/if}
-          </span>
-        </div>
-      {/if}
-
-      {#if trustPromptVisible && projectTrust}
-        <div
-          class="shrink-0 flex items-center gap-2 px-3 py-1.5 text-xs bg-warning/10 text-warning/85 border-b border-warning/15"
-          role="status"
-          aria-live="polite"
-        >
-          <ShieldQuestion class="w-3.5 h-3.5 shrink-0" />
-          <span class="flex-1 min-w-0 truncate">
-            Project resources in
-            <span class="font-mono text-warning/70">{projectTrust?.cwd}</span>
-            aren't trusted
-          </span>
-          <button
-            class="shrink-0 px-2 py-0.5 rounded-md font-semibold text-warning/90 hover:text-warning hover:bg-warning/15 transition-colors"
-            onclick={() =>
-              send({
-                type: 'set_project_trust',
-                cwd: projectTrust?.cwd ?? '',
-                decision: 'trusted',
-              })}>Trust project</button
-          >
-          <button
-            class="shrink-0 px-2 py-0.5 rounded-md font-semibold text-warning/90 hover:text-warning hover:bg-warning/15 transition-colors"
-            onclick={() =>
-              send({
-                type: 'set_project_trust',
-                cwd: projectTrust?.cwd ?? '',
-                decision: 'session',
-              })}>Trust this session</button
-          >
-        </div>
-      {/if}
-
-      {#if showNotifNudge}
-        <div
-          class="shrink-0 flex items-center gap-2 px-3 py-1.5 text-xs bg-primary/[0.08] text-base-content/80 border-b border-primary/15"
-          role="status"
-        >
-          <Bell class="w-3.5 h-3.5 shrink-0 text-primary/80" />
-          <span class="flex-1 min-w-0 truncate"
-            >Get a notification when pi finishes — even with the app closed.</span
-          >
-          <button
-            class="shrink-0 px-2 py-0.5 rounded-md font-semibold text-primary hover:text-primary/90 hover:bg-primary/12 transition-colors"
-            onclick={() => notificationController.enableNotifications()}>Enable</button
-          >
-          <button
-            class="shrink-0 px-2 py-0.5 rounded-md text-base-content/50 hover:text-base-content/80 hover:bg-base-content/8 transition-colors"
-            onclick={() => notificationController.dismissNotificationsNudge()}
-            aria-label="Dismiss notification prompt"><X class="w-3 h-3" /></button
-          >
-        </div>
-      {/if}
-      <!-- Extension header -->
-      {#if extensionUiState.header}
-        <div
-          class="shrink-0 min-w-0 px-3 py-1.5 text-xs text-base-content/60 bg-base-200/50 border-b border-base-content/10 font-mono whitespace-pre-wrap flex items-start gap-2"
-        >
-          <span class="min-w-0 flex-1 break-words">{extensionUiState.header}</span>
-          <Button
-            variant="ghost"
-            size="icon-xs"
-            onclick={() => {
-              extensionUiState.setHeader(undefined);
-            }}
-            aria-label="Dismiss header"><X class="w-3 h-3" /></Button
-          >
-        </div>
-      {/if}
-      <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-      <main
-        id="main-content"
-        bind:this={scrollEl}
-        onscroll={handleScroll}
-        onclick={handleMessageAreaClick}
-        onkeydown={handleCodeCopy}
-        role="region"
-        aria-label="Conversation"
-        aria-busy={sessionLoading}
-        class="flex-1 overflow-y-auto overflow-x-hidden scroll-container-mobile pb-3 sm:pb-4 bg-base-100 rounded-none sm:rounded-xl"
-        style="overflow-anchor: none; overscroll-behavior: contain;"
-      >
-        <MessageList
-          {messages}
-          {sessionLoading}
-          {wsState}
-          {sessionId}
-          {isMobile}
-          {copiedId}
-          {copiedTurnId}
-          {isStreaming}
-          {expandedUserMsgs}
-          bind:truncatedUserMsgs
-          workingVisible={extensionUiState.workingVisible}
-          hiddenThinkingLabel={extensionUiState.hiddenThinkingLabel}
-          workingIndicatorFrames={extensionUiState.workingIndicatorFrames}
-          {workingFrameIndex}
-          workingMessage={extensionUiState.workingMessage}
-          {messagesTruncated}
-          {totalRawMessagesLoaded}
-          {totalMessageCount}
-          {projectPickerOpen}
-          {activeProjectName}
-          onLoadOlder={loadOlderMessages}
-          onCopyMessage={copyMessage}
-          onCopyTurn={copyTurnMessages}
-          onExpandUserMsg={(msgId, val) => {
-            expandedUserMsgs[msgId] = val;
-          }}
-          onToggleThinking={(msg) => {
-            msg.thinkingExpanded = !msg.thinkingExpanded;
-          }}
-          onToggleTool={(msg) => {
-            const expanding = !msg.expanded;
-            msg.expanded = expanding;
-            if (expanding) toolOutputController.request(msg);
-          }}
-          onProjectPickerToggle={(e) => {
-            e.stopPropagation();
-            projectPickerOpen = !projectPickerOpen;
-          }}
-          onProjectPickerClose={() => (projectPickerOpen = false)}
-          onInsertShortcut={(text) => {
-            setComposerInput(text);
-            tick().then(() => inputEl?.focus());
-          }}
-          onEditMessage={editMessage}
-          onDismissNotice={dismissChatNotice}
-          onHaptic={haptic}
-        />
-      </main>
-
-      <!-- Extension footer -->
-      {#if visibleExtensionFooter}
-        <div
-          class="shrink-0 min-w-0 px-3 py-1.5 text-xs text-base-content/60 bg-base-200/50 border-t border-base-content/10 font-mono whitespace-pre-wrap flex items-start gap-2"
-        >
-          <span class="min-w-0 flex-1 break-words">{visibleExtensionFooter}</span>
-          <Button
-            variant="ghost"
-            size="icon-xs"
-            onclick={() => {
-              extensionUiState.setFooter(undefined);
-            }}
-            aria-label="Dismiss footer"><X class="w-3 h-3" /></Button
-          >
-        </div>
-      {/if}
-
-      <!-- Scroll-to-bottom button — fades in when user scrolls up -->
-      <div
-        class="absolute right-4 z-10 pointer-events-none transition-all duration-200"
-        style="bottom: calc(env(safe-area-inset-bottom, 0px) + 5.5rem);"
-        class:opacity-0={isAtBottom}
-        class:translate-y-2={isAtBottom}
-      >
-        <button
-          onclick={scrollToBottom}
-          class="pointer-events-auto w-9 h-9 rounded-full bg-base-200/85 backdrop-blur-md border border-base-content/15 shadow-lg shadow-black/25 flex items-center justify-center text-base-content/55 hover:text-base-content hover:border-primary/40 transition-colors"
-          aria-label="Scroll to bottom"
-          tabindex={isAtBottom ? -1 : 0}
-          ><svg
-            class="w-4 h-4"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="2"
-            stroke-linecap="round"
-            stroke-linejoin="round"><path d="M12 5v14m0 0-7-7m7 7 7-7"></path></svg
-          >
-        </button>
-      </div>
+      <ConversationViewport
+        bind:scrollEl
+        {messages}
+        {sessionLoading}
+        {wsState}
+        {sessionId}
+        {isMobile}
+        {isStreaming}
+        {copiedId}
+        {copiedTurnId}
+        {expandedUserMsgs}
+        bind:truncatedUserMsgs
+        workingVisible={extensionUiState.workingVisible}
+        hiddenThinkingLabel={extensionUiState.hiddenThinkingLabel}
+        workingIndicatorFrames={extensionUiState.workingIndicatorFrames}
+        {workingFrameIndex}
+        workingMessage={extensionUiState.workingMessage}
+        {messagesTruncated}
+        {totalRawMessagesLoaded}
+        {totalMessageCount}
+        {projectPickerOpen}
+        {activeProjectName}
+        {isAtBottom}
+        extensionFooter={visibleExtensionFooter}
+        onScroll={handleScroll}
+        onMessageAreaClick={handleMessageAreaClick}
+        onCodeCopy={handleCodeCopy}
+        onScrollToBottom={scrollToBottom}
+        onLoadOlder={loadOlderMessages}
+        onCopyMessage={copyMessage}
+        onCopyTurn={copyTurnMessages}
+        onExpandUserMsg={(msgId, val) => {
+          expandedUserMsgs[msgId] = val;
+        }}
+        onToggleThinking={(msg) => {
+          msg.thinkingExpanded = !msg.thinkingExpanded;
+        }}
+        onToggleTool={(msg) => {
+          const expanding = !msg.expanded;
+          msg.expanded = expanding;
+          if (expanding) toolOutputController.request(msg);
+        }}
+        onProjectPickerToggle={(e) => {
+          e.stopPropagation();
+          projectPickerOpen = !projectPickerOpen;
+        }}
+        onProjectPickerClose={() => (projectPickerOpen = false)}
+        onInsertShortcut={(text) => {
+          setComposerInput(text);
+          tick().then(() => inputEl?.focus());
+        }}
+        onEditMessage={editMessage}
+        onDismissNotice={dismissChatNotice}
+        onHaptic={haptic}
+        onDismissFooter={() => extensionUiState.setFooter(undefined)}
+      />
 
       <!-- Input bar — elevated surface to distinguish from chat -->
       <footer
@@ -5165,7 +5052,7 @@
                     >
                   </div>
                   <div class="max-h-[min(18rem,45dvh)] overflow-y-auto p-1.5">
-                    {#each filteredSlashCommands as cmd, i (cmd.label ?? i)}
+                    {#each filteredSlashCommands as cmd, i (`${i}:${cmd.insert}`)}
                       {#if cmd.section && (i === 0 || cmd.section !== filteredSlashCommands[i - 1]?.section)}
                         <div class="px-3 pt-2 pb-1">
                           <span
@@ -5176,6 +5063,7 @@
                         </div>
                       {/if}
                       <button
+                        id="slash-option-{i}"
                         onclick={() => selectSlashCommand(cmd)}
                         role="option"
                         aria-selected={slashMenuIndex === i}
@@ -6777,83 +6665,6 @@
         </div>
       </Dialog.Content>
     </Dialog.Root>
-
-    <!-- ── Interactive custom component full overlay (ConversationViewer etc.) ── -->
-    {#if modal?.method === 'custom' && modal.interactive}
-      <div
-        class="fixed inset-0 z-[60] flex items-center justify-center bg-base-100/76 px-3 py-6 backdrop-blur-md sm:px-6"
-      >
-        <div
-          class="relative w-full max-w-3xl"
-          role="dialog"
-          aria-label="Extension terminal"
-          aria-modal="true"
-          tabindex="-1"
-        >
-          <span id="extension-terminal-instructions" class="sr-only">
-            Arrow keys, Page Up/Down, Home, End, and Enter are forwarded to the extension. Press
-            Escape to close.
-          </span>
-          <!-- Keep dismissal outside the extension's own drawn border so it never
-               overlaps its corner glyphs. -->
-          <button
-            onclick={modalCancel}
-            class="absolute top-3 right-3 z-20 flex h-11 w-11 items-center justify-center rounded-full border border-base-content/10 bg-base-200/95 text-base-content/65 shadow-lg shadow-black/30 backdrop-blur-md transition-all hover:scale-105 hover:border-primary/30 hover:bg-primary/15 hover:text-base-content focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/50 sm:-top-3 sm:-right-3"
-            aria-label="Close extension overlay"
-          >
-            <X class="w-3.5 h-3.5" />
-          </button>
-          <div
-            class="flex h-[min(30rem,calc(100dvh-4rem))] flex-col overflow-hidden rounded-2xl border border-base-content/10 bg-base-200/95 shadow-2xl shadow-black/40 ring-1 ring-primary/[0.06] backdrop-blur-xl"
-          >
-            <div
-              aria-hidden="true"
-              class="flex h-10 shrink-0 items-center border-b border-base-content/8 bg-gradient-to-r from-primary/[0.08] via-base-content/[0.025] to-transparent px-4"
-            >
-              <div class="flex items-center gap-1.5">
-                <span class="h-2 w-2 rounded-full bg-error/70"></span>
-                <span class="h-2 w-2 rounded-full bg-warning/70"></span>
-                <span class="h-2 w-2 rounded-full bg-success/70"></span>
-              </div>
-              <div class="ml-3 flex min-w-0 items-center gap-2 font-mono">
-                <span
-                  class="truncate text-[10px] font-medium uppercase tracking-[0.16em] text-base-content/55"
-                  >extension terminal</span
-                >
-                <span class="h-1 w-1 shrink-0 rounded-full bg-success/80"></span>
-                <span class="text-[9px] uppercase tracking-[0.14em] text-base-content/40">live</span
-                >
-              </div>
-              <span
-                class="ml-auto hidden rounded-md border border-base-content/10 bg-base-content/[0.035] px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-[0.14em] text-base-content/35 sm:inline"
-                >esc</span
-              >
-            </div>
-            <div
-              bind:this={overlayViewportEl}
-              class="min-h-0 flex-1 overflow-y-auto bg-base-100/35"
-            >
-              <pre
-                bind:this={overlayPreEl}
-                class="min-h-full select-text whitespace-pre-wrap px-4 py-2 font-mono text-[13px] leading-[1.55] text-base-content/85">{#if modal.htmlLines}{#each modal.htmlLines as line, i (i)}<div>{@html line ||
-                        '&nbsp;'}</div>{/each}{:else}{(modal.lines ?? []).join('\n')}{/if}</pre>
-            </div>
-          </div>
-          <!-- Hidden input to capture keystrokes, paste, and IME composition. -->
-          <input
-            type="text"
-            class="sr-only"
-            aria-label="Extension terminal input"
-            aria-describedby="extension-terminal-instructions"
-            tabindex="-1"
-            onkeydown={overlayKeydown}
-            onpaste={overlayPaste}
-            oncompositionend={overlayCompositionEnd}
-            bind:this={modalFocusEl}
-          />
-        </div>
-      </div>
-    {/if}
   </div>
 </Tooltip.Provider>
 
@@ -6867,203 +6678,29 @@
     <p class="font-mono text-base-content/35 text-xs">reconnecting automatically</p>
   </div>
 {/if}
-<!-- ── Extension UI modal ─────────────────────────────────────────────────────── -->
-<Dialog.Root
-  open={!!modal && !(modal.method === 'custom' && modal.interactive)}
-  onOpenChange={(v) => {
-    if (!v && modal) modalCancel();
+
+<ExtensionOverlays
+  {modal}
+  {filteredSelectOptions}
+  {selectOptionIndex}
+  onSelectOptionFocus={(index) => (selectOptionIndex = index)}
+  bind:selectFilter
+  bind:modalInput
+  bind:modalFocusEl
+  bind:overlayPreEl
+  bind:overlayViewportEl
+  onSelectOption={(value) => extensionUiState.answerSelect(value)}
+  onConfirm={(confirmed) => {
+    if (confirmed) extensionUiState.answerConfirm(true);
   }}
->
-  <Dialog.Content
-    class="flex w-full max-w-[min(42rem,calc(100vw_-_1.5rem))] min-h-0 max-h-[min(44rem,calc(100dvh_-_2rem))] flex-col gap-0 overflow-hidden rounded-2xl border border-base-content/10 bg-base-100/96 p-0 shadow-2xl shadow-black/45 ring-1 ring-primary/12 backdrop-blur-xl sm:max-w-2xl"
-    showCloseButton={false}
-    onkeydown={modalContentKeydown}
-  >
-    <Dialog.Header
-      class="min-w-0 shrink-0 border-b border-base-content/8 bg-gradient-to-br from-primary/[0.08] via-base-100/65 to-transparent px-4 py-4 sm:px-5 sm:py-5"
-    >
-      <div class="flex min-w-0 items-start gap-3">
-        <div
-          class="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-primary/12 text-primary ring-1 ring-primary/15"
-        >
-          <Blocks class="h-[1.125rem] w-[1.125rem]" />
-        </div>
-        <div class="min-w-0 flex-1 pt-0.5">
-          <p class="text-[10px] font-medium uppercase tracking-[0.18em] text-primary/65">
-            Extension question
-          </p>
-          <Dialog.Title
-            class="min-w-0 whitespace-normal break-words text-[0.95rem] font-semibold leading-snug text-base-content [overflow-wrap:anywhere]"
-            >{modal?.title}</Dialog.Title
-          >
-        </div>
-      </div>
-      {#if modal?.method === 'confirm' && modal.message}
-        <Dialog.Description
-          class="mt-3 max-h-[min(12rem,30dvh)] min-w-0 overflow-y-auto whitespace-pre-wrap break-words text-sm leading-relaxed text-base-content/65 [overflow-wrap:anywhere]"
-          >{modal.message}</Dialog.Description
-        >
-      {/if}
-    </Dialog.Header>
-
-    {#if modal?.method === 'input'}
-      <div class="min-h-0 min-w-0 flex-1 px-4 py-4 sm:px-5">
-        <input
-          bind:this={modalFocusEl}
-          type={modal.secret ? 'password' : 'text'}
-          bind:value={modalInput}
-          placeholder={modal.placeholder ?? ''}
-          class="dialog-input w-full rounded-xl px-3.5 py-2.5 text-sm outline-none placeholder-muted-foreground transition-colors"
-        />
-      </div>
-    {:else if modal?.method === 'select'}
-      <div
-        class="min-h-0 min-w-0 flex-1 overflow-y-auto overscroll-contain px-4 py-3 sm:px-5 sm:py-4"
-      >
-        {#if modal.options.length > 0}
-          {#if modal.options.length > 10}
-            <div class="relative mb-3">
-              <input
-                bind:this={modalFocusEl}
-                type="search"
-                bind:value={selectFilter}
-                oninput={() => (selectOptionIndex = 0)}
-                placeholder="Filter options…"
-                aria-label="Filter options"
-                autocomplete="off"
-                class="w-full rounded-xl border border-base-content/10 bg-base-content/[0.035] px-3.5 py-2.5 pr-14 text-sm outline-none transition-colors placeholder:text-base-content/35 focus:border-primary/45 focus:bg-base-content/[0.06]"
-              />
-              <span
-                class="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-[10px] tabular-nums uppercase tracking-wide text-base-content/30"
-                >{filteredSelectOptions.length}/{modal.options.length}</span
-              >
-            </div>
-          {/if}
-          {#if filteredSelectOptions.length > 0}
-            <div role="listbox" aria-label={modal.title} class="min-w-0 space-y-2">
-              {#each filteredSelectOptions as item, i (item.index + ':' + item.value)}
-                {@const option = item.option}
-                <!-- svelte-ignore a11y_autofocus -->
-                <button
-                  type="button"
-                  data-extension-option="true"
-                  data-extension-option-index={i}
-                  role="option"
-                  aria-selected={selectOptionIndex === i}
-                  aria-posinset={i + 1}
-                  aria-setsize={filteredSelectOptions.length}
-                  autofocus={i === 0 && !selectFilter}
-                  class="group flex w-full min-w-0 max-w-full items-start gap-3 overflow-hidden rounded-2xl border border-base-content/10 bg-base-content/[0.025] px-3.5 py-3 text-left transition-[border-color,background-color,transform] duration-150 hover:border-primary/35 hover:bg-primary/[0.06] focus-visible:border-primary/55 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/35 active:scale-[0.995]"
-                  onclick={() => extensionUiState.answerSelect(item.value)}
-                  onfocus={() => (selectOptionIndex = i)}
-                >
-                  <span
-                    class="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-primary/12 text-xs font-semibold tabular-nums text-primary/85 ring-1 ring-primary/10"
-                    >{option.index}</span
-                  >
-                  <span class="min-w-0 flex-1 [overflow-wrap:anywhere]">
-                    <span
-                      class="block min-w-0 whitespace-normal break-words text-sm font-medium leading-snug text-base-content/85 group-hover:text-base-content [overflow-wrap:anywhere]"
-                      >{option.label}</span
-                    >
-                    {#if option.description}
-                      <span
-                        class="mt-1 block min-w-0 whitespace-normal break-words text-xs leading-relaxed text-base-content/50 group-hover:text-base-content/65 [overflow-wrap:anywhere]"
-                        >{option.description}</span
-                      >
-                    {/if}
-                  </span>
-                  <ChevronRight
-                    class="mt-1 h-4 w-4 shrink-0 text-base-content/25 transition-transform group-hover:translate-x-0.5 group-hover:text-primary/70"
-                  />
-                </button>
-              {/each}
-            </div>
-          {:else}
-            <p
-              class="rounded-xl border border-dashed border-base-content/10 px-4 py-8 text-center text-sm text-muted-foreground"
-            >
-              No matching options.
-            </p>
-          {/if}
-        {:else}
-          <p
-            class="rounded-xl border border-dashed border-base-content/10 px-4 py-8 text-center text-sm text-muted-foreground"
-          >
-            No options were provided.
-          </p>
-        {/if}
-      </div>
-    {:else if modal?.method === 'editor'}
-      <div class="min-h-0 min-w-0 flex-1 px-4 py-4 sm:px-5">
-        <textarea
-          bind:this={modalFocusEl}
-          bind:value={modalInput}
-          rows={8}
-          autocapitalize="off"
-          spellcheck={false}
-          use:autoCorrectOff
-          class="dialog-input min-h-48 w-full resize-none rounded-xl p-3.5 text-sm leading-relaxed transition-colors"
-        ></textarea>
-      </div>
-    {:else if modal?.method === 'custom'}
-      <div class="min-h-0 min-w-0 flex-1 overflow-y-auto px-4 py-4 sm:px-5">
-        {#if modal.parsed}
-          <ExtensionComponent
-            component={modal.parsed}
-            interactive
-            onaction={modalComponentAction}
-            bind:inputValue={modalInput}
-          />
-          {#if customModalNeedsTextInput(modal.parsed)}
-            <input
-              bind:this={modalFocusEl}
-              type="text"
-              bind:value={modalInput}
-              placeholder="Type your response…"
-              class="dialog-input mt-4 w-full rounded-xl px-3.5 py-2.5 text-sm placeholder-muted-foreground transition-colors"
-            />
-          {/if}
-        {:else}
-          <p class="mb-2 text-sm text-muted-foreground">Extension request:</p>
-          <input
-            bind:this={modalFocusEl}
-            type="text"
-            bind:value={modalInput}
-            placeholder="Type your response…"
-            class="dialog-input w-full rounded-xl px-3.5 py-2.5 text-sm placeholder-muted-foreground transition-colors"
-          />
-        {/if}
-      </div>
-    {/if}
-
-    <Dialog.Footer
-      class="extension-dialog-footer shrink-0 flex-row justify-end gap-2 border-t border-base-content/8 bg-base-200/35 px-4 py-3 sm:px-5"
-    >
-      {#if modal?.method === 'select'}
-        <span class="mr-auto hidden text-[11px] text-base-content/35 sm:inline"
-          >↑↓ move · Enter select · Esc cancel</span
-        >
-      {/if}
-      <Button
-        variant="ghost"
-        size="sm"
-        class="text-muted-foreground/80 hover:text-base-content"
-        onclick={modalCancel}>Cancel</Button
-      >
-      {#if modal?.method === 'confirm'}
-        <Button size="sm" onclick={() => extensionUiState.answerConfirm(true)}>Confirm</Button>
-      {:else if modal?.method === 'input' || modal?.method === 'editor'}
-        <Button size="sm" onclick={modalSubmitValue}>Submit</Button>
-      {:else if modal?.method === 'custom' && !modal.interactive && (customModalNeedsTextInput(modal.parsed) || parsedComponentHasInput(modal.parsed) || parsedComponentHasCheckbox(modal.parsed) || parsedComponentIsDisplayOnly(modal.parsed))}
-        <Button size="sm" onclick={modalSubmitValue}
-          >{parsedComponentIsDisplayOnly(modal.parsed) ? 'OK' : 'Submit'}</Button
-        >
-      {/if}
-    </Dialog.Footer>
-  </Dialog.Content>
-</Dialog.Root>
-
+  onSubmitValue={modalSubmitValue}
+  onCancel={modalCancel}
+  onComponentAction={modalComponentAction}
+  onKeydown={modalContentKeydown}
+  onOverlayKeydown={overlayKeydown}
+  onOverlayPaste={overlayPaste}
+  onOverlayCompositionEnd={overlayCompositionEnd}
+/>
 <!-- ── Fork session dialog ──────────────────────────────────────────────────── -->
 {#if showForkDialog}
   {#await import('#lib/components/dialogs/fork-dialog.svelte') then { default: ForkDialog }}

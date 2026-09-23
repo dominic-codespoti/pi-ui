@@ -1,5 +1,6 @@
 import { test, expect, submitPrompt } from './fixtures';
 import {
+  CONNECTED_PAYLOAD,
   agentStartPayload,
   assistantMessageStartPayload,
   textDeltaPayload,
@@ -468,8 +469,266 @@ test.describe('Chat / prompt streaming', () => {
       timeout: 3000,
     });
     await expect.poll(() => commandPrefixes).toContain('child gr');
-    await page.getByRole('option', { name: /grand Grandchild command/ }).click();
+    const option = page.getByRole('option', { name: /grand Grandchild command/ });
+    await option.focus();
+    await expect(option).toBeFocused();
+    await page.keyboard.press('Enter');
     await expect(page.locator('textarea')).toHaveValue('/parent child grand ');
+  });
+
+  test('resolves mixed-case extension command invocations canonically', async ({ page }) => {
+    const completions: { command: string; prefix: string }[] = [];
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.onMessage((data) => {
+        const msg = JSON.parse(String(data));
+        if (msg.type === 'get_command_completions') {
+          completions.push({ command: msg.command, prefix: msg.prefix });
+        }
+      });
+      ws.send(
+        JSON.stringify({
+          type: 'connected',
+          sessionId: 'mixed-case-session',
+          isStreaming: false,
+          thinkingLevel: 'medium',
+          model: null,
+          availableModels: [],
+          messages: [],
+        })
+      );
+      ws.send(
+        JSON.stringify({
+          type: 'commands_list',
+          commands: [{ name: 'Deploy', description: 'Deploy command', source: 'test' }],
+        })
+      );
+    });
+
+    await page.goto('/');
+    await page.fill('textarea', '/deploy ');
+    await expect.poll(() => completions).toContainEqual({ command: 'Deploy', prefix: '' });
+    await page.fill('textarea', '/Deploy st');
+    await expect.poll(() => completions).toContainEqual({ command: 'Deploy', prefix: 'st' });
+    expect(completions.every(({ command }) => command !== 'deploy')).toBe(true);
+  });
+
+  test('keeps fuzzy extension argument results returned by the server', async ({ page }) => {
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.onMessage((data) => {
+        const msg = JSON.parse(String(data));
+        if (msg.type !== 'get_command_completions') return;
+        ws.send(
+          JSON.stringify({
+            type: 'command_completions',
+            sessionId: msg.sessionId,
+            requestId: msg.requestId,
+            command: msg.command,
+            prefix: msg.prefix,
+            items: [{ value: 'status', label: 'status' }],
+          })
+        );
+      });
+      ws.send(
+        JSON.stringify({
+          type: 'connected',
+          sessionId: 'fuzzy-session',
+          isStreaming: false,
+          thinkingLevel: 'medium',
+          model: null,
+          availableModels: [],
+          messages: [],
+        })
+      );
+      ws.send(
+        JSON.stringify({
+          type: 'commands_list',
+          commands: [{ name: 'ag', description: 'Agent command', source: 'test' }],
+        })
+      );
+    });
+
+    await page.goto('/');
+    await page.fill('textarea', '/ag sts');
+    await expect(page.getByRole('option', { name: /status/ })).toBeVisible({ timeout: 3000 });
+  });
+
+  test('does not request argument completions for commands that do not provide them', async ({
+    page,
+  }) => {
+    const requests: unknown[] = [];
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.onMessage((data) => {
+        const msg = JSON.parse(String(data));
+        if (msg.type === 'get_command_completions') requests.push(msg);
+      });
+      ws.send(
+        JSON.stringify({
+          type: 'connected',
+          sessionId: 'no-args-session',
+          isStreaming: false,
+          thinkingLevel: 'medium',
+          model: null,
+          availableModels: [],
+          messages: [],
+        })
+      );
+      ws.send(
+        JSON.stringify({
+          type: 'commands_list',
+          commands: [
+            {
+              name: 'cmd',
+              description: 'No completable arguments',
+              source: 'test',
+              hasArgumentCompletions: false,
+            },
+          ],
+        })
+      );
+    });
+
+    await page.goto('/');
+    await page.fill('textarea', '/cmd ');
+    await expect(page.getByRole('listbox', { name: 'Composer shortcuts' })).toHaveCount(0);
+    await expect.poll(() => requests.length, { timeout: 400 }).toBe(0);
+  });
+
+  test('matches skills by their full slash invocation', async ({ page }) => {
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.onMessage((data) => {
+        const msg = JSON.parse(String(data));
+        if (msg.type === 'get_resources') {
+          ws.send(
+            JSON.stringify({
+              type: 'resources_list',
+              skills: [
+                {
+                  name: 'frontend',
+                  description: 'Frontend workflows',
+                  scope: 'project',
+                  isBuiltin: false,
+                  source: 'test',
+                },
+              ],
+              prompts: [],
+            })
+          );
+        }
+      });
+      ws.send(
+        JSON.stringify({
+          type: 'connected',
+          sessionId: 'skill-session',
+          isStreaming: false,
+          thinkingLevel: 'medium',
+          model: null,
+          availableModels: [],
+          messages: [],
+        })
+      );
+    });
+
+    await page.goto('/');
+    await page.fill('textarea', '/skill:');
+    await expect(page.getByRole('option', { name: /\/skill:frontend/ })).toBeVisible({
+      timeout: 3000,
+    });
+  });
+
+  test('Escape dismisses the slash menu until the composer input changes', async ({ page }) => {
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.send(
+        JSON.stringify({
+          type: 'connected',
+          sessionId: 'escape-session',
+          isStreaming: false,
+          thinkingLevel: 'medium',
+          model: null,
+          availableModels: [],
+          messages: [],
+        })
+      );
+    });
+    await page.goto('/');
+    await page.fill('textarea', '/ho');
+    const menu = page.getByRole('listbox', { name: 'Composer shortcuts' });
+    await expect(menu).toBeVisible();
+    await page.keyboard.press('Escape');
+    await expect(menu).toHaveCount(0);
+    await page.waitForTimeout(150);
+    await expect(menu).toHaveCount(0);
+    await page.fill('textarea', '/hot');
+    await expect(menu).toBeVisible();
+  });
+
+  test('shows slash completions while the agent is streaming', async ({ page }) => {
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.send(
+        JSON.stringify({
+          type: 'connected',
+          sessionId: 'streaming-menu-session',
+          isStreaming: true,
+          thinkingLevel: 'medium',
+          model: null,
+          availableModels: [],
+          messages: [],
+        })
+      );
+    });
+    await page.goto('/');
+    await page.fill('textarea', '/ho');
+    await expect(page.getByRole('listbox', { name: 'Composer shortcuts' })).toBeVisible();
+  });
+
+  test('handles duplicate slash labels without breaking input updates', async ({ page }) => {
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.onMessage((data) => {
+        const msg = JSON.parse(String(data));
+        if (msg.type === 'get_resources') {
+          ws.send(
+            JSON.stringify({
+              type: 'resources_list',
+              skills: [],
+              prompts: [
+                {
+                  name: 'review',
+                  description: 'Review prompt',
+                  scope: 'project',
+                  isBuiltin: false,
+                  source: 'test',
+                },
+              ],
+            })
+          );
+        }
+      });
+      ws.send(
+        JSON.stringify({
+          type: 'connected',
+          sessionId: 'duplicate-label-session',
+          isStreaming: false,
+          thinkingLevel: 'medium',
+          model: null,
+          availableModels: [],
+          messages: [],
+        })
+      );
+      ws.send(
+        JSON.stringify({
+          type: 'commands_list',
+          commands: [{ name: 'review', description: 'Review extension command', source: 'test' }],
+        })
+      );
+    });
+
+    await page.goto('/');
+    await page.fill('textarea', '/review');
+    const reviewOptions = page.getByRole('option', { name: /\/review/ });
+    await expect(reviewOptions.first()).toBeVisible();
+    await expect(reviewOptions).toHaveCount(1);
+    await page.fill('textarea', '/rev');
+    await expect(page.locator('textarea')).toHaveValue('/rev');
+    await expect(reviewOptions.first()).toBeVisible();
   });
 
   test('ignores out-of-order same-query completion responses', async ({ page }) => {
@@ -597,14 +856,11 @@ test.describe('Chat / prompt streaming', () => {
       });
       ws.send(
         JSON.stringify({
+          ...CONNECTED_PAYLOAD,
           type: 'connected',
           sessionId: 'session-one',
-          isStreaming: false,
-          thinkingLevel: 'medium',
-          model: null,
-          availableModels: [],
           messages: [],
-          contextUsage: { tokens: 90, contextWindow: 100 },
+          contextUsage: { tokens: 90, contextWindow: 100, percent: 90 },
         })
       );
     });
@@ -628,13 +884,11 @@ test.describe('Chat / prompt streaming', () => {
 
     socket!.send(
       JSON.stringify({
+        ...CONNECTED_PAYLOAD,
         type: 'session_loaded',
         sessionId: 'session-two',
-        isStreaming: false,
-        thinkingLevel: 'medium',
-        model: null,
-        availableModels: [],
         messages: [],
+        contextUsage: { tokens: 0, contextWindow: 100, percent: 0 },
       })
     );
     await expect.poll(() => secondRequest !== null, { timeout: 3000 }).toBe(true);
@@ -705,6 +959,237 @@ test.describe('Chat / prompt streaming', () => {
         { timeout: 3000 }
       )
       .toBe(true);
+  });
+});
+
+test.describe('Keyboard navigation regressions', () => {
+  test.beforeEach(async ({ page, login, mockWs }) => {
+    await mockWs(page);
+    await login(page, 'test-password');
+  });
+
+  test('skip link focuses the conversation landmark', async ({ page }) => {
+    const skipLink = page.getByRole('link', { name: 'Skip to content' });
+    const main = page.locator('main#main-content');
+
+    await skipLink.focus();
+    await expect(skipLink).toBeFocused();
+    await page.keyboard.press('Enter');
+    await expect(main).toBeFocused();
+  });
+
+  test('closed session panel is excluded from keyboard navigation and reopens focusably', async ({
+    page,
+    isMobile,
+  }) => {
+    const toggle = page.getByLabel('Toggle session panel');
+    const filter = page.getByLabel('Filter projects and sessions');
+
+    await toggle.click();
+    await expect(filter).toBeVisible();
+    await filter.focus();
+    await expect(filter).toBeFocused();
+
+    if (isMobile) {
+      await page.getByLabel('Close projects panel').click();
+    } else {
+      await toggle.click();
+    }
+    await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    await expect(filter).not.toBeFocused();
+    await expect
+      .poll(() =>
+        filter.evaluate((element) => ({
+          hidden: element.closest('[aria-hidden="true"]') !== null,
+          inert: element.closest('[inert]') !== null,
+        }))
+      )
+      .toEqual({ hidden: true, inert: true });
+
+    await page.keyboard.press('Tab');
+    await expect(filter).not.toBeFocused();
+
+    await toggle.click();
+    await expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    await expect(filter).toBeVisible();
+    await expect
+      .poll(() =>
+        filter.evaluate((element) => ({
+          hidden: element.closest('[aria-hidden="true"]') !== null,
+          inert: element.closest('[inert]') !== null,
+        }))
+      )
+      .toEqual({ hidden: false, inert: false });
+    await filter.focus();
+
+    await expect(filter).toBeFocused();
+  });
+});
+test.describe('Message accessibility regressions', () => {
+  test('editing a user message focuses the editor and restores the edit trigger on cancel', async ({
+    page,
+    login,
+    mockWs,
+  }) => {
+    const harness = await mockWs(page);
+    await login(page, 'test-password');
+    await harness.waitForMessage('get_all_sessions');
+    harness.send({
+      ...CONNECTED_PAYLOAD,
+      messages: [{ role: 'user', content: 'Draft to edit', timestamp: Date.now() }],
+    });
+
+    const editTrigger = page.getByRole('button', { name: 'Edit message' });
+    await expect(editTrigger).toBeVisible();
+    await editTrigger.focus();
+    await editTrigger.press('Enter');
+    const editor = page.getByRole('textbox', { name: 'Edit your message' });
+    await expect(editor).toBeFocused();
+    const cancel = page.getByRole('button', { name: 'cancel', exact: true });
+    await cancel.focus();
+    await cancel.press('Enter');
+    await expect(editor).toHaveCount(0);
+    await expect(editTrigger).toBeFocused();
+  });
+
+  test('thinking and tool output disclosures expose and update their controlled regions', async ({
+    page,
+    login,
+    mockWs,
+  }) => {
+    const harness = await mockWs(page);
+    await login(page, 'test-password');
+    await harness.waitForMessage('get_all_sessions');
+    harness.send({
+      ...CONNECTED_PAYLOAD,
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'thinking', thinking: 'First reason carefully.' },
+            { type: 'text', text: 'Final answer.' },
+          ],
+          timestamp: Date.now(),
+        },
+        {
+          role: 'bash',
+          command: 'printf output',
+          output: 'Tool output text',
+          timestamp: Date.now() + 1,
+        },
+      ],
+    });
+
+    const thinkingToggle = page.getByRole('button', { name: /thinking/ }).first();
+    const thinkingControls = await thinkingToggle.getAttribute('aria-controls');
+    if (!thinkingControls) throw new Error('thinking disclosure has no controlled region');
+    const thinkingRegion = page.locator(`#${thinkingControls}`);
+    await expect(thinkingToggle).toHaveAttribute('aria-expanded', 'false');
+    await expect(thinkingRegion).toHaveCount(1);
+    await expect(thinkingRegion).toBeHidden();
+    await thinkingToggle.focus();
+    await thinkingToggle.press('Enter');
+    await expect(thinkingToggle).toHaveAttribute('aria-expanded', 'true');
+    await expect(thinkingRegion).toBeVisible();
+
+    const toolToggle = page.getByRole('button', { name: 'Expand Shell output' });
+    const toolToggleId = await toolToggle.getAttribute('id');
+    const toolControls = await toolToggle.getAttribute('aria-controls');
+    if (!toolToggleId || !toolControls)
+      throw new Error('tool disclosure relationships are missing');
+    const stableToolToggle = page.locator(`#${toolToggleId}`);
+    const toolRegion = page.locator(`#${toolControls}`);
+    await expect(stableToolToggle).toHaveAttribute('aria-expanded', 'false');
+    await expect
+      .poll(() => toolRegion.evaluate((element) => (element as HTMLElement).hidden))
+      .toBe(true);
+    await toolToggle.focus();
+    await toolToggle.press('Enter');
+    await expect(stableToolToggle).toHaveAttribute('aria-expanded', 'true');
+    await expect
+      .poll(() => toolRegion.evaluate((element) => (element as HTMLElement).hidden))
+      .toBe(false);
+    await expect(toolRegion).toContainText('Tool output text');
+  });
+
+  test('image download action appears when focused from the keyboard', async ({
+    page,
+    login,
+    mockWs,
+  }) => {
+    const harness = await mockWs(page);
+    await login(page, 'test-password');
+    await harness.waitForMessage('get_all_sessions');
+    harness.send({
+      ...CONNECTED_PAYLOAD,
+      messages: [
+        {
+          role: 'tool_result',
+          toolCallId: 'image-result',
+          toolName: 'screenshot',
+          content: [{ type: 'image', data: 'aGVsbG8=', mimeType: 'image/png' }],
+          timestamp: Date.now(),
+        },
+      ],
+    });
+
+    const imageToggle = page.getByRole('button', { name: 'Expand Screenshot output' });
+    const imageToggleId = await imageToggle.getAttribute('id');
+    const outputControls = await imageToggle.getAttribute('aria-controls');
+    if (!imageToggleId || !outputControls) {
+      throw new Error('image tool disclosure relationships are missing');
+    }
+    const stableImageToggle = page.locator(`#${imageToggleId}`);
+    const imageRegion = page.locator(`#${outputControls}`);
+    await expect(stableImageToggle).toHaveAttribute('aria-expanded', 'false');
+    await expect
+      .poll(() => imageRegion.evaluate((element) => (element as HTMLElement).hidden))
+      .toBe(true);
+    await imageToggle.focus();
+    await imageToggle.press('Enter');
+    await expect(stableImageToggle).toHaveAttribute('aria-expanded', 'true');
+    await expect
+      .poll(() => imageRegion.evaluate((element) => (element as HTMLElement).hidden))
+      .toBe(false);
+    await expect(imageRegion.locator('img')).toHaveCount(1);
+    const download = page.getByRole('button', { name: 'Download image' });
+    await expect(download).toHaveCount(1);
+    await expect.poll(() => download.evaluate((el) => getComputedStyle(el).opacity)).toBe('0');
+    await download.focus();
+    await expect(download).toBeFocused();
+    await expect.poll(() => download.evaluate((el) => getComputedStyle(el).opacity)).toBe('1');
+  });
+
+  test('mobile message actions meet the compact touch target', async ({
+    page,
+    login,
+    mockWs,
+    isMobile,
+  }) => {
+    test.skip(!isMobile, 'compact message actions are mobile-only');
+    const harness = await mockWs(page);
+    await login(page, 'test-password');
+    await harness.waitForMessage('get_all_sessions');
+    harness.send({
+      ...CONNECTED_PAYLOAD,
+      messages: [
+        { role: 'user', content: 'Mobile message', timestamp: Date.now() },
+        {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'Mobile answer' }],
+          timestamp: Date.now() + 1,
+        },
+      ],
+    });
+
+    const actions = page.getByRole('button', { name: /^(Copy message|Edit message)$/ });
+    await expect(actions).toHaveCount(3);
+    for (let index = 0; index < (await actions.count()); index++) {
+      const box = await actions.nth(index).boundingBox();
+      expect(box).not.toBeNull();
+      expect(box!.width).toBeGreaterThanOrEqual(44);
+      expect(box!.height).toBeGreaterThanOrEqual(44);
+    }
   });
 });
 

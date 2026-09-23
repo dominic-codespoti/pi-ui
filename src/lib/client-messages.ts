@@ -63,11 +63,71 @@ export function uid(): string {
   return crypto.randomUUID();
 }
 
-export function extractTextContent(blocks: { type: string; text?: string }[]): string {
+export function extractTextContent(blocks: unknown[]): string {
   return blocks
-    .filter((b) => b.type === 'text')
-    .map((b) => b.text ?? '')
+    .filter(
+      (block): block is { type: string; text?: unknown } =>
+        !!block &&
+        typeof block === 'object' &&
+        typeof (block as Record<string, unknown>).type === 'string'
+    )
+    .filter((block) => block.type === 'text')
+    .map((block) => (typeof block.text === 'string' ? block.text : ''))
     .join('');
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function contentBlocks(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value) ? value.filter(isRecord) : [];
+}
+
+function stableSerialize(value: unknown): string {
+  if (value === null || typeof value !== 'object') {
+    try {
+      return JSON.stringify(value) ?? String(value);
+    } catch {
+      return String(value);
+    }
+  }
+  if (Array.isArray(value)) return `[${value.map(stableSerialize).join(',')}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${stableSerialize(record[key])}`)
+    .join(',')}}`;
+}
+
+function messageFingerprint(msg: Record<string, unknown>): string {
+  const role = typeof msg.role === 'string' ? msg.role.toLowerCase() : 'unknown';
+  const timestamp = typeof msg.timestamp === 'number' ? msg.timestamp : '';
+  return `${role}:${timestamp}:${stableSerialize(msg)}`;
+}
+type ToolInputInfo = { name: string; input: Record<string, unknown> };
+type ToolInputLookup = Map<string, ToolInputInfo>;
+
+function toolIdAliases(id: string): string[] {
+  const aliases: string[] = [];
+  for (let i = 0; i < id.length; i++) {
+    if (id[i] === '-' || id[i] === '_' || id[i] === ':' || id[i] === '/') {
+      const alias = id.slice(i + 1);
+      if (alias) aliases.push(alias);
+    }
+  }
+  return aliases;
+}
+
+function lookupToolInput(toolInputMap: ToolInputLookup | undefined, toolCallId: string) {
+  if (!toolInputMap) return undefined;
+  const exact = toolInputMap.get(toolCallId);
+  if (exact) return exact;
+  for (const alias of toolIdAliases(toolCallId)) {
+    const info = toolInputMap.get(alias);
+    if (info) return info;
+  }
+  return undefined;
 }
 
 export function formatToolInput(
@@ -130,50 +190,39 @@ export function formatToolInput(
 }
 
 function msgTimestamp(msg: Record<string, unknown>): number {
-  return typeof msg.timestamp === 'number' ? (msg.timestamp as number) : Date.now();
+  return typeof msg.timestamp === 'number' ? msg.timestamp : 0;
 }
 
 export function agentMsgToUI(
   m: unknown,
-  toolInputMap?: Map<string, { name: string; input: Record<string, unknown> }>,
+  toolInputMap?: ToolInputLookup,
   index?: number
 ): UIMessage[] {
-  const msg = m as Record<string, unknown>;
-  if (!msg || typeof msg.role !== 'string') return [];
+  if (!isRecord(m) || typeof m.role !== 'string') return [];
+  const msg = m;
 
   /**
    * Derive a stable message ID from the raw SDK message.
-   * Uses the SDK's own `id` field if present, otherwise hashes
-   * role + timestamp + content prefix. This ensures re-parsed
-   * messages keep the same ID across reconnects, preserving
-   * Svelte keyed-DOM stability and UI state (expanded tools, etc.).
+   * Uses the SDK's own `id` field if present, otherwise hashes the complete
+   * stable raw message. The optional absolute index is only a deterministic
+   * tie-breaker for duplicate messages and keeps IDs distinct across pages.
    */
   function stableMsgId(msg: Record<string, unknown>, index?: number): string {
-    const rawId = msg.id as string | undefined;
-    if (rawId && typeof rawId === 'string' && rawId.length > 8) return rawId;
-    const role = (msg.role as string) ?? 'unknown';
-    const ts = msgTimestamp(msg);
-    // Use first 64 chars of content/command as content fingerprint
-    const content = (msg.content ?? msg.command ?? '') as string;
-    const prefix =
-      typeof content === 'string' ? content.slice(0, 64) : JSON.stringify(content).slice(0, 64);
-    // The SDK's sessionEntryToContextMessages returns the inner `message` object
-    // which carries NO `id` field — so rawId is always undefined for incoming
-    // history payloads. The array index is the only reliably unique differentiator.
-    const dedup = index !== undefined ? `:${index}` : '';
-    // Simple stable hash — good enough for dedup, not cryptographic
+    const rawId = msg.id;
+    if (typeof rawId === 'string' && rawId.length > 8) return rawId;
+    const key = messageFingerprint(msg);
     let hash = 0;
-    const key = `${role}:${ts}:${prefix}${dedup}`;
     for (let i = 0; i < key.length; i++) {
-      const ch = key.charCodeAt(i);
-      hash = (hash << 5) - hash + ch;
-      hash |= 0; // convert to 32bit int
+      hash = (hash << 5) - hash + key.charCodeAt(i);
+      hash |= 0;
     }
-    return `msg-${ts}-${Math.abs(hash).toString(36)}`;
+    const base = `msg-${Math.abs(hash).toString(36)}`;
+    return index === undefined ? base : `${base}-${index}`;
   }
-
   const ts = msgTimestamp(msg);
-  const role = msg.role.toLowerCase();
+  const rawRole = msg.role;
+  if (typeof rawRole !== 'string') return [];
+  const role = rawRole.toLowerCase();
   switch (role) {
     case 'user':
     case 'human': {
@@ -182,23 +231,20 @@ export function agentMsgToUI(
       if (typeof msg.content === 'string') {
         text = msg.content;
       } else if (Array.isArray(msg.content)) {
-        const blocks = msg.content as {
-          type: string;
-          text?: string;
-          data?: string;
-          mimeType?: string;
-        }[];
+        const blocks = contentBlocks(msg.content);
         text = blocks
           .filter((b) => b.type === 'text')
-          .map((b) => b.text ?? '')
+          .map((b) => (typeof b.text === 'string' ? b.text : ''))
           .join('');
-        const imgBlocks = blocks.filter((b) => b.type === 'image' && b.data && b.mimeType);
+        const imgBlocks = blocks.filter(
+          (b) => b.type === 'image' && typeof b.data === 'string' && typeof b.mimeType === 'string'
+        );
         if (imgBlocks.length > 0) {
-          images = imgBlocks.map((b) => `data:${b.mimeType};base64,${b.data}`);
+          images = imgBlocks.map((b) => `data:${b.mimeType as string};base64,${b.data as string}`);
         }
-        if (!text && imgBlocks.length === 0) text = JSON.stringify(msg.content);
+        if (!text && imgBlocks.length === 0) text = stableSerialize(msg.content);
       } else {
-        text = JSON.stringify(msg.content);
+        text = stableSerialize(msg.content);
       }
       return [
         {
@@ -220,27 +266,20 @@ export function agentMsgToUI(
       if (typeof msg.content === 'string') {
         text = msg.content;
       } else if (Array.isArray(msg.content)) {
-        const blocks = msg.content as {
-          type: string;
-          text?: string;
-          thinking?: string;
-          data?: string;
-          mimeType?: string;
-        }[];
+        const blocks = contentBlocks(msg.content);
         text = blocks
           .filter((b) => b.type === 'text')
-          .map((b) => b.text ?? '')
+          .map((b) => (typeof b.text === 'string' ? b.text : ''))
           .join('');
         thinkingText = blocks
           .filter((b) => b.type === 'thinking')
-          .map((b) => b.thinking ?? '')
+          .map((b) => (typeof b.thinking === 'string' ? b.thinking : ''))
           .join('');
         const imgBlocks = blocks.filter(
-          (b): b is { type: 'image'; data: string; mimeType: string } =>
-            b.type === 'image' && !!b.data && !!b.mimeType
+          (b) => b.type === 'image' && typeof b.data === 'string' && typeof b.mimeType === 'string'
         );
         if (imgBlocks.length > 0) {
-          images = imgBlocks.map((b) => `data:${b.mimeType};base64,${b.data}`);
+          images = imgBlocks.map((b) => `data:${b.mimeType as string};base64,${b.data as string}`);
         }
       }
 
@@ -293,17 +332,12 @@ export function agentMsgToUI(
     }
     case 'toolresult':
     case 'tool_result': {
-      const toolCallId = (msg.toolCallId as string | undefined) ?? (msg.id as string | undefined);
-      let toolInfo = toolCallId ? toolInputMap?.get(toolCallId) : undefined;
-      if (!toolInfo && toolCallId && toolInputMap && toolInputMap.size > 0) {
-        for (const [id, info] of toolInputMap) {
-          if (id.endsWith(toolCallId) || toolCallId.endsWith(id)) {
-            toolInfo = info;
-            break;
-          }
-        }
-      }
-      const toolName = (msg.toolName as string | undefined) ?? toolInfo?.name ?? 'tool';
+      const toolCallId =
+        (typeof msg.toolCallId === 'string' ? msg.toolCallId : undefined) ??
+        (typeof msg.id === 'string' ? msg.id : undefined);
+      const toolInfo = toolCallId ? lookupToolInput(toolInputMap, toolCallId) : undefined;
+      const toolName =
+        (typeof msg.toolName === 'string' ? msg.toolName : undefined) ?? toolInfo?.name ?? 'tool';
       const toolInput = toolInfo ? formatToolInput(toolName, toolInfo.input) : undefined;
 
       let content = '';
@@ -311,19 +345,13 @@ export function agentMsgToUI(
       if (typeof msg.content === 'string') {
         content = msg.content;
       } else if (Array.isArray(msg.content)) {
-        const blocks = msg.content as {
-          type: string;
-          text?: string;
-          data?: string;
-          mimeType?: string;
-        }[];
+        const blocks = contentBlocks(msg.content);
         content = extractTextContent(blocks);
         const imgBlocks = blocks.filter(
-          (b): b is { type: 'image'; data: string; mimeType: string } =>
-            b.type === 'image' && !!b.data && !!b.mimeType
+          (b) => b.type === 'image' && typeof b.data === 'string' && typeof b.mimeType === 'string'
         );
         if (imgBlocks.length > 0)
-          images = imgBlocks.map((b) => `data:${b.mimeType};base64,${b.data}`);
+          images = imgBlocks.map((b) => `data:${b.mimeType as string};base64,${b.data as string}`);
       }
 
       const result: UIMessage = {
@@ -420,36 +448,46 @@ export function reconnectDelay(attempt: number): number {
   return Math.max(500, base + jitter);
 }
 
-export function rawMessagesToUI(rawMessages: unknown[]): UIMessage[] {
+export function rawMessagesToUI(rawMessages: unknown[], absoluteOffset = 0): UIMessage[] {
   if (rawMessages.length === 0) return [];
-  // Single pass: collect tool-call info for matching and convert each message.
-  const toolInputMap = new Map<string, { name: string; input: Record<string, unknown> }>();
+  // Collect tool-call info before conversion so later tool results can resolve
+  // exact IDs and known aliases without scanning the whole map per result.
+  const fingerprints = new Map<string, number>();
+  for (const raw of rawMessages) {
+    if (isRecord(raw) && typeof raw.role === 'string') {
+      const fingerprint = messageFingerprint(raw);
+      fingerprints.set(fingerprint, (fingerprints.get(fingerprint) ?? 0) + 1);
+    }
+  }
+  const toolInputMap: ToolInputLookup = new Map();
+  for (const raw of rawMessages) {
+    if (!isRecord(raw) || typeof raw.role !== 'string') continue;
+    const role = raw.role.toLowerCase();
+    if ((role !== 'assistant' && role !== 'ai') || !Array.isArray(raw.content)) continue;
+    for (const block of raw.content) {
+      if (!isRecord(block)) continue;
+      const id = typeof block.id === 'string' ? block.id : undefined;
+      const name = typeof block.name === 'string' ? block.name : undefined;
+      if (!id || !name || (block.type !== 'toolCall' && block.type !== 'tool_use')) continue;
+      const rawInput = block.arguments ?? block.input;
+      const input = isRecord(rawInput) ? rawInput : {};
+      const info = { name, input };
+      if (!toolInputMap.has(id)) toolInputMap.set(id, info);
+      for (const alias of toolIdAliases(id)) {
+        if (!toolInputMap.has(alias)) toolInputMap.set(alias, info);
+      }
+    }
+  }
+
   const result = new Array<UIMessage>(rawMessages.length);
   let writeIdx = 0;
   for (let i = 0; i < rawMessages.length; i++) {
-    const m = rawMessages[i] as Record<string, unknown>;
-    if (!m || typeof m.role !== 'string') continue;
-    // Collect tool call info from assistant messages (needed for later toolResult matching)
-    if (m.role === 'assistant' && Array.isArray(m.content)) {
-      for (const blk of m.content as {
-        type: string;
-        id?: string;
-        name?: string;
-        input?: Record<string, unknown>;
-        arguments?: Record<string, unknown>;
-      }[]) {
-        const isToolCall =
-          (blk.type === 'toolCall' || blk.type === 'tool_use') && blk.id && blk.name;
-        if (isToolCall) {
-          toolInputMap.set(blk.id!, { name: blk.name!, input: blk.arguments ?? blk.input ?? {} });
-        }
-      }
-    }
-    // Convert and write — agentMsgToUI returns an array, spread into result.
-    const ui = agentMsgToUI(m, toolInputMap, i);
-    for (let j = 0; j < ui.length; j++) {
-      result[writeIdx++] = ui[j];
-    }
+    const m = rawMessages[i];
+    if (!isRecord(m) || typeof m.role !== 'string') continue;
+    const fingerprint = messageFingerprint(m);
+    const duplicate = (fingerprints.get(fingerprint) ?? 0) > 1;
+    const ui = agentMsgToUI(m, toolInputMap, duplicate ? absoluteOffset + i : undefined);
+    for (let j = 0; j < ui.length; j++) result[writeIdx++] = ui[j];
   }
   result.length = writeIdx;
   return result;

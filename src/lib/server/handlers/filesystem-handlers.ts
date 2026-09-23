@@ -2,11 +2,17 @@ import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import { mkdir, readdir, rm, stat } from 'node:fs/promises';
 import { statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import type { ClientMessage } from '../../ws/protocol.ts';
+import type { ClientMessage, CompletionItem } from '../../ws/protocol.ts';
 import type { CommandCompletionItem, ExtensionCommandResolver } from '../extension-completions.ts';
 
 export interface FilesystemHandlerSocket {
   send(data: string): unknown;
+  readonly data?: { readonly focusedSessionId?: string };
+}
+
+export interface FilesystemUploadTarget {
+  readonly workspaceRoot: string;
+  readonly sessionId: string | null;
 }
 
 /** The only resident-session shape needed by filesystem completions. */
@@ -34,7 +40,7 @@ export interface FilesystemCompletionCache {
 }
 
 export interface FilesystemHandlerDependencies {
-  /** Current workspace root used by read/write/upload operations. */
+  /** Current workspace root used by read/write operations. */
   activeCwd: () => string;
   /** Lookup is intentionally explicit: completion requests never use socket focus. */
   getResidentSession: (sessionId: string) => FilesystemResidentTarget | undefined;
@@ -46,9 +52,17 @@ export interface FilesystemHandlerDependencies {
     command: string,
     prefix: string
   ) => Promise<readonly CommandCompletionItem[]>;
-  /** Check an already-resolved path against the active workspace (including symlinks). */
-  isInsideWorkspace: (resolvedPath: string) => boolean;
-  /** Directory where uploads are staged, derived from the active workspace root. */
+  /** Check an already-resolved path against a workspace root (including symlinks). */
+  isInsideWorkspace: (resolvedPath: string, workspaceRoot?: string) => boolean;
+  /**
+   * Resolve the upload workspace and session before any asynchronous staging work.
+   * An unresolved explicit/focused session returns the active workspace and null.
+   */
+  resolveUploadTarget: (
+    requestedSessionId: string | undefined,
+    focusedSessionId: string | undefined
+  ) => FilesystemUploadTarget;
+  /** Directory where uploads are staged, derived from the workspace root. */
   uploadStagingDir: (workspaceRoot: string) => string;
   /** Filesystem operations are injected so file messages remain independently testable. */
   readFile: (path: string) => Promise<string>;
@@ -85,6 +99,26 @@ const MAX_FILE_COMPLETIONS = 40;
 const MAX_DIR_COMPLETIONS = 20;
 const MAX_READ_BYTES = 2 * 1024 * 1024;
 const AUTOCOMPLETE_TIMEOUT_MS = 2_000;
+
+function normalizeCompletionItems(items: readonly unknown[] | undefined): CompletionItem[] {
+  if (!items) return [];
+  const normalized: CompletionItem[] = [];
+  for (const item of items) {
+    if (!item || typeof item !== 'object') continue;
+    const record = item as Record<string, unknown>;
+    const value =
+      typeof record.value === 'string'
+        ? record.value
+        : typeof record.label === 'string'
+          ? record.label
+          : undefined;
+    if (value === undefined) continue;
+    const label = typeof record.label === 'string' ? record.label : value;
+    const description = typeof record.description === 'string' ? record.description : undefined;
+    normalized.push(description === undefined ? { value, label } : { value, label, description });
+  }
+  return normalized;
+}
 
 function expandTilde(path: string): string {
   if (path === '~' || path.startsWith('~/')) return join(homedir(), path.slice(1));
@@ -295,7 +329,7 @@ export async function dispatchFilesystemMessage(
             requestId,
             trigger,
             query,
-            items: result?.items ?? [],
+            items: normalizeCompletionItems(result?.items),
           })
         );
       } catch (err) {
@@ -346,7 +380,7 @@ export async function dispatchFilesystemMessage(
             requestId,
             command,
             prefix,
-            items,
+            items: normalizeCompletionItems(items),
           })
         );
       } catch (err) {
@@ -462,9 +496,19 @@ export async function dispatchFilesystemMessage(
     }
 
     case 'upload_file': {
+      const uploadId = message.uploadId;
       const originalName = message.name;
       const uploadData = message.data;
+      let workspaceRoot: string;
+      let sessionId: string | null = null;
       try {
+        workspaceRoot = dependencies.activeCwd();
+        const uploadTarget = dependencies.resolveUploadTarget(
+          message.sessionId,
+          socket.data?.focusedSessionId
+        );
+        workspaceRoot = uploadTarget.workspaceRoot;
+        sessionId = uploadTarget.sessionId;
         if (originalName.includes('\0')) throw new Error('Invalid filename');
         const sanitizedName = basename(originalName.replaceAll('\\', '/')).replace(
           /[^A-Za-z0-9._-]/g,
@@ -479,10 +523,9 @@ export async function dispatchFilesystemMessage(
           .randomUUID()
           .replaceAll('-', '')
           .slice(0, 6)}-${safeName}`;
-        const workspaceRoot = dependencies.activeCwd();
         const stagingDir = dependencies.uploadStagingDir(workspaceRoot);
         const resolved = resolve(stagingDir, uniqueName);
-        if (!dependencies.isInsideWorkspace(resolved))
+        if (!dependencies.isInsideWorkspace(resolved, workspaceRoot))
           throw new Error('Path escapes workspace root');
         if ((uploadData.length * 3) / 4 > dependencies.maxUploadBytes) {
           throw new Error(
@@ -496,7 +539,7 @@ export async function dispatchFilesystemMessage(
           );
         }
         await mkdir(stagingDir, { recursive: true });
-        if (!dependencies.isInsideWorkspace(resolved))
+        if (!dependencies.isInsideWorkspace(resolved, workspaceRoot))
           throw new Error('Path escapes workspace root');
         await dependencies.writeFile(resolved, bytes);
         try {
@@ -528,14 +571,24 @@ export async function dispatchFilesystemMessage(
           /* prune is best effort; the staged reply stands */
         }
         const stagedPath = relative(workspaceRoot, resolved).split(sep).join('/');
-        socket.send(JSON.stringify({ type: 'file_staged', name: originalName, path: stagedPath }));
+        socket.send(
+          JSON.stringify({
+            type: 'file_staged',
+            uploadId,
+            name: originalName,
+            path: stagedPath,
+            sessionId,
+          })
+        );
       } catch (err) {
         errorLog(dependencies, '[pifrontier] upload_file error:', err);
         socket.send(
           JSON.stringify({
             type: 'file_staged',
+            uploadId,
             name: originalName,
             path: originalName,
+            sessionId,
             error: String(err),
           })
         );

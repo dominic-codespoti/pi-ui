@@ -110,7 +110,8 @@ export class NotificationController {
   private nudgeSeen: boolean;
   private pushVapidKey: string | null = null;
   private connectionOpen = false;
-  private pushSyncInFlight = false;
+  private pushSyncGeneration = 0;
+  private pushSyncLoop: Promise<void> | null = null;
   private readonly notifiedCompletions = new Set<string>();
 
   constructor(options: NotificationControllerOptions) {
@@ -137,7 +138,7 @@ export class NotificationController {
     this.prefs = { enabled: Boolean(next.enabled), onComplete: Boolean(next.onComplete) };
     this.savePreferences();
     this.options.onPreferencesChanged?.(this.preferences);
-    void this.reconcilePushSubscription();
+    this.requestPushReconciliation();
   }
 
   setEnabled(enabled: boolean): void {
@@ -150,24 +151,24 @@ export class NotificationController {
 
   setPushVapidKey(key: string | null): void {
     this.pushVapidKey = key;
-    void this.reconcilePushSubscription();
+    this.requestPushReconciliation();
   }
 
   setConnectionOpen(open: boolean): void {
     this.connectionOpen = open;
-    if (open) void this.reconcilePushSubscription();
+    this.requestPushReconciliation();
   }
 
   enableNotifications(): void {
     this.hideNudgeAndMarkSeen();
     if (!this.notification || this.notification.permission !== 'default') {
-      if (this.notification?.permission === 'granted') void this.reconcilePushSubscription();
+      if (this.notification?.permission === 'granted') this.requestPushReconciliation();
       return;
     }
     void this.notification
       .requestPermission()
       .then((permission) => {
-        if (permission === 'granted') void this.reconcilePushSubscription();
+        if (permission === 'granted') this.requestPushReconciliation();
       })
       .catch(() => {});
   }
@@ -287,38 +288,72 @@ export class NotificationController {
     this.options.onNudgeVisibilityChanged?.(false);
   }
 
-  private async reconcilePushSubscription(): Promise<void> {
+  private requestPushReconciliation(): void {
+    this.pushSyncGeneration += 1;
     if (!this.serviceWorker || !this.connectionOpen || !this.pushVapidKey) return;
-    if (this.prefs.enabled && this.notification?.permission === 'granted') {
-      await this.syncPushSubscription();
-    } else {
-      await this.unsubscribePush();
+    if (this.pushSyncLoop) return;
+    this.pushSyncLoop = this.reconcilePushLoop().finally(() => {
+      this.pushSyncLoop = null;
+    });
+  }
+
+  private async reconcilePushLoop(): Promise<void> {
+    while (true) {
+      const generation = this.pushSyncGeneration;
+      await this.reconcilePushSubscription(generation);
+      if (generation === this.pushSyncGeneration) return;
     }
   }
 
-  private async syncPushSubscription(): Promise<void> {
-    if (this.pushSyncInFlight || !this.serviceWorker || !this.pushVapidKey) return;
-    this.pushSyncInFlight = true;
+  private pushStateIsCurrent(
+    generation: number,
+    shouldSubscribe: boolean,
+    vapidKey: string
+  ): boolean {
+    return (
+      generation === this.pushSyncGeneration &&
+      this.connectionOpen &&
+      this.pushVapidKey === vapidKey &&
+      (this.prefs.enabled && this.notification?.permission === 'granted') === shouldSubscribe
+    );
+  }
+
+  private async reconcilePushSubscription(generation: number): Promise<void> {
+    const vapidKey = this.pushVapidKey;
+    if (!this.serviceWorker || !this.connectionOpen || !vapidKey) return;
+    const shouldSubscribe = this.prefs.enabled && this.notification?.permission === 'granted';
+    if (shouldSubscribe) {
+      await this.syncPushSubscription(generation, vapidKey);
+    } else {
+      await this.unsubscribePush(generation, vapidKey);
+    }
+  }
+
+  private async syncPushSubscription(generation: number, vapidKey: string): Promise<void> {
+    if (!this.serviceWorker) return;
     try {
       const registration = await this.serviceWorker.ready;
+      if (!this.pushStateIsCurrent(generation, true, vapidKey)) return;
       const existing = await registration.pushManager.getSubscription();
+      if (!this.pushStateIsCurrent(generation, true, vapidKey)) return;
       if (existing) {
         const json = existing.toJSON();
-        if (json.keys?.p256dh && json.keys.auth) {
-          const message: PushSubscribeMessage = {
-            type: 'push_subscribe',
-            endpoint: existing.endpoint,
-            keys: { p256dh: json.keys.p256dh, auth: json.keys.auth },
-            expirationTime: existing.expirationTime ?? null,
-          };
-          this.options.send(message);
-        }
+        if (!json.keys?.p256dh || !json.keys.auth) return;
+        const message: PushSubscribeMessage = {
+          type: 'push_subscribe',
+          endpoint: existing.endpoint,
+          keys: { p256dh: json.keys.p256dh, auth: json.keys.auth },
+          expirationTime: existing.expirationTime ?? null,
+        };
+        if (this.pushStateIsCurrent(generation, true, vapidKey)) this.options.send(message);
         return;
       }
+      if (!this.pushStateIsCurrent(generation, true, vapidKey)) return;
       const subscription = await registration.pushManager.subscribe({
         userVisibleOnly: true,
-        applicationServerKey: this.decodeVapidKey(this.pushVapidKey),
+        applicationServerKey: this.decodeVapidKey(vapidKey),
       });
+      if (!this.pushStateIsCurrent(generation, true, vapidKey)) return;
       const json = subscription.toJSON();
       const message: PushSubscribeMessage = {
         type: 'push_subscribe',
@@ -326,26 +361,32 @@ export class NotificationController {
         keys: { p256dh: json.keys?.p256dh ?? '', auth: json.keys?.auth ?? '' },
         expirationTime: subscription.expirationTime ?? null,
       };
-      this.options.send(message);
+      if (this.pushStateIsCurrent(generation, true, vapidKey)) this.options.send(message);
     } catch (error) {
       this.logger.warn('[pi-ui] push subscribe failed:', error);
-    } finally {
-      this.pushSyncInFlight = false;
     }
   }
 
-  private async unsubscribePush(): Promise<void> {
+  private async unsubscribePush(generation: number, vapidKey: string): Promise<void> {
     if (!this.serviceWorker) return;
     try {
       const registration = await this.serviceWorker.ready;
+      if (!this.pushStateIsCurrent(generation, false, vapidKey)) return;
       const subscription = await registration.pushManager.getSubscription();
+      if (!this.pushStateIsCurrent(generation, false, vapidKey)) return;
       if (subscription) {
         const message: PushUnsubscribeMessage = {
           type: 'push_unsubscribe',
           endpoint: subscription.endpoint,
         };
+        if (!this.pushStateIsCurrent(generation, false, vapidKey)) return;
+        try {
+          await subscription.unsubscribe();
+        } catch {
+          /* push removal is best effort */
+        }
+        if (!this.pushStateIsCurrent(generation, false, vapidKey)) return;
         this.options.send(message);
-        await subscription.unsubscribe();
       }
     } catch {
       /* push removal is best effort */

@@ -121,23 +121,23 @@ test.describe('Session status orbs', () => {
 
     // s3 running in background → green pulsing orb (broadcast persists until
     // the first click, so this can never miss the transient state).
-    await expect(backgroundRow.getByLabel('Running in background')).toBeVisible({ timeout: 3000 });
+    await expect(backgroundRow.getByText('Running in background', { exact: true })).toHaveCount(1);
 
     // Open (check) s3 → orb goes grey.
     await backgroundRow.click();
-    await expect(backgroundRow.getByLabel('Running in background')).toHaveCount(0);
-    await expect(backgroundRow.getByLabel('Unchecked result')).toHaveCount(0);
+    await expect(backgroundRow.getByText('Running in background', { exact: true })).toHaveCount(0);
+    await expect(backgroundRow.getByText('Unchecked result', { exact: true })).toHaveCount(0);
 
     // Leave to s1 → s3 finished while background → "ready to check" orb.
     await openProjectsSidebar(page);
     await page.getByRole('button', { name: /Bug fix|Fix the login bug/ }).click();
     await openProjectsSidebar(page);
-    await expect(backgroundRow.getByLabel('Unchecked result')).toBeVisible({ timeout: 3000 });
-    await expect(backgroundRow.getByLabel('Running in background')).toHaveCount(0);
+    await expect(backgroundRow.getByText('Unchecked result', { exact: true })).toHaveCount(1);
+    await expect(backgroundRow.getByText('Running in background', { exact: true })).toHaveCount(0);
 
     // Open s3 again → grey.
     await backgroundRow.click();
-    await expect(backgroundRow.getByLabel('Unchecked result')).toHaveCount(0);
+    await expect(backgroundRow.getByText('Unchecked result', { exact: true })).toHaveCount(0);
 
     // Leave again → s3 must STAY grey (regression: a finished background
     // session used to flash green "Running in background" forever because its
@@ -145,8 +145,8 @@ test.describe('Session status orbs', () => {
     await openProjectsSidebar(page);
     await page.getByRole('button', { name: /Bug fix|Fix the login bug/ }).click();
     await openProjectsSidebar(page);
-    await expect(backgroundRow.getByLabel('Running in background')).toHaveCount(0);
-    await expect(backgroundRow.getByLabel('Unchecked result')).toHaveCount(0);
+    await expect(backgroundRow.getByText('Running in background', { exact: true })).toHaveCount(0);
+    await expect(backgroundRow.getByText('Unchecked result', { exact: true })).toHaveCount(0);
   });
 
   test('active session streams with a green orb and greys out on finish', async ({
@@ -186,11 +186,15 @@ test.describe('Session status orbs', () => {
     await expect(page.getByText('Bug fix')).toBeVisible({ timeout: 3000 });
 
     // Active + streaming → green "Streaming" orb.
-    await expect(page.getByLabel('Streaming')).toBeVisible({ timeout: 3000 });
+    await expect(
+      page.getByRole('button', { name: /Bug fix/ }).getByText('Streaming', { exact: true })
+    ).toHaveCount(1);
 
     // Clicking the row "switches" to it; the mock reports the run finished.
     await page.getByRole('button', { name: /Bug fix/ }).click();
-    await expect(page.getByLabel('Streaming')).toHaveCount(0);
+    await expect(
+      page.getByRole('button', { name: /Bug fix/ }).getByText('Streaming', { exact: true })
+    ).toHaveCount(0);
   });
 
   test('renders a background tool-call indicator', async ({ page, login }) => {
@@ -226,7 +230,11 @@ test.describe('Session status orbs', () => {
     await openProjectsSidebar(page);
     await expect(page.getByText('hello world')).toBeVisible({ timeout: 3000 });
 
-    await expect(page.getByLabel('Running tool in background')).toBeVisible({ timeout: 3000 });
-    await expect(page.getByLabel('Background session running')).toBeVisible({ timeout: 3000 });
+    const backgroundRow = page.getByRole('button', { name: /hello world/ });
+    await expect(
+      backgroundRow.getByText('Running tool in background', { exact: true })
+    ).toHaveCount(1);
+    const projectB = page.getByRole('button', { name: /project-b/ });
+    await expect(projectB.getByText('Background session running', { exact: true })).toHaveCount(1);
   });
 });

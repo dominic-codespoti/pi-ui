@@ -116,6 +116,10 @@ export class ComposerTerminalBridge {
   private lastNativeEditSeq = -1;
   private expectingNativeEdit = false;
   private expectedNativeSeq = -1;
+  /** True while insertText/deleteText/restore mutate the textarea. Their
+   *  dispatched input events re-enter noteInput via the page handler and must
+   *  not consume a real key's pending native expectation. */
+  private applyingOwnEdit = false;
   private nextId = 0;
   private deadlineTimer: Timer | undefined;
   private deadlineAt = 0;
@@ -126,14 +130,35 @@ export class ComposerTerminalBridge {
     return this.pending.size;
   }
 
-  /** Call from the textarea's oninput. Returns nothing; updates seq books. */
-  noteInput(): void {
+  /** Call from the textarea's oninput. The input event carries which kind of
+   *  edit just painted, so classify directly instead of racing the browser's
+   *  native default action with an expiry timer (a microtask drains before the
+   *  native input event, misclassifying every real keystroke as foreign and
+   *  double-inserting on the unconsumed verdict). */
+  noteInput(event?: InputEvent): void {
+    if (this.applyingOwnEdit) return;
     if (this.expectingNativeEdit && this.expectedNativeSeq === this.composerEditSeq) {
-      this.expectingNativeEdit = false;
-      this.lastNativeEditSeq = this.composerEditSeq;
-    } else {
-      this.composerForeignEditSeq++;
+      if (this.isNativeKeyPaint(event)) {
+        this.expectingNativeEdit = false;
+        this.lastNativeEditSeq = this.composerEditSeq;
+        return;
+      }
     }
+    this.composerForeignEditSeq++;
+  }
+
+  /** Whether an input event is the pending key's own native default action.
+   *  Accepted types are exactly what natively follows an optimistic keydown:
+   *  a single-char insert or a backward/forward delete. Paste, drop, IME,
+   *  and multi-char replacements are foreign even mid-expectation. An absent
+   *  event (direct caller) keeps the historical native classification. */
+  private isNativeKeyPaint(event?: InputEvent): boolean {
+    const type = event?.inputType ?? '';
+    if (type === '') return true;
+    if (type === 'deleteContentBackward' || type === 'deleteContentForward') return true;
+    if (type !== 'insertText') return false;
+    const data = event?.data;
+    return data == null || data.length <= 1;
   }
 
   /**
@@ -172,16 +197,22 @@ export class ComposerTerminalBridge {
         snapshot.deferredDelete = e.key === 'Backspace' ? 'backward' : 'forward';
         snapshot.deferredBaseLength = (inputEl?.value ?? input).length;
       } else {
-        // The native default action (when this is a real keypress) paints
-        // next; the seq stamp lets noteInput() tell that paint apart
-        // from foreign/verdict-driven edits even when keydowns arrive faster
-        // than input events. Synthetic keydowns produce no native input, so
-        // their verdict falls back to programmatic insert (see verdict path).
-        this.expectingNativeEdit = true;
-        this.expectedNativeSeq = snapshot.seq;
-        queueMicrotask(() => {
-          this.expectingNativeEdit = false;
-        });
+        // Arm the native-paint expectation only for keys whose default action
+        // mutates the value (printable insert, non-deferred delete).
+        // Non-mutating optimistic keys (arrows, Home/End, …) paint nothing:
+        // arming for them would misclassify a later foreign insert as their
+        // native paint and let a consumed verdict erase it. Synthetic
+        // keydowns produce no native input, so their verdict falls back to
+        // programmatic insert (see verdict path). The pending expectation
+        // must NOT expire on a timer: a microtask drains before the browser
+        // dispatches the native input event, so expiry misclassifies real
+        // keystrokes as foreign and the unconsumed verdict double-inserts.
+        // A later keydown overwrites the seq stamp, so stale expectations
+        // self-invalidate without a timer.
+        if (expectsNativeInsert || e.key === 'Backspace' || e.key === 'Delete') {
+          this.expectingNativeEdit = true;
+          this.expectedNativeSeq = snapshot.seq;
+        }
         this.host.handleKey(e);
       }
     } else {
@@ -410,10 +441,15 @@ export class ComposerTerminalBridge {
     const input = this.host.getInput();
     const start = inputEl.selectionStart ?? input.length;
     const end = inputEl.selectionEnd ?? input.length;
-    inputEl.setRangeText(text, start, end, 'end');
-    inputEl.dispatchEvent(
-      new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text })
-    );
+    this.applyingOwnEdit = true;
+    try {
+      inputEl.setRangeText(text, start, end, 'end');
+      inputEl.dispatchEvent(
+        new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text })
+      );
+    } finally {
+      this.applyingOwnEdit = false;
+    }
     this.host.resize();
   }
 
@@ -429,13 +465,18 @@ export class ComposerTerminalBridge {
     const end = inputEl.selectionEnd ?? input.length;
     const delStart = backward ? Math.max(0, start - (start === end ? 1 : 0)) : start;
     const delEnd = backward ? end : Math.min(inputEl.value.length, end + (start === end ? 1 : 0));
-    inputEl.setRangeText('', delStart, delEnd, 'end');
-    inputEl.dispatchEvent(
-      new InputEvent('input', {
-        bubbles: true,
-        inputType: backward ? 'deleteContentBackward' : 'deleteContentForward',
-      })
-    );
+    this.applyingOwnEdit = true;
+    try {
+      inputEl.setRangeText('', delStart, delEnd, 'end');
+      inputEl.dispatchEvent(
+        new InputEvent('input', {
+          bubbles: true,
+          inputType: backward ? 'deleteContentBackward' : 'deleteContentForward',
+        })
+      );
+    } finally {
+      this.applyingOwnEdit = false;
+    }
     this.host.resize();
   }
 
@@ -445,9 +486,16 @@ export class ComposerTerminalBridge {
       this.host.setInput(s.value);
       return;
     }
-    inputEl.value = s.value;
-    inputEl.setSelectionRange(s.start, s.end);
-    inputEl.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertFromDrop' }));
+    this.applyingOwnEdit = true;
+    try {
+      inputEl.value = s.value;
+      inputEl.setSelectionRange(s.start, s.end);
+      inputEl.dispatchEvent(
+        new InputEvent('input', { bubbles: true, inputType: 'insertFromDrop' })
+      );
+    } finally {
+      this.applyingOwnEdit = false;
+    }
     this.host.resize();
   }
 }

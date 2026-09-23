@@ -7,6 +7,27 @@ import type { ParsedComponent } from '#lib/tui-stubs.js';
 /** Version of the extension-UI wire payloads (ExtensionUiStatePayload et al). Bump on breaking shape changes. */
 export const EXTENSION_UI_SCHEMA_VERSION = 1 as const;
 
+// Shared item shapes used by resource/tool/command and completion catalogs.
+export interface ToolSummary {
+  name: string;
+  description: string;
+  isBuiltin: boolean;
+  origin?: string;
+}
+
+export interface CommandSummary {
+  name: string;
+  description?: string;
+  source: string;
+  hasArgumentCompletions?: boolean;
+}
+
+export interface CompletionItem {
+  value: string;
+  label: string;
+  description?: string;
+}
+
 // ── Shared data shapes ────────────────────────────────────────────────────────
 
 export interface ModelInfo {
@@ -169,7 +190,7 @@ export interface PackageUpdateInfo {
 }
 
 export interface PackageProgress {
-  phase: 'start' | 'progress' | 'complete' | 'error';
+  phase?: 'start' | 'progress' | 'complete' | 'error';
   action: 'install' | 'remove' | 'update' | 'clone' | 'pull';
   source: string;
   message?: string;
@@ -192,8 +213,8 @@ export interface ExtensionSummary {
   path: string;
   scope: 'user' | 'project' | 'temporary';
   origin: 'package' | 'top-level';
-  tools: { name: string; description: string }[];
-  commands: { name: string; description: string }[];
+  tools: Array<{ name: string; description: string }>;
+  commands: Array<{ name: string; description: string }>;
   flags?: ExtensionFlagInfo[];
   shortcuts?: ExtensionShortcutInfo[];
   diagnostics?: ExtensionDiagnostic[];
@@ -329,11 +350,11 @@ export interface ConnectedMessage {
   /** SDK model fallback warning, if the saved model was unavailable. */
   modelFallbackMessage?: string;
   /** All tools available in this session (proactive warm — avoids extra get_tools round-trip). */
-  tools?: Array<{ name: string; description: string; isBuiltin: boolean; origin?: string }>;
+  tools?: ToolSummary[];
   /** Names of active/enabled tools. */
   activeToolNames?: string[];
   /** Extension slash commands available in this session (snapshot-embedded catalog). */
-  commands?: Array<{ name: string; description?: string; source: string }>;
+  commands?: CommandSummary[];
 }
 export type SessionPhase = 'idle' | 'running' | 'awaiting-input' | 'error';
 
@@ -348,7 +369,10 @@ export type SessionPhase = 'idle' | 'running' | 'awaiting-input' | 'error';
  * a stale-event guard for one active session.
  *
  * `connected` and `session_loaded` snapshots describe the session this client
- * is looking at; `session_runtime` deltas may describe any resident session.
+ * is looking at. A requester-directed `session_loaded` echoes the initiating
+ * structural operation's `requestId`; an unstamped `session_loaded` is a
+ * global inventory/snapshot broadcast and must not settle a local operation.
+ * `session_runtime` deltas may describe any resident session.
  *
  * Session inventory events describe persisted `.jsonl` files discovered by the
  * session/project catalogs; they do not represent resident or background
@@ -356,7 +380,7 @@ export type SessionPhase = 'idle' | 'running' | 'awaiting-input' | 'error';
  *
  * Custom server events (not from the SDK):
  *   { type: "model_changed",           model: ModelInfo | null; sessionId?: string }
- *   { type: "session_loaded",          sessionId, isStreaming, activeToolName?, thinkingLevel, model, availableModels, messages, contextUsage }
+ *   { type: "session_loaded",          sessionId, requestId?, isStreaming, activeToolName?, thinkingLevel, model, availableModels, messages, contextUsage }
  *   { type: "sessions_list",           sessions: SessionSummary[] }
  *   { type: "all_sessions_list",       sessions: SessionSummary[] }
  *   { type: "session_updated",         session: SessionSummary }
@@ -369,7 +393,7 @@ export type SessionPhase = 'idle' | 'running' | 'awaiting-input' | 'error';
  *   { type: "file_completions",        sessionId, requestId, query: string; entries: string[]; error?: string }
  *   { type: "providers_list",          providers: ProviderInfo[] }
  *   { type: "available_models_changed", availableModels: ModelInfo[] }
- *   { type: "sessions_error",          message: string }
+ *   { type: "sessions_error",          message, requestId? }
  *   { type: "fork_points",             entries: Array<{ entryId: string; text: string }> }
  *   { type: "tools_list",              tools: Array<{ name: string; description: string; isBuiltin: boolean; origin?: string }>, activeToolNames: string[] }
  *   { type: "resources_list",          skills: SkillSummary[], prompts: PromptSummary[] }
@@ -385,7 +409,7 @@ export type SessionPhase = 'idle' | 'running' | 'awaiting-input' | 'error';
  *
  *   { type: "slash_result",            command: string, message: string, level?: "info" | "warning" | "error" }
  *   { type: "file_content",            path: string, content: string, error?: string }
- *   { type: "file_staged",             name: string, path: string, error?: string }
+ *   { type: "file_staged",             uploadId: string; name: string; path: string; sessionId: string | null; error?: string }
  *   { type: "older_messages",          messages: unknown[], totalMessageCount: number, messagesTruncated: boolean }
  *
  * SDK events the browser must handle:
@@ -470,17 +494,26 @@ export type PiEvent = { type: string } & Record<string, unknown>;
  *  a missing or renamed field — fails at compile time on the broadcast site. */
 export type ServerCustomEvent =
   | { type: 'model_changed'; model: ModelInfo | null; sessionId?: string }
+  | { type: 'shutdown_requested'; sessionId: string }
+  | { type: 'bash_execution_update'; id: string; delta: string; sessionId: string }
+  | {
+      type: 'extension_flag_result';
+      name: string;
+      value: boolean | string;
+      success: boolean;
+    }
   | {
       type: 'session_loaded';
       /** Session described by this snapshot. */
       sessionId: string;
-      /** Correlation token for the initiating client; accept a snapshot only when it matches an in-flight switch_session/new_session request, and treat unstamped global broadcasts as foreign switches. */
-      requestId?: string;
+      /** Echoed only for the requester-directed structural operation response. */
+      /** Legacy switch snapshots may omit isStreaming. */
       isStreaming?: boolean;
       /** Name of the tool currently executing in this session (if any). */
       activeToolName?: string;
       thinkingLevel: string;
       model: ModelInfo | null;
+      availableModels: ModelInfo[];
       /** History tool-result records may include outputElided?: boolean and outputBytes?: number metadata. */
       messages: unknown[];
       streamingMessage?: unknown;
@@ -498,11 +531,22 @@ export type ServerCustomEvent =
       uiVersion?: string;
       projectTrust?: ProjectTrustInfo;
       diagnostics?: RuntimeDiagnostic[];
+      sessionMode?: 'in-memory' | 'persisted';
       modelFallbackMessage?: string;
       contextUsage?: ContextUsage | null;
-      tools?: Array<{ name: string; description: string; isBuiltin: boolean; origin?: string }>;
+      extensionUiState?: ExtensionUiStatePayload;
+      tools?: ToolSummary[];
       activeToolNames?: string[];
-      commands?: Array<{ name: string; description?: string; source: string }>;
+      commands?: CommandSummary[];
+    }
+  | { type: 'resources_list'; skills: SkillSummary[]; prompts: PromptSummary[]; sessionId?: string }
+  | { type: 'commands_list'; commands: CommandSummary[]; sessionId?: string }
+  | { type: 'providers_error'; message: string; sessionId?: string }
+  | {
+      type: 'queue_update';
+      steering: string[];
+      followUp: string[];
+      sessionId?: string;
     }
   /** Full tool output fetched for an expanded history row. */
   | {
@@ -530,20 +574,22 @@ export type ServerCustomEvent =
       error?: string;
     }
   | { type: 'models_refresh_result'; success: boolean; message: string; sessionId?: string }
+  | { type: 'providers_list'; providers: ProviderInfo[]; sessionId?: string }
+  | { type: 'available_models_changed'; availableModels: ModelInfo[]; sessionId?: string }
   | {
       type: 'sessions_error';
       message: string;
-      /** Vestigial server echo; clients no longer use this for request correlation. */
+      /** Echoed for the requester-directed structural operation response; absent on global broadcasts. */
       requestId?: string;
     }
   | { type: 'fork_points'; entries: Array<{ entryId: string; text: string }>; sessionId?: string }
   | {
       type: 'tools_list';
-      tools: Array<{ name: string; description: string; isBuiltin: boolean; origin?: string }>;
+      tools: ToolSummary[];
       activeToolNames: string[];
       sessionId?: string;
     }
-  | { type: 'project_trust'; trust: ProjectTrustInfo; sessionId?: string }
+  | { type: 'project_trust'; trust: ProjectTrustInfo; sessionId?: string; message?: string }
   | { type: 'runtime_diagnostics'; diagnostics: RuntimeDiagnostic[]; sessionId?: string }
   | { type: 'extension_error'; error: ExtensionErrorNotice; sessionId?: string }
   | {
@@ -560,7 +606,7 @@ export type ServerCustomEvent =
     }
   | { type: 'package_progress'; progress: PackageProgress; sessionId?: string }
   | { type: 'package_result'; success: boolean; message: string; sessionId?: string }
-  | { type: 'session_stats'; stats: SessionStats }
+  | { type: 'session_stats'; stats: SessionStats; sessionId?: string }
   | {
       type: 'export_result';
       format: 'html' | 'jsonl';
@@ -583,7 +629,14 @@ export type ServerCustomEvent =
     }
   | { type: 'file_content'; path: string; content: string; error?: string }
   | { type: 'file_saved'; path: string; error?: string }
-  | { type: 'file_staged'; name: string; path: string; error?: string }
+  | {
+      type: 'file_staged';
+      uploadId: string;
+      name: string;
+      path: string;
+      sessionId: string | null;
+      error?: string;
+    }
   | {
       type: 'older_messages';
       messages: unknown[];
@@ -597,7 +650,7 @@ export type ServerCustomEvent =
       command: string;
       /** Raw complete argument text passed to the SDK provider. */
       prefix: string;
-      items: Array<{ value: string; label: string; description?: string }>;
+      items: CompletionItem[];
       sessionId: string;
       requestId: string;
       error?: string;
@@ -606,7 +659,7 @@ export type ServerCustomEvent =
       type: 'extension_completions';
       trigger: string;
       query: string;
-      items: unknown[];
+      items: CompletionItem[];
       sessionId: string;
       requestId: string;
       error?: string;
@@ -690,14 +743,14 @@ export type ClientMessage =
   | { type: 'abort_retry'; sessionId?: string }
   | { type: 'set_thinking_level'; sessionId?: string; level: string }
   | { type: 'set_model'; sessionId?: string; provider: string; modelId: string }
-  | { type: 'new_session'; targetCwd?: string; requestId?: string }
-  | { type: 'switch_session'; path: string; requestId?: string }
+  | { type: 'new_session'; targetCwd?: string; requestId: string }
+  | { type: 'switch_session'; path: string; requestId: string }
   /** Tell the server which session this socket is looking at; drives unread and visibility semantics. */
   | { type: 'session_focus'; sessionId: string | null }
   /** Fetch the full output for an expanded tool-result history row. */
   | { type: 'get_tool_output'; sessionId?: string; toolCallId: string; requestId?: string }
   /** Request a fresh snapshot for the current session. */
-  | { type: 'resync_session'; sessionId?: string; requestId?: string }
+  | { type: 'resync_session'; sessionId?: string; requestId: string }
   /** Request all sessions across all project directories. Server replies with all_sessions_list. */
   | { type: 'get_all_sessions' }
   /** Request the merged project list (registry + session dirs). Server replies with projects_list. */
@@ -770,9 +823,9 @@ export type ClientMessage =
   /** Remove stored API key for a provider. */
   | { type: 'remove_provider_key'; provider: string }
   /** Rename a session by its stable session ID. */
-  | { type: 'rename_session'; sessionId: string; name: string }
+  | { type: 'rename_session'; sessionId: string; name: string; requestId: string }
   /** Permanently delete a session file by its stable session ID (cannot delete the active session). */
-  | { type: 'delete_session'; sessionId: string }
+  | { type: 'delete_session'; sessionId: string; requestId: string }
   /** Manually compact the session context (aborts running agent first). */
   | { type: 'compact'; sessionId?: string }
   /** Enable or disable automatic context compaction. */
@@ -782,7 +835,7 @@ export type ClientMessage =
   /** Request the list of fork-able user message entry IDs. Server replies with fork_points. */
   | { type: 'get_fork_points'; sessionId?: string }
   /** Fork the session at the given entry ID, creating a new branched session. */
-  | { type: 'fork_session'; sessionId?: string; entryId: string }
+  | { type: 'fork_session'; sessionId?: string; entryId: string; requestId: string }
   /** Edit a user message: server finds the entry, rewinds session, and resends. */
   | { type: 'edit_message'; sessionId?: string; originalMessage: string; newMessage: string }
   /** Request the full list of tools and which are active. Server replies with tools_list. */
@@ -832,7 +885,7 @@ export type ClientMessage =
   /** Write file content from the file viewer modal's edit mode. */
   | { type: 'write_file'; path: string; content: string }
   /** Stage an uploaded binary file in the active workspace. */
-  | { type: 'upload_file'; name: string; data: string }
+  | { type: 'upload_file'; uploadId: string; sessionId?: string; name: string; data: string }
   /** Request older messages before the current window. Server replies with older_messages. */
   | { type: 'load_messages'; sessionId?: string; count: number; alreadyHasCount: number }
   /** Request argument completions for an extension slash command. The prefix is raw full argument text. */

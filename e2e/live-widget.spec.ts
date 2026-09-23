@@ -88,7 +88,10 @@ export default function widgetTestExtension(pi: PiLike): void {
           // undefined — that is the regression this spec guards.
           const t: ThemeLike = ctxTheme;
           return {
-            render: () => ['ctx: widget-live-ctx ' + ++n],
+            render: () => {
+              const text = 'ctx: widget-live-ctx ' + ++n;
+              return [t.fg?.('accent', text) ?? text];
+            },
             invalidate: () => {},
           };
         },
@@ -136,14 +139,16 @@ test.describe('Live above-editor widgets', () => {
     try {
       await login(page);
       await waitForReady(page);
-      // WS-open ≠ session-ready: /reload hits activeSession() and throws
-      // 'No active session' if the lazy SDK session is still initializing.
-      await sendSlash(page, '/new');
-      await waitForReady(page);
       await sendSlash(page, '/reload');
       await expect(page.getByText(/Reloaded extensions/i)).toBeVisible({
         timeout: WIDGET_TIMEOUT,
       });
+      const previousSession = new URL(page.url()).searchParams.get('session');
+      await sendSlash(page, '/new');
+      await expect
+        .poll(() => new URL(page.url()).searchParams.get('session'), { timeout: WIDGET_TIMEOUT })
+        .not.toBe(previousSession);
+      await waitForReady(page);
       await sendSlash(page, '/wtest');
 
       // Both widgets appear…
