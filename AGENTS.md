@@ -34,26 +34,26 @@ Bun server bridges pi SDK events to browser over WebSocket. Key flow: CLI → se
 
 ## Key Directories
 
-| Path                           | Purpose                                                                                                                                    |
-| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| `src/lib/auth/`                | Password hashing (bcrypt/PBKDF2), JWT (crypto.subtle), IP rate limiter (`rate-limiter.ts`)                                                 |
-| `src/lib/ws/`                  | Shared WebSocket protocol types (`protocol.ts`), Valibot wire schemas (`server-message-schema.ts`)                                         |
-| `src/lib/server/`              | Server-side helpers: session catalog, project catalog, wire bounding, watcher, extension tools/completions, webhooks, push                 |
-| `src/lib/state/`               | Runes-based shared stores: `projects-state.svelte.ts`, `extension-ui-state.svelte.ts`                                                      |
-| `src/lib/components/chat/`     | Chat components: `message-list.svelte`, `chat-header.svelte`, `status-banners.svelte` (reconnection/read-only alerts, context meter)       |
+| Path                                 | Purpose                                                                                                                                                   |
+| ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `src/lib/auth/`                      | Password hashing (bcrypt/PBKDF2), JWT (crypto.subtle), IP rate limiter (`rate-limiter.ts`)                                                                |
+| `src/lib/ws/`                        | Shared WebSocket protocol types (`protocol.ts`), Valibot wire schemas (`server-message-schema.ts`)                                                        |
+| `src/lib/server/`                    | Server-side helpers: session catalog, project catalog, wire bounding, watcher, extension tools/completions, webhooks, push                                |
+| `src/lib/state/`                     | Runes-based shared stores: `projects-state.svelte.ts`, `extension-ui-state.svelte.ts`                                                                     |
+| `src/lib/components/chat/`           | Chat components: `message-list.svelte`, `chat-header.svelte`, `status-banners.svelte` (reconnection/read-only alerts, context meter)                      |
 | `src/lib/extension-ui-capabilities/` | Typed catalog of how each `ctx.ui` capability renders in Pi UI, with executable examples and a pure skill renderer; source of truth for the bundled skill |
-| `skills/pi-ui-extension-ui/`        | GENERATED bundled Pi skill, loaded into every Pi UI session through `additionalSkillPaths`; do not edit by hand                           |
-| `src/lib/components/panels/`   | Panel components: `right-panel.svelte`, `settings-panel.svelte` (theme, notifications, UI options), lazy panel wrappers                    |
-| `src/lib/components/dialogs/`  | Dialogs: `confirm-dialog.svelte`, `fork-dialog.svelte`, `session-tree-modal.svelte`, `extension-overlays.svelte`, `toast-container.svelte` |
-| `src/lib/components/projects/` | Project management: `projects-sidebar.svelte`, `project-picker.svelte`, `directory-picker.svelte`                                          |
-| `src/lib/components/`          | Svelte 5 components: chat, panels, projects, dialogs, `file-viewer-modal.svelte`, `diff-viewer.svelte`, `sidebar-panel.svelte`             |
-| `src/lib/components/ui/`       | shadcn-style primitives (button, dialog, select, switch, tabs, card, tooltip, scroll-area, separator, bottom-sheet)                        |
-| `src/routes/(app)/`            | Main SPA (chat UI) — `ssr=false, prerender=false`                                                                                          |
-| `src/routes/(auth)/`           | Login page (auth group separates routing from hooks guard)                                                                                 |
-| `bin/`                         | CLI entry point (`pifrontier.ts`) and shell shim                                                                                           |
-| `scripts/`                     | Dev orchestrator (`dev.ts` — parallel Vite + WS server), `maybe-build.ts` freshness check guard                                            |
-| `e2e/`                         | Playwright E2E tests: mock WS specs, live agent specs, `global-setup.ts` scratch dirs, fake LLM server stub                                |
-| `static/`                      | PWA assets: icons, manifest.webmanifest                                                                                                    |
+| `skills/pi-ui-extension-ui/`         | GENERATED bundled Pi skill, loaded into every Pi UI session through `additionalSkillPaths`; do not edit by hand                                           |
+| `src/lib/components/panels/`         | Panel components: `right-panel.svelte`, `settings-panel.svelte` (theme, notifications, UI options), lazy panel wrappers                                   |
+| `src/lib/components/dialogs/`        | Dialogs: `confirm-dialog.svelte`, `fork-dialog.svelte`, `session-tree-modal.svelte`, `extension-overlays.svelte`, `toast-container.svelte`                |
+| `src/lib/components/projects/`       | Project management: `projects-sidebar.svelte`, `project-picker.svelte`, `directory-picker.svelte`                                                         |
+| `src/lib/components/`                | Svelte 5 components: chat, panels, projects, dialogs, `file-viewer-modal.svelte`, `diff-viewer.svelte`, `sidebar-panel.svelte`                            |
+| `src/lib/components/ui/`             | shadcn-style primitives (button, dialog, select, switch, tabs, card, tooltip, scroll-area, separator, bottom-sheet)                                       |
+| `src/routes/(app)/`                  | Main SPA (chat UI) — `ssr=false, prerender=false`                                                                                                         |
+| `src/routes/(auth)/`                 | Login page (auth group separates routing from hooks guard)                                                                                                |
+| `bin/`                               | CLI entry point (`pifrontier.ts`) and shell shim                                                                                                          |
+| `scripts/`                           | Dev orchestrator (`dev.ts` — parallel Vite + WS server), `maybe-build.ts` freshness check guard                                                           |
+| `e2e/`                               | Playwright E2E tests: mock WS specs, live agent specs, `global-setup.ts` scratch dirs, fake LLM server stub                                               |
+| `static/`                            | PWA assets: icons, manifest.webmanifest                                                                                                                   |
 
 ---
 
@@ -226,7 +226,7 @@ bun run test:ci           # check + check:sw + check:server + check:skill + lint
 | `src/lib/components/dialogs/extension-overlays.svelte` | Modal dialogs and overlay renderer for extension interactions                                       |
 | `src/lib/markdown.ts`                                  | Configured marked + hljs + LaTeX renderer + FNV-1a LRU memoization                                  |
 | `src/lib/tui-stubs.ts`                                 | Server-side pi-tui stub bridge, component tree parser, markdown transformer runner                  |
-| `src/lib/extension-ui-capabilities/catalog.ts`           | Typed source of truth for extension UI capability rendering and bundled skill content      |
+| `src/lib/extension-ui-capabilities/catalog.ts`         | Typed source of truth for extension UI capability rendering and bundled skill content               |
 | `src/lib/diff-parser.ts`                               | Unified diff parser                                                                                 |
 | `e2e/fixtures.ts`                                      | Playwright custom fixtures — `mockWs`, `login`                                                      |
 | `e2e/global-setup.ts`                                  | E2E test suite scratch directory initialization and fake LLM config                                 |
