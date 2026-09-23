@@ -9,7 +9,6 @@
     SkillSummary,
     PromptSummary,
     ResourceDiagnosticSummary,
-    ScopedModelInfo,
   } from '#lib/ws/protocol.js';
   import AlertTriangle from '@lucide/svelte/icons/triangle-alert';
 
@@ -21,7 +20,6 @@
     tab,
     modelTab = $bindable(),
     model,
-    allModels,
     modelRefreshLoading,
     modelRefreshFeedback,
     toolsList,
@@ -31,7 +29,6 @@
     contextFiles,
     thinkingLevel,
     availableThinkingLevels,
-    scopedModels,
     providers,
     providerError = $bindable(),
     providerKeyInputs = $bindable(),
@@ -43,7 +40,6 @@
     providerLoginPending,
     configuredProviderCount,
     filteredModelsByProvider,
-    highlightProviderId,
     filteredTools,
     filteredSkills,
     onUsePrompt,
@@ -59,12 +55,9 @@
     onTabChange,
     onSelectModel,
     onPickThinkingLevel,
-    onOpenScopedModels,
     onToggleTool,
     onSetProviderKey,
     onProviderLogin,
-    onOpenProviderKey,
-    onHighlightConsumed,
     onRemoveProviderKey,
     onSetActiveTools,
     onInstallSkill,
@@ -79,7 +72,6 @@
     tab: 'models' | 'tools' | 'skills';
     modelTab: 'models' | 'providers';
     model: ModelInfo | null;
-    allModels: ModelInfo[];
     modelRefreshLoading: boolean;
     modelRefreshFeedback: { success: boolean; message: string } | null;
     toolsList: { name: string; description: string; isBuiltin: boolean; origin?: string }[];
@@ -87,7 +79,6 @@
     resourcesLoaded: boolean;
     thinkingLevel: string;
     availableThinkingLevels: readonly string[];
-    scopedModels: ScopedModelInfo[];
     providers: ProviderInfo[];
     providerError: string | null;
     providerKeyInputs: Record<string, string>;
@@ -99,7 +90,6 @@
     configuredProviderCount: number;
     filteredModelsByProvider: [string, ModelInfo[]][];
     providerLoginPending: string | null;
-    highlightProviderId: string | null;
     filteredTools: { name: string; description: string; isBuiltin: boolean; origin?: string }[];
     filteredSkills: { skills: SkillSummary[]; prompts: PromptSummary[] };
     resourceDiagnostics: ResourceDiagnosticSummary[];
@@ -115,12 +105,9 @@
     onTabChange: (tab: 'models' | 'tools' | 'skills') => void;
     onSelectModel: (m: ModelInfo) => void;
     onPickThinkingLevel: (level: string) => void;
-    onOpenScopedModels: () => void;
     onToggleTool: (name: string) => void;
     onSetProviderKey: (id: string) => void;
     onProviderLogin: (id: string) => void;
-    onHighlightConsumed: () => void;
-    onOpenProviderKey: (id: string) => void;
     onRemoveProviderKey: (id: string) => void;
     onSetActiveTools: (names: string[]) => void;
     onInstallSkill: (url: string, scope: 'project' | 'user') => void;
@@ -184,7 +171,7 @@
           : 'text-base-content/45 hover:text-base-content/70'}"
         tabindex={open ? 0 : -1}
         >tools{#if toolsList.length}
-          <span class="text-base-content/30 font-normal ml-0.5"
+          <span class="text-base-content/30 font-normal text-[10px] tabular-nums ml-1"
             >{activeToolNames.length}/{toolsList.length}</span
           >{/if}</button
       >
@@ -226,12 +213,10 @@
       {open}
       bind:modelTab
       {model}
-      {allModels}
       {modelRefreshLoading}
       {modelRefreshFeedback}
       {thinkingLevel}
       {availableThinkingLevels}
-      {scopedModels}
       {providers}
       bind:providerError
       bind:providerKeyInputs
@@ -240,14 +225,10 @@
       {filteredProviders}
       {configuredProviderCount}
       {filteredModelsByProvider}
-      {highlightProviderId}
       {providerLoginPending}
-      {onHighlightConsumed}
       {onProviderLogin}
-      {onOpenProviderKey}
       {onSelectModel}
       {onPickThinkingLevel}
-      {onOpenScopedModels}
       {onSetProviderKey}
       {onRemoveProviderKey}
       {onDismissProviderError}

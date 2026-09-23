@@ -68,9 +68,9 @@ test.describe('Provider credentials', () => {
 
     await login(page, 'test-password');
     await page.getByRole('button', { name: 'Open model and provider panel' }).click();
-    await expect(page.getByText('Needs sign-in · anthropic')).toBeVisible();
-    await page.getByText('Needs sign-in · anthropic').click();
-    await expect(page.getByText('Claude Sonnet', { exact: true })).toBeVisible();
+    // Models of providers you're not signed in to are not listed.
+    await expect(page.getByRole('button', { name: /^Claude Sonnet/ })).toHaveCount(0);
+    await expect(page.getByText(/more providers? available — sign in/)).toBeVisible();
     await page.getByRole('tab', { name: /providers/ }).click();
 
     const keyInput = page.getByLabel('API key for Anthropic');
@@ -81,10 +81,7 @@ test.describe('Provider credentials', () => {
     await expect(page.getByRole('button', { name: 'remove key', exact: true })).toBeVisible();
     expect(savedKey).toBe('sk-test');
     await page.locator('button[data-value="models"]').click();
-    await expect(
-      page.getByRole('button', { name: /^Claude Sonnet (Image input )?200k/ })
-    ).toBeVisible();
-    await expect(page.getByText('Needs sign-in · anthropic')).toHaveCount(0);
+    await expect(page.getByRole('button', { name: /^Claude Sonnet 200k ctx/ })).toBeVisible();
   });
 
   test('derives thinking rungs from the selected model capabilities', async ({ page, login }) => {

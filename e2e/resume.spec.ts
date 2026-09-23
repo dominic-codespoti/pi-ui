@@ -14,7 +14,7 @@ const SESSION_PATH = '/home/user/.pi/sessions/proj/2026-01-01_mock.jsonl';
 
 function snapshotPayload() {
   return {
-    v: 1,
+    v: 2,
     sessionPath: SESSION_PATH,
     sessionName: 'Resumed session',
     savedAt: Date.now(),

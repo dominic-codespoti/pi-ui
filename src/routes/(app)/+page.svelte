@@ -17,7 +17,6 @@
     ExtensionSummary,
     WidgetContent,
     ExtensionUiStatePayload,
-    ScopedModelInfo,
     TreeNode,
     UpdateStatus,
     UpdateTarget,
@@ -86,7 +85,6 @@
   import ExtensionOverlays from '#lib/components/dialogs/extension-overlays.svelte';
   import CompactDialog from '#lib/components/dialogs/compact-dialog.svelte';
   import ProviderLoginDialog from '#lib/components/dialogs/provider-login-dialog.svelte';
-  import ScopedModelsDialog from '#lib/components/dialogs/scoped-models-dialog.svelte';
   import ChevronRight from '@lucide/svelte/icons/chevron-right';
   import X from '@lucide/svelte/icons/x';
   import Keyboard from '@lucide/svelte/icons/keyboard';
@@ -733,8 +731,11 @@
       ) => candidates.push({ shortcut, invocation, category, order, descriptionSearch });
       let order = 0;
       for (const command of [
-        // The browser cannot meaningfully implement the SDK's process-exit command.
-        ...sdkBuiltinCommands.filter((candidate) => candidate.name !== 'quit'),
+        // The browser cannot meaningfully implement the SDK's process-exit command, and
+        // model cycling/scoping is intentionally not part of the web UI.
+        ...sdkBuiltinCommands.filter(
+          (candidate) => candidate.name !== 'quit' && candidate.name !== 'scoped-models'
+        ),
         ...WEB_SLASH_COMMANDS,
       ]) {
         add(
@@ -920,10 +921,7 @@
   let model = $state<ModelInfo | null>(null);
   let modelAcceptsImages = $derived(model?.input === undefined || model.input.includes('image'));
   let availableThinkingLevels = $state<string[]>([]);
-  let scopedModels = $state<ScopedModelInfo[]>([]);
-  let showScopedModels = $state(false);
   let availableModels = $state<ModelInfo[]>([]);
-  let allModels = $state<ModelInfo[]>([]);
   /** Server working directory */
   let cwd = $state('');
   /** pi SDK version reported by server */
@@ -1150,7 +1148,6 @@
     { keys: 'Ctrl / Cmd + K', action: 'Toggle model picker' },
     { keys: 'Ctrl / Cmd + T', action: 'Open thinking level' },
     { keys: 'Ctrl / Cmd + Alt + T', action: 'Cycle thinking level' },
-    { keys: 'Ctrl / Cmd + Alt + M', action: 'Cycle model' },
     { keys: 'Escape', action: 'Close modal or panel' },
     { keys: 'Enter', action: 'Send from composer' },
     { keys: 'Shift + Enter', action: 'New line in composer' },
@@ -1359,7 +1356,6 @@
   let modelTab = $state<'models' | 'providers'>(
     urlParam('mt', 'models') === 'providers' ? 'providers' : 'models'
   );
-  let highlightProviderId = $state<string | null>(null);
   let providers = $state<ProviderInfo[]>([]);
   /** Staged key text per provider id — cleared on successful save */
   let providerKeyInputs = $state<Record<string, string>>({});
@@ -2050,7 +2046,6 @@
     model = next.model;
     thinkingLevel = next.thinkingLevel;
     availableModels = next.availableModels;
-    allModels = next.allModels;
     cwd = next.cwd;
     sessionPath = next.sessionPath;
     sessionName = next.sessionName;
@@ -2102,9 +2097,6 @@
   function applySessionState(payload: Record<string, unknown>) {
     if (Array.isArray(payload.availableThinkingLevels)) {
       availableThinkingLevels = payload.availableThinkingLevels as string[];
-    }
-    if (Array.isArray(payload.scopedModels)) {
-      scopedModels = payload.scopedModels as ScopedModelInfo[];
     }
     const prevSessionId = sessionId;
     const sessionIdentityChanged =
@@ -2426,13 +2418,11 @@
           model: ModelInfo | null;
           thinkingLevel: string;
           availableThinkingLevels: string[];
-          scopedModels: ScopedModelInfo[];
         };
         applySessionState({
           model: state.model ?? null,
           thinkingLevel: state.thinkingLevel,
           availableThinkingLevels: state.availableThinkingLevels,
-          scopedModels: state.scopedModels,
         });
         break;
       }
@@ -3859,11 +3849,6 @@
     // Escape — dismiss modal or close open panels
     if (e.key === 'Escape') {
       if (modal) return; // modal's own onkeydown handles this
-      if (showScopedModels) {
-        e.preventDefault();
-        showScopedModels = false;
-        return;
-      }
       if (showSessionPanel) {
         e.preventDefault();
         showSessionPanel = false;
@@ -3911,13 +3896,6 @@
       if (availableThinkingLevels.length > 0) {
         send({ type: 'cycle_thinking_level' });
       }
-      return;
-    }
-
-    // Ctrl/Cmd+Alt+M cycles models within the SDK's active scope.
-    if (!inEditable() && (e.ctrlKey || e.metaKey) && e.altKey && (e.key === 'm' || e.key === 'M')) {
-      e.preventDefault();
-      send({ type: 'cycle_model', direction: 'forward' });
       return;
     }
 
@@ -4210,9 +4188,6 @@
         showSettingsPanel = true;
         showRightPanel = false;
         showSessionPanel = false;
-        return true;
-      case 'open_scoped_models':
-        showScopedModels = true;
         return true;
       case 'show_hotkeys':
         settingsSection = 'shortcuts';
@@ -6056,9 +6031,7 @@
       resizing={rightResizing}
       tab={rightPanelTab}
       {modelTab}
-      {highlightProviderId}
       {model}
-      {allModels}
       {modelRefreshLoading}
       {modelRefreshFeedback}
       {toolsList}
@@ -6068,7 +6041,6 @@
       contextFiles={resourceContextFiles}
       {thinkingLevel}
       {availableThinkingLevels}
-      {scopedModels}
       {providers}
       bind:providerError
       bind:providerKeyInputs
@@ -6080,7 +6052,6 @@
       {configuredProviderCount}
       {filteredModelsByProvider}
       {providerLoginPending}
-      onHighlightConsumed={() => (highlightProviderId = null)}
       {filteredTools}
       {filteredSkills}
       bind:skillInstallUrl
@@ -6101,7 +6072,6 @@
       onPickThinkingLevel={(lvl) => {
         send({ type: 'set_thinking_level', level: lvl });
       }}
-      onOpenScopedModels={() => (showScopedModels = true)}
       onToggleTool={(name) => {
         const next = activeToolNames.includes(name)
           ? activeToolNames.filter((n) => n !== name)
@@ -6151,12 +6121,6 @@
           authType: 'oauth',
           sessionId: sessionId ?? undefined,
         });
-      }}
-      onOpenProviderKey={(provider) => {
-        showRightPanel = true;
-        rightPanelTab = 'models';
-        modelTab = 'providers';
-        highlightProviderId = provider;
       }}
       onRefreshModels={requestModelRefresh}
     />
@@ -7308,11 +7272,4 @@
   onClose={() => (providerLoginDialog = null)}
   onRetry={(provider: string, authType: 'oauth' | 'api_key') =>
     send({ type: 'provider_login', provider, authType })}
-/>
-<ScopedModelsDialog
-  open={showScopedModels}
-  models={availableModels}
-  {scopedModels}
-  onClose={() => (showScopedModels = false)}
-  onSave={(models) => send({ type: 'set_scoped_models', models })}
 />

@@ -1,6 +1,5 @@
 <script lang="ts">
-  import { tick } from 'svelte';
-  import { SvelteMap, SvelteSet } from 'svelte/reactivity';
+  import { SvelteSet } from 'svelte/reactivity';
   import { Button } from '#lib/components/ui/button/index.js';
   import * as Tabs from '#lib/components/ui/tabs/index.js';
   import { ScrollArea } from '#lib/components/ui/scroll-area/index.js';
@@ -8,19 +7,17 @@
   import RefreshCw from '@lucide/svelte/icons/refresh-cw';
   import Eye from '@lucide/svelte/icons/eye';
   import LoaderCircle from '@lucide/svelte/icons/loader-circle';
-  import type { ModelInfo, ProviderInfo, ScopedModelInfo } from '#lib/ws/protocol.js';
+  import type { ModelInfo, ProviderInfo } from '#lib/ws/protocol.js';
   import { providerColor, sourceLabel, canRemove, fmtPricePerMillion } from '#lib/utils.js';
 
   let {
     open,
     modelTab = $bindable(),
     model,
-    allModels,
     modelRefreshLoading,
     modelRefreshFeedback,
     thinkingLevel,
     availableThinkingLevels,
-    scopedModels,
     providers,
     providerError = $bindable(),
     providerKeyInputs = $bindable(),
@@ -30,27 +27,21 @@
     configuredProviderCount,
     filteredModelsByProvider,
     providerLoginPending,
-    highlightProviderId,
-    onHighlightConsumed,
     onSelectModel,
     onPickThinkingLevel,
-    onOpenScopedModels,
     onSetProviderKey,
     onRemoveProviderKey,
     onProviderLogin,
-    onOpenProviderKey,
     onDismissProviderError,
     onRefreshModels,
   }: {
     open: boolean;
     modelTab: 'models' | 'providers';
     model: ModelInfo | null;
-    allModels: ModelInfo[];
     modelRefreshLoading: boolean;
     modelRefreshFeedback: { success: boolean; message: string } | null;
     thinkingLevel: string;
     availableThinkingLevels: readonly string[];
-    scopedModels: ScopedModelInfo[];
     providers: ProviderInfo[];
     providerError: string | null;
     providerKeyInputs: Record<string, string>;
@@ -60,65 +51,22 @@
     configuredProviderCount: number;
     filteredModelsByProvider: [string, ModelInfo[]][];
     providerLoginPending: string | null;
-    highlightProviderId: string | null;
-    onHighlightConsumed: () => void;
     onSelectModel: (m: ModelInfo) => void;
     onPickThinkingLevel: (level: string) => void;
-    onOpenScopedModels: () => void;
     onSetProviderKey: (id: string) => void;
     onRemoveProviderKey: (id: string) => void;
     onProviderLogin: (id: string) => void;
-    onOpenProviderKey: (id: string) => void;
     onDismissProviderError: () => void;
     onRefreshModels: () => void;
   } = $props();
-  let providerCards: Record<string, HTMLDivElement | undefined> = $state({});
-  let providerKeyFields: Record<string, HTMLInputElement | undefined> = $state({});
   const userTypedProviderKeys = new SvelteSet<string>();
-  let highlightedProviderId = $state<string | null>(null);
-  $effect(() => {
-    const id = highlightProviderId;
-    if (!id) return;
-    modelTab = 'providers';
-    void (async () => {
-      await tick();
-      const card = providerCards[id];
-      card?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      providerKeyFields[id]?.focus();
-      highlightedProviderId = id;
-      onHighlightConsumed();
-      setTimeout(() => {
-        if (highlightedProviderId === id) highlightedProviderId = null;
-      }, 1400);
-    })();
-  });
-  const unavailableModelsByProvider = $derived.by(() => {
-    const query = modelFilter.trim().toLowerCase();
-    const grouped = new SvelteMap<string, ModelInfo[]>();
-    for (const model of allModels) {
-      if (model.available !== false) continue;
-      if (
-        query &&
-        !model.name.toLowerCase().includes(query) &&
-        !model.provider.toLowerCase().includes(query)
-      )
-        continue;
-      const group = grouped.get(model.provider) ?? [];
-      group.push(model);
-      grouped.set(model.provider, group);
-    }
-    return [...grouped.entries()];
-  });
-  const visibleProviders = $derived.by(() => {
-    if (
-      !highlightProviderId ||
-      filteredProviders.some((provider) => provider.id === highlightProviderId)
-    ) {
-      return filteredProviders;
-    }
-    const requested = providers.find((provider) => provider.id === highlightProviderId);
-    return requested ? [...filteredProviders, requested] : filteredProviders;
-  });
+  const unconfiguredProviderCount = $derived(providers.filter((p) => !p.configured).length);
+  const compactTokens = (n: number) =>
+    n >= 1_000_000
+      ? `${Math.round(n / 1_000_000)}M`
+      : n >= 1_000
+        ? `${Math.round(n / 1_000)}k`
+        : `${n}`;
   function modelDetailsTitle(model: ModelInfo): string {
     const prices = model.cost
       ? `Input ${fmtPricePerMillion(model.cost.input)} · output ${fmtPricePerMillion(model.cost.output)} · cache read ${fmtPricePerMillion(model.cost.cacheRead)} · cache write ${fmtPricePerMillion(model.cost.cacheWrite)} per Mtok`
@@ -182,13 +130,13 @@
   class="pointer-events-none absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-base-content/6 to-transparent z-10"
 ></div>
 
-<div class="shrink-0 px-5 py-2 border-b border-base-content/8 flex items-center gap-3">
-  <Tabs.Root bind:value={modelTab} class="min-w-0">
-    <Tabs.List variant="line">
+<div class="shrink-0 pl-5 pr-3 py-2.5 border-b border-base-content/8 flex items-center gap-2">
+  <Tabs.Root bind:value={modelTab} class="min-w-0 flex-1">
+    <Tabs.List variant="line" class="gap-4">
       <Tabs.Trigger value="models" tabindex={open ? 0 : -1}>models</Tabs.Trigger>
-      <Tabs.Trigger value="providers" tabindex={open ? 0 : -1}
+      <Tabs.Trigger value="providers" tabindex={open ? 0 : -1} class="gap-1.5"
         >providers{#if providers.length}
-          <span class="text-base-content/30 font-normal text-xs"
+          <span class="text-base-content/30 font-normal text-[10px] tabular-nums"
             >{configuredProviderCount}/{providers.length}</span
           >{/if}</Tabs.Trigger
       >
@@ -196,7 +144,7 @@
   </Tabs.Root>
   <Button
     variant="ghost"
-    size="icon"
+    size="icon-sm"
     onclick={onRefreshModels}
     disabled={modelRefreshLoading || !open}
     aria-label={modelRefreshLoading ? 'Refreshing model catalog' : 'Refresh model catalog'}
@@ -207,18 +155,6 @@
   >
     <RefreshCw class="h-3.5 w-3.5 {modelRefreshLoading ? 'animate-spin' : ''}" aria-hidden="true" />
   </Button>
-  {#if modelTab === 'models'}
-    <Button
-      variant="ghost"
-      size="sm"
-      onclick={onOpenScopedModels}
-      disabled={!open}
-      aria-label="Scope models"
-      title="Choose models available for cycling"
-      tabindex={open ? 0 : -1}
-      class="shrink-0 text-[10px] text-base-content/40 hover:text-base-content/75">Scope…</Button
-    >
-  {/if}
 </div>
 {#if modelRefreshFeedback}
   <div
@@ -283,13 +219,19 @@
       </div>
     </div>
     <ScrollArea class="flex-1 min-h-0">
-      {#if allModels.length === 0}
-        <div class="flex-1 flex items-center justify-center px-5 py-8">
-          <p class="text-xs text-base-content/45">no models configured</p>
-        </div>
-      {:else if filteredModelsByProvider.length === 0 && unavailableModelsByProvider.length === 0}
-        <div class="flex-1 flex items-center justify-center px-5 py-8">
-          <p class="text-xs text-base-content/20">no match</p>
+      {#if filteredModelsByProvider.length === 0}
+        <div class="flex flex-col items-center gap-2 px-5 py-8 text-center">
+          <p class="text-xs text-base-content/40">
+            {modelFilter.trim() ? 'no match' : 'No signed-in providers yet'}
+          </p>
+          {#if !modelFilter.trim()}
+            <Button
+              variant="ghost"
+              size="xs"
+              onclick={() => (modelTab = 'providers')}
+              tabindex={open ? 0 : -1}>Sign in to a provider</Button
+            >
+          {/if}
         </div>
       {:else}
         {#each filteredModelsByProvider as [provider, models] (provider)}
@@ -307,7 +249,7 @@
               <button
                 onclick={() => onSelectModel(m)}
                 title={modelDetailsTitle(m)}
-                class="w-full text-left px-5 py-2 text-sm transition-all duration-150 flex items-center gap-2.5 relative {isActive
+                class="w-full text-left px-5 py-2 transition-all duration-150 flex items-start gap-2.5 relative {isActive
                   ? 'text-primary bg-primary/[0.06]'
                   : 'text-base-content/70 hover:text-base-content hover:bg-base-content/[0.03]'}"
                 aria-pressed={isActive}
@@ -317,114 +259,62 @@
                     class="absolute left-0 top-1 bottom-1 w-0.5 rounded-r-full bg-primary glow-primary"
                   ></span>{/if}
                 <span
-                  class="w-1.5 h-1.5 rounded-full shrink-0"
+                  class="mt-[7px] w-1.5 h-1.5 rounded-full shrink-0"
                   style="background:{providerColor(provider)}"
                 ></span>
-                <span class="flex-1 truncate">{m.name}</span>
-                {#if !m.input || m.input.includes('image')}
-                  <Eye class="w-3.5 h-3.5 text-base-content/35 shrink-0" aria-label="Image input" />
-                {/if}
-                {#if scopedModels.some((scope) => scope.provider === m.provider && scope.modelId === m.id)}
-                  <span
-                    class="shrink-0 rounded-full bg-primary/10 px-1.5 py-0.5 text-[9px] font-medium text-primary/75"
-                    >scoped</span
-                  >
-                {/if}
-                {#if m.isDefault}
-                  <span
-                    class="shrink-0 rounded-full bg-success/10 px-1.5 py-0.5 text-[9px] font-medium text-success/75"
-                    >default</span
-                  >
-                {/if}
-                {#if included}
-                  <span
-                    class="shrink-0 rounded-full bg-secondary/10 px-1.5 py-0.5 text-[9px] font-medium text-secondary/75"
-                    >included</span
-                  >
-                {:else if m.cost}
-                  <span
-                    class="hidden sm:inline text-[10px] text-base-content/35 tabular-nums shrink-0"
-                    title={modelDetailsTitle(m)}
-                  >
-                    {fmtPricePerMillion(m.cost.input)} / {fmtPricePerMillion(m.cost.output)} per Mtok
+                <span class="min-w-0 flex-1">
+                  <span class="flex items-center gap-1.5">
+                    <span class="min-w-0 flex-1 truncate text-sm">{m.name}</span>
+                    {#if isActive}<svg
+                        class="w-3.5 h-3.5 shrink-0 text-primary"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2.5"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        aria-hidden="true"><path d="m20 6-11 11-5-5" /></svg
+                      >{/if}
                   </span>
-                {/if}
-                {#if m.contextWindow}
-                  <span class="text-[10px] text-base-content/25 tabular-nums shrink-0"
-                    >{m.contextWindow >= 1_000_000
-                      ? `${(m.contextWindow / 1_000_000).toFixed(0)}M`
-                      : m.contextWindow >= 1_000
-                        ? `${Math.round(m.contextWindow / 1_000)}k`
-                        : m.contextWindow}</span
-                  >
-                {/if}
-                {#if m.maxTokens}
                   <span
-                    class="hidden sm:inline text-[10px] text-base-content/25 tabular-nums shrink-0"
-                    >{m.maxTokens >= 1_000 ? `${Math.round(m.maxTokens / 1_000)}k` : m.maxTokens} out</span
+                    class="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[10px] tabular-nums text-base-content/35"
                   >
-                {/if}
-                {#if m.reasoning}<Sparkles
-                    class="w-3 h-3 text-secondary/50 shrink-0"
-                    aria-label="Supports reasoning"
-                  />{/if}
-                {#if isActive}<span class="text-primary shrink-0"
-                    ><svg
-                      class="w-3.5 h-3.5"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      stroke-width="2.5"
-                      stroke-linecap="round"
-                      stroke-linejoin="round"><path d="m20 6-11 11-5-5" /></svg
-                    ></span
-                  >{/if}
+                    {#if m.contextWindow}<span>{compactTokens(m.contextWindow)} ctx</span>{/if}
+                    {#if m.maxTokens}<span>{compactTokens(m.maxTokens)} out</span>{/if}
+                    {#if included}
+                      <span class="text-secondary/70">included</span>
+                    {:else if m.cost}
+                      <span
+                        >{fmtPricePerMillion(m.cost.input)} / {fmtPricePerMillion(m.cost.output)}
+                        per Mtok</span
+                      >
+                    {/if}
+                    {#if !m.input || m.input.includes('image')}
+                      <Eye class="w-3 h-3" aria-label="Image input" />
+                    {/if}
+                    {#if m.reasoning}<Sparkles
+                        class="w-3 h-3 text-secondary/50"
+                        aria-label="Supports reasoning"
+                      />{/if}
+                    {#if m.isDefault}<span class="text-success/70">default</span>{/if}
+                  </span>
+                </span>
               </button>
             {/each}
           </div>
         {/each}
-        {#each unavailableModelsByProvider as [provider, models] (provider)}
-          {@const providerInfo = providers.find((item) => item.id === provider)}
-          <details class="border-b border-base-content/6">
-            <summary
-              class="cursor-pointer list-none px-5 py-2.5 text-xs text-warning/75 flex items-center justify-between"
-            >
-              <span>Needs sign-in · {provider}</span>
-              <span class="text-[10px] text-base-content/30">{models.length} models</span>
-            </summary>
-            <div class="flex items-center gap-1 px-5 py-1.5 border-b border-base-content/5">
-              {#if providerInfo?.oauthLoginLabel}
-                <Button
-                  variant="ghost"
-                  size="xs"
-                  disabled={providerLoginPending === provider}
-                  onclick={() => onProviderLogin(provider)}
-                  tabindex={open ? 0 : -1}
-                  >{#if providerLoginPending === provider}<LoaderCircle
-                      class="w-3 h-3 animate-spin"
-                    />{/if}Sign in</Button
-                >
-              {/if}
-              {#if providerInfo?.apiKeyLogin}
-                <Button
-                  variant="ghost"
-                  size="xs"
-                  disabled={providerLoginPending === provider}
-                  onclick={() => onOpenProviderKey(provider)}
-                  tabindex={open ? 0 : -1}>Add key</Button
-                >
-              {/if}
-            </div>
-            {#each models as unavailable (unavailable.id)}
-              <div
-                class="px-5 py-1 text-[11px] text-base-content/45 truncate"
-                title={unavailable.name}
-              >
-                {unavailable.name}
-              </div>
-            {/each}
-          </details>
-        {/each}
+        {#if (providers.length === 0 || unconfiguredProviderCount > 0) && !modelFilter.trim()}
+          <button
+            type="button"
+            onclick={() => (modelTab = 'providers')}
+            tabindex={open ? 0 : -1}
+            class="w-full px-5 py-3 text-left text-[11px] text-base-content/35 hover:text-base-content/70 transition-colors"
+          >
+            {unconfiguredProviderCount > 0
+              ? `${unconfiguredProviderCount} more provider${unconfiguredProviderCount === 1 ? '' : 's'} available`
+              : 'More providers available'} — sign in to see their models →
+          </button>
+        {/if}
       {/if}
     </ScrollArea>
   </div>
@@ -498,23 +388,19 @@
             </div>
           {/each}
         </div>
-      {:else if visibleProviders.length === 0}
+      {:else if filteredProviders.length === 0}
         <div class="flex-1 flex items-center justify-center px-5 py-8">
           <p class="text-xs text-base-content/20">no match</p>
         </div>
       {:else}
-        {#each visibleProviders as p (p.id)}
+        {#each filteredProviders as p (p.id)}
           {@const isCurrentProvider = model?.provider === p.id}
           {@const isPending = providerLoginPending === p.id}
           {@const label = p.authLabel ?? authSourceText(p)}
           <div
-            bind:this={providerCards[p.id]}
-            class="px-5 py-3 border-b border-base-content/6 transition-colors duration-300 {highlightedProviderId ===
-            p.id
-              ? 'bg-primary/15 ring-1 ring-inset ring-primary/40'
-              : isCurrentProvider
-                ? 'bg-primary/[0.04]'
-                : 'hover:bg-base-content/[0.02]'}"
+            class="px-5 py-3 border-b border-base-content/6 transition-colors duration-300 {isCurrentProvider
+              ? 'bg-primary/[0.04]'
+              : 'hover:bg-base-content/[0.02]'}"
           >
             <div class="flex items-center gap-3 mb-2">
               <span
@@ -597,7 +483,6 @@
               {/if}
               {#if !p.configured && p.apiKeyLogin}
                 <input
-                  bind:this={providerKeyFields[p.id]}
                   type="password"
                   name="provider-api-key-{p.id}"
                   autocomplete="new-password"

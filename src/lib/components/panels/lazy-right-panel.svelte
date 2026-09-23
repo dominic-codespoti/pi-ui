@@ -5,7 +5,6 @@
     SkillSummary,
     PromptSummary,
     ResourceDiagnosticSummary,
-    ScopedModelInfo,
   } from '#lib/ws/protocol.js';
 
   /**
@@ -23,7 +22,6 @@
     tab,
     modelTab = $bindable(),
     model,
-    allModels,
     modelRefreshLoading,
     modelRefreshFeedback,
     toolsList,
@@ -33,7 +31,6 @@
     contextFiles,
     thinkingLevel,
     availableThinkingLevels,
-    scopedModels,
     providers,
     providerError = $bindable(),
     providerKeyInputs = $bindable(),
@@ -45,7 +42,6 @@
     configuredProviderCount,
     filteredModelsByProvider,
     providerLoginPending,
-    highlightProviderId,
     filteredTools,
     filteredSkills,
     onUsePrompt,
@@ -61,10 +57,7 @@
     onTabChange,
     onSelectModel,
     onPickThinkingLevel,
-    onOpenScopedModels,
     onProviderLogin,
-    onOpenProviderKey,
-    onHighlightConsumed,
     onToggleTool,
     onSetProviderKey,
     onRemoveProviderKey,
@@ -81,7 +74,6 @@
     tab: 'models' | 'tools' | 'skills';
     modelTab: 'models' | 'providers';
     model: ModelInfo | null;
-    allModels: ModelInfo[];
     modelRefreshLoading: boolean;
     modelRefreshFeedback: { success: boolean; message: string } | null;
     toolsList: { name: string; description: string; isBuiltin: boolean; origin?: string }[];
@@ -93,7 +85,6 @@
     onOpenResourceFile: (path: string) => void;
     thinkingLevel: string;
     availableThinkingLevels: readonly string[];
-    scopedModels: ScopedModelInfo[];
     providers: ProviderInfo[];
     providerError: string | null;
     providerKeyInputs: Record<string, string>;
@@ -104,7 +95,6 @@
     filteredProviders: ProviderInfo[];
     configuredProviderCount: number;
     filteredModelsByProvider: [string, ModelInfo[]][];
-    highlightProviderId: string | null;
     providerLoginPending: string | null;
     filteredTools: { name: string; description: string; isBuiltin: boolean; origin?: string }[];
     filteredSkills: { skills: SkillSummary[]; prompts: PromptSummary[] };
@@ -119,10 +109,7 @@
     onTabChange: (tab: 'models' | 'tools' | 'skills') => void;
     onSelectModel: (m: ModelInfo) => void;
     onPickThinkingLevel: (level: string) => void;
-    onOpenScopedModels: () => void;
     onProviderLogin: (id: string) => void;
-    onOpenProviderKey: (id: string) => void;
-    onHighlightConsumed: () => void;
     onToggleTool: (name: string) => void;
     onSetProviderKey: (id: string) => void;
     onRemoveProviderKey: (id: string) => void;
@@ -151,7 +138,6 @@
     {tab}
     bind:modelTab
     {model}
-    {allModels}
     {modelRefreshLoading}
     {modelRefreshFeedback}
     {toolsList}
@@ -161,7 +147,6 @@
     {contextFiles}
     {thinkingLevel}
     {availableThinkingLevels}
-    {scopedModels}
     {providers}
     bind:providerError
     bind:providerKeyInputs
@@ -171,7 +156,6 @@
     bind:skillFilter
     {filteredProviders}
     {configuredProviderCount}
-    {highlightProviderId}
     {providerLoginPending}
     {filteredModelsByProvider}
     {filteredTools}
@@ -186,13 +170,10 @@
     {onResizeStart}
     {onResizeMove}
     {onProviderLogin}
-    {onOpenProviderKey}
-    {onHighlightConsumed}
     {onResizeStop}
     {onTabChange}
     {onSelectModel}
     {onPickThinkingLevel}
-    {onOpenScopedModels}
     {onToggleTool}
     {onSetProviderKey}
     {onRemoveProviderKey}

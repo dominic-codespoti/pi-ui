@@ -55,7 +55,6 @@ export type ComposerSlashRoute =
   | 'hotkeys'
   | 'settings'
   | 'thinking'
-  | 'scoped-models'
   | 'trust'
   | 'reload'
   | 'login'
@@ -82,7 +81,6 @@ export type ComposerEffect =
   | { type: 'copy_last_assistant' }
   | { type: 'show_hotkeys' }
   | { type: 'open_settings'; section?: 'session' | 'shortcuts' }
-  | { type: 'open_scoped_models' }
   | { type: 'open_import' }
   | { type: 'confirm_share'; sessionId?: string }
   | { type: 'open_tree_modal' };
@@ -159,7 +157,6 @@ const BUILTIN_COMMANDS: Record<string, true> = {
   hotkeys: true,
   settings: true,
   thinking: true,
-  'scoped-models': true,
   trust: true,
   reload: true,
   login: true,
@@ -595,9 +592,6 @@ export class ComposerController {
           break;
         case 'trust':
           effectAccepted = this.effect({ type: 'open_settings', section: 'session' }, effects);
-          break;
-        case 'scoped-models':
-          effectAccepted = this.effect({ type: 'open_scoped_models' }, effects);
           break;
         case 'thinking':
           message = classification.args
