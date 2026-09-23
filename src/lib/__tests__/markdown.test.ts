@@ -102,16 +102,29 @@ describe('renderMarkdown', () => {
     expect(result).toContain('<br>');
   });
 
-  it('renders common LaTeX symbols as Unicode', () => {
-    const result = renderMarkdown(String.raw`$a \rightarrow b$ and $c \leftarrow d$`);
+  it('renders common LaTeX symbols after the lazy extension loads', async () => {
+    const source = String.raw`$a \rightarrow b$ and $c \leftarrow d$`;
+    const unresolved: string[] = [];
+    const registered: string[] = [];
+    const unsubscribe = onLangRegistered((lang) => registered.push(lang));
+    renderMarkdown(source, { onUnresolvedLang: (lang) => unresolved.push(lang) });
+    expect(unresolved).toContain('latex');
+    await whenLangReady('latex');
+    unsubscribe();
+    expect(registered).toContain('latex');
+
+    const result = renderMarkdown(source);
     expect(result).toContain('a → b');
     expect(result).toContain('c ← d');
     expect(result).not.toContain('rightarrow');
     expect(result).not.toContain('leftarrow');
   });
 
-  it('resolves complete math in the streaming preview without changing code', () => {
-    const result = renderStreamingPreview('$a \\rightarrow b$ and `$c \\leftarrow d$`');
+  it('resolves complete math in the streaming preview without changing code', async () => {
+    const source = '$a \\rightarrow b$ and `$c \\leftarrow d$`';
+    renderStreamingPreview(source);
+    await whenLangReady('latex');
+    const result = renderStreamingPreview(source);
     expect(result).toContain('a → b');
     expect(result).toContain('$c \\leftarrow d$');
   });

@@ -66,6 +66,8 @@ export type SessionReducerResult = {
   effects: SessionEffect[];
   identityChanged: boolean;
   transcriptReplaced: boolean;
+  structureChanged: boolean;
+  touchedMessageIds: string[];
 };
 
 const defaultOptions: Required<SessionReducerOptions> = {
@@ -177,7 +179,11 @@ function lastStreaming(state: SessionReducerState, role: UIMessage['role']): UIM
   return undefined;
 }
 
-function sealStreaming(state: SessionReducerState, effects: SessionEffect[]): void {
+function sealStreaming(
+  state: SessionReducerState,
+  effects: SessionEffect[],
+  touchedMessageIds: Set<string>
+): void {
   for (let i = state.messages.length - 1; i >= 0; i--) {
     const message = state.messages[i];
     if (
@@ -189,6 +195,7 @@ function sealStreaming(state: SessionReducerState, effects: SessionEffect[]): vo
       state.messages.splice(i, 1);
     } else if (message.streaming) {
       message.streaming = false;
+      touchedMessageIds.add(message.id);
       effects.push({
         type: 'render_message',
         messageId: message.id,
@@ -326,7 +333,8 @@ function applyEvent(
   state: SessionReducerState,
   frame: Record<string, unknown>,
   effects: SessionEffect[],
-  options: Required<SessionReducerOptions>
+  options: Required<SessionReducerOptions>,
+  touchedMessageIds: Set<string>
 ): void {
   const type = frame.type;
   switch (type) {
@@ -338,7 +346,7 @@ function applyEvent(
     case 'agent_error':
       state.isStreaming = false;
       state.activeToolName = undefined;
-      sealStreaming(state, effects);
+      sealStreaming(state, effects, touchedMessageIds);
       return;
     case 'message_start': {
       const message = frame.message as { role?: string } | undefined;
@@ -364,6 +372,7 @@ function applyEvent(
       if (!active || typeof event?.delta !== 'string') return;
       if (event.type === 'text_delta') {
         active.content += event.delta;
+        touchedMessageIds.add(active.id);
         effects.push({
           type: 'render_message',
           messageId: active.id,
@@ -373,6 +382,7 @@ function applyEvent(
       } else if (event.type === 'thinking_delta') {
         active.thinking = (active.thinking ?? '') + event.delta;
         if (!active.thinkingStartMs) active.thinkingStartMs = options.now();
+        touchedMessageIds.add(active.id);
         effects.push({
           type: 'render_message',
           messageId: active.id,
@@ -437,6 +447,7 @@ function applyEvent(
             if (images.length > 0)
               active.images = images.map((block) => `data:${block.mimeType};base64,${block.data}`);
           }
+          touchedMessageIds.add(active.id);
           effects.push({
             type: 'render_message',
             messageId: active.id,
@@ -476,6 +487,7 @@ function applyEvent(
         tool.outputLoading = false;
         tool.outputElided = false;
         tool.endMs = undefined;
+        touchedMessageIds.add(tool.id);
       }
       return;
     }
@@ -504,6 +516,7 @@ function applyEvent(
         }
         if (frame.renderedResultHtml)
           tool.renderedResultHtml = frame.renderedResultHtml as string[];
+        touchedMessageIds.add(tool.id);
       }
       return;
     }
@@ -543,6 +556,7 @@ function applyEvent(
           tool.images = images.map((block) => `data:${block.mimeType};base64,${block.data}`);
       }
       const diff = result?.details?.diff ?? result?.details?.patch;
+      touchedMessageIds.add(tool.id);
       if (diff) {
         tool.diff = diff;
         tool.lineCount = diff.split('\n').length;
@@ -560,9 +574,15 @@ function applyEvent(
       state.activeToolName = 'bash';
       const delta = frame.delta as string | undefined;
       if (bash && delta) {
+        bash.content += delta;
         bash.streaming = true;
-        bash.lineCount = bash.content.split('\n').length;
+        let addedLines = 0;
+        for (let i = 0; i < delta.length; i++) {
+          if (delta.charCodeAt(i) === 10) addedLines++;
+        }
+        bash.lineCount = (bash.lineCount ?? 1) + addedLines;
         delete bash.renderedResultHtml;
+        touchedMessageIds.add(bash.id);
       }
       return;
     }
@@ -583,6 +603,7 @@ function applyEvent(
       tool.outputElided = false;
       if (tool.content && tool.lineCount === undefined)
         tool.lineCount = tool.content.split('\n').length;
+      touchedMessageIds.add(tool.id);
       return;
     }
     case 'queue_update':
@@ -668,6 +689,7 @@ function applyEvent(
               : result?.tokensBefore != null && result.estimatedTokensAfter != null
                 ? `context compacted · ${result.tokensBefore.toLocaleString()} → ${result.estimatedTokensAfter.toLocaleString()} tokens`
                 : 'context compacted';
+        touchedMessageIds.add(notice.id);
         effects.push({
           type: 'render_message',
           messageId: notice.id,
@@ -716,6 +738,7 @@ function applyEvent(
         notice.content = success
           ? 'retry succeeded'
           : `retry failed${finalError ? `: ${finalError}` : ''}`;
+        touchedMessageIds.add(notice.id);
       }
       return;
     }
@@ -734,10 +757,26 @@ export function reduceSession(
 ): SessionReducerResult {
   const options = { ...defaultOptions, ...suppliedOptions };
   const effects: SessionEffect[] = [];
+  const messagesBefore = state.messages;
+  const lengthBefore = messagesBefore.length;
+  const touchedMessageIds = new Set<string>();
   if (action.type === 'snapshot') {
     const result = applySnapshot(state, action.payload, effects, options);
-    return { state, effects, ...result };
+    return {
+      state,
+      effects,
+      ...result,
+      structureChanged: state.messages !== messagesBefore,
+      touchedMessageIds: [],
+    };
   }
-  applyEvent(state, action.message as Record<string, unknown>, effects, options);
-  return { state, effects, identityChanged: false, transcriptReplaced: false };
+  applyEvent(state, action.message as Record<string, unknown>, effects, options, touchedMessageIds);
+  return {
+    state,
+    effects,
+    identityChanged: false,
+    transcriptReplaced: false,
+    structureChanged: state.messages !== messagesBefore || state.messages.length !== lengthBefore,
+    touchedMessageIds: [...touchedMessageIds],
+  };
 }

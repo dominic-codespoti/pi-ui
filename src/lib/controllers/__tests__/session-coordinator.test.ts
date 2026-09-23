@@ -155,4 +155,36 @@ describe('session coordinator', () => {
     expect(coordinator.state.messages).toHaveLength(1);
     expect(coordinator.state.toolsById.size).toBe(0);
   });
+
+  it('keeps the transcript array stable for deltas and reports only the touched row', () => {
+    const coordinator = new SessionCoordinator({ createId: () => 'assistant' });
+    coordinator.applyEvent({ type: 'message_start', message: { role: 'assistant' } });
+    const messages = coordinator.state.messages;
+    let touched: string[] = [];
+    coordinator.subscribe((change) => {
+      touched = change.touchedMessageIds;
+    });
+
+    coordinator.applyEvent({
+      type: 'message_update',
+      assistantMessageEvent: { type: 'text_delta', delta: 'token' },
+    });
+
+    expect(coordinator.state.messages).toBe(messages);
+    expect(touched).toEqual(['assistant']);
+  });
+
+  it('changes transcript identity on append and removal', () => {
+    const coordinator = new SessionCoordinator({ createId: () => 'assistant' });
+    const empty = coordinator.state.messages;
+
+    coordinator.applyEvent({ type: 'message_start', message: { role: 'assistant' } });
+    const appended = coordinator.state.messages;
+    expect(appended).not.toBe(empty);
+    expect(appended).toHaveLength(1);
+
+    coordinator.applyEvent({ type: 'agent_end' });
+    expect(coordinator.state.messages).not.toBe(appended);
+    expect(coordinator.state.messages).toHaveLength(0);
+  });
 });

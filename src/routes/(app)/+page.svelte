@@ -557,14 +557,17 @@
 
   // ── Core state ───────────────────────────────────────────────────────────────
 
-  let messages = $state<UIMessage[]>([]);
+  let messages = $state.raw<UIMessage[]>([]);
+  const messageRevisions = new SvelteMap<string, number>();
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity -- lookup rebuilt only on structural edits
+  const _messageById = new Map<string, UIMessage>();
   let expandedUserMsgs = $state<Record<string, boolean>>({});
   let truncatedUserMsgs = $state<Record<string, boolean>>({});
   /** Long runtime diagnostics (e.g. absolute-path dumps) collapse to a
    * preview by default in the settings panel — keyed by message text. */
   let expandedDiagnostics = $state<Record<string, boolean>>({});
   /** Direct pointer to the currently-streaming assistant message. */
-  let activeStreamMsg = $state<UIMessage | null>(null);
+  let activeStreamMsg = $state.raw<UIMessage | null>(null);
   let input = $state('');
   /** Non-empty trimmed composer — one derived instead of input.trim() per template read. */
   const hasComposerText = $derived(input.trim().length > 0);
@@ -1395,8 +1398,15 @@
 
   const configuredProviderCount = $derived(providers.filter((p) => p.configured).length);
 
-  const sessionTokens = $derived(messages.reduce((s, m) => s + (m.usage?.totalTokens ?? 0), 0));
-  const sessionCostTotal = $derived(messages.reduce((s, m) => s + (m.usage?.cost?.total ?? 0), 0));
+  let messageStatsRevision = $state(0);
+  const sessionTokens = $derived.by(() => {
+    void messageStatsRevision;
+    return messages.reduce((sum, message) => sum + (message.usage?.totalTokens ?? 0), 0);
+  });
+  const sessionCostTotal = $derived.by(() => {
+    void messageStatsRevision;
+    return messages.reduce((sum, message) => sum + (message.usage?.cost?.total ?? 0), 0);
+  });
   const sessionDuration = $derived(
     sessionStartTime > 0 ? fmtDuration(Date.now() - sessionStartTime) : ''
   );
@@ -1423,6 +1433,7 @@
 
   /** Most recent completed compaction, surfaced in the context tooltip. */
   const latestCompaction = $derived.by(() => {
+    void messageStatsRevision;
     for (let i = messages.length - 1; i >= 0; i--) {
       const message = messages[i];
       if (message.noticeKind === 'compaction' && message.compaction?.status === 'completed') {
@@ -1686,8 +1697,12 @@
     }
   }
 
+  let _lastSentFocus: string | null | undefined;
+  let _lastFocusHandshake = false;
   function handleSocketReplace(): void {
     cleanupSocketLifecycle();
+    _lastSentFocus = undefined;
+    _lastFocusHandshake = false;
   }
 
   function handleSocketError(info: ClientWebSocketErrorInfo): void {
@@ -1711,6 +1726,8 @@
     },
   });
   wsController.subscribe((state: ClientWebSocketControllerState) => {
+    if (state.handshakeComplete && !_lastFocusHandshake) _lastSentFocus = undefined;
+    _lastFocusHandshake = state.handshakeComplete;
     wsState = state.connectionState;
     reconnectCountdown = state.reconnectCountdown;
     _wsHandshakeComplete = state.handshakeComplete;
@@ -1761,7 +1778,9 @@
 
   /** Tell the server which session this socket currently has in view. */
   function sendSessionFocus(focusedSessionId: string | null): void {
-    send({ type: 'session_focus', sessionId: focusedSessionId });
+    const key = JSON.stringify([focusedSessionId, focusedSessionId !== null]);
+    if (key === _lastSentFocus) return;
+    if (send({ type: 'session_focus', sessionId: focusedSessionId })) _lastSentFocus = key;
   }
 
   /** Apply the latest queued notification deep link after a live handshake. */
@@ -1958,9 +1977,33 @@
     isAtBottom = view.scrollAtBottom;
   }
 
-  function applyPageSessionReducerState(next: SessionReducerState): void {
-    messages = next.messages;
-    activeStreamMsg = next.activeStreamMsg;
+  function bumpMessageRevision(id: string): void {
+    messageRevisions.set(id, (messageRevisions.get(id) ?? 0) + 1);
+  }
+
+  function applyPageSessionReducerState(
+    next: SessionReducerState,
+    structureChanged: boolean,
+    touchedMessageIds: string[],
+    effects: SessionEffect[]
+  ): void {
+    if (messages !== next.messages) {
+      messages = next.messages;
+      if (structureChanged) {
+        _messageById.clear();
+        for (const message of messages) _messageById.set(message.id, message);
+        const liveIds = new Set(_messageById.keys());
+        for (const id of messageRevisions.keys()) {
+          if (!liveIds.has(id)) messageRevisions.delete(id);
+        }
+      }
+    }
+    for (const id of touchedMessageIds) {
+      const renderedThisFrame = effects.some(
+        (effect) => effect.type === 'render_message' && effect.streaming && effect.messageId === id
+      );
+      if (!renderedThisFrame) bumpMessageRevision(id);
+    }
     sessionId = next.sessionId;
     isStreaming = next.isStreaming;
     activeToolName = next.activeToolName;
@@ -1999,10 +2042,15 @@
     }
   }
 
-  unsubscribeSessionCoordinator = sessionCoordinator.subscribe(({ state, effects }) => {
-    applyPageSessionReducerState(state);
-    executeSessionEffects(effects);
-  });
+  unsubscribeSessionCoordinator = sessionCoordinator.subscribe(
+    ({ state, effects, touchedMessageIds }) => {
+      if (effects.some((effect) => effect.type === 'render_message' && !effect.streaming)) {
+        messageStatsRevision++;
+      }
+      applyPageSessionReducerState(state, state.messages !== messages, touchedMessageIds, effects);
+      executeSessionEffects(effects);
+    }
+  );
 
   function reduceActiveSessionEvent(message: ServerMessage | Record<string, unknown>): void {
     sessionCoordinator.applyEvent(message);
@@ -3340,29 +3388,37 @@
         return;
       }
       for (const m of _pendingRenderSet) {
-        if (!messages.includes(m)) continue; // stale — evicted or replaced
+        if (_messageById.get(m.id) !== m) continue; // stale — evicted or replaced
+        let rendered = false;
         if (m.streaming) {
-          // Escaped plain-text preview — full markdown parse per delta is the
-          // streaming hot spot (100k chars ≈ 24 ms parse, 60×/s); the
-          // message_end / reducer finalization paths render real markdown.
-          // Large buffers skip the per-char LaTeX scan (see markdown.ts).
-          if (m.content) m.renderedContent = renderStreamingPreview(m.content);
-          if (m.thinking) m.renderedThinking = renderStreamingPreview(m.thinking);
+          // Escaped previews keep per-token markdown parsing off the hot path.
+          if (m.content) {
+            m.renderedContent = renderStreamingPreview(m.content);
+            rendered = true;
+          }
+          if (m.thinking) {
+            m.renderedThinking = renderStreamingPreview(m.thinking);
+            rendered = true;
+          }
         } else {
-          if (m.content)
+          if (m.content) {
             m.renderedContent = renderMarkdown(m.content, {
               onUnresolvedLang: (lang) => recordUnresolvedLang(m, lang),
             });
-          if (m.thinking)
+            rendered = true;
+          }
+          if (m.thinking) {
             m.renderedThinking = renderMarkdown(m.thinking, {
               onUnresolvedLang: (lang) => recordUnresolvedLang(m, lang),
             });
+            rendered = true;
+          }
         }
+        if (rendered) bumpMessageRevision(m.id);
       }
       _pendingRenderSet.clear();
       _renderScheduled = false;
-      // Fold the per-delta scroll into this same frame — deltas previously
-      // scheduled a second rAF + tick per token on top of the render rAF.
+      // Fold the per-delta scroll into this same frame.
       if (_scrollPending) {
         _scrollPending = false;
         if (isAtBottom && scrollEl) {
@@ -3439,7 +3495,7 @@
     }
   }
   async function copyTurnMessages(msg: UIMessage) {
-    const msgIdx = messages.indexOf(msg);
+    const msgIdx = messages.findIndex((message) => message.id === msg.id);
     if (msgIdx === -1) return;
     // Walk backward to find the last user message before this one
     let turnStart = 0;
@@ -3675,9 +3731,8 @@
   async function handleComposerPaste(e: ClipboardEvent) {
     const data = e.clipboardData;
     if (!data) return;
-
     const imageFiles = Array.from(data.items)
-      .filter((item) => item.kind === 'file' && item.type.startsWith('image/'))
+      .filter((item) => item.type.startsWith('image/'))
       .map((item) => item.getAsFile())
       .filter((file): file is File => file !== null);
     if (imageFiles.length === 0) {
@@ -3704,8 +3759,7 @@
     sessionCoordinator.appendNotice(message, level);
   }
   function dismissChatNotice(id: string) {
-    const idx = messages.findIndex((m) => m.id === id);
-    if (idx >= 0) messages.splice(idx, 1);
+    sessionCoordinator.dismissMessage(id);
   }
 
   function selectSlashCommand(shortcut: ComposerShortcut) {
@@ -4827,6 +4881,7 @@
       <ConversationViewport
         bind:scrollEl
         {messages}
+        {messageRevisions}
         {sessionLoading}
         {wsState}
         {sessionId}
@@ -4859,12 +4914,18 @@
           expandedUserMsgs[msgId] = val;
         }}
         onToggleThinking={(msg) => {
-          msg.thinkingExpanded = !msg.thinkingExpanded;
+          const message = _messageById.get(msg.id);
+          if (!message) return;
+          message.thinkingExpanded = !message.thinkingExpanded;
+          bumpMessageRevision(message.id);
         }}
         onToggleTool={(msg) => {
-          const expanding = !msg.expanded;
-          msg.expanded = expanding;
-          if (expanding) toolOutputController.request(msg);
+          const message = _messageById.get(msg.id);
+          if (!message) return;
+          const expanding = !message.expanded;
+          message.expanded = expanding;
+          bumpMessageRevision(message.id);
+          if (expanding && toolOutputController.request(message)) bumpMessageRevision(message.id);
         }}
         onProjectPickerToggle={(e) => {
           e.stopPropagation();

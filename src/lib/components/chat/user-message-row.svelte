@@ -4,6 +4,7 @@
   import type { UIMessage } from '#lib/client-messages.js';
   import { formatRelativeDate as formatDate } from '#lib/utils.js';
   import { messageElementId } from './message-row-helpers.ts';
+  import { observeOverflow } from './overflow-observer.ts';
   let {
     msg,
     isNewest,
@@ -71,22 +72,8 @@
         truncatedUserMsgs[msgId] = node.scrollHeight > node.clientHeight + 2;
       }
     };
-    let ro: ResizeObserver | null = null;
-    const io = new IntersectionObserver((entries) => {
-      if (!entries[0]?.isIntersecting) return;
-      if (!ro) {
-        ro = new ResizeObserver(update);
-        ro.observe(node);
-      }
-      update();
-    });
-    io.observe(node);
-    return {
-      destroy() {
-        io.disconnect();
-        ro?.disconnect();
-      },
-    };
+    const cleanup = observeOverflow(node, update);
+    return { destroy: cleanup };
   }
 </script>
 

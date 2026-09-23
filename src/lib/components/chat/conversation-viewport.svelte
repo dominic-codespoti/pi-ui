@@ -6,6 +6,7 @@
 
   interface Props {
     messages: UIMessage[];
+    messageRevisions: ReadonlyMap<string, number>;
     sessionLoading: boolean;
     wsState: 'connecting' | 'open' | 'closed';
     sessionId: string | null;
@@ -49,6 +50,7 @@
 
   let {
     messages,
+    messageRevisions,
     sessionLoading,
     wsState,
     sessionId,
@@ -106,6 +108,7 @@
 >
   <MessageList
     {messages}
+    {messageRevisions}
     {sessionLoading}
     {wsState}
     {sessionId}

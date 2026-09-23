@@ -33,7 +33,7 @@ export type ProjectCatalogPatch =
 const EXISTS_TTL_MS = 30_000;
 /** Debounce window for registry persistence (coalesces rapid touches). */
 const PERSIST_DEBOUNCE_MS = 500;
-type SessionAggregate = { count: number; lastModified: number };
+type SessionAggregate = { count: number; lastModified: number; maxSessionId: string };
 type SessionIdentity = { cwd: string; modified: number };
 
 export class ProjectCatalog {
@@ -167,7 +167,7 @@ export class ProjectCatalog {
 
   private applySessionUpsert(session: { id: string; cwd: string; modified: Date }): void {
     const previous = this.sessionById.get(session.id);
-    if (previous) this.removeSession(session.id, previous);
+    if (previous) this.removeSession(session.id, previous, previous.cwd !== session.cwd);
     const identity = { cwd: session.cwd, modified: session.modified.getTime() };
     this.sessionById.set(session.id, identity);
     if (!identity.cwd) return;
@@ -177,10 +177,10 @@ export class ProjectCatalog {
       this.sessionTimesByCwd.set(identity.cwd, times);
     }
     times.set(session.id, identity.modified);
-    this.updateAggregate(identity.cwd, times);
+    this.updateAggregate(identity.cwd, times, session.id);
   }
 
-  private removeSession(id: string, identity: SessionIdentity): void {
+  private removeSession(id: string, identity: SessionIdentity, updateAggregate = true): void {
     if (!identity.cwd) return;
     const times = this.sessionTimesByCwd.get(identity.cwd);
     if (!times) return;
@@ -190,13 +190,46 @@ export class ProjectCatalog {
       this.sessionAggregates.delete(identity.cwd);
       return;
     }
-    this.updateAggregate(identity.cwd, times);
+    if (updateAggregate) this.updateAggregate(identity.cwd, times);
   }
 
-  private updateAggregate(cwd: string, times: Map<string, number>): void {
+  private updateAggregate(cwd: string, times: Map<string, number>, changedId?: string): void {
+    const previous = this.sessionAggregates.get(cwd);
+    const changedTime = changedId === undefined ? undefined : times.get(changedId);
+    if (!previous && changedId !== undefined && changedTime !== undefined) {
+      this.sessionAggregates.set(cwd, {
+        count: times.size,
+        lastModified: changedTime,
+        maxSessionId: changedId,
+      });
+      return;
+    }
+    if (
+      previous &&
+      changedId !== undefined &&
+      changedTime !== undefined &&
+      changedTime >= previous.lastModified
+    ) {
+      this.sessionAggregates.set(cwd, {
+        count: times.size,
+        lastModified: changedTime,
+        maxSessionId: changedId,
+      });
+      return;
+    }
+    if (previous && times.get(previous.maxSessionId) === previous.lastModified) {
+      this.sessionAggregates.set(cwd, { ...previous, count: times.size });
+      return;
+    }
+    let maxSessionId = '';
     let lastModified = -Infinity;
-    for (const modified of times.values()) lastModified = Math.max(lastModified, modified);
-    this.sessionAggregates.set(cwd, { count: times.size, lastModified });
+    for (const [id, modified] of times) {
+      if (modified > lastModified) {
+        lastModified = modified;
+        maxSessionId = id;
+      }
+    }
+    this.sessionAggregates.set(cwd, { count: times.size, lastModified, maxSessionId });
   }
 
   private async ensureAggregates(): Promise<void> {

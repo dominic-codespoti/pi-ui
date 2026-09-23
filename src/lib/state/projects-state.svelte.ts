@@ -39,6 +39,13 @@ export interface SessionRow {
   hasChildren: boolean;
 }
 
+interface ProjectSearchIndex {
+  name: string;
+  cwd: string;
+  sessionNames: string[];
+  sessionFirstMessages: string[];
+}
+
 /**
  * Build display rows for one project: sessions whose `parentSession` points at
  * another session in the list nest under it; every sibling level (roots and
@@ -181,6 +188,9 @@ class ProjectsState {
   private sessionIdsByCwd = new SvelteMap<string, SvelteSet<string>>();
   /** Materialized groups; only groups touched by a state delta are rebuilt. */
   private groupByCwd = new SvelteMap<string, ProjectGroup>();
+  /** Search fields are built only when a materialized group is first filtered. */
+  private searchByGroup = new WeakMap<ProjectGroup, ProjectSearchIndex>();
+
   /** Invalidates derived public collections after batched map updates. */
   private groupRevision = $state(0);
 
@@ -379,36 +389,42 @@ class ProjectsState {
   filteredGroups = $derived.by<ProjectGroup[]>(() => {
     const q = this.filter.trim().toLowerCase();
     if (!q) return this.groups;
-    return this.groups
-      .map((g) => {
-        if (g.name.toLowerCase().includes(q) || g.cwd.toLowerCase().includes(q)) return g;
-        // Keep a row when it matches or any of its descendants does — a match
-        // deep in a substack stays anchored under its parent chain. DFS order
-        // lets one depth-keyed ancestor walk mark whole chains.
-        const keep = new Array<boolean>(g.sessions.length).fill(false);
-        const path: number[] = [];
-        for (let i = 0; i < g.sessions.length; i++) {
-          const row = g.sessions[i];
-          path.length = row.depth;
-          const s = row.session;
-          if (
-            (s.name ?? '').toLowerCase().includes(q) ||
-            (s.firstMessage ?? '').toLowerCase().includes(q)
-          ) {
-            keep[i] = true;
-            for (const anc of path) keep[anc] = true;
-          }
-          path.push(i);
+    const out: ProjectGroup[] = [];
+    for (const group of this.groups) {
+      let search = this.searchByGroup.get(group);
+      if (!search) {
+        search = {
+          name: (group.name ?? '').toLowerCase(),
+          cwd: (group.cwd ?? '').toLowerCase(),
+          sessionNames: group.sessions.map((row) => (row.session.name ?? '').toLowerCase()),
+          sessionFirstMessages: group.sessions.map((row) =>
+            (row.session.firstMessage ?? '').toLowerCase()
+          ),
+        };
+        this.searchByGroup.set(group, search);
+      }
+      if (search.name.includes(q) || search.cwd.includes(q)) {
+        out.push(group);
+        continue;
+      }
+      // Keep a row when it matches or any of its descendants does — a match
+      // deep in a substack stays anchored under its parent chain.
+      const keep = new Array<boolean>(group.sessions.length).fill(false);
+      const path: number[] = [];
+      for (let i = 0; i < group.sessions.length; i++) {
+        const row = group.sessions[i];
+        path.length = row.depth;
+        if (search.sessionNames[i].includes(q) || search.sessionFirstMessages[i].includes(q)) {
+          keep[i] = true;
+          for (const ancestor of path) keep[ancestor] = true;
         }
-        const sessions = g.sessions.filter((_, i) => keep[i]);
-        return sessions.length === g.sessions.length ? g : { ...g, sessions };
-      })
-      .filter(
-        (g) =>
-          g.sessions.length > 0 ||
-          g.name.toLowerCase().includes(q) ||
-          g.cwd.toLowerCase().includes(q)
-      );
+        path.push(i);
+      }
+      const sessions = group.sessions.filter((_, i) => keep[i]);
+      if (sessions.length > 0)
+        out.push(sessions.length === group.sessions.length ? group : { ...group, sessions });
+    }
+    return out;
   });
 
   /** The project group for the active session's cwd, when known. */
@@ -476,21 +492,20 @@ class ProjectsState {
       }
     }
 
-    this.groupByCwd.set(
-      cwd,
-      project
-        ? { ...project, sessions: buildSessionRows(sessions) }
-        : {
-            cwd,
-            name: pathBasename(cwd),
-            pinned: false,
-            exists: true,
-            registered: false,
-            sessionCount: sessions.length,
-            lastActivity,
-            sessions: buildSessionRows(sessions),
-          }
-    );
+    const rows = buildSessionRows(sessions);
+    const group: ProjectGroup = project
+      ? { ...project, sessions: rows }
+      : {
+          cwd,
+          name: pathBasename(cwd),
+          pinned: false,
+          exists: true,
+          registered: false,
+          sessionCount: sessions.length,
+          lastActivity,
+          sessions: rows,
+        };
+    this.groupByCwd.set(cwd, group);
   }
 
   /** Upsert one session and rebuild only its previous/current project groups. */

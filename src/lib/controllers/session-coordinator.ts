@@ -18,6 +18,7 @@ import {
 export type SessionCoordinatorChange = {
   state: SessionReducerState;
   effects: SessionEffect[];
+  touchedMessageIds: string[];
 };
 
 export type SessionCoordinatorListener = (change: SessionCoordinatorChange) => void;
@@ -70,22 +71,20 @@ export class SessionCoordinator {
     return () => this.listeners.delete(listener);
   }
 
-  private publish(effects: SessionEffect[] = []): void {
+  private publish(effects: SessionEffect[] = [], touchedMessageIds: string[] = []): void {
     if (this.listeners.size === 0) return;
-    const change = { state: this.stateValue, effects };
+    const change = { state: this.stateValue, effects, touchedMessageIds };
     for (const listener of this.listeners) listener(change);
   }
 
   private reduce(action: SessionAction): SessionReducerResult {
-    const messagesBefore = this.stateValue.messages;
     const result = reduceSession(this.stateValue, action, this.reducerOptions);
-    // Reducer messages are intentionally mutable so streaming deltas do not
-    // copy the transcript. Publish a new array once per frame so reactive hosts
-    // observe the mutation without rebuilding the tool index.
-    if (this.stateValue.messages === messagesBefore) {
-      this.stateValue.messages = this.stateValue.messages.slice();
+    if (result.structureChanged) {
+      // The reducer can append/splice in place; publish a fresh array only for
+      // those structural changes so keyed transcript derivations stay stable.
+      this.stateValue.messages = [...this.stateValue.messages];
     }
-    this.publish(result.effects);
+    this.publish(result.effects, result.touchedMessageIds);
     return result;
   }
 
@@ -255,28 +254,34 @@ export class SessionCoordinator {
 
   setToolsExpanded(expanded: boolean): void {
     this.stateValue.toolsExpanded = expanded;
+    const touchedMessageIds: string[] = [];
     for (const message of this.stateValue.messages) {
-      if (message.role === 'tool' && !message.streaming) message.expanded = expanded;
+      if (message.role === 'tool' && !message.streaming && message.expanded !== expanded) {
+        message.expanded = expanded;
+        touchedMessageIds.push(message.id);
+      }
     }
-    this.stateValue.messages = this.stateValue.messages.slice();
-    this.publish();
+    this.publish([], touchedMessageIds);
   }
 
   updateTool(toolCallId: string, update: (message: UIMessage) => void): boolean {
     const message = this.stateValue.toolsById.get(toolCallId);
     if (!message) return false;
     update(message);
-    this.stateValue.messages = this.stateValue.messages.slice();
-    this.publish();
+    this.publish([], [message.id]);
     return true;
   }
+
   clearStreamingFlags(): void {
+    const touchedMessageIds: string[] = [];
     for (const message of this.stateValue.messages) {
-      if (message.streaming) message.streaming = false;
+      if (message.streaming) {
+        message.streaming = false;
+        touchedMessageIds.push(message.id);
+      }
     }
     this.stateValue.activeStreamMsg = null;
-    this.stateValue.messages = this.stateValue.messages.slice();
-    this.publish();
+    this.publish([], touchedMessageIds);
   }
   private buildToolIndex(messages: UIMessage[]): Map<string, UIMessage> {
     const index = new Map<string, UIMessage>();

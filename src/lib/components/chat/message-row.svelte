@@ -23,7 +23,8 @@
   import ToolMessageRow from './tool-message-row.svelte';
 
   let {
-    msg,
+    msg: sourceMsg,
+    revision,
     isNewest,
     isLastInTurn,
     copiedId,
@@ -47,6 +48,7 @@
     onHaptic,
   }: {
     msg: UIMessage;
+    revision: number;
     isNewest: boolean;
     isLastInTurn: boolean;
     copiedId: string | null;
@@ -69,6 +71,10 @@
     onDismissNotice: (id: string) => void;
     onHaptic?: () => void;
   } = $props();
+  let msg = $derived.by(() => {
+    void revision;
+    return { ...sourceMsg };
+  });
   let editingId: string | null = $state(null);
   let editingText = $state('');
 

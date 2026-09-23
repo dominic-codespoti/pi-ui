@@ -50,6 +50,7 @@
 
   let {
     messages,
+    messageRevisions,
     sessionLoading,
     wsState,
     sessionId,
@@ -83,6 +84,7 @@
     onHaptic,
   }: {
     messages: UIMessage[];
+    messageRevisions: ReadonlyMap<string, number>;
     sessionLoading: boolean;
     wsState: 'connecting' | 'open' | 'closed';
     sessionId: string | null;
@@ -298,6 +300,7 @@
         {#each turn.messages as msg (msg.id)}
           <MessageRow
             {msg}
+            revision={messageRevisions.get(msg.id) ?? 0}
             isNewest={msg === visibleMessages[visibleMessages.length - 1]}
             isLastInTurn={isLastInTurnMap[msg.id] ?? false}
             {copiedId}

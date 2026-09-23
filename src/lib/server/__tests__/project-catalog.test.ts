@@ -101,6 +101,42 @@ describe('project-catalog', () => {
     });
   });
 
+  it('updates the project maximum directly for a newer session upsert', async () => {
+    upsertSession('older', '/proj/a', 1_700_000_100_000);
+    upsertSession('newer', '/proj/a', 1_700_000_200_000);
+    await catalog.list();
+
+    upsertSession('newer', '/proj/a', 1_700_000_300_000);
+
+    expect((await catalog.list()).find((project) => project.cwd === '/proj/a')?.lastActivity).toBe(
+      1_700_000_300_000
+    );
+  });
+
+  it('recomputes the project maximum when its session moves backward', async () => {
+    upsertSession('older', '/proj/a', 1_700_000_100_000);
+    upsertSession('newer', '/proj/a', 1_700_000_200_000);
+    await catalog.list();
+
+    upsertSession('newer', '/proj/a', 1_700_000_050_000);
+
+    expect((await catalog.list()).find((project) => project.cwd === '/proj/a')?.lastActivity).toBe(
+      1_700_000_100_000
+    );
+  });
+
+  it('recomputes the project maximum when its session is removed', async () => {
+    upsertSession('older', '/proj/a', 1_700_000_100_000);
+    upsertSession('newer', '/proj/a', 1_700_000_200_000);
+    await catalog.list();
+
+    sessions.apply({ kind: 'remove', id: 'newer' });
+
+    expect((await catalog.list()).find((project) => project.cwd === '/proj/a')?.lastActivity).toBe(
+      1_700_000_100_000
+    );
+  });
+
   it('rebuilds aggregates once after releasing a resident session', async () => {
     const listSpy = vi.spyOn(sessions, 'list');
     upsertSession('s1', '/proj/a', 1_700_000_100_000);

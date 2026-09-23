@@ -220,4 +220,55 @@ describe('session reducer', () => {
       content: 'retry succeeded',
     });
   });
+
+  it('keeps message identity stable for deltas and reports the touched id', () => {
+    const state = createSessionReducerState({ sessionId: 'session-1' });
+    const started = reduceSession(
+      state,
+      { type: 'event', message: { type: 'message_start', message: { role: 'assistant' } } },
+      { createId: () => 'assistant' }
+    );
+    const messages = started.state.messages;
+
+    const result = reduceSession(state, {
+      type: 'event',
+      message: {
+        type: 'message_update',
+        assistantMessageEvent: { type: 'text_delta', delta: 'x' },
+      },
+    });
+
+    expect(result.state.messages).toBe(messages);
+    expect(result.structureChanged).toBe(false);
+    expect(result.touchedMessageIds).toEqual(['assistant']);
+    expect(result.state.messages[0]?.content).toBe('x');
+  });
+
+  it('reports structural append and removal changes', () => {
+    const state = createSessionReducerState({ sessionId: 'session-1' });
+    const start = reduceSession(
+      state,
+      { type: 'event', message: { type: 'message_start', message: { role: 'assistant' } } },
+      { createId: () => 'assistant' }
+    );
+    expect(start.structureChanged).toBe(true);
+
+    const end = reduceSession(state, {
+      type: 'event',
+      message: { type: 'agent_end' },
+    });
+    expect(end.structureChanged).toBe(true);
+    expect(end.state.messages).toHaveLength(0);
+  });
+
+  it('counts bash output lines across delta boundaries', () => {
+    const state = createSessionReducerState({ sessionId: 'session-1' });
+    apply(state, { type: 'bash_execution_update', id: 'bash-1', delta: 'one\n' });
+    apply(state, { type: 'bash_execution_update', id: 'bash-1', delta: 'two\nthree' });
+
+    expect(state.messages[0]).toMatchObject({
+      content: 'one\ntwo\nthree',
+      lineCount: 3,
+    });
+  });
 });

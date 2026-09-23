@@ -913,9 +913,8 @@ function serializeTreeNode(
 const PI_CONFIG_DIR = '.pi';
 
 /**
- * Return the first visible user/assistant text for a session summary. This is
- * intentionally scanned only when a live session is registered, not once
- * per message_end event.
+ * Return the first visible user/assistant text for a session summary. Full
+ * history scans are cached by each resident until a user message completes.
  */
 function firstMessageForSession(sess: AgentSession): string {
   for (const message of sess.messages) {
@@ -950,6 +949,7 @@ function refreshSessionSummary(sess: AgentSession): void {
   const entry = residentStore.get(sess.sessionId);
   if (!entry || entry.session !== sess) return;
   entry.firstMessage = firstMessageForSession(sess);
+  entry.firstMessageExamined = true;
   entry.sessionName = sess.sessionManager.getSessionName();
   entry.sessionSummaryDirty = true;
   refreshResidentHistory(entry);
@@ -2057,6 +2057,8 @@ interface ManagedSession extends ResidentEntry {
   pendingReload: boolean;
   /** Cached first user/assistant text for O(1) session-list updates. */
   firstMessage: string;
+  /** Prevent repeated history scans while the summary has no visible text. */
+  firstMessageExamined: boolean;
   /** Whether a completed turn has reported an error. */
   lastTurnError: boolean;
   /** Whether a completed turn needs attention in an unfocused session. */
@@ -2582,7 +2584,8 @@ async function createSdkSession(
   targetCwd: string,
   sessionManager: PiSDKNS.SessionManager,
   reason: PiSDKNS.SessionStartEvent['reason'],
-  previousSessionFile?: string
+  previousSessionFile?: string,
+  options?: { model?: AgentSession['model'] }
 ): Promise<CreatedSdkSession> {
   const tCreate = Date.now();
   const sdk = await getSDK();
@@ -2601,6 +2604,7 @@ async function createSdkSession(
   const result = await sdk.createAgentSessionFromServices({
     services,
     sessionManager,
+    ...(options?.model !== undefined ? { model: options.model } : {}),
     sessionStartEvent: {
       type: 'session_start',
       reason,
@@ -3239,6 +3243,7 @@ function registerSession(
     pendingReload: false,
     generation: 0,
     firstMessage: firstMessageForSession(sess),
+    firstMessageExamined: true,
     lastTurnError: false,
     shutdownRequested: false,
     unread: false,
@@ -3332,7 +3337,10 @@ function registerSession(
       case 'message_end':
         entry.lastActivity = Date.now();
         entry.sessionSummaryDirty = true;
-        if (!entry.firstMessage) entry.firstMessage = firstMessageForSession(sess);
+        if (!entry.firstMessage && (!entry.firstMessageExamined || event.message.role === 'user')) {
+          entry.firstMessage = firstMessageForSession(sess);
+          entry.firstMessageExamined = true;
+        }
         scheduleResidentHistoryRefresh(entry);
         // Resident summary replaces the disk parse — the file is not re-read.
         sessionCatalog.apply({ kind: 'upsert', session: liveSummary(sess, entry) });
@@ -3582,11 +3590,10 @@ function broadcastSessionLoaded(
   // copy only to other tabs and send the stamped copy directly to the requester.
   // Resyncs are requester-only and must not fan a snapshot out to other tabs.
   if (requester) {
-    if (!requesterOnly) {
-      requester.publish(WS_TOPIC, JSON.stringify(payload));
-    }
+    const json = !requesterOnly || requestId === undefined ? JSON.stringify(payload) : null;
+    if (!requesterOnly) requester.publish(WS_TOPIC, json!);
     try {
-      requester.send(JSON.stringify(requestId === undefined ? payload : { ...payload, requestId }));
+      requester.send(requestId === undefined ? json! : JSON.stringify({ ...payload, requestId }));
     } catch {
       /* the requesting socket may have closed after the mutation completed */
     }
@@ -5092,9 +5099,9 @@ try {
                           cwd,
                           clonedSm,
                           'new',
-                          session.sessionFile
+                          session.sessionFile,
+                          { model: session.model }
                         );
-                        if (session.model) await created.session.setModel(session.model);
                         await setActiveSession(created.session, cwd, created);
                         sendSlashResult(ws, command, 'Cloned to a fresh session.');
                         return;
@@ -5105,9 +5112,9 @@ try {
                         clonedCwd,
                         clonedSm,
                         'fork',
-                        session.sessionFile
+                        session.sessionFile,
+                        { model: session.model }
                       );
-                      if (session.model) await created.session.setModel(session.model);
                       await setActiveSession(created.session, clonedCwd, created);
                       sendSlashResult(ws, command, `Cloned current branch to ${newPath}.`);
                     });

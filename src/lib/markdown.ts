@@ -1,5 +1,5 @@
 import { marked, type RendererObject, type TokenizerAndRendererExtension } from 'marked';
-import { renderLatex } from '@earendil-works/pi-tui/dist/latex.js';
+import type { renderLatex } from '@earendil-works/pi-tui/dist/latex.js';
 import type { LanguageFn } from 'highlight.js';
 import hljs from 'highlight.js/lib/core';
 import javascript from 'highlight.js/lib/languages/javascript';
@@ -51,7 +51,9 @@ export function onLangRegistered(listener: (lang: string) => void): () => void {
 
 /** Resolves once `lang` finishes loading (immediately if already loaded, eager, or unknown). */
 export function whenLangReady(lang: string): Promise<void> {
-  return _lazyLoaders.get(lang) ?? Promise.resolve();
+  return lang === 'latex'
+    ? (_latexLoader ?? Promise.resolve())
+    : (_lazyLoaders.get(lang) ?? Promise.resolve());
 }
 
 /** Ensure a lazy hljs language is loaded — fire-and-forget dynamic import. */
@@ -110,10 +112,33 @@ function escHtml(s: string) {
 
 /** When true, code blocks are escaped without hljs — used while a message is streaming. */
 let _skipHighlight = false;
-/** Notified when a render encounters a fence language that is still loading
- *  lazily — lets callers re-render just the messages that need it once the
- *  grammar registers (see `renderMarkdown` opts). */
+/** Notified when a render encounters a fence language or extension that is still loading. */
 let _onUnresolvedLang: ((lang: string) => void) | null = null;
+
+type RenderLatex = typeof renderLatex;
+let _renderLatex: RenderLatex | null = null;
+let _latexLoader: Promise<void> | null = null;
+
+function ensureLatex(): void {
+  if (_latexLoader || _renderLatex) return;
+  _latexLoader = import('@earendil-works/pi-tui/dist/latex.js')
+    .then((mod) => {
+      _renderLatex = mod.renderLatex;
+      marked.use({ extensions: [latexBlockExtension, latexInlineExtension] });
+      for (const listener of _langReadyListeners) listener('latex');
+    })
+    .catch(() => {
+      _latexLoader = null;
+    });
+}
+
+function renderMath(source: string, options?: { display?: boolean }): string | undefined {
+  return _renderLatex?.(source, options);
+}
+
+function hasMathDelimiter(source: string): boolean {
+  return source.includes('$') || source.includes('\\(') || source.includes('\\[');
+}
 
 /** Highlight code or fall back to plain-escaped text if language unknown. */
 function highlight(code: string, lang: string): string {
@@ -426,11 +451,10 @@ const latexBlockExtension: TokenizerAndRendererExtension = {
   renderer(token) {
     const latex = token as unknown as LatexToken;
     const raw = latex.raw.trim();
-    const rendered = renderLatex(latex.text, { display: true });
+    const rendered = renderMath(latex.text, { display: true });
     return `<div class="math-block whitespace-pre-wrap">${escHtml(rendered ?? raw)}</div>`;
   },
 };
-
 const latexInlineExtension: TokenizerAndRendererExtension = {
   name: 'latex',
   level: 'inline',
@@ -447,10 +471,9 @@ const latexInlineExtension: TokenizerAndRendererExtension = {
   },
   renderer(token) {
     const latex = token as unknown as LatexToken;
-    return `<span class="math-inline">${escHtml(renderLatex(latex.text) ?? latex.raw)}</span>`;
+    return `<span class="math-inline">${escHtml(renderMath(latex.text) ?? latex.raw)}</span>`;
   },
 };
-
 /**
  * Convert complete math expressions in the streaming fast path without
  * parsing the rest of the Markdown. Code spans are copied verbatim so a
@@ -475,7 +498,7 @@ function renderCompleteLatex(source: string): string {
 
     const match = matchInlineLatex(source, index);
     if (match) {
-      result += renderLatex(match.text, { display: match.display }) ?? match.raw;
+      result += renderMath(match.text, { display: match.display }) ?? match.raw;
       index = match.end;
       continue;
     }
@@ -488,7 +511,7 @@ function renderCompleteLatex(source: string): string {
 marked.use({
   breaks: true,
   renderer,
-  extensions: [fileLinkExtension, latexBlockExtension, latexInlineExtension],
+  extensions: [fileLinkExtension],
 });
 
 /** Above this size, marked+hljs parsing stalls the main thread (seconds on
@@ -572,6 +595,10 @@ export function renderMarkdown(
   const prevLangHook = _onUnresolvedLang;
   _skipHighlight = opts?.skipHighlight ?? false;
   _onUnresolvedLang = opts?.onUnresolvedLang ?? null;
+  if (hasMathDelimiter(src) && !_renderLatex) {
+    ensureLatex();
+    _onUnresolvedLang?.('latex');
+  }
   try {
     return marked.parse(src) as string;
   } finally {
@@ -612,7 +639,7 @@ function evictOldest(): void {
  * Bounds: max 300 entries AND max 4,000,000 total cached HTML chars.
  */
 export function memoizedRenderMarkdown(content: string): string {
-  const key = `${content.length}:${fnv1a(content)}`;
+  const key = `${_renderLatex ? 1 : 0}:${content.length}:${fnv1a(content)}`;
   const cached = _memoCache.get(key);
   if (cached !== undefined) {
     _memoCache.delete(key);
@@ -672,6 +699,7 @@ export function renderStreamingPreview(src: string): string {
     return `<pre class="whitespace-pre-wrap break-words">${escaped}</pre>`;
   }
 
+  if (hasMathDelimiter(src) && !_renderLatex) ensureLatex();
   _streamingPreviewCache = null;
   return `<pre class="whitespace-pre-wrap break-words">${escHtml(renderCompleteLatex(src))}</pre>`;
 }

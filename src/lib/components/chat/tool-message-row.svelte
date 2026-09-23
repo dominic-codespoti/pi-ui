@@ -6,7 +6,6 @@
   import type { UIMessage } from '#lib/client-messages.js';
   import { highlightCode } from '#lib/markdown.js';
   import { getToolLang, getToolRowData, messageElementId } from './message-row-helpers.ts';
-  import DiffViewer from '#lib/components/diff-viewer.svelte';
   import LiveElapsed from '#lib/components/chat/live-elapsed.svelte';
 
   let {
@@ -148,7 +147,11 @@
       </div>
     {:else}
       {#if msg.diff}
-        <div class="trace-output mt-1"><DiffViewer diff={msg.diff} /></div>
+        <div class="trace-output mt-1">
+          {#await import('#lib/components/diff-viewer.svelte') then { default: DiffViewer }}
+            <DiffViewer diff={msg.diff} />
+          {/await}
+        </div>
       {:else if msg.content}
         {@const toolLang = getToolLang(msg.toolName, msg.toolInput)}
         <div class="relative group/copy mt-1">
