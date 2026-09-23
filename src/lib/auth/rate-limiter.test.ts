@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach } from 'vitest';
-import { checkRateLimit, recordFailure, clearRecord } from './rate-limiter';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { checkRateLimit, recordFailure, clearRecord, getClientIp } from './rate-limiter';
 
 const IP = '1.2.3.4';
 const IP6_MAPPED = '::ffff:1.2.3.4';
@@ -132,5 +132,37 @@ describe('time-based expiry (injected records)', () => {
     const r = checkRateLimit(IP);
     expect(r.blocked).toBe(false);
     expect(r.remaining).toBe(2);
+  });
+});
+
+describe('getClientIp', () => {
+  const originalHost = process.env.HOST;
+  afterEach(() => {
+    if (originalHost === undefined) delete process.env.HOST;
+    else process.env.HOST = originalHost;
+  });
+
+  it('uses cf-connecting-ip on loopback when proxy headers are present', () => {
+    process.env.HOST = '127.0.0.1';
+    const request = new Request('http://localhost/login', {
+      headers: { 'cf-connecting-ip': '203.0.113.7', 'x-forwarded-for': '198.51.100.2' },
+    });
+    expect(getClientIp(request, '127.0.0.1', true)).toBe('203.0.113.7');
+  });
+
+  it('ignores x-forwarded-for and x-real-ip on loopback', () => {
+    process.env.HOST = 'localhost';
+    const request = new Request('http://localhost/login', {
+      headers: { 'x-forwarded-for': '198.51.100.2', 'x-real-ip': '203.0.113.9' },
+    });
+    expect(getClientIp(request, '127.0.0.1', true)).toBe('127.0.0.1');
+  });
+
+  it('keeps existing trusted proxy header behavior on non-loopback hosts', () => {
+    process.env.HOST = '0.0.0.0';
+    const request = new Request('http://example.test/login', {
+      headers: { 'x-forwarded-for': '198.51.100.2, 10.0.0.1' },
+    });
+    expect(getClientIp(request, '10.0.0.2', true)).toBe('198.51.100.2');
   });
 });
