@@ -8,6 +8,28 @@ import Trash from '@lucide/svelte/icons/trash';
 import Send from '@lucide/svelte/icons/send';
 import type { CompactionNoticeDetails, UIMessage } from '#lib/client-messages.js';
 
+/**
+ * Tooltip text for a message's usage breakdown. Usage reaches the UI from
+ * several sources (live events, history, cached views, cold-start snapshots
+ * written by older versions), so every field is treated as optional: a
+ * missing number must never throw during render and blank the whole app.
+ */
+export function usageBreakdownTitle(usage: UIMessage['usage']): string {
+  if (!usage) return '';
+  const tokens = (n: unknown) => (typeof n === 'number' && Number.isFinite(n) ? n : 0);
+  const usd = (n: unknown) => `$${tokens(n).toFixed(6)}`;
+  const cost: Partial<Record<'input' | 'output' | 'cacheRead' | 'cacheWrite' | 'total', number>> =
+    usage.cost ?? {};
+  return (
+    `Input ${tokens(usage.input)} · Output ${tokens(usage.output)} · ` +
+    `Cache read ${tokens(usage.cacheRead)} · Cache write ${tokens(usage.cacheWrite)}` +
+    (usage.reasoning !== undefined ? ` · Reasoning ${tokens(usage.reasoning)}` : '') +
+    ` · Total ${tokens(usage.totalTokens)} tokens · Cost: input ${usd(cost.input)}, ` +
+    `output ${usd(cost.output)}, cache read ${usd(cost.cacheRead)}, ` +
+    `cache write ${usd(cost.cacheWrite)}, total ${usd(cost.total)}`
+  );
+}
+
 type ToolMetaEntry = { icon: typeof Cog; label: string; color: string };
 
 const TOOL_META: Record<string, ToolMetaEntry> = {

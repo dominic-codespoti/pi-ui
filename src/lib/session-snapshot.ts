@@ -26,7 +26,9 @@ export interface SessionSnapshot {
 }
 
 export const SNAPSHOT_KEY = 'pi-session-snapshot';
-const SNAPSHOT_VERSION = 1;
+// v2: UIMessage gained ordered `blocks`, stop metadata, and a per-field usage
+// cost breakdown; v1 tails written by <=0.22 lack those fields.
+const SNAPSHOT_VERSION = 2;
 /** Only the visible tail matters for first paint. */
 const MAX_MESSAGES = 50;
 /** Hard cap on the serialized payload — protects the ~5 MB localStorage quota. */

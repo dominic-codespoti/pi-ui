@@ -6,7 +6,7 @@
   import type { UIMessage } from '#lib/client-messages.js';
   import { memoizedRenderMarkdown } from '#lib/markdown.js';
   import { formatRelativeDate as formatDate } from '#lib/utils.js';
-  import { messageElementId } from './message-row-helpers.ts';
+  import { messageElementId, usageBreakdownTitle } from './message-row-helpers.ts';
   let {
     msg,
     isNewest,
@@ -56,11 +56,7 @@
   );
   let thinkingPanelId = $derived(messageElementId('thinking', msg.id));
   let thinkingText = $derived(msg.thinking ?? '');
-  let usageTitle = $derived(
-    msg.usage
-      ? `Input ${msg.usage.input} · Output ${msg.usage.output} · Cache read ${msg.usage.cacheRead} · Cache write ${msg.usage.cacheWrite}${msg.usage.reasoning !== undefined ? ` · Reasoning ${msg.usage.reasoning}` : ''} · Total ${msg.usage.totalTokens} tokens · Cost: input $${msg.usage.cost.input.toFixed(6)}, output $${msg.usage.cost.output.toFixed(6)}, cache read $${msg.usage.cost.cacheRead.toFixed(6)}, cache write $${msg.usage.cost.cacheWrite.toFixed(6)}, total $${msg.usage.cost.total.toFixed(6)}`
-      : ''
-  );
+  let usageTitle = $derived(usageBreakdownTitle(msg.usage));
 </script>
 
 <!-- Long-press gesture surface — children are the interactive elements -->

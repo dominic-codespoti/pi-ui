@@ -139,6 +139,21 @@ describe('loadSnapshot gating', () => {
     );
     expect(loadSnapshot(PATH)).toBeNull();
   });
+
+  it('discards v1 tails written by <=0.22, whose usage lacks the cost breakdown', () => {
+    localStorage.setItem(
+      SNAPSHOT_KEY,
+      JSON.stringify({
+        v: 1,
+        sessionPath: PATH,
+        savedAt: Date.now(),
+        messages: [
+          msg({ usage: { input: 5, output: 7, totalTokens: 12, cost: { total: 0.01 } } as never }),
+        ],
+      })
+    );
+    expect(loadSnapshot(PATH)).toBeNull();
+  });
 });
 
 describe('clearSnapshot', () => {
