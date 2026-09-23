@@ -1315,7 +1315,9 @@ test.describe('Mobile native feel', () => {
     const box = await picker.boundingBox();
     const vh = page.viewportSize()?.height ?? 0;
     expect(box).not.toBeNull();
-    expect(box!.y).toBeGreaterThan(vh / 2);
+    // Docked, not centred: the sheet sits in the lower half regardless of its
+    // content height (which varies with platform font metrics).
+    expect(box!.y + box!.height / 2).toBeGreaterThan(vh / 2);
     expect(box!.y + box!.height).toBeGreaterThanOrEqual(vh - 8);
   });
 });
