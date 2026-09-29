@@ -4,6 +4,10 @@
  */
 
 import type { ParsedComponent } from '#lib/tui-stubs.js';
+import type {
+  AppExtensionScope,
+  AppExtensionSummary,
+} from '#lib/app-extensions/types.js';
 /** Version of the extension-UI wire payloads (ExtensionUiStatePayload et al). Bump on breaking shape changes. */
 export const EXTENSION_UI_SCHEMA_VERSION = 1 as const;
 
@@ -490,6 +494,10 @@ export type SessionPhase = 'idle' | 'running' | 'awaiting-input' | 'error';
  *   { type: "tools_list",              tools: ToolSummary[], activeToolNames: string[] }
  *   { type: "resources_list",          skills: SkillSummary[], prompts: PromptSummary[] }
  *   { type: "extensions_list",         extensions: ExtensionSummary[], errors: Array<{ path: string; error: string }> }
+ *   { type: "app_extensions_list",     extensions: AppExtensionSummary[] }
+ *   { type: "app_extension_result",    callId, extensionId, ok, result?, error? }
+ *   { type: "app_extension_event",     extensionId, eventName, data?, scope? }
+ *   { type: "app_extension_toggle_result", extensionId, enabled, ok, error? }
  *   { type: "commands_list",           commands: Array<{ name: string; description?: string; source: string }> }
  *   { type: "skill_install_result",    success: boolean; name?: string; error?: string }
  *   { type: "update_status",           ...UpdateStatus }
@@ -900,9 +908,74 @@ export type ServerCustomEvent =
       aborted?: boolean;
       willRetry?: boolean;
       errorMessage?: string;
+    }
+  // ── App-level extensions (transport slice) ───────────────────────────────
+  // Independent of EXTENSION_UI_SCHEMA_VERSION — these carry the trusted
+  // app-extension catalog and operation calls, not session extension-UI state.
+  | { type: 'app_extensions_list'; extensions: AppExtensionSummary[] }
+  | {
+      /** Requester-targeted response to an app_extension_call. */
+      type: 'app_extension_result';
+      callId: string;
+      extensionId: string;
+      ok: boolean;
+      result?: unknown;
+      error?: string;
+    }
+  | {
+      type: 'app_extension_event';
+      extensionId: string;
+      eventName: string;
+      data?: unknown;
+      scope?: AppExtensionScope;
+    }
+  | {
+      type: 'app_extension_subscription_result';
+      subscriptionId: string;
+      extensionId: string;
+      ok: boolean;
+      error?: string;
+    }
+  | {
+      type: 'app_extension_toggle_result';
+      extensionId: string;
+      enabled: boolean;
+      ok: boolean;
+      error?: string;
+    }
+  | {
+      type: 'app_extension_reload_result';
+      extensionId: string;
+      ok: boolean;
+      error?: string;
     };
 
 export type ServerMessage = ConnectedMessage | ServerCustomEvent | PiEvent;
+
+/** Typed app-level extension frames; the broad SDK `PiEvent` otherwise hides their fields as unknown. */
+export type AppExtensionServerMessage = Extract<
+  ServerCustomEvent,
+  {
+    type:
+      | 'app_extensions_list'
+      | 'app_extension_result'
+      | 'app_extension_event'
+      | 'app_extension_subscription_result'
+      | 'app_extension_toggle_result'
+      | 'app_extension_reload_result'
+  }
+>;
+
+export function isAppExtensionServerMessage(message: ServerMessage): message is AppExtensionServerMessage {
+  return (
+    message.type === 'app_extensions_list' ||
+    message.type === 'app_extension_result' ||
+    message.type === 'app_extension_event' ||
+    message.type === 'app_extension_subscription_result' ||
+    message.type === 'app_extension_toggle_result' ||
+    message.type === 'app_extension_reload_result'
+  );
+}
 
 // ── Browser → Server ─────────────────────────────────────────────────────────
 
@@ -1143,4 +1216,37 @@ export type ClientMessage =
       expirationTime?: number | null;
     }
   /** Deregister this device from Web Push. */
-  | { type: 'push_unsubscribe'; endpoint: string };
+  | { type: 'push_unsubscribe'; endpoint: string }
+  /** Request the app-level extension catalog. Server replies with app_extensions_list. */
+  | { type: 'get_app_extensions' }
+  /** Invoke an app-level extension operation. Scope is required and explicit —
+   * unlike session-scoped messages, this never falls back to socket focus. */
+  | {
+      type: 'app_extension_call';
+      callId: string;
+      extensionId: string;
+      operationId: string;
+      kind: 'read' | 'action';
+      input?: Record<string, unknown>;
+      scope: AppExtensionScope;
+    }
+  | { type: 'app_extension_cancel'; callId: string }
+  /** Enable or disable an app-level extension. Server replies with the refreshed catalog plus app_extension_toggle_result. */
+  | { type: 'set_app_extension_enabled'; extensionId: string; enabled: boolean }
+  /**
+   * Re-import an enabled extension's server entry and swap its handlers in place, without the
+   * host restarting. It exists for code edits to an already-trusted extension, so it stays an
+   * explicit action rather than something discovery may do implicitly. Server replies with the
+   * refreshed catalog plus app_extension_reload_result.
+   */
+  | { type: 'reload_app_extension'; extensionId: string }
+  /** Subscribe this socket to one extension event at an explicit scope. */
+  | {
+      type: 'app_extension_subscribe';
+      subscriptionId: string;
+      extensionId: string;
+      eventName: string;
+      scope: AppExtensionScope;
+    }
+  /** Remove one app-extension event subscription from this socket. */
+  | { type: 'app_extension_unsubscribe'; subscriptionId: string };

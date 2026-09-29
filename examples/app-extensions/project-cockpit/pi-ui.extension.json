@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "apiVersion": 1,
+  "id": "project-cockpit",
+  "name": "Project Cockpit",
+  "version": "1.0.0",
+  "description": "A compact project status view and check action.",
+  "clientEntry": "client/index.mjs",
+  "serverEntry": "server/index.mjs",
+  "views": [{ "id": "cockpit", "title": "Cockpit", "slot": "right-panel" }],
+  "operations": [
+    {
+      "id": "project-summary",
+      "kind": "read",
+      "scope": "project",
+      "description": "Read package metadata and Git working-tree status for an explicitly selected project.",
+      "inputSchema": { "type": "object", "additionalProperties": false },
+      "exposeToAgent": true
+    },
+    {
+      "id": "run-check",
+      "kind": "action",
+      "scope": "project",
+      "description": "Run the project's Bun check script in an explicitly selected project.",
+      "inputSchema": { "type": "object", "additionalProperties": false },
+      "exposeToAgent": true
+    }
+  ],
+  "events": []
+}

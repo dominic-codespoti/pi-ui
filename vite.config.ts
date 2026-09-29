@@ -42,6 +42,14 @@ export default defineConfig({
     // In `dev:full` mode the Bun WS server runs on port 5174. The client
     // connects directly in dev mode, bypassing Vite's proxy — Bun.serve's
     // `server.upgrade()` is incompatible with http-proxy's WS forwarding.
+    // Extension ESM chunks are ordinary authenticated HTTP GETs, so keep them
+    // same-origin (CSP `script-src 'self'`) while forwarding to the WS server.
+    proxy: {
+      '/extensions': {
+        target: 'http://127.0.0.1:5174',
+        changeOrigin: true,
+      },
+    },
   },
   ssr: {
     // Bundle SvelteKit's runtime deps into the SSR output so the package is

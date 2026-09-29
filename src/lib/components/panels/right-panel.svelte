@@ -3,6 +3,17 @@
   import ModelsTab from './models-tab.svelte';
   import ToolsTab from './tools-tab.svelte';
   import SkillsTab from './skills-tab.svelte';
+  import AppsTab from './apps-tab.svelte';
+  import type { AppExtensionCall, AppExtensionEventListener } from '#lib/app-extensions/transport.js';
+  import type {
+    AppExtensionHostPrompt,
+    AppExtensionHostDraft,
+    AppExtensionHostConfirm,
+    AppExtensionHostOpenFile,
+    AppExtensionHostSwitchSession,
+  } from '#lib/app-extensions/client-loader.js';
+  import type { AppExtensionScope, AppExtensionSlot, AppExtensionSummary } from '#lib/app-extensions/types.js';
+  import type { AppExtensionViewRef } from '#lib/state/app-extensions-state.svelte.js';
   import type {
     ModelInfo,
     ProviderInfo,
@@ -18,6 +29,24 @@
     width,
     resizing,
     tab,
+    appExtensions,
+    activeAppViews,
+    pinnedSidebarViews,
+    appScope,
+    appCall,
+    appSubscribe,
+    appPrompt,
+    appDraft,
+    appConfirm,
+    appOpenFile,
+    appSwitchSession,
+    appSetEnabled,
+    appReload,
+    appRefresh,
+    onSelectAppView,
+    onClearAppView,
+    onToggleSidebarPin,
+    onAppNotify,
     modelTab = $bindable(),
     model,
     modelRefreshLoading,
@@ -69,7 +98,30 @@
     isMobile: boolean;
     width: number;
     resizing: boolean;
-    tab: 'models' | 'tools' | 'skills';
+    tab: 'models' | 'tools' | 'skills' | 'apps';
+    appExtensions: AppExtensionSummary[];
+    activeAppViews: Record<AppExtensionSlot, AppExtensionViewRef | null>;
+    pinnedSidebarViews: AppExtensionViewRef[];
+    appScope: AppExtensionScope;
+    appCall: AppExtensionCall;
+    appPrompt: AppExtensionHostPrompt;
+    appDraft: AppExtensionHostDraft;
+    appConfirm: AppExtensionHostConfirm;
+    appOpenFile: AppExtensionHostOpenFile;
+    appSwitchSession: AppExtensionHostSwitchSession;
+    appSetEnabled: (extensionId: string, enabled: boolean) => boolean;
+    appReload: (extensionId: string) => boolean;
+    appRefresh: () => boolean;
+    appSubscribe: (
+      extensionId: string,
+      eventName: string,
+      listener: AppExtensionEventListener,
+      scope: AppExtensionScope
+    ) => () => void;
+    onSelectAppView: (slot: AppExtensionSlot, extensionId: string, viewId: string) => void;
+    onClearAppView: (slot: AppExtensionSlot) => void;
+    onToggleSidebarPin: (extensionId: string, viewId: string) => void;
+    onAppNotify: (message: string, kind?: 'info' | 'success' | 'warning' | 'error') => void;
     modelTab: 'models' | 'providers';
     model: ModelInfo | null;
     modelRefreshLoading: boolean;
@@ -102,7 +154,7 @@
     onResizeStart: (e: PointerEvent) => void;
     onResizeMove: (e: PointerEvent) => void;
     onResizeStop: () => void;
-    onTabChange: (tab: 'models' | 'tools' | 'skills') => void;
+    onTabChange: (tab: 'models' | 'tools' | 'skills' | 'apps') => void;
     onSelectModel: (m: ModelInfo) => void;
     onPickThinkingLevel: (level: string) => void;
     onToggleTool: (name: string) => void;
@@ -129,7 +181,9 @@
       ? toolsList.length
         ? `tools (${activeToolNames.length}/${toolsList.length})`
         : 'tools'
-      : 'skills & prompts'}
+      : tab === 'skills'
+        ? 'skills & prompts'
+        : 'apps'}
   {open}
   {isMobile}
   {width}
@@ -174,6 +228,16 @@
           <span class="text-base-content/30 font-normal text-[10px] tabular-nums ml-1"
             >{activeToolNames.length}/{toolsList.length}</span
           >{/if}</button
+      >
+      <button
+        role="tab"
+        aria-selected={tab === 'apps'}
+        onclick={() => onTabChange('apps')}
+        class="flex-1 px-2.5 py-1.5 text-xs font-medium rounded-full transition-colors {tab ===
+        'apps'
+          ? 'text-base-content bg-base-content/12 shadow-sm shadow-black/10'
+          : 'text-base-content/45 hover:text-base-content/70'}"
+        tabindex={open ? 0 : -1}>apps</button
       >
       <button
         role="tab"
@@ -244,7 +308,7 @@
       {onToggleTool}
       {onSetActiveTools}
     />
-  {:else}
+  {:else if tab === 'skills'}
     <SkillsTab
       {open}
       {resourcesLoaded}
@@ -260,6 +324,27 @@
       {onUseSkill}
       {onUsePrompt}
       onOpenFile={onOpenResourceFile}
+    />
+  {:else}
+    <AppsTab
+      extensions={appExtensions}
+      activeViews={activeAppViews}
+      {pinnedSidebarViews}
+      scope={appScope}
+      call={appCall}
+      subscribe={appSubscribe}
+      prompt={appPrompt}
+      draft={appDraft}
+      confirm={appConfirm}
+      openFile={appOpenFile}
+      switchSession={appSwitchSession}
+      onSetEnabled={appSetEnabled}
+      onReload={appReload}
+      onRefresh={appRefresh}
+      onSelectView={onSelectAppView}
+      onClearView={onClearAppView}
+      {onToggleSidebarPin}
+      onNotify={onAppNotify}
     />
   {/if}
 </SidebarPanel>

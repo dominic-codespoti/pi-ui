@@ -1,4 +1,14 @@
 <script lang="ts">
+  import type { AppExtensionCall, AppExtensionEventListener } from '#lib/app-extensions/transport.js';
+  import type {
+    AppExtensionHostPrompt,
+    AppExtensionHostDraft,
+    AppExtensionHostConfirm,
+    AppExtensionHostOpenFile,
+    AppExtensionHostSwitchSession,
+  } from '#lib/app-extensions/client-loader.js';
+  import type { AppExtensionScope, AppExtensionSlot, AppExtensionSummary } from '#lib/app-extensions/types.js';
+  import type { AppExtensionViewRef } from '#lib/state/app-extensions-state.svelte.js';
   import type {
     ModelInfo,
     ProviderInfo,
@@ -20,6 +30,24 @@
     width,
     resizing,
     tab,
+    appExtensions,
+    activeAppViews,
+    pinnedSidebarViews,
+    appScope,
+    appCall,
+    appSubscribe,
+    appPrompt,
+    appDraft,
+    appConfirm,
+    appOpenFile,
+    appSwitchSession,
+    appSetEnabled,
+    appReload,
+    appRefresh,
+    onSelectAppView,
+    onClearAppView,
+    onToggleSidebarPin,
+    onAppNotify,
     modelTab = $bindable(),
     model,
     modelRefreshLoading,
@@ -71,7 +99,30 @@
     isMobile: boolean;
     width: number;
     resizing: boolean;
-    tab: 'models' | 'tools' | 'skills';
+    tab: 'models' | 'tools' | 'skills' | 'apps';
+    appExtensions: AppExtensionSummary[];
+    activeAppViews: Record<AppExtensionSlot, AppExtensionViewRef | null>;
+    pinnedSidebarViews: AppExtensionViewRef[];
+    appScope: AppExtensionScope;
+    appCall: AppExtensionCall;
+    appPrompt: AppExtensionHostPrompt;
+    appDraft: AppExtensionHostDraft;
+    appConfirm: AppExtensionHostConfirm;
+    appOpenFile: AppExtensionHostOpenFile;
+    appSwitchSession: AppExtensionHostSwitchSession;
+    appSetEnabled: (extensionId: string, enabled: boolean) => boolean;
+    appReload: (extensionId: string) => boolean;
+    appRefresh: () => boolean;
+    appSubscribe: (
+      extensionId: string,
+      eventName: string,
+      listener: AppExtensionEventListener,
+      scope: AppExtensionScope
+    ) => () => void;
+    onSelectAppView: (slot: AppExtensionSlot, extensionId: string, viewId: string) => void;
+    onClearAppView: (slot: AppExtensionSlot) => void;
+    onToggleSidebarPin: (extensionId: string, viewId: string) => void;
+    onAppNotify: (message: string, kind?: 'info' | 'success' | 'warning' | 'error') => void;
     modelTab: 'models' | 'providers';
     model: ModelInfo | null;
     modelRefreshLoading: boolean;
@@ -106,7 +157,7 @@
     onResizeStart: (e: PointerEvent) => void;
     onResizeMove: (e: PointerEvent) => void;
     onResizeStop: () => void;
-    onTabChange: (tab: 'models' | 'tools' | 'skills') => void;
+    onTabChange: (tab: 'models' | 'tools' | 'skills' | 'apps') => void;
     onSelectModel: (m: ModelInfo) => void;
     onPickThinkingLevel: (level: string) => void;
     onProviderLogin: (id: string) => void;
@@ -136,6 +187,24 @@
     {width}
     {resizing}
     {tab}
+    {appExtensions}
+    {activeAppViews}
+    {pinnedSidebarViews}
+    {appScope}
+    {appCall}
+    {appSubscribe}
+    {appPrompt}
+    {appDraft}
+    {appConfirm}
+    {appOpenFile}
+    {appSwitchSession}
+    {appSetEnabled}
+    {appReload}
+    {appRefresh}
+    {onSelectAppView}
+    {onClearAppView}
+    {onToggleSidebarPin}
+    {onAppNotify}
     bind:modelTab
     {model}
     {modelRefreshLoading}

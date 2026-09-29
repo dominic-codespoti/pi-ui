@@ -38,6 +38,18 @@
   import type { ParsedComponent } from '#lib/tui-stubs.js';
   import { projectsState } from '#lib/state/projects-state.svelte.js';
   import { extensionUiState } from '#lib/state/extension-ui-state.svelte.js';
+  import { appExtensionsState } from '#lib/state/app-extensions-state.svelte.js';
+  import { AppExtensionTransport } from '#lib/app-extensions/transport.js';
+  import type { AppExtensionEventListener } from '#lib/app-extensions/transport.js';
+  import type {
+    AppExtensionHostPrompt,
+    AppExtensionHostDraft,
+    AppExtensionHostConfirm,
+    AppExtensionHostOpenFile,
+    AppExtensionHostSwitchSession,
+  } from '#lib/app-extensions/client-loader.js';
+  import type { AppExtensionScope, AppExtensionSlot } from '#lib/app-extensions/types.js';
+  import type { AppExtensionViewRef } from '#lib/state/app-extensions-state.svelte.js';
   import { uid, type UIMessage } from '#lib/client-messages.js';
   import { extensionOptionParts } from '#lib/extension-modals.js';
   import { saveSnapshot, loadSnapshot } from '#lib/session-snapshot.js';
@@ -80,6 +92,8 @@
   import ConversationViewport from '#lib/components/chat/conversation-viewport.svelte';
   import SessionFooter from '#lib/components/chat/session-footer.svelte';
   import RightPanel from '#lib/components/panels/lazy-right-panel.svelte';
+  import AppLauncherSheet from '#lib/components/app-extensions/app-launcher-sheet.svelte';
+  import WorkspaceSlot from '#lib/components/app-extensions/workspace-slot.svelte';
   import SdkSettingsSection from '#lib/components/panels/sdk-settings-section.svelte';
   import ExtensionComponent from '#lib/components/ui/extension-component.svelte';
   import ConfirmDialog from '#lib/components/dialogs/confirm-dialog.svelte';
@@ -357,6 +371,8 @@
   let isMobile = $state(false);
   /** Confirmed session switches must not let drawer-marker cleanup rewind the URL. */
   let _skipDrawerHistoryBack = false;
+  let _restoringWorkspaceHistory = false;
+  let _suppressWorkspaceHistorySync = false;
 
   /** autocorrect is a real attribute but missing from Svelte's HTML typings. */
   function autoCorrectOff(node: HTMLElement) {
@@ -440,20 +456,48 @@
     return () => vv.removeEventListener('resize', onResize);
   });
 
-  // ── Android back: close open drawers before leaving ──────────────────────
-  // A same-URL history marker is pushed while a drawer is open; the system
-  // back gesture pops it, we swallow the pop and close the drawer. SvelteKit's
-  // router ignores same-URL pops, so no navigation happens.
+  function isAppExtensionViewRef(value: unknown): value is AppExtensionViewRef {
+    return (
+      typeof value === 'object' && value !== null &&
+      typeof (value as Record<string, unknown>).extensionId === 'string' &&
+      typeof (value as Record<string, unknown>).viewId === 'string'
+    );
+  }
+
+  function restoreWorkspaceFromHistoryState(state: unknown): void {
+    const historyState = typeof state === 'object' && state !== null
+      ? state as Record<string, unknown>
+      : {};
+    const ref = historyState.piUiAppWorkspaceView;
+    if (
+      historyState.piUiAppWorkspace === true &&
+      isAppExtensionViewRef(ref) &&
+      appExtensionsState.isRefLive('workspace', ref)
+    ) {
+      appExtensionsState.setActiveViewForSlot('workspace', ref);
+    } else {
+      appExtensionsState.setActiveViewForSlot('workspace', null);
+    }
+  }
+
+  // Native/browser Back unwinds the topmost app surface before leaving the app.
   $effect(() => {
-    // popstate.state describes the entry becoming active, not the one being
-    // popped — so the marker can't be inspected here. The sync effect below
-    // keeps the marker on top whenever a drawer is open, making ANY pop with a
-    // drawer open a back gesture on it: swallow by closing the drawer.
     const onPop = () => {
+      if (_skipDrawerHistoryBack) {
+        _skipDrawerHistoryBack = false;
+        return;
+      }
+      if (appLauncherOpen) appLauncherOpen = false;
       if (showSessionPanel || showRightPanel) {
         showSessionPanel = false;
         showRightPanel = false;
       }
+      // SvelteKit applies the popped shallow-routing state asynchronously.
+      _restoringWorkspaceHistory = true;
+      window.setTimeout(() => {
+        restoreWorkspaceFromHistoryState(page.state);
+        _restoringWorkspaceHistory = false;
+      }, 0);
     };
     window.addEventListener('popstate', onPop);
     return () => window.removeEventListener('popstate', onPop);
@@ -1057,12 +1101,13 @@
   // ── Panel state ──────────────────────────────────────────────────────────────
 
   let showRightPanel = $state(urlParam('rp', '') === '1');
+  let appLauncherOpen = $state(false);
 
-  let rightPanelTab = $state<'models' | 'tools' | 'skills'>(
-    (['models', 'tools', 'skills'] as const).includes(
-      urlParam('rpt', '') as 'models' | 'tools' | 'skills'
+  let rightPanelTab = $state<'models' | 'tools' | 'skills' | 'apps'>(
+    (['models', 'tools', 'skills', 'apps'] as const).includes(
+      urlParam('rpt', '') as 'models' | 'tools' | 'skills' | 'apps'
     )
-      ? (urlParam('rpt', '') as 'models' | 'tools' | 'skills')
+      ? (urlParam('rpt', '') as 'models' | 'tools' | 'skills' | 'apps')
       : 'models'
   );
 
@@ -1230,6 +1275,8 @@
     variant: 'error' | 'warning' | 'info';
     onConfirm: () => void;
   } | null>(null);
+  /** Settles an extension-driven confirm when its dialog is dismissed. */
+  let pendingConfirmOnDismiss: (() => void) | null = null;
   function requestConfirm(
     message: string,
     onConfirm: () => void,
@@ -1710,11 +1757,14 @@
           location.reload();
         }
       }
+      appExtensionTransport.requestExtensions();
     }
+    if (appExtensionTransport.handle(parsed)) return;
     handleServer(parsed);
   }
 
   function cleanupSocketLifecycle(): void {
+    appExtensionTransport.failPending('The connection was closed.');
     pendingUploads.clear();
     olderMessagesLoading = false;
     modelRefreshLoading = false;
@@ -1811,6 +1861,40 @@
   function send(msg: ClientMessage): boolean {
     return wsController.send(msg);
   }
+
+  const appExtensionTransport = new AppExtensionTransport(send);
+  const unsubscribeAppExtensionCatalog = appExtensionTransport.onExtensions((extensions) => {
+    appExtensionsState.setExtensions(extensions);
+  });
+  const unsubscribeAppExtensionToggle = appExtensionTransport.onToggleResult((result) => {
+    if (!result.ok) {
+      showChatNotice(result.error ?? 'App extension could not be enabled or disabled.', 'error');
+      return;
+    }
+    showChatNotice(
+      `${result.enabled ? 'Enabled' : 'Disabled'} app extension ${result.extensionId}. Agent-tool changes apply to newly created sessions.`,
+      'info',
+    );
+  });
+  const unsubscribeAppExtensionReload = appExtensionTransport.onReloadResult((result) => {
+    if (!result.ok) {
+      showChatNotice(
+        result.error ?? `App extension ${result.extensionId} could not be reloaded.`,
+        'error',
+      );
+      return;
+    }
+    showChatNotice(
+      `Reloaded ${result.extensionId}. Client views remount automatically; chunked builds may still need a page reload.`,
+      'info',
+    );
+  });
+  $effect(() => {
+    appExtensionsState.setScope({
+      ...(projectsState.cwd ? { projectId: projectsState.cwd } : {}),
+      ...(projectsState.activeSessionId ? { sessionId: projectsState.activeSessionId } : {}),
+    });
+  });
 
   /** Tell the server which session this socket currently has in view. */
   function sendSessionFocus(focusedSessionId: string | null): void {
@@ -3520,7 +3604,7 @@
 
   // ── Model & session actions ──────────────────────────────────────────────────
 
-  function openTab(tab: 'models' | 'tools' | 'skills') {
+  function openTab(tab: 'models' | 'tools' | 'skills' | 'apps') {
     if (showRightPanel && rightPanelTab === tab) {
       showRightPanel = false;
     } else {
@@ -3529,6 +3613,264 @@
     }
     showSessionPanel = false;
     showSettingsPanel = false;
+  }
+
+  // ── App-extension slot surfaces ──────────────────────────────────────────
+  // One shared transport and scope feed every slot; each mounted ViewHost
+  // binds call/subscribe to its own extension ID with independent teardown.
+
+  /** Resolved locally pinned attachments (including disabled placeholders). */
+  const appSidebarViews = $derived(appExtensionsState.resolvePinnedSidebarViews());
+  /** Resolved primary Workspace view (undefined when no view is active). */
+  const appWorkspaceView = $derived(appExtensionsState.resolveSlotView('workspace'));
+
+  // A Workspace restored from local selection after reload still needs a shallow
+  // history entry so the first browser/mobile Back returns to Chat.
+  $effect(() => {
+    const view = appWorkspaceView;
+    if (!view || _restoringWorkspaceHistory || _suppressWorkspaceHistorySync) return;
+    if (page.state.piUiAppWorkspace === true) return;
+    const ref = appExtensionsState.activeViewForSlot('workspace');
+    if (!ref) return;
+    pushState(new URL(window.location.href), {
+      ...page.state,
+      piUiAppWorkspace: true,
+      piUiAppWorkspaceView: ref,
+    }).catch(() => {});
+  });
+
+  function openAppLauncher() {
+    if (appLauncherOpen) {
+      closeAppLauncher();
+      return;
+    }
+    const state = {
+      ...page.state,
+      piUiAppLauncher: true,
+      piUiDrawer: undefined,
+    };
+    const navigation = page.state.piUiDrawer === true
+      ? replaceState(new URL(window.location.href), state)
+      : pushState(new URL(window.location.href), state);
+    navigation.catch(() => {});
+    appLauncherOpen = true;
+    showSessionPanel = false;
+    showRightPanel = false;
+    showSettingsPanel = false;
+  }
+
+  function closeAppLauncher() {
+    const hasHistoryEntry = page.state.piUiAppLauncher === true;
+    appLauncherOpen = false;
+    if (hasHistoryEntry) history.back();
+  }
+
+  function openAppWorkspace(extensionId: string, viewId: string) {
+    const ref = { extensionId, viewId };
+    const state = {
+      ...page.state,
+      piUiAppWorkspace: true,
+      piUiAppWorkspaceView: ref,
+      piUiAppLauncher: undefined,
+      piUiDrawer: undefined,
+    };
+    const replaceCurrent = page.state.piUiAppLauncher === true || page.state.piUiDrawer === true;
+    const navigation = replaceCurrent
+      ? replaceState(new URL(window.location.href), state)
+      : pushState(new URL(window.location.href), state);
+    _suppressWorkspaceHistorySync = true;
+    navigation.catch(() => {}).finally(() => {
+      _suppressWorkspaceHistorySync = false;
+    });
+    appLauncherOpen = false;
+    appExtensionsState.setActiveViewForSlot('workspace', ref);
+    showSessionPanel = false;
+    showRightPanel = false;
+    showSettingsPanel = false;
+  }
+
+  function openAppManager() {
+    const replacingAppSurface =
+      appLauncherOpen ||
+      page.state.piUiAppLauncher === true ||
+      page.state.piUiAppWorkspace === true ||
+      page.state.piUiDrawer === true;
+    if (replacingAppSurface) {
+      const state = {
+        ...page.state,
+        piUiAppLauncher: undefined,
+        piUiAppWorkspace: undefined,
+        piUiAppWorkspaceView: undefined,
+        piUiDrawer: isMobile ? true : undefined,
+      };
+      replaceState(new URL(window.location.href), state).catch(() => {});
+      appExtensionsState.setActiveViewForSlot('workspace', null);
+    }
+    appLauncherOpen = false;
+    showRightPanel = true;
+    rightPanelTab = 'apps';
+    showSessionPanel = false;
+    showSettingsPanel = false;
+  }
+
+  function openAppExtensionView(slot: AppExtensionSlot, extensionId: string, viewId: string) {
+    if (slot === 'sidebar') {
+      toggleAppSidebarPin(extensionId, viewId);
+      return;
+    }
+    if (slot === 'workspace') {
+      openAppWorkspace(extensionId, viewId);
+      return;
+    }
+
+    if (appLauncherOpen || appWorkspaceView) {
+      const state = {
+        ...page.state,
+        piUiAppLauncher: undefined,
+        piUiAppWorkspace: undefined,
+        piUiAppWorkspaceView: undefined,
+        piUiDrawer: isMobile ? true : undefined,
+      };
+      replaceState(new URL(window.location.href), state).catch(() => {});
+      appLauncherOpen = false;
+      appExtensionsState.setActiveViewForSlot('workspace', null);
+    }
+    appExtensionsState.setActiveViewForSlot('right-panel', { extensionId, viewId });
+    showRightPanel = true;
+    rightPanelTab = 'apps';
+    showSessionPanel = false;
+    showSettingsPanel = false;
+  }
+
+  function toggleAppSidebarPin(extensionId: string, viewId: string) {
+    const pinned = appExtensionsState.toggleSidebarViewPin({ extensionId, viewId });
+    const contribution = appExtensionsState.findView(extensionId, viewId);
+    if (contribution) {
+      showChatNotice(
+        pinned
+          ? `${contribution.view.title} pinned to the Projects sidebar.`
+          : `${contribution.view.title} removed from sidebar attachments.`,
+        'info',
+      );
+    }
+  }
+
+  /** Clear one launch surface's selection. */
+  function clearAppExtensionView(slot: AppExtensionSlot) {
+    appExtensionsState.setActiveViewForSlot(slot, null);
+  }
+
+  function closeAppWorkspace() {
+    // Clear first, then pop: if the history pop is ever swallowed, delayed, or
+    // stacked behind a duplicate workspace entry, the surface still closes and
+    // every press consumes one entry — Back can never leave the app stuck open.
+    // The popstate restore reconciles from the popped state afterwards.
+    clearAppExtensionView('workspace');
+    if (page.state.piUiAppWorkspace === true) {
+      history.back();
+    }
+  }
+
+  function appSubscribeStable(
+    extensionId: string,
+    eventName: string,
+    listener: AppExtensionEventListener,
+    scope: AppExtensionScope
+  ): () => void {
+    return appExtensionTransport.subscribe(extensionId, eventName, listener, scope);
+  }
+
+  /**
+   * Submit extension-authored text as a chat prompt to the session in the
+   * view's scope. Explicit scope only — never socket focus. From a fullscreen
+   * workspace the host returns to chat so the turn stays visible.
+   */
+  const appPromptStable: AppExtensionHostPrompt = async (
+    text: string,
+    scope: AppExtensionScope
+  ): Promise<void> => {
+    const sessionId = scope.sessionId;
+    if (!sessionId) {
+      throw new Error('Chat prompts need an active session — open a chat session first.');
+    }
+    const sent = send({ type: 'prompt', sessionId, message: text });
+    if (!sent) {
+      throw new Error('Chat prompt could not be sent — the connection is closed.');
+    }
+    if (appWorkspaceView) closeAppWorkspace();
+  };
+
+  /**
+   * Replace the chat composer draft for the session in the view's scope.
+   * The draft belongs to the viewed session, so the scope session must be
+   * the active one — otherwise the text would land in another draft.
+   */
+  const appDraftStable: AppExtensionHostDraft = (text: string, scope: AppExtensionScope): void => {
+    const sessionId = scope.sessionId;
+    if (!sessionId || sessionId !== projectsState.activeSessionId) {
+      throw new Error('Composer drafts target the active session — open the session in chat first.');
+    }
+    setComposerInput(text);
+  };
+
+  /**
+   * Confirm an extension action with the host dialog. Resolves true on
+   * confirm, false on cancel/dismiss. Only one confirm at a time.
+   */
+  const appConfirmStable: AppExtensionHostConfirm = (
+    options: { title?: string; message: string; confirmLabel?: string },
+    _scope: AppExtensionScope
+  ): Promise<boolean> => {
+    if (pendingConfirmOnDismiss) {
+      return Promise.reject(new Error('A confirmation is already pending.'));
+    }
+    return new Promise((resolve) => {
+      let settled = false;
+      const settle = (value: boolean): void => {
+        if (settled) return;
+        settled = true;
+        pendingConfirmOnDismiss = null;
+        resolve(value);
+      };
+      pendingConfirmOnDismiss = () => settle(false);
+      requestConfirm(options.message, () => settle(true), {
+        title: options.title ?? 'Confirm action',
+        confirmLabel: options.confirmLabel ?? 'Confirm',
+        variant: 'info',
+      });
+    });
+  };
+
+  /** Open a project-relative file in the host file viewer. */
+  const appOpenFileStable: AppExtensionHostOpenFile = (path: string, scope: AppExtensionScope): void => {
+    const projectCwd = scope.projectId;
+    if (!projectCwd) {
+      throw new Error('File viewing needs a project scope — open a project first.');
+    }
+    openFileViewer(`${projectCwd.replace(/\/+$/, '')}/${path}`);
+  };
+
+  /** Switch chat to another session by ID. */
+  const appSwitchSessionStable: AppExtensionHostSwitchSession = (sessionId: string): void => {
+    const target = projectsState.allSessions.find((session) => session.id === sessionId);
+    if (!target) {
+      throw new Error(`Unknown session "${sessionId}".`);
+    }
+    const result = projectsState.switchSession(target.path);
+    if (result !== 'ok') {
+      throw new Error(
+        result === 'busy'
+          ? 'A session operation is already in progress — try again shortly.'
+          : 'The connection is closed — cannot switch sessions.'
+      );
+    }
+  };
+
+  function notifyAppExtension(
+    message: string,
+    kind: 'info' | 'success' | 'warning' | 'error' = 'info'
+  ): void {
+    showChatNotice(message, kind === 'warning' || kind === 'error' ? kind : 'info');
   }
 
   function openForkDialog() {
@@ -3853,8 +4195,14 @@
       return;
     }
 
-    // Escape — dismiss modal or close open panels
+    // Escape — let the launcher sheet dismiss itself before unwinding Workspace.
     if (e.key === 'Escape') {
+      if (appLauncherOpen) return;
+      if (appWorkspaceView) {
+        e.preventDefault();
+        closeAppWorkspace();
+        return;
+      }
       if (modal) return; // modal's own onkeydown handles this
       if (showSessionPanel) {
         e.preventDefault();
@@ -4635,6 +4983,10 @@
   onDestroy(() => {
     pageDestroyed = true;
     if (unsubscribeSessionCoordinator) unsubscribeSessionCoordinator();
+    unsubscribeAppExtensionCatalog();
+    unsubscribeAppExtensionToggle();
+    unsubscribeAppExtensionReload();
+    appExtensionTransport.dispose('The page was closed.');
     releaseWakeLock();
     completionController.dispose();
     notificationController.setConnectionOpen(false);
@@ -4740,6 +5092,7 @@
 <Tooltip.Provider delayDuration={400} disabled={isMobile}>
   <div
     role="presentation"
+    inert={!!appWorkspaceView}
     class="flex flex-row w-dvw h-dvh text-base-content font-mono text-base select-none overflow-hidden"
     ontouchstart={handleTouchStart}
     ontouchend={handleTouchEnd}
@@ -4797,6 +5150,20 @@
           openForkDialog();
         }}
         onRequestConfirm={requestConfirm}
+        appExtensionViews={appSidebarViews}
+        appScope={appExtensionsState.scope}
+        appCall={appExtensionTransport.call}
+        appSubscribe={appSubscribeStable}
+        appPrompt={appPromptStable}
+        appDraft={appDraftStable}
+        appConfirm={appConfirmStable}
+        appOpenFile={appOpenFileStable}
+        appSwitchSession={appSwitchSessionStable}
+        appNotify={notifyAppExtension}
+        onUnpinAppView={(extensionId, viewId) =>
+          appExtensionsState.unpinSidebarView({ extensionId, viewId })}
+        onMoveAppViewPin={(ref, targetIndex) =>
+          appExtensionsState.moveSidebarViewPin(ref, targetIndex)}
       />
     </SidebarPanel>
 
@@ -5037,6 +5404,23 @@
             </Tooltip.Trigger>
             <Tooltip.Content side="bottom">Tools</Tooltip.Content>
           </Tooltip.Root>
+          <Tooltip.Root>
+            <Tooltip.Trigger>
+              {#snippet child({ props })}
+                <button
+                  {...props}
+                  onclick={openAppLauncher}
+                  class="{isMobile ? 'h-10 w-10' : 'h-9 w-9'} flex items-center justify-center rounded-lg transition-colors {appLauncherOpen
+                    ? 'text-primary bg-primary/12'
+                    : 'text-base-content/45 hover:text-base-content/75 hover:bg-base-content/8'}"
+                  aria-label="Open apps"
+                  aria-expanded={appLauncherOpen}
+                  ><Blocks class="w-4 h-4" /></button
+                >
+              {/snippet}
+            </Tooltip.Trigger>
+            <Tooltip.Content side="bottom">Apps</Tooltip.Content>
+          </Tooltip.Root>
           {#if installReady}
             <Tooltip.Root>
               <Tooltip.Trigger>
@@ -5181,6 +5565,7 @@
           </Tooltip.Root>
         </div>
       </header>
+      <div class="flex min-h-0 flex-1 flex-col">
       <ConversationStatus
         {wsState}
         {reconnectCountdown}
@@ -6033,9 +6418,10 @@
           {/if}
         </div>
       </footer>
+      </div>
     </div>
 
-    <!-- ── RIGHT SIDEBAR: Unified panel (models / tools / skills) ─────────── -->
+    <!-- ── RIGHT SIDEBAR: Unified panel (models / tools / skills / apps) ─── -->
 
     <RightPanel
       open={showRightPanel}
@@ -6043,6 +6429,25 @@
       width={rightPanelWidth}
       resizing={rightResizing}
       tab={rightPanelTab}
+      appExtensions={appExtensionsState.extensions}
+      activeAppViews={appExtensionsState.activeViews}
+      pinnedSidebarViews={appExtensionsState.pinnedSidebarViews}
+      appScope={appExtensionsState.scope}
+      appCall={appExtensionTransport.call}
+      appSubscribe={appSubscribeStable}
+      appPrompt={appPromptStable}
+      appDraft={appDraftStable}
+      appConfirm={appConfirmStable}
+      appOpenFile={appOpenFileStable}
+      appSwitchSession={appSwitchSessionStable}
+      appSetEnabled={(extensionId, enabled) =>
+        appExtensionTransport.setEnabled(extensionId, enabled)}
+      appReload={(extensionId) => appExtensionTransport.reload(extensionId)}
+      appRefresh={() => appExtensionTransport.requestExtensions()}
+      onSelectAppView={openAppExtensionView}
+      onClearAppView={clearAppExtensionView}
+      onToggleSidebarPin={toggleAppSidebarPin}
+      onAppNotify={notifyAppExtension}
       {modelTab}
       {model}
       {modelRefreshLoading}
@@ -7178,6 +7583,34 @@
   </div>
 </Tooltip.Provider>
 
+{#if appWorkspaceView}
+  <WorkspaceSlot
+    extension={appWorkspaceView.extension}
+    view={appWorkspaceView.view}
+    scope={appExtensionsState.scope}
+    call={appExtensionTransport.call}
+    subscribe={appSubscribeStable}
+    prompt={appPromptStable}
+    draft={appDraftStable}
+    confirm={appConfirmStable}
+    openFile={appOpenFileStable}
+    switchSession={appSwitchSessionStable}
+    notify={notifyAppExtension}
+    onClose={closeAppWorkspace}
+    onOpenLauncher={openAppLauncher}
+  />
+{/if}
+
+<AppLauncherSheet
+  open={appLauncherOpen}
+  extensions={appExtensionsState.extensions}
+  pinnedSidebarViews={appExtensionsState.pinnedSidebarViews}
+  onOpenView={openAppExtensionView}
+  onToggleSidebarPin={toggleAppSidebarPin}
+  onManageApps={openAppManager}
+  onClose={closeAppLauncher}
+/>
+
 <!-- ── Restarting overlay ───────────────────────────────────────────────────── -->
 {#if isRestarting}
   <div
@@ -7284,7 +7717,13 @@
 
 <!-- ── Confirmation dialog (replaces window.confirm for delete/update/restart) ── -->
 
-<ConfirmDialog {pendingConfirm} onClose={() => (pendingConfirm = null)} />
+<ConfirmDialog
+  {pendingConfirm}
+  onClose={() => {
+    pendingConfirmOnDismiss?.();
+    pendingConfirm = null;
+  }}
+/>
 <CompactDialog bind:open={showCompactDialog} onCompact={compactSession} />
 <ProviderLoginDialog
   login={providerLoginDialog}

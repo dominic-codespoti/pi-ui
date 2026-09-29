@@ -7,6 +7,12 @@ declare global {
        * listener closes the drawer instead of leaving the app).
        */
       piUiDrawer?: boolean;
+      /** App workspace marker — Back closes the active app page before navigating away. */
+      piUiAppWorkspace?: boolean;
+      /** The workspace contribution represented by this browser history entry. */
+      piUiAppWorkspaceView?: { extensionId: string; viewId: string };
+      /** App launcher sheet marker — Back dismisses the launcher first. */
+      piUiAppLauncher?: boolean;
       /**
        * Path this app optimistically wrote into `?session=` during a switch.
        * Present means the URL is app-owned (not a user deep link), so boot

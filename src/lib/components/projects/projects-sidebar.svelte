@@ -16,11 +16,29 @@
   import ProjectRow from './project-row.svelte';
   import { projectsState, type ProjectGroup } from '#lib/state/projects-state.svelte.js';
   import type { SessionSummary } from '#lib/ws/protocol.js';
+  import type {
+    AppExtensionCall,
+    AppExtensionEventListener,
+  } from '#lib/app-extensions/transport.js';
+  import type { AppExtensionScope } from '#lib/app-extensions/types.js';
+  import type {
+    AppExtensionHostPrompt,
+    AppExtensionHostDraft,
+    AppExtensionHostConfirm,
+    AppExtensionHostOpenFile,
+    AppExtensionHostSwitchSession,
+  } from '#lib/app-extensions/client-loader.js';
+  import type {
+    AppExtensionResolvedView,
+    AppExtensionViewRef,
+  } from '#lib/state/app-extensions-state.svelte.js';
+  import ExtensionSlotHost from '#lib/components/app-extensions/extension-slot-host.svelte';
 
   import Search from '@lucide/svelte/icons/search';
   import FolderPlus from '@lucide/svelte/icons/folder-plus';
   import Pin from '@lucide/svelte/icons/pin';
   import X from '@lucide/svelte/icons/x';
+  import ChevronDown from '@lucide/svelte/icons/chevron-down';
   interface SessionRowState {
     isActive: boolean;
     isSubsessionsExpanded: boolean;
@@ -36,6 +54,18 @@
     canFork = false,
     onFork,
     onRequestConfirm = () => {},
+    appExtensionViews = [],
+    appScope = {},
+    appCall = null,
+    appSubscribe = null,
+    appPrompt = null,
+    appDraft = null,
+    appConfirm = null,
+    appOpenFile = null,
+    appSwitchSession = null,
+    appNotify = () => {},
+    onUnpinAppView = () => {},
+    onMoveAppViewPin = () => {},
   }: {
     /** Whether the panel is visible — gates tab order. */
     open: boolean;
@@ -49,6 +79,37 @@
       onConfirm: () => void,
       opts?: { title?: string; confirmLabel?: string; variant?: 'error' | 'warning' | 'info' }
     ) => void;
+    /** Locally pinned sidebar attachments; disabled apps remain visible but do not mount. */
+    appExtensionViews?: AppExtensionResolvedView[];
+    /** Current project/session scope passed to the extension view. */
+    appScope?: AppExtensionScope;
+    /** Transport-level operation call (bound to the mounted extension by the slot host). */
+    appCall?: AppExtensionCall | null;
+    /** Transport-level event subscription (bound to the mounted extension by the slot host). */
+    appSubscribe?:
+      | ((
+          extensionId: string,
+          eventName: string,
+          listener: AppExtensionEventListener,
+          scope: AppExtensionScope
+        ) => () => void)
+      | null;
+    /** Chat prompt submission for extension views (bound to the view scope by the slot host). */
+    appPrompt?: AppExtensionHostPrompt | null;
+    /** Composer draft replacement for extension views. */
+    appDraft?: AppExtensionHostDraft | null;
+    /** Host-rendered confirmation dialog for extension views. */
+    appConfirm?: AppExtensionHostConfirm | null;
+    /** Host file viewer for project-relative paths. */
+    appOpenFile?: AppExtensionHostOpenFile | null;
+    /** Chat session switch for extension views. */
+    appSwitchSession?: AppExtensionHostSwitchSession | null;
+    /** Surface an extension notice in the chat. */
+    appNotify?: (message: string, kind?: 'info' | 'success' | 'warning' | 'error') => void;
+    /** Remove one local sidebar attachment. */
+    onUnpinAppView?: (extensionId: string, viewId: string) => void;
+    /** Move one pinned attachment to a zero-based position. */
+    onMoveAppViewPin?: (ref: AppExtensionViewRef, targetIndex: number) => void;
   } = $props();
 
   const ps = projectsState;
@@ -60,6 +121,12 @@
   let renameDraft = $state('');
   /** Whether the footer "new project" picker is visible. */
   let newProjectMode = $state(false);
+  /** Only one small attachment is expanded at a time to avoid mounting hidden views. */
+  let expandedAppAttachment = $state<string | null>(null);
+
+  function attachmentKey(extensionId: string, viewId: string): string {
+    return `${extensionId}:${viewId}`;
+  }
   const pinnedGroups = $derived(ps.filteredGroups.filter((g) => g.pinned));
   const recentGroups = $derived(ps.filteredGroups.filter((g) => !g.pinned));
 
@@ -258,6 +325,94 @@
     {/if}
   </div>
 </ScrollArea>
+
+<!-- Browser-local app attachments: pin state persists, but only the expanded view mounts. -->
+{#if appExtensionViews.length > 0}
+  <section aria-label="Pinned app attachments" class="shrink-0 border-t border-base-content/10">
+    <div class="flex items-center gap-1.5 px-3 py-2 text-[10px] uppercase tracking-[0.18em] text-base-content/40">
+      <Pin class="h-3 w-3" aria-hidden="true" />
+      <span class="flex-1">attachments</span>
+      <span class="tabular-nums">{appExtensionViews.length}</span>
+    </div>
+    <div class="max-h-80 min-h-0 space-y-1 overflow-y-auto px-2 pb-2">
+      {#each appExtensionViews as attachment, index (attachmentKey(attachment.extension.id, attachment.view.id))}
+        {@const key = attachmentKey(attachment.extension.id, attachment.view.id)}
+        {@const expanded = open && expandedAppAttachment === key}
+        <article class="overflow-hidden rounded-xl border border-base-content/8 bg-base-content/[0.025]">
+          <div class="flex items-center gap-1 px-1.5 py-1">
+            <button
+              type="button"
+              class="flex min-w-0 flex-1 items-center gap-1.5 rounded-lg px-1 py-1 text-left text-xs text-base-content/70 hover:bg-base-content/5"
+              aria-expanded={expanded}
+              aria-controls="app-attachment-{key}"
+              tabindex={open ? 0 : -1}
+              onclick={() => (expandedAppAttachment = expanded ? null : key)}
+            >
+              <ChevronDown
+                class="h-3.5 w-3.5 shrink-0 transition-transform {expanded ? '' : '-rotate-90'}"
+                aria-hidden="true"
+              />
+              <span class="min-w-0 flex-1 truncate">{attachment.view.title}</span>
+              <span class="max-w-20 truncate text-[10px] text-base-content/35">{attachment.extension.name}</span>
+            </button>
+            <button
+              type="button"
+              class="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-base-content/35 hover:bg-base-content/8 hover:text-base-content/70 disabled:opacity-25"
+              aria-label="Move {attachment.view.title} attachment up"
+              disabled={index === 0}
+              tabindex={open ? 0 : -1}
+              onclick={() => onMoveAppViewPin({ extensionId: attachment.extension.id, viewId: attachment.view.id }, index - 1)}
+            >
+              <ChevronDown class="h-3.5 w-3.5 rotate-180" aria-hidden="true" />
+            </button>
+            <button
+              type="button"
+              class="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-base-content/35 hover:bg-base-content/8 hover:text-base-content/70 disabled:opacity-25"
+              aria-label="Move {attachment.view.title} attachment down"
+              disabled={index === appExtensionViews.length - 1}
+              tabindex={open ? 0 : -1}
+              onclick={() => onMoveAppViewPin({ extensionId: attachment.extension.id, viewId: attachment.view.id }, index + 1)}
+            >
+              <ChevronDown class="h-3.5 w-3.5" aria-hidden="true" />
+            </button>
+            <button
+              type="button"
+              class="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-base-content/35 hover:bg-base-content/8 hover:text-base-content/70"
+              aria-label="Unpin {attachment.view.title}"
+              tabindex={open ? 0 : -1}
+              onclick={() => onUnpinAppView(attachment.extension.id, attachment.view.id)}
+            >
+              <X class="h-3.5 w-3.5" aria-hidden="true" />
+            </button>
+          </div>
+          {#if expanded}
+            <div id="app-attachment-{key}" class="max-h-56 overflow-y-auto border-t border-base-content/6 px-1.5 py-1.5">
+              {#if attachment.extension.enabled && appCall && appSubscribe && appPrompt && appDraft && appConfirm && appOpenFile && appSwitchSession}
+                <ExtensionSlotHost
+                  extension={attachment.extension}
+                  view={attachment.view}
+                  scope={appScope}
+                  call={appCall}
+                  subscribe={appSubscribe}
+                  prompt={appPrompt}
+                  draft={appDraft}
+                  confirm={appConfirm}
+                  openFile={appOpenFile}
+                  switchSession={appSwitchSession}
+                  notify={appNotify}
+                />
+              {:else}
+                <p class="px-2 py-3 text-center text-[11px] text-base-content/40">
+                  This extension is disabled. Re-enable it in Manage apps to use this attachment.
+                </p>
+              {/if}
+            </div>
+          {/if}
+        </article>
+      {/each}
+    </div>
+  </section>
+{/if}
 
 <!-- Footer: new project -->
 <div class="shrink-0 p-3 pt-2 space-y-2 bg-gradient-to-t from-base-300/25 to-transparent">

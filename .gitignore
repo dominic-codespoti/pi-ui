@@ -36,3 +36,6 @@ Thumbs.db
 test-results/
 e2e/screenshots/
 e2e/visual-test-helper.js
+
+# Extension package-loader test scratch dirs
+.tmp-*/

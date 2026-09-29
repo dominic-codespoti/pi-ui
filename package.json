@@ -45,8 +45,6 @@
   ],
   "scripts": {
     "benchmark": "bun run benchmark.ts",
-    "generate:skill": "bun scripts/generate-extension-ui-skill.ts",
-    "check:skill": "bun scripts/generate-extension-ui-skill.ts --check",
     "dev": "vite dev",
     "dev:ws": "PI_UI_JWT_SECRET=dev-ws-only-secret HOST=127.0.0.1 PORT=5174 DEV_WS_ONLY=true bun --watch server.ts",
     "dev:full": "bun scripts/dev.ts",
@@ -67,7 +65,7 @@
     "test:e2e": "playwright test && playwright test -c playwright.live.config.ts",
     "test:e2e:fast": "playwright test --project=chromium",
     "test:e2e:live": "playwright test -c playwright.live.config.ts",
-    "test:ci": "bun run check && bun run check:sw && bun run check:server && bun run check:skill && bun run check:e2e && bun run lint && bun run test:coverage && bun run test:e2e",
+    "test:ci": "bun run check && bun run check:sw && bun run check:server && bun run check:e2e && bun run lint && bun run test:coverage && bun run test:e2e",
     "prepublishOnly": "bun run build && bun run build:server"
   },
   "dependencies": {

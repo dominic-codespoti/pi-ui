@@ -14,6 +14,7 @@ Designed to run on a Raspberry Pi, but works on any machine with Bun.
 - **Model & provider picker** — per-provider colour chips, thinking-level control
 - **Skills & prompts browser** — browse and inject skills/prompts; install from GitHub URLs
 - **Tool control** — enable/disable individual tools per session
+- **App extensions** — installation-wide trusted views and shared server operations ([authoring guide](docs/app-extensions.md))
 - **Extension UI** — `select`, `confirm`, `input`, and `editor` dialogs forwarded to the browser
 - **Diffs & file links** — inline unified-diff viewer and clickable workspace file references
 - **Syntax highlighting** — tool output and code blocks highlighted via `highlight.js`

@@ -738,6 +738,79 @@ export const ExtensionsListSchema = v.looseObject({
   sessionId: v.optional(v.string()),
 });
 
+export const AppExtensionScopeSchema = v.looseObject({
+  projectId: v.optional(v.string()),
+  sessionId: v.optional(v.string()),
+});
+
+export const AppExtensionViewContributionSchema = v.looseObject({
+  id: v.string(),
+  title: v.string(),
+  slot: v.union([
+    v.literal('sidebar'),
+    v.literal('right-panel'),
+    v.literal('workspace'),
+  ]),
+  icon: v.optional(v.string()),
+  order: v.optional(v.number()),
+});
+
+export const AppExtensionSummarySchema = v.looseObject({
+  id: v.string(),
+  name: v.string(),
+  version: v.string(),
+  description: v.optional(v.string()),
+  enabled: v.boolean(),
+  clientUrl: v.optional(v.string()),
+  views: v.array(AppExtensionViewContributionSchema),
+});
+
+export const AppExtensionsListSchema = v.looseObject({
+  type: v.literal('app_extensions_list'),
+  extensions: v.array(AppExtensionSummarySchema),
+});
+
+export const AppExtensionResultSchema = v.looseObject({
+  type: v.literal('app_extension_result'),
+  callId: v.string(),
+  extensionId: v.string(),
+  ok: v.boolean(),
+  // Deliberately unvalidated: extension result payloads are arbitrary JSON.
+  result: v.optional(v.unknown()),
+  error: v.optional(v.string()),
+});
+
+export const AppExtensionEventSchema = v.looseObject({
+  type: v.literal('app_extension_event'),
+  extensionId: v.string(),
+  eventName: v.string(),
+  // Deliberately unvalidated: extension event payloads are arbitrary JSON.
+  data: v.optional(v.unknown()),
+  scope: v.optional(AppExtensionScopeSchema),
+});
+
+export const AppExtensionSubscriptionResultSchema = v.looseObject({
+  type: v.literal('app_extension_subscription_result'),
+  subscriptionId: v.string(),
+  extensionId: v.string(),
+  ok: v.boolean(),
+  error: v.optional(v.string()),
+});
+
+export const AppExtensionToggleResultSchema = v.looseObject({
+  type: v.literal('app_extension_toggle_result'),
+  extensionId: v.string(),
+  enabled: v.boolean(),
+  ok: v.boolean(),
+  error: v.optional(v.string()),
+});
+export const AppExtensionReloadResultSchema = v.looseObject({
+  type: v.literal('app_extension_reload_result'),
+  extensionId: v.string(),
+  ok: v.boolean(),
+  error: v.optional(v.string()),
+});
+
 export const PackagesListSchema = v.looseObject({
   type: v.literal('packages_list'),
   packages: v.array(
@@ -1084,6 +1157,12 @@ export const customEventSchemas = {
   project_trust: ProjectTrustSchema,
   runtime_diagnostics: RuntimeDiagnosticsSchema,
   extensions_list: ExtensionsListSchema,
+  app_extensions_list: AppExtensionsListSchema,
+  app_extension_result: AppExtensionResultSchema,
+  app_extension_event: AppExtensionEventSchema,
+  app_extension_subscription_result: AppExtensionSubscriptionResultSchema,
+  app_extension_toggle_result: AppExtensionToggleResultSchema,
+  app_extension_reload_result: AppExtensionReloadResultSchema,
   packages_list: PackagesListSchema,
   session_stats: SessionStatsEventSchema,
   update_status: UpdateStatusEventSchema,

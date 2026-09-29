@@ -456,6 +456,109 @@ describe('server-message-schema', () => {
     }
   });
 
+  it('parses valid app extension messages as typed custom events', () => {
+    const list = parseServerMessage({
+      type: 'app_extensions_list',
+      extensions: [
+        {
+          id: 'notes',
+          name: 'Notes',
+          version: '1.0.0',
+          enabled: true,
+          views: [
+            { id: 'notes-main', title: 'Notes', slot: 'sidebar' },
+            { id: 'notes-workspace', title: 'Notes workspace', slot: 'workspace' },
+          ],
+        },
+      ],
+    });
+    expect(list).toMatchObject({ ok: true, kind: 'custom' });
+    if (list.ok) expect(list.value.type).toBe('app_extensions_list');
+
+    expect(
+      parseServerMessage({
+        type: 'app_extension_result',
+        callId: 'call-1',
+        extensionId: 'notes',
+        ok: true,
+        result: { notes: [{ id: 'n1' }], nested: { deep: [1, 2, 3] } },
+      })
+    ).toMatchObject({ ok: true, kind: 'custom' });
+
+    expect(
+      parseServerMessage({
+        type: 'app_extension_result',
+        callId: 'call-2',
+        extensionId: 'notes',
+        ok: false,
+        error: 'operation "write" not found',
+      })
+    ).toMatchObject({ ok: true, kind: 'custom' });
+
+    expect(
+      parseServerMessage({
+        type: 'app_extension_subscription_result',
+        subscriptionId: 'sub-1',
+        extensionId: 'notes',
+        ok: false,
+        error: 'unknown event',
+      })
+    ).toMatchObject({ ok: true, kind: 'custom' });
+
+    expect(
+      parseServerMessage({
+        type: 'app_extension_event',
+        extensionId: 'notes',
+        eventName: 'notes-changed',
+        data: { count: 3 },
+        scope: { projectId: 'proj-1' },
+      })
+    ).toMatchObject({ ok: true, kind: 'custom' });
+
+  });
+
+  it('rejects malformed app extension envelopes', () => {
+    // result missing callId
+    expect(
+      parseServerMessage({ type: 'app_extension_result', extensionId: 'notes', ok: true })
+        .ok
+    ).toBe(false);
+    // result with wrong ok type
+    expect(
+      parseServerMessage({
+        type: 'app_extension_result',
+        callId: 'call-1',
+        extensionId: 'notes',
+        ok: 'yes',
+      }).ok
+    ).toBe(false);
+    // subscription result missing subscriptionId
+    expect(
+      parseServerMessage({
+        type: 'app_extension_subscription_result',
+        extensionId: 'notes',
+        ok: false,
+      }).ok
+    ).toBe(false);
+    // event missing extensionId
+    expect(parseServerMessage({ type: 'app_extension_event', eventName: 'x' }).ok).toBe(false);
+    // event with wrong eventName type
+    expect(
+      parseServerMessage({
+        type: 'app_extension_event',
+        extensionId: 'notes',
+        eventName: 42,
+      }).ok
+    ).toBe(false);
+    // list with malformed extension entry
+    expect(
+      parseServerMessage({
+        type: 'app_extensions_list',
+        extensions: [{ id: 'notes' }],
+      }).ok
+    ).toBe(false);
+  });
+
   describe('exported schemas direct use', () => {
     it('ConnectedMessageSchema validates a handshake payload', () => {
       const res = v.safeParse(ConnectedMessageSchema, {

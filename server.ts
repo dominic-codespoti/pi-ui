@@ -33,8 +33,8 @@ import {
   uploadPreparedBugReport,
 } from './src/lib/server/slash-command-catalog.ts';
 import type { AutocompleteProvider } from '@earendil-works/pi-tui';
-import { rm, mkdir, writeFile, mkdtemp } from 'node:fs/promises';
-import { join, resolve, basename, sep, dirname } from 'node:path';
+import { rm, mkdir, writeFile, mkdtemp, readFile, stat } from 'node:fs/promises';
+import { join, resolve, basename, sep, dirname, extname } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import {
@@ -77,7 +77,6 @@ import {
   setLastSession,
   updateSettings,
 } from './src/lib/server/ui-settings.ts';
-import { BUNDLED_SKILL_NAME, bundledSkillPaths } from './src/lib/server/bundled-resources.ts';
 import { log } from './src/lib/server/logger.ts';
 import { terminalInputRegistry } from './src/lib/server/terminal-input.ts';
 import { summarizeResources } from './src/lib/server/resources-summary.ts';
@@ -115,6 +114,17 @@ import {
   dispatchExtensionUiMessage,
   type ExtensionUiHandlerDependencies,
 } from './src/lib/server/handlers/extension-ui-handlers.ts';
+import {
+  appExtensionEventRecipients,
+  cancelAppExtensionCallsForSocket,
+  dispatchAppExtensionMessage,
+  resolveAppExtensionScope,
+  type AppExtensionHandlerDependencies,
+} from './src/lib/server/handlers/app-extension-handlers.ts';
+import { AppExtensionHost } from './src/lib/server/app-extensions/host.ts';
+import { buildSdkAppExtensionTools } from './src/lib/server/app-extensions/sdk-tools.ts';
+import { createAppExtensionExecutionContext } from './src/lib/server/app-extensions/context.ts';
+import type { AppExtensionCallContext, AppExtensionExecutionContext } from './src/lib/app-extensions/types.ts';
 import { navigateTree, setEntryLabel } from './src/lib/server/handlers/tree-handlers.ts';
 import { getSdkSettings, setSdkSetting } from './src/lib/server/handlers/sdk-settings-handlers.ts';
 import {
@@ -183,10 +193,6 @@ import {
 import ownPkgJson from './package.json' with { type: 'json' };
 
 const APP_ROOT = dirname(fileURLToPath(import.meta.url));
-const BUNDLED_SKILL_PATHS = bundledSkillPaths(APP_ROOT);
-if (BUNDLED_SKILL_PATHS.length === 0) {
-  log.warn(`[pifrontier] Bundled skill '${BUNDLED_SKILL_NAME}' is missing.`);
-}
 
 /** pi-ui version baked in at startup. */
 const UI_VERSION: string = (ownPkgJson as { version: string }).version;
@@ -1107,7 +1113,6 @@ function flushInteractiveRender(id: string): void {
   extensionRuntime.flushInteractiveRender(id, (component) => renderTerminalLines(component));
 }
 
-// Behavior changes here must be reflected in src/lib/extension-ui-capabilities/catalog.ts; then run `bun run generate:skill`.
 type ServerExtensionUIContext = Omit<
   ExtensionUIContext,
   | 'getEditorText'
@@ -2666,6 +2671,154 @@ const projectCatalog = new ProjectCatalog(sessionCatalog);
 
 projectCatalog.onChange(() => scheduleProjectsRefresh());
 
+// App extensions are installation-scoped trusted code. Package manifests are
+// scanned without importing code; persisted packages are imported only through
+// the explicit enable path in AppExtensionHost.init()/setEnabled().
+let appExtensionHost: AppExtensionHost | null = null;
+let appExtensionHostPromise: Promise<AppExtensionHost> | null = null;
+
+async function ensureAppExtensionHost(): Promise<AppExtensionHost> {
+  if (appExtensionHost) return appExtensionHost;
+  if (!appExtensionHostPromise) {
+    const init = (async () => {
+      const sdk = await getSDK();
+      const agentDir = sdk.getAgentDir();
+      const host = new AppExtensionHost({
+        extensionsRoot: join(agentDir, 'app-extensions'),
+        dataRoot: agentDir,
+        onDiagnostic: (diagnostic) =>
+          log.warn(`[pifrontier] app extension ${diagnostic.code}: ${diagnostic.message}`),
+      });
+      await host.init();
+      return host;
+    })();
+    appExtensionHostPromise = init;
+  }
+  try {
+    appExtensionHost = await appExtensionHostPromise;
+    return appExtensionHost;
+  } catch (err) {
+    appExtensionHostPromise = null;
+    throw err;
+  }
+}
+
+function broadcastAppExtensionEvent(
+  extensionId: string,
+  eventName: string,
+  data: unknown,
+  scope: import('./src/lib/app-extensions/types.ts').AppExtensionScope,
+): void {
+  const frame = { type: 'app_extension_event', extensionId, eventName, data, scope } as const;
+  try {
+    const encoded = JSON.stringify(frame);
+    const bytes = Buffer.byteLength(encoded, 'utf8');
+    if (bytes > 128 * 1024) {
+      log.warn(`[pifrontier] dropped oversized app extension event ${extensionId}:${eventName} (${bytes} bytes)`);
+      return;
+    }
+    for (const socket of appExtensionEventRecipients(extensionId, eventName, scope)) {
+      try {
+        socket.send(encoded);
+      } catch (err) {
+        log.warn(`[pifrontier] could not deliver app extension event ${extensionId}:${eventName}`, err);
+      }
+    }
+  } catch (err) {
+    log.warn(`[pifrontier] dropped unserializable app extension event ${extensionId}:${eventName}`, err);
+  }
+}
+
+async function createAppExtensionOperationContext(args: {
+  extensionId: string;
+  operationId: string;
+  scope: import('./src/lib/app-extensions/types.ts').AppExtensionScope;
+  caller: AppExtensionCallContext['caller'];
+  signal?: AbortSignal;
+}): Promise<AppExtensionExecutionContext> {
+  const [host, sdk] = await Promise.all([ensureAppExtensionHost(), getSDK()]);
+  const declared = host.operations(args.extensionId).find((operation) => operation.id === args.operationId);
+  if (!declared) throw new Error(`unknown app extension operation ${args.extensionId}:${args.operationId}`);
+  const scopeDeps = { runtime: host, projectCatalog, sessionCatalog };
+  const resolved = await resolveAppExtensionScope(declared, args.scope, scopeDeps, args.caller);
+  return createAppExtensionExecutionContext({
+    extensionId: args.extensionId,
+    scope: resolved.scope,
+    caller: resolved.caller,
+    ...(args.signal ? { signal: args.signal } : {}),
+    resolveProjectRoot: (projectId) => {
+      if (!resolved.scope.projectId || projectId !== resolved.scope.projectId) {
+        throw new Error(`projectId ${JSON.stringify(projectId)} is outside this operation's validated scope`);
+      }
+      return projectId;
+    },
+    extensionDataRoot: join(sdk.getAgentDir(), 'app-extension-data'),
+    capabilities: host.capabilities(args.extensionId),
+    getSessionMessages: async (sessionId: string) => {
+      if (!resolved.scope.sessionId || sessionId !== resolved.scope.sessionId) {
+        throw new Error(`session ${JSON.stringify(sessionId)} is outside this operation's validated scope`);
+      }
+      const entry = residentStore.get(sessionId);
+      const messages = entry?.session.messages;
+      if (!entry || !Array.isArray(messages)) {
+        throw new Error(`session "${sessionId}" is not resident — open it in chat first`);
+      }
+      return messages as unknown[];
+    },
+    listProjects: async () =>
+      (await projectCatalog.list()).map((project) => ({ cwd: project.cwd, name: project.name })),
+    listSessions: async () =>
+      (await sessionCatalog.list()).map((session) => ({
+        id: session.id,
+        cwd: session.cwd,
+        ...(session.name !== undefined ? { name: session.name } : {}),
+        messageCount: session.messageCount,
+      })),
+    emit: (id, eventName, data, eventScope) => {
+      if (!host.eventNames(id).includes(eventName)) {
+        throw new Error(`event "${eventName}" is not declared by app extension "${id}"`);
+      }
+      broadcastAppExtensionEvent(id, eventName, data, eventScope);
+    },
+  });
+}
+
+function appExtensionHandlerDependenciesFor(host: AppExtensionHost): AppExtensionHandlerDependencies {
+  return {
+    runtime: host,
+    projectCatalog,
+    sessionCatalog,
+    eventNames: (extensionId) => host.eventNames(extensionId),
+    clientUrl: (extensionId) => {
+      try {
+        const clientPath = host.clientEntryRelativePath(extensionId)
+          .split('/')
+          .map((segment) => encodeURIComponent(segment))
+          .join('/');
+        const version = host.get(extensionId)?.version ?? '0';
+        // Fingerprint the client entry bytes so an edited client remounts with
+        // fresh code after Reload without a manifest version bump or page reload.
+        // Assets serve with `no-store`, but the browser ES module map keys on URL.
+        let fingerprint = '';
+        try {
+          const entryStat = statSync(host.clientEntryPath(extensionId));
+          fingerprint = `&t=${Math.floor(entryStat.mtimeMs)}-${entryStat.size}`;
+        } catch {
+          // Keep the version-only URL when the entry cannot be stat'ed.
+        }
+        return `/extensions/${encodeURIComponent(extensionId)}/${clientPath}?v=${encodeURIComponent(version)}${fingerprint}`;
+      } catch {
+        return undefined;
+      }
+    },
+    createExecutionContext: createAppExtensionOperationContext,
+    refresh: () => host.refresh(),
+    setEnabled: (extensionId, enabled) => host.setEnabled(extensionId, enabled),
+    reload: (extensionId) => host.reload(extensionId),
+    logError: (...args) => log.error(...args),
+  };
+}
+
 /** The selected AgentSession (throws if none). */
 function activeSession(): AgentSession {
   const entry = activeSessionOrNullEntry();
@@ -2765,6 +2918,24 @@ async function createSdkSession(
 ): Promise<CreatedSdkSession> {
   const tCreate = Date.now();
   const sdk = await getSDK();
+  let appCustomTools: ReturnType<typeof buildSdkAppExtensionTools> = [];
+  let appToolDiagnostic: string | undefined;
+  try {
+    const host = await ensureAppExtensionHost();
+    appCustomTools = buildSdkAppExtensionTools(host.innerRuntime, {
+      createContext: ({ extensionId, operationId, scope, sessionId, signal }) =>
+        createAppExtensionOperationContext({
+          extensionId,
+          operationId,
+          scope,
+          caller: sessionId ? { kind: 'agent', sessionId } : { kind: 'agent' },
+          ...(signal ? { signal } : {}),
+        }),
+    });
+  } catch (err) {
+    appToolDiagnostic = `App extension agent tools unavailable: ${err instanceof Error ? err.message : String(err)}`;
+    log.warn(`[pifrontier] ${appToolDiagnostic}`);
+  }
   const settingsManager = sdk.SettingsManager.create(targetCwd, sdk.getAgentDir(), {
     projectTrusted: false,
   });
@@ -2773,7 +2944,6 @@ async function createSdkSession(
     agentDir: sdk.getAgentDir(),
     extensionFlagValues: extensionFlagValuesFor(),
     resourceLoaderOptions: {
-      additionalSkillPaths: BUNDLED_SKILL_PATHS,
       extensionFactories: await getBuiltInExtensions(),
     },
     resourceLoaderReloadOptions: {
@@ -2783,6 +2953,7 @@ async function createSdkSession(
   const result = await sdk.createAgentSessionFromServices({
     services,
     sessionManager,
+    customTools: appCustomTools,
     ...(options?.model !== undefined ? { model: options.model } : {}),
     sessionStartEvent: {
       type: 'session_start',
@@ -2791,6 +2962,7 @@ async function createSdkSession(
     },
   });
   const diagnostics: RuntimeDiagnostic[] = [...services.diagnostics];
+  if (appToolDiagnostic) diagnostics.push({ type: 'warning', message: appToolDiagnostic });
   const enabledModels = settingsManager.getEnabledModels();
   if (enabledModels?.length) {
     try {
@@ -4088,6 +4260,23 @@ const WS_TOPIC = 'pi';
  * self-contained (assets from same origin; images may be remote https/http
  * or data: URIs for pasted pictures; the microphone is used for STT).
  */
+const APP_EXTENSION_ASSET_CONTENT_TYPES: Record<string, string> = {
+  '.js': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.gif': 'image/gif',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+  '.ttf': 'font/ttf',
+  '.wasm': 'application/wasm',
+};
+
 const SECURITY_HEADERS: Record<string, string> = {
   'Content-Security-Policy':
     "default-src 'self'; " +
@@ -4313,6 +4502,63 @@ try {
           status: 400,
           headers: securityHeaders(isTls),
         });
+      }
+
+      if (url.pathname.startsWith('/extensions/')) {
+        if (req.method !== 'GET' && req.method !== 'HEAD') {
+          return new Response('Method not allowed', {
+            status: 405,
+            headers: securityHeaders(isTls),
+          });
+        }
+        const cookieHeader = req.headers.get('cookie') ?? '';
+        if (!(await isValidSessionCookie(cookieHeader))) {
+          return new Response('Unauthorized', { status: 401, headers: securityHeaders(isTls) });
+        }
+        const parts = url.pathname.slice('/extensions/'.length).split('/');
+        let decoded: string[];
+        try {
+          decoded = parts.map((part) => decodeURIComponent(part));
+        } catch {
+          return new Response('Invalid extension asset path', {
+            status: 400,
+            headers: securityHeaders(isTls),
+          });
+        }
+        const extensionId = decoded.shift();
+        const relativeAssetPath = decoded.join('/');
+        if (!extensionId || !relativeAssetPath) {
+          return new Response('Not found', { status: 404, headers: securityHeaders(isTls) });
+        }
+        try {
+          const host = await ensureAppExtensionHost();
+          const assetPath = host.clientAssetPath(extensionId, relativeAssetPath);
+          const info = await stat(assetPath);
+          if (!info.isFile()) {
+            return new Response('Not found', { status: 404, headers: securityHeaders(isTls) });
+          }
+          if (info.size > 25 * 1024 * 1024) {
+            return new Response('Extension asset too large', {
+              status: 413,
+              headers: securityHeaders(isTls),
+            });
+          }
+          const headers = securityHeaders(isTls);
+          headers.set(
+            'Content-Type',
+            APP_EXTENSION_ASSET_CONTENT_TYPES[extname(assetPath).toLowerCase()] ??
+              'application/octet-stream'
+          );
+          headers.set('Cache-Control', 'no-store');
+          headers.set('X-Content-Type-Options', 'nosniff');
+          return new Response(req.method === 'HEAD' ? null : await readFile(assetPath), {
+            status: 200,
+            headers,
+          });
+        } catch (err) {
+          log.warn(`[pifrontier] app extension asset unavailable: ${extensionId}`, err);
+          return new Response('Not found', { status: 404, headers: securityHeaders(isTls) });
+        }
       }
 
       const res = DEV_WS_ONLY
@@ -6834,6 +7080,25 @@ try {
             }
             default: {
               if (
+                msg.type === 'get_app_extensions' ||
+                msg.type === 'app_extension_call' ||
+                msg.type === 'app_extension_cancel' ||
+                msg.type === 'set_app_extension_enabled' ||
+                msg.type === 'reload_app_extension' ||
+                msg.type === 'app_extension_subscribe' ||
+                msg.type === 'app_extension_unsubscribe'
+              ) {
+                const appHost = await ensureAppExtensionHost();
+                if (
+                  await dispatchAppExtensionMessage(
+                    msg,
+                    ws,
+                    appExtensionHandlerDependenciesFor(appHost)
+                  )
+                )
+                  break;
+              }
+              if (
                 await dispatchExtensionUiMessage(
                   msg,
                   { data: ws.data, send: (data) => ws.send(data) },
@@ -6858,6 +7123,7 @@ try {
       },
 
       close(ws) {
+        cancelAppExtensionCallsForSocket(ws);
         cancelProviderLoginsForSocket(ws.data);
         wsTransport.onClose(ws);
       },
