@@ -1760,11 +1760,13 @@
       appExtensionTransport.requestExtensions();
     }
     if (appExtensionTransport.handle(parsed)) return;
+    if (settlePromptResult(parsed)) return;
     handleServer(parsed);
   }
 
   function cleanupSocketLifecycle(): void {
     appExtensionTransport.failPending('The connection was closed.');
+    failPendingPrompts('The connection was closed.');
     pendingUploads.clear();
     olderMessagesLoading = false;
     modelRefreshLoading = false;
@@ -3785,19 +3787,89 @@
    * view's scope. Explicit scope only — never socket focus. From a fullscreen
    * workspace the host returns to chat so the turn stays visible.
    */
-  const appPromptStable: AppExtensionHostPrompt = async (
+  /** Outstanding extension prompt submits, keyed by requestId (see `prompt_result`). */
+  const pendingPrompts = new Map<
+    string,
+    { resolve: () => void; reject: (err: Error) => void; timer: ReturnType<typeof setTimeout> }
+  >();
+
+  /** Settle an extension prompt from a targeted server frame; true when consumed. */
+  function settlePromptResult(message: ServerMessage): boolean {
+    // Structural reads: the caller passes ServerMessage & Record, which
+    // defeats discriminated-union narrowing.
+    const frame = message as {
+      type: string;
+      requestId?: unknown;
+      ok?: unknown;
+      error?: unknown;
+      message?: unknown;
+    };
+    if (frame.type !== 'prompt_result' && frame.type !== 'sessions_error') return false;
+    if (typeof frame.requestId !== 'string') return false;
+    const pending = pendingPrompts.get(frame.requestId);
+    if (!pending) return false;
+    clearTimeout(pending.timer);
+    pendingPrompts.delete(frame.requestId);
+    if (frame.type === 'prompt_result') {
+      if (frame.ok === true) pending.resolve();
+      else {
+        pending.reject(
+          new Error(
+            typeof frame.error === 'string' && frame.error
+              ? frame.error
+              : 'Chat prompt was rejected.'
+          )
+        );
+      }
+    } else {
+      pending.reject(
+        new Error(
+          typeof frame.message === 'string' && frame.message
+            ? frame.message
+            : 'Session is not resident.'
+        )
+      );
+    }
+    return true;
+  }
+
+  function failPendingPrompts(reason: string): void {
+    for (const [requestId, pending] of pendingPrompts) {
+      clearTimeout(pending.timer);
+      pendingPrompts.delete(requestId);
+      pending.reject(new Error(reason));
+    }
+  }
+
+  const appPromptStable: AppExtensionHostPrompt = (
     text: string,
     scope: AppExtensionScope
   ): Promise<void> => {
     const sessionId = scope.sessionId;
     if (!sessionId) {
-      throw new Error('Chat prompts need an active session — open a chat session first.');
+      return Promise.reject(new Error('Chat prompts need an active session — open a chat session first.'));
     }
-    const sent = send({ type: 'prompt', sessionId, message: text });
-    if (!sent) {
-      throw new Error('Chat prompt could not be sent — the connection is closed.');
-    }
-    if (appWorkspaceView) closeAppWorkspace();
+    const requestId = projectsState.nextRequestId();
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pendingPrompts.delete(requestId);
+        reject(new Error('Chat prompt timed out — the server did not acknowledge it.'));
+      }, 15_000);
+      pendingPrompts.set(requestId, { resolve, reject, timer });
+      let sent = false;
+      try {
+        sent = send({ type: 'prompt', sessionId, message: text, requestId });
+      } catch {
+        sent = false;
+      }
+      if (!sent) {
+        clearTimeout(timer);
+        pendingPrompts.delete(requestId);
+        reject(new Error('Chat prompt could not be sent — the connection is closed.'));
+        return;
+      }
+      if (appWorkspaceView) closeAppWorkspace();
+    });
   };
 
   /**

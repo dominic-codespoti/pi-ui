@@ -955,6 +955,15 @@ export const AgentErrorSchema = v.looseObject({
   dedupeKey: v.optional(v.string()),
 });
 
+export const PromptResultSchema = v.looseObject({
+  type: v.literal('prompt_result'),
+  requestId: v.string(),
+  sessionId: v.string(),
+  ok: v.boolean(),
+  error: v.optional(v.string()),
+  disposition: v.optional(v.picklist(['started', 'queued', 'steered'])),
+});
+
 export const QueueRestoredSchema = v.looseObject({
   type: v.literal('queue_restored'),
   text: v.string(),
@@ -1114,6 +1123,7 @@ export const customEventSchemas = {
   extension_completions: ExtensionCompletionsSchema,
   pong: PongSchema,
   agent_error: AgentErrorSchema,
+  prompt_result: PromptResultSchema,
   queue_restored: QueueRestoredSchema,
   extension_ui_state: ExtensionUiStateSchema,
   extension_ui_cancel: ExtensionUiCancelSchema,

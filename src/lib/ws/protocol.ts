@@ -859,6 +859,16 @@ export type ServerCustomEvent =
   | { type: 'extension_ui_cancel'; id: string; sessionId?: string; reason: 'timeout' | 'aborted' }
   | { type: 'pong' }
   | { type: 'agent_error'; error: string; sessionId?: string; dedupeKey?: string }
+  | {
+      /** Targeted accept/reject for a `prompt` carrying `requestId` (extension submits). */
+      type: 'prompt_result';
+      requestId: string;
+      sessionId: string;
+      ok: boolean;
+      error?: string;
+      /** How the prompt was accepted; absent unless ok. */
+      disposition?: 'started' | 'queued' | 'steered';
+    }
   | { type: 'queue_restored'; text: string }
   | {
       type: 'session_runtime';
@@ -989,6 +999,8 @@ export type ClientMessage =
       message: string;
       images?: Array<{ data: string; mimeType: string }>;
       streamingBehavior?: 'steer' | 'followUp';
+      /** When present, the server replies with a targeted `prompt_result`. */
+      requestId?: string;
     }
   | {
       type: 'steer';

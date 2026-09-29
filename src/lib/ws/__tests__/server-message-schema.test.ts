@@ -515,6 +515,26 @@ describe('server-message-schema', () => {
       })
     ).toMatchObject({ ok: true, kind: 'custom' });
 
+    expect(
+      parseServerMessage({
+        type: 'prompt_result',
+        requestId: 'req-1',
+        sessionId: 'sess-1',
+        ok: true,
+        disposition: 'queued',
+      })
+    ).toMatchObject({ ok: true, kind: 'custom' });
+
+    expect(
+      parseServerMessage({
+        type: 'prompt_result',
+        requestId: 'req-2',
+        sessionId: 'sess-1',
+        ok: false,
+        error: 'Prompt already in progress on another tab.',
+      })
+    ).toMatchObject({ ok: true, kind: 'custom' });
+
   });
 
   it('rejects malformed app extension envelopes', () => {
@@ -542,6 +562,18 @@ describe('server-message-schema', () => {
     ).toBe(false);
     // event missing extensionId
     expect(parseServerMessage({ type: 'app_extension_event', eventName: 'x' }).ok).toBe(false);
+    // prompt_result missing requestId
+    expect(parseServerMessage({ type: 'prompt_result', sessionId: 's', ok: true }).ok).toBe(false);
+    // prompt_result with unknown disposition
+    expect(
+      parseServerMessage({
+        type: 'prompt_result',
+        requestId: 'r',
+        sessionId: 's',
+        ok: true,
+        disposition: 'teleported',
+      }).ok
+    ).toBe(false);
     // event with wrong eventName type
     expect(
       parseServerMessage({

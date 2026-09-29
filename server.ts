@@ -4723,6 +4723,30 @@ try {
               if (!target) break;
               const targetSession = target.session;
               const targetGeneration = target.generation;
+              // Targeted accept/reject for requesters that passed `requestId`
+              // (extension submits). Fire-and-forget otherwise — no new frames.
+              // Acks precede the awaits below: invokeRun/s.prompt resolve at
+              // turn end, but acceptance is known at dispatch.
+              const promptRequestId = typeof msg.requestId === 'string' ? msg.requestId : undefined;
+              const ackPrompt = (
+                ok: boolean,
+                extra?: { error?: string; disposition?: 'started' | 'queued' | 'steered' }
+              ): void => {
+                if (promptRequestId === undefined) return;
+                try {
+                  ws.send(
+                    JSON.stringify({
+                      type: 'prompt_result',
+                      requestId: promptRequestId,
+                      sessionId: targetSession.sessionId,
+                      ok,
+                      ...extra,
+                    })
+                  );
+                } catch {
+                  // ws may be closed; the requester-side timeout handles it
+                }
+              };
               await residentStore.withSessionLock(targetSession.sessionId, async () => {
                 try {
                   const s = targetSession;
@@ -4734,6 +4758,7 @@ try {
                         error: 'Session is no longer current.',
                       })
                     );
+                    ackPrompt(false, { error: 'Session is no longer current.' });
                     return;
                   }
                   const imageContent = msg.images?.length
@@ -4757,8 +4782,10 @@ try {
                           error: 'Streaming input requires a steer or follow-up mode.',
                         })
                       );
+                      ackPrompt(false, { error: 'Streaming input requires a steer or follow-up mode.' });
                       return;
                     }
+                    ackPrompt(true, { disposition: 'started' });
                     await s.prompt(msg.message, options);
                     return;
                   }
@@ -4769,6 +4796,7 @@ try {
                         error: 'Prompt already in progress on another tab.',
                       })
                     );
+                    ackPrompt(false, { error: 'Prompt already in progress on another tab.' });
                     return;
                   }
                   if (
@@ -4785,12 +4813,15 @@ try {
                       message: msg.message,
                       ...(imageContent ? { images: imageContent } : {}),
                     });
+                    ackPrompt(true, { disposition: 'queued' });
                     return;
                   }
+                  ackPrompt(true, { disposition: 'started' });
                   await invokeRun(target, msg.message, imageContent);
                 } catch (err) {
                   log.error('[pifrontier] prompt error:', err);
                   ws.send(JSON.stringify({ type: 'agent_error', error: String(err) }));
+                  ackPrompt(false, { error: String(err) });
                 }
               });
               break;
