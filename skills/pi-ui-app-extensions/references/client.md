@@ -57,6 +57,11 @@ The client API intentionally exposes no filesystem or process primitives.
 
 All four act on the visible UI, so call them only from explicit user gestures and surface rejections.
 
+## Transport budgets
+
+- Operation inputs are capped at 64 KiB JSON-encoded; larger payloads are rejected before dispatch. Keep inputs narrow.
+- Calls are rate-limited per connection (120/min, sliding window) on top of the 32-concurrent cap. A rejected burst returns a retryable error — back off instead of retrying in a tight loop.
+
 ## Browser constraints
 
 - Build the browser module as browser-compatible ESM. Relative ESM chunks may be imported; other assets in the same public directory load with normal browser APIs. Prefer a single-file client: its catalog URL is fingerprinted, so **Reload** remounts it with fresh code. With chunked builds, sibling chunk URLs are unchanged and the browser reuses their cached modules — those need a page reload.

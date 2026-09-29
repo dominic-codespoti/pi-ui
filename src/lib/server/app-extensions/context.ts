@@ -78,6 +78,9 @@ export const APP_EXTENSION_CLI_DEFAULT_MAX_OUTPUT_BYTES = 64 * 1024;
 /** Serialized JSON storage values are capped so the store stays small. */
 export const APP_EXTENSION_STORAGE_MAX_VALUE_BYTES = 1024 * 1024;
 
+/** Key count per extension is capped so the store cannot grow without bound. */
+export const APP_EXTENSION_STORAGE_MAX_KEYS = 256;
+
 /** Storage keys (and extension IDs) are capped at this length. */
 export const APP_EXTENSION_STORAGE_MAX_KEY_LENGTH = 128;
 
@@ -807,6 +810,39 @@ export function createAppExtensionExecutionContext(
 
       set: async (key: string, value: unknown): Promise<void> => {
         const target = storagePathFor(key);
+        const exists = await fs.stat(target).then(
+          () => true,
+          (err: unknown) => {
+            if (isEnoent(err)) return false;
+            throw new AppExtensionContextError(
+              'storage-error',
+              `failed to access storage key ${JSON.stringify(key)} for extension "${extensionId}"`,
+              { cause: err }
+            );
+          }
+        );
+        if (!exists) {
+          let names: Array<{ name: string }>;
+          try {
+            names = await fs.readdir(storageDir(), { withFileTypes: true });
+          } catch (err) {
+            if (!isEnoent(err)) {
+              throw new AppExtensionContextError(
+                'storage-error',
+                `failed to list storage for extension "${extensionId}"`,
+                { cause: err }
+              );
+            }
+            names = [];
+          }
+          const used = names.filter((entry) => entry.name.endsWith('.json')).length;
+          if (used >= APP_EXTENSION_STORAGE_MAX_KEYS) {
+            throw new AppExtensionContextError(
+              'too-large',
+              `storage key limit (${APP_EXTENSION_STORAGE_MAX_KEYS} keys) reached for extension "${extensionId}" — delete unused keys`
+            );
+          }
+        }
         let serialized: string | undefined;
         try {
           serialized = JSON.stringify(value);

@@ -491,3 +491,16 @@ describe('catalog listing', () => {
     await expectCode(appCtx.sessions.list(), 'missing-scope');
   });
 });
+
+describe('storage key budget', () => {
+  test('rejects the 257th key but allows overwrites at the cap', async () => {
+    const h = harness();
+    const ctx = createAppExtensionExecutionContext(h.options());
+    for (let i = 0; i < 256; i++) {
+      await ctx.storage.set(`k${i}`, i);
+    }
+    await expectCode(ctx.storage.set('k256', 256), 'too-large');
+    await ctx.storage.set('k0', 'overwritten');
+    await expect(ctx.storage.get('k0')).resolves.toBe('overwritten');
+  });
+});

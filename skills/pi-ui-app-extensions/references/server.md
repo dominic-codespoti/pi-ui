@@ -24,7 +24,7 @@ Handlers receive `(input, ctx)`. `ctx` carries the validated `scope`, `caller` (
 
 - `ctx.workspace.readText(path)`, `readJson(path)`, `listFiles(path?)` — reads under the selected project root. Paths are project-relative with traversal and symlink-escape checks.
 - `ctx.cli.run(program, argv, options?)` — explicit executable plus argument vector, no shell. Working directory derives from the validated project scope, never from the extension. Supports `timeoutMs`, `maxOutputBytes`, cancellation. Resolves `{ stdout, stderr, exitCode, timedOut, killed }`.
-- `ctx.storage.get/set/delete(key)` — extension-namespaced JSON data in the Pi agent directory.
+- `ctx.storage.get/set/delete(key)` — extension-namespaced JSON data in the Pi agent directory (1 MiB per value, 256 keys per extension).
 - `ctx.emit(eventName, data?)` — broadcasts a manifest-declared event tagged with the operation's exact scope.
 
 These are convenience APIs, not a sandbox: enabled code also has its process privileges directly. Validate all inputs in the handler; never trust scope, kind, or schemas as confinement. UI calls, agent tools, and cancellation all dispatch through the same registered handler.

@@ -13,6 +13,10 @@ export interface AppExtensionHandlerSocket {
 }
 
 const MAX_APP_EXTENSION_CALLS_PER_SOCKET = 32;
+/** Sliding-window call budget per socket (abuse/loop guard, generous by design). */
+const MAX_APP_EXTENSION_CALLS_PER_MINUTE_PER_SOCKET = 120;
+const APP_EXTENSION_CALL_BUDGET_WINDOW_MS = 60_000;
+const appExtensionCallBudgets = new WeakMap<object, { windowStart: number; count: number }>();
 const MAX_APP_EXTENSION_SUBSCRIPTIONS_PER_SOCKET = 128;
 const appExtensionCallsBySocket = new WeakMap<object, Map<string, AbortController>>();
 const appExtensionSubscriptionsBySocket = new WeakMap<object, Map<string, AppExtensionEventSubscription>>();
@@ -192,6 +196,8 @@ export interface AppExtensionHandlerDependencies {
 }
 
 /** Wire budget for a single operation result (JSON-encoded bytes). */
+/** Wire budget for a single operation input (JSON-encoded bytes). */
+export const APP_EXTENSION_INPUT_LIMIT_BYTES = 64 * 1024;
 export const APP_EXTENSION_RESULT_LIMIT_BYTES = 128 * 1024;
 /** Upper bound for error strings returned to the requester. */
 export const APP_EXTENSION_ERROR_LIMIT_CHARS = 2000;
@@ -503,6 +509,19 @@ export async function dispatchAppExtensionMessage(
         fail(`too many concurrent app-extension operations (limit ${MAX_APP_EXTENSION_CALLS_PER_SOCKET})`);
         return true;
       }
+      const now = Date.now();
+      let budget = appExtensionCallBudgets.get(socket);
+      if (!budget || now - budget.windowStart >= APP_EXTENSION_CALL_BUDGET_WINDOW_MS) {
+        budget = { windowStart: now, count: 0 };
+        appExtensionCallBudgets.set(socket, budget);
+      }
+      budget.count += 1;
+      if (budget.count > MAX_APP_EXTENSION_CALLS_PER_MINUTE_PER_SOCKET) {
+        fail(
+          `app-extension call rate exceeded (limit ${MAX_APP_EXTENSION_CALLS_PER_MINUTE_PER_SOCKET}/min per connection); slow down and retry.`
+        );
+        return true;
+      }
       const controller = new AbortController();
       calls.set(callId, controller);
       try {
@@ -533,7 +552,27 @@ export async function dispatchAppExtensionMessage(
               signal: controller.signal,
             })
           : { scope: resolved.scope, caller: resolved.caller, signal: controller.signal };
-        const input = message.input ?? {};
+        const rawInput = message.input ?? {};
+        let inputBytes = 0;
+        try {
+          inputBytes = byteLength(JSON.stringify(rawInput) ?? 'null');
+        } catch (err) {
+          fail(
+            toErrorMessage(
+              `input is not JSON-serializable: ${err instanceof Error ? err.message : String(err)}`
+            )
+          );
+          return true;
+        }
+        if (inputBytes > APP_EXTENSION_INPUT_LIMIT_BYTES) {
+          fail(
+            toErrorMessage(
+              `input exceeds 64 KiB limit (${inputBytes} bytes JSON-encoded); narrow the operation input`
+            )
+          );
+          return true;
+        }
+        const input = rawInput;
         const result =
           declared.kind === 'read'
             ? await dependencies.runtime.read(extensionId, operationId, input, ctx)

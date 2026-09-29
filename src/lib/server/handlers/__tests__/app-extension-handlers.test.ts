@@ -612,6 +612,49 @@ describe('dispatchAppExtensionMessage', () => {
     expect(payload.ok).toBe(false);
     expect(payload.error).toMatch(/JSON-serializable/);
   });
+
+  it('rejects inputs over the 64 KiB cap before dispatch', async () => {
+    const deps = setup({ operations: [op('stats', 'read')] });
+    await dispatchAppExtensionMessage(
+      {
+        type: 'app_extension_call',
+        callId: 'big',
+        extensionId: 'notes',
+        operationId: 'stats',
+        kind: 'read',
+        input: { blob: 'x'.repeat(70 * 1024) },
+        scope: {},
+      },
+      deps.socket,
+      deps
+    );
+    expect(deps.read).not.toHaveBeenCalled();
+    expect(lastPayload(deps.socket)).toMatchObject({ ok: false });
+    expect((lastPayload(deps.socket) as { error: string }).error).toMatch(/64 KiB/);
+  });
+
+  it('rate-limits burst callers per connection', async () => {
+    const deps = setup({ operations: [op('stats', 'read')] });
+    const call = (callId: string) =>
+      dispatchAppExtensionMessage(
+        {
+          type: 'app_extension_call',
+          callId,
+          extensionId: 'notes',
+          operationId: 'stats',
+          kind: 'read',
+          scope: {},
+        },
+        deps.socket,
+        deps
+      );
+    for (let i = 0; i < 120; i++) await call(`c${i}`);
+    expect(deps.read).toHaveBeenCalledTimes(120);
+    await call('c120');
+    expect(deps.read).toHaveBeenCalledTimes(120);
+    expect(lastPayload(deps.socket)).toMatchObject({ ok: false });
+    expect((lastPayload(deps.socket) as { error: string }).error).toMatch(/rate exceeded/);
+  });
 });
 
 describe('set_app_extension_enabled', () => {
