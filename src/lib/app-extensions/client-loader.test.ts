@@ -246,6 +246,43 @@ describe('buildAppExtensionClientApi', () => {
     });
     await expect(withoutHost.switchSession('s1')).rejects.toThrow('unavailable');
   });
+
+  it('resolves provider scope lazily per call', async () => {
+    let current = { projectId: 'p1', sessionId: 's1' };
+    const call = vi.fn(async () => null);
+    const subscribe = vi.fn(() => () => {});
+    const api = buildAppExtensionClientApi({
+      extensionId: 'ext-a',
+      scope: () => ({ ...current }),
+      call,
+      subscribe,
+    });
+    await api.read('op', {});
+    expect(call).toHaveBeenLastCalledWith('read', 'op', {}, { projectId: 'p1', sessionId: 's1' });
+    current = { projectId: 'p2', sessionId: 's2' };
+    expect(api.scope).toEqual({ projectId: 'p2', sessionId: 's2' });
+    await api.invoke('op2', {});
+    expect(call).toHaveBeenLastCalledWith('action', 'op2', {}, { projectId: 'p2', sessionId: 's2' });
+    api.subscribe('ev', () => {});
+    expect(subscribe).toHaveBeenCalledWith('ev', expect.any(Function), {
+      projectId: 'p2',
+      sessionId: 's2',
+    });
+  });
+
+  it('freezes plain-object scope into a copy', async () => {
+    const scope = { projectId: 'p1' };
+    const call = vi.fn(async () => null);
+    const api = buildAppExtensionClientApi({
+      extensionId: 'ext-a',
+      scope,
+      call,
+      subscribe: vi.fn(() => () => {}),
+    });
+    scope.projectId = 'mutated';
+    await api.read('op', {});
+    expect(call).toHaveBeenCalledWith('read', 'op', {}, { projectId: 'p1' });
+  });
 });
 
 describe('trackAppExtensionSubscriptions', () => {

@@ -33,9 +33,9 @@ export function mount(root, api) {
 
 ## Client API
 
-- `api.extensionId`, `api.scope` (snapshot of the current explicit scope).
+- `api.extensionId`, `api.scope` (live view scope — read fresh on every access, always the current project/session; the view is not remounted on switches).
 - `api.read(operationId, input?, { signal? })` for `read` operations; `api.invoke(operationId, input?, { signal? })` for `action` operations. Both dispatch through the same server runtime as Pi agent tools.
-- `api.subscribe(eventName, listener, scope?)` returns an unsubscribe function. Defaults to the view's scope; pass `{}` to receive app-wide events. Global listeners get only global events; project-only listeners get project events (not session events); session listeners match that exact session ID; a project+session listener must match both.
+- `api.subscribe(eventName, listener, scope?)` returns an unsubscribe function. Defaults to the view's scope at subscribe time; existing subscriptions keep their creation scope across session switches (resubscribe to follow); pass `{}` to receive app-wide events. Global listeners get only global events; project-only listeners get project events (not session events); session listeners match that exact session ID; a project+session listener must match both.
 - `api.notify(message, kind?)` — `kind`: `info` | `success` | `warning` | `error`.
 - `api.prompt(text)` — submits text as a chat prompt to the session in the view's scope. Rejects on blank text, when no session is active, or when the send fails.
 

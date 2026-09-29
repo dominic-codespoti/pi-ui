@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from 'svelte';
   import type { AppExtensionScope } from '#lib/app-extensions/types.js';
   import {
     buildAppExtensionClientApi,
@@ -59,7 +60,9 @@
     const extId = extensionId;
     // Tracked so switching views remounts even when the bundle URL is shared.
     const vId = viewId;
-    const currentScope = scope;
+    // Live scope provider: reads the current prop value per call WITHOUT
+    // subscribing, so project/session switches no longer remount the view.
+    const getViewScope = () => untrack(() => ({ ...scope }));
     const doCall = call;
     const doSubscribe = subscribe;
     const doPrompt = prompt;
@@ -87,7 +90,7 @@
         if (cancelled) return;
         const api = buildAppExtensionClientApi({
           extensionId: extId,
-          scope: currentScope,
+          scope: getViewScope,
           call: doCall,
           subscribe: eventSubscriptions.subscribe,
           prompt: doPrompt,

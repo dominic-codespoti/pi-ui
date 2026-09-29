@@ -155,6 +155,7 @@ export interface AppExtensionExecutionContext extends AppExtensionCallContext {
 /** Client-only bridge. Implementations must not expose process or filesystem primitives. */
 export interface AppExtensionClientApi {
   readonly extensionId: string;
+  /** Live view scope: read fresh on every access, always the calling view's current project/session. */
   readonly scope: AppExtensionScope;
   read(
     operationId: string,

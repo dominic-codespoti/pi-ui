@@ -66,7 +66,12 @@ export type AppExtensionHostNotify = (
 
 export interface BuildAppExtensionClientApiOptions {
   extensionId: string;
-  scope: AppExtensionScope;
+  /**
+   * View scope, resolved lazily per call. Pass a provider when the scope
+   * can change without remounting (project/session switches); a plain
+   * object is frozen into a copy for static contexts and tests.
+   */
+  scope: AppExtensionScope | (() => AppExtensionScope);
   call: AppExtensionHostCall;
   subscribe: AppExtensionHostSubscribe;
   notify?: AppExtensionHostNotify;
@@ -183,18 +188,27 @@ export function buildAppExtensionClientApi(
 ): AppExtensionClientApi {
   const { extensionId, scope, call, subscribe, notify, prompt, draft, confirm, openFile, switchSession } =
     options;
-  const snapshot: AppExtensionScope = { ...scope };
+  // Scope is resolved lazily per call so views survive project/session
+  // switches without remounting: the host passes a provider reading the
+  // live view scope, while plain objects keep working (frozen copy).
+  const getScope: () => AppExtensionScope =
+    typeof scope === 'function' ? scope : (() => {
+      const frozen = { ...scope };
+      return () => ({ ...frozen });
+    })();
   return {
     extensionId,
-    scope: snapshot,
+    get scope(): AppExtensionScope {
+      return getScope();
+    },
     read(
       operationId: string,
       input?: Record<string, unknown>,
       options?: { signal?: AbortSignal }
     ): Promise<unknown> {
       return options?.signal
-        ? call('read', operationId, input, snapshot, options.signal)
-        : call('read', operationId, input, snapshot);
+        ? call('read', operationId, input, getScope(), options.signal)
+        : call('read', operationId, input, getScope());
     },
     invoke(
       operationId: string,
@@ -202,13 +216,13 @@ export function buildAppExtensionClientApi(
       options?: { signal?: AbortSignal }
     ): Promise<unknown> {
       return options?.signal
-        ? call('action', operationId, input, snapshot, options.signal)
-        : call('action', operationId, input, snapshot);
+        ? call('action', operationId, input, getScope(), options.signal)
+        : call('action', operationId, input, getScope());
     },
     subscribe(
       eventName: string,
       listener: (data: unknown) => void,
-      subscriptionScope: AppExtensionScope = snapshot
+      subscriptionScope: AppExtensionScope = getScope()
     ): () => void {
       return subscribe(eventName, listener, subscriptionScope);
     },
@@ -222,7 +236,7 @@ export function buildAppExtensionClientApi(
       if (!draft) {
         throw new Error('Composer drafts are unavailable for this view.');
       }
-      await draft(text, snapshot);
+      await draft(text, getScope());
     },
     async confirm(options: { title?: string; message: string; confirmLabel?: string }): Promise<boolean> {
       if (!options || typeof options !== 'object' || Array.isArray(options)) {
@@ -248,7 +262,7 @@ export function buildAppExtensionClientApi(
             message,
             ...(confirmLabel !== undefined ? { confirmLabel } : {}),
           },
-          snapshot
+          getScope()
         )
       );
     },
@@ -257,7 +271,7 @@ export function buildAppExtensionClientApi(
       if (!openFile) {
         throw new Error('File viewing is unavailable for this view.');
       }
-      await openFile(path, snapshot);
+      await openFile(path, getScope());
     },
     async switchSession(sessionId: string): Promise<void> {
       if (typeof sessionId !== 'string' || sessionId.length === 0) {
@@ -266,7 +280,7 @@ export function buildAppExtensionClientApi(
       if (!switchSession) {
         throw new Error('Session switching is unavailable for this view.');
       }
-      await switchSession(sessionId, snapshot);
+      await switchSession(sessionId, getScope());
     },
     async prompt(text: string): Promise<void> {
       if (typeof text !== 'string' || text.trim().length === 0) {
@@ -275,7 +289,7 @@ export function buildAppExtensionClientApi(
       if (!prompt) {
         throw new Error('Chat prompts are unavailable for this view.');
       }
-      await prompt(text, snapshot);
+      await prompt(text, getScope());
     },
   };
 }
