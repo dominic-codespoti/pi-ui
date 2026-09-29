@@ -172,7 +172,7 @@ describe('buildSdkAppExtensionTools mapping', () => {
       [{ id: 'list', kind: 'read', exposeToAgent: true, inputSchema: schema }],
       calls,
     );
-    const tools = buildSdkAppExtensionTools(rt);
+    const { tools } = buildSdkAppExtensionTools(rt);
     expect(tools).toHaveLength(1);
     const [tool] = tools;
     expect(tool.name).toBe('app_demo_notes_list');
@@ -195,8 +195,21 @@ describe('buildSdkAppExtensionTools mapping', () => {
       calls,
     );
     registerTestExtension(rt, 'alpha', [{ id: 'a', kind: 'read', exposeToAgent: true }], calls);
-    const tools = buildSdkAppExtensionTools(rt);
+    const { tools } = buildSdkAppExtensionTools(rt);
     expect(tools.map((t) => t.name)).toEqual(['app_alpha_a', 'app_zeta_b']);
+  });
+
+  test('reports skipped extensions as warnings without losing the rest', () => {
+    const rt = new AppExtensionRuntime();
+    const calls: SeenCall[] = [];
+    registerTestExtension(rt, 'good', [{ id: 'ping', kind: 'read', exposeToAgent: true }], calls);
+    registerTestExtension(rt, 'team.a', [{ id: 'b_c', kind: 'read', exposeToAgent: true }], calls);
+    registerTestExtension(rt, 'team_a', [{ id: 'b.c', kind: 'read', exposeToAgent: true }], calls);
+    const built = buildSdkAppExtensionTools(rt);
+    expect(built.tools.map((t) => t.name).sort()).toEqual(['app_good_ping', 'app_team_a_b_c']);
+    expect(built.warnings).toHaveLength(1);
+    expect(built.warnings[0]).toMatch(/team_a/);
+    expect(built.warnings[0]).toMatch(/collides/);
   });
 });
 
@@ -214,7 +227,7 @@ describe('buildSdkAppExtensionTools scope derivation', () => {
       ],
       calls,
     );
-    const tools = buildSdkAppExtensionTools(rt);
+    const { tools } = buildSdkAppExtensionTools(rt);
 
     // Tool params carrying fake scope ids must not leak into the call scope.
     const hostile = { q: 1, scope: { projectId: '/evil', sessionId: 'evil' }, projectId: '/evil' };
@@ -240,7 +253,7 @@ describe('buildSdkAppExtensionTools scope derivation', () => {
       [{ id: 'summarize', kind: 'read', exposeToAgent: true, scope: 'session' }],
       calls,
     );
-    const [tool] = buildSdkAppExtensionTools(rt);
+    const [tool] = buildSdkAppExtensionTools(rt).tools;
     await expect(
       execute(tool, {}, {} as unknown as ExtensionContext),
     ).rejects.toThrowError(/live.*sessionManager/i);
@@ -259,7 +272,7 @@ describe('buildSdkAppExtensionTools scope derivation', () => {
       [{ id: 'reindex', kind: 'action', exposeToAgent: true, scope: 'project' }],
       calls,
     );
-    const [tool] = buildSdkAppExtensionTools(rt);
+    const [tool] = buildSdkAppExtensionTools(rt).tools;
     await expect(execute(tool, {}, sdkCtx('', 'sess-1'))).rejects.toThrowError();
     expect(calls).toHaveLength(0);
   });
@@ -275,7 +288,7 @@ describe('buildSdkAppExtensionTools abort handling', () => {
       [{ id: 'list', kind: 'read', exposeToAgent: true }],
       calls,
     );
-    const [tool] = buildSdkAppExtensionTools(rt);
+    const [tool] = buildSdkAppExtensionTools(rt).tools;
     const controller = new AbortController();
     controller.abort();
     await expect(execute(tool, { q: 1 }, sdkCtx(), controller.signal)).rejects.toThrowError(
@@ -293,7 +306,7 @@ describe('buildSdkAppExtensionTools abort handling', () => {
       [{ id: 'list', kind: 'read', exposeToAgent: true }],
       calls,
     );
-    const [tool] = buildSdkAppExtensionTools(rt);
+    const [tool] = buildSdkAppExtensionTools(rt).tools;
     const controller = new AbortController();
     await execute(tool, { q: 1 }, sdkCtx(), controller.signal);
     expect(calls).toHaveLength(1);
@@ -316,7 +329,7 @@ describe('buildSdkAppExtensionTools abort handling', () => {
       },
       { reads: { wait: async () => new Promise(() => {}) }, actions: {} },
     );
-    const [tool] = buildSdkAppExtensionTools(rt);
+    const [tool] = buildSdkAppExtensionTools(rt).tools;
     const controller = new AbortController();
     const pending = execute(tool, {}, sdkCtx(), controller.signal);
     controller.abort();
@@ -353,7 +366,7 @@ describe('toSdkAgentToolResult bounding', () => {
       },
       { reads: { dump: async () => big }, actions: {} },
     );
-    const [tool] = buildSdkAppExtensionTools(rt);
+    const [tool] = buildSdkAppExtensionTools(rt).tools;
     const result = await execute(tool, {}, sdkCtx());
     const text = (result.content[0] as { text: string }).text;
     expect(text).toMatch(/truncated/);
@@ -405,7 +418,7 @@ describe('toSdkAgentToolResult bounding', () => {
         actions: {},
       },
     );
-    const tools = buildSdkAppExtensionTools(rt);
+    const { tools } = buildSdkAppExtensionTools(rt);
     await expect(execute(toolByName(tools, 'app_fail_ext_nope'), {}, sdkCtx())).rejects.toThrowError(
       /fail\.ext:nope.*boom/i,
     );
@@ -442,7 +455,7 @@ describe('buildSdkAppExtensionTools context-factory injection', () => {
       ...(args.signal !== undefined ? { signal: args.signal } : {}),
       workspace: { marker: 'shared-validated' },
     }));
-    const tools = buildSdkAppExtensionTools(rt, {
+    const { tools } = buildSdkAppExtensionTools(rt, {
       createContext: createContext as unknown as Parameters<typeof buildSdkAppExtensionTools>[1] extends {
         createContext?: infer F;
       }

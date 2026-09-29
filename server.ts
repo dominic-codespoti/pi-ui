@@ -2918,11 +2918,11 @@ async function createSdkSession(
 ): Promise<CreatedSdkSession> {
   const tCreate = Date.now();
   const sdk = await getSDK();
-  let appCustomTools: ReturnType<typeof buildSdkAppExtensionTools> = [];
-  let appToolDiagnostic: string | undefined;
+  let appCustomTools: ReturnType<typeof buildSdkAppExtensionTools>['tools'] = [];
+  const appToolDiagnostics: string[] = [];
   try {
     const host = await ensureAppExtensionHost();
-    appCustomTools = buildSdkAppExtensionTools(host.innerRuntime, {
+    const built = buildSdkAppExtensionTools(host.innerRuntime, {
       createContext: ({ extensionId, operationId, scope, sessionId, signal }) =>
         createAppExtensionOperationContext({
           extensionId,
@@ -2932,9 +2932,15 @@ async function createSdkSession(
           ...(signal ? { signal } : {}),
         }),
     });
+    appCustomTools = built.tools;
+    for (const warning of built.warnings) {
+      appToolDiagnostics.push(warning);
+      log.warn(`[pifrontier] ${warning}`);
+    }
   } catch (err) {
-    appToolDiagnostic = `App extension agent tools unavailable: ${err instanceof Error ? err.message : String(err)}`;
-    log.warn(`[pifrontier] ${appToolDiagnostic}`);
+    const diagnostic = `App extension agent tools unavailable: ${err instanceof Error ? err.message : String(err)}`;
+    appToolDiagnostics.push(diagnostic);
+    log.warn(`[pifrontier] ${diagnostic}`);
   }
   const settingsManager = sdk.SettingsManager.create(targetCwd, sdk.getAgentDir(), {
     projectTrusted: false,
@@ -2962,7 +2968,7 @@ async function createSdkSession(
     },
   });
   const diagnostics: RuntimeDiagnostic[] = [...services.diagnostics];
-  if (appToolDiagnostic) diagnostics.push({ type: 'warning', message: appToolDiagnostic });
+  for (const diagnostic of appToolDiagnostics) diagnostics.push({ type: 'warning', message: diagnostic });
   const enabledModels = settingsManager.getEnabledModels();
   if (enabledModels?.length) {
     try {

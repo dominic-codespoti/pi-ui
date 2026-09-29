@@ -86,7 +86,7 @@ describe('buildAppExtensionAgentTools filtering', () => {
       enabled: false,
     });
 
-    const tools = buildAppExtensionAgentTools(rt);
+    const { tools } = buildAppExtensionAgentTools(rt);
     expect(tools).toHaveLength(1);
     const [tool] = tools;
     expect(tool.name).toBe('app_exta_r1');
@@ -103,8 +103,8 @@ describe('buildAppExtensionAgentTools filtering', () => {
     const rt = new AppExtensionRuntime();
     const calls: SeenCall[] = [];
     registerTestExtension(rt, 'plain', [{ id: 'list', kind: 'read' }], calls);
-    expect(buildAppExtensionAgentTools(rt)).toEqual([]);
-    expect(buildAppExtensionAgentTools(new AppExtensionRuntime())).toEqual([]);
+    expect(buildAppExtensionAgentTools(rt).tools).toEqual([]);
+    expect(buildAppExtensionAgentTools(new AppExtensionRuntime()).tools).toEqual([]);
   });
 
   test('uses the manifest input schema or a generic object fallback', () => {
@@ -125,7 +125,7 @@ describe('buildAppExtensionAgentTools filtering', () => {
       ],
       calls,
     );
-    const tools = buildAppExtensionAgentTools(rt);
+    const { tools } = buildAppExtensionAgentTools(rt);
     expect(tools).toHaveLength(2);
     const byOp = new Map(tools.map((t) => [t.operationId, t]));
     expect(byOp.get('search')?.inputSchema).toEqual(schema);
@@ -134,7 +134,7 @@ describe('buildAppExtensionAgentTools filtering', () => {
     expect(byOp.get('search')?.inputSchema).not.toBe(schema);
     byOp.get('ping')!.inputSchema.extra = true;
     expect(
-      buildAppExtensionAgentTools(rt).find((t) => t.operationId === 'ping')?.inputSchema,
+      buildAppExtensionAgentTools(rt).tools.find((t) => t.operationId === 'ping')?.inputSchema,
     ).toEqual({ type: 'object', additionalProperties: true });
   });
 });
@@ -152,8 +152,8 @@ describe('agent tool naming', () => {
     const rt2 = new AppExtensionRuntime();
     registerTestExtension(rt2, 'alpha', [{ id: 'a', kind: 'read', exposeToAgent: true }], calls);
     registerTestExtension(rt2, 'zeta', [{ id: 'b', kind: 'read', exposeToAgent: true }], calls);
-    const names1 = buildAppExtensionAgentTools(rt1).map((t) => t.name);
-    const names2 = buildAppExtensionAgentTools(rt2).map((t) => t.name);
+    const names1 = buildAppExtensionAgentTools(rt1).tools.map((t) => t.name);
+    const names2 = buildAppExtensionAgentTools(rt2).tools.map((t) => t.name);
     expect(names1).toEqual(['app_alpha_a', 'app_zeta_b']);
     expect(names2).toEqual(names1);
   });
@@ -172,7 +172,7 @@ describe('agent tool naming', () => {
     }
   });
 
-  test('rejects overlong generated names', () => {
+  test('skips overlong generated names', () => {
     expect(() => toAgentToolName('e'.repeat(120), 'o'.repeat(20))).toThrowError(
       AppExtensionAgentToolError,
     );
@@ -184,10 +184,13 @@ describe('agent tool naming', () => {
       [{ id: 'o'.repeat(40), kind: 'read', exposeToAgent: true }],
       calls,
     );
-    expect(() => buildAppExtensionAgentTools(rt)).toThrowError(AppExtensionAgentToolError);
+    const built = buildAppExtensionAgentTools(rt);
+    expect(built.tools).toEqual([]);
+    expect(built.skipped).toHaveLength(1);
+    expect(built.skipped[0]?.extensionId).toBe('e'.repeat(100));
   });
 
-  test('rejects colliding names within one extension', () => {
+  test('skips colliding names within one extension', () => {
     const rt = new AppExtensionRuntime();
     const calls: SeenCall[] = [];
     // Distinct operation ids that normalize identically ('List' vs 'list').
@@ -200,22 +203,41 @@ describe('agent tool naming', () => {
       ],
       calls,
     );
-    expect(() => buildAppExtensionAgentTools(rt)).toThrowError(/collides/);
-    try {
-      buildAppExtensionAgentTools(rt);
-      expect.unreachable();
-    } catch (err) {
-      expect((err as AppExtensionAgentToolError).code).toBe('duplicate-name');
-    }
+    const built = buildAppExtensionAgentTools(rt);
+    expect(built.tools).toEqual([]);
+    expect(built.skipped).toHaveLength(1);
+    expect(built.skipped[0]?.extensionId).toBe('demo.notes');
+    expect(built.skipped[0]?.message).toMatch(/collides/);
   });
 
-  test('rejects colliding names across extensions', () => {
+  test('skips colliding names across extensions, keeping the first winner', () => {
     const rt = new AppExtensionRuntime();
     const calls: SeenCall[] = [];
     // 'team.a' + 'b_c' and 'team_a' + 'b.c' both normalize to app_team_a_b_c.
     registerTestExtension(rt, 'team.a', [{ id: 'b_c', kind: 'read', exposeToAgent: true }], calls);
     registerTestExtension(rt, 'team_a', [{ id: 'b.c', kind: 'read', exposeToAgent: true }], calls);
-    expect(() => buildAppExtensionAgentTools(rt)).toThrowError(/collides/);
+    const built = buildAppExtensionAgentTools(rt);
+    expect(built.tools.map((t) => t.name)).toEqual(['app_team_a_b_c']);
+    expect(built.tools[0]?.extensionId).toBe('team.a');
+    expect(built.skipped).toHaveLength(1);
+    expect(built.skipped[0]?.extensionId).toBe('team_a');
+    expect(built.skipped[0]?.message).toMatch(/collides/);
+  });
+
+  test('one broken extension never takes down the rest', () => {
+    const rt = new AppExtensionRuntime();
+    const calls: SeenCall[] = [];
+    registerTestExtension(rt, 'good', [{ id: 'ping', kind: 'read', exposeToAgent: true }], calls);
+    registerTestExtension(rt, 'team.a', [{ id: 'b_c', kind: 'read', exposeToAgent: true }], calls);
+    registerTestExtension(rt, 'team_a', [{ id: 'b.c', kind: 'read', exposeToAgent: true }], calls);
+    registerTestExtension(rt, 'also-good', [{ id: 'pong', kind: 'read', exposeToAgent: true }], calls);
+    const built = buildAppExtensionAgentTools(rt);
+    expect(built.tools.map((t) => t.name).sort()).toEqual([
+      'app_also_good_pong',
+      'app_good_ping',
+      'app_team_a_b_c',
+    ]);
+    expect(built.skipped.map((s) => s.extensionId)).toEqual(['team_a']);
   });
 });
 
@@ -232,7 +254,7 @@ describe('agent tool execution', () => {
       ],
       calls,
     );
-    const tools = buildAppExtensionAgentTools(rt);
+    const { tools } = buildAppExtensionAgentTools(rt);
     const byOp = new Map(tools.map((t) => [t.operationId, t]));
     const scope = scopeFor();
 
@@ -260,7 +282,7 @@ describe('agent tool execution', () => {
     const rt = new AppExtensionRuntime();
     const calls: SeenCall[] = [];
     registerTestExtension(rt, 'demo.notes', [{ id: 'list', kind: 'read', exposeToAgent: true }], calls);
-    const [tool] = buildAppExtensionAgentTools(rt);
+    const [tool] = buildAppExtensionAgentTools(rt).tools;
     const scope = scopeFor('proj-9', 'sess-9');
     const controller = new AbortController();
 
@@ -275,7 +297,7 @@ describe('agent tool execution', () => {
     const rt = new AppExtensionRuntime();
     const calls: SeenCall[] = [];
     registerTestExtension(rt, 'demo.notes', [{ id: 'list', kind: 'read', exposeToAgent: true }], calls);
-    const [tool] = buildAppExtensionAgentTools(rt);
+    const [tool] = buildAppExtensionAgentTools(rt).tools;
     await tool.execute({}, undefined, { scope: scopeFor() });
     expect(calls[0].ctx.caller).toEqual({ kind: 'agent' });
     expect('sessionId' in (calls[0].ctx.caller as object)).toBe(false);
@@ -286,7 +308,7 @@ describe('agent tool execution', () => {
     const rt = new AppExtensionRuntime();
     const calls: SeenCall[] = [];
     registerTestExtension(rt, 'demo.notes', [{ id: 'list', kind: 'read', exposeToAgent: true }], calls);
-    const [tool] = buildAppExtensionAgentTools(rt);
+    const [tool] = buildAppExtensionAgentTools(rt).tools;
     const scope = scopeFor();
     await tool.execute({ q: 2 }, { scope, sessionId: 's-2' });
     expect(calls[0].ctx.caller).toEqual({ kind: 'agent', sessionId: 's-2' });
@@ -302,7 +324,7 @@ describe('agent tool execution', () => {
       [{ id: 'list', kind: 'read', exposeToAgent: true }],
       calls,
     );
-    const [tool] = buildAppExtensionAgentTools(rt);
+    const [tool] = buildAppExtensionAgentTools(rt).tools;
     await expect(tool.execute({ q: 1 })).rejects.toThrowError(/explicit scope/i);
     await expect(tool.execute({ q: 1 }, new AbortController().signal)).rejects.toThrowError(
       AppExtensionAgentToolError,
@@ -326,7 +348,7 @@ describe('agent tool execution', () => {
     const rt = new AppExtensionRuntime();
     const calls: SeenCall[] = [];
     registerTestExtension(rt, 'demo.notes', [{ id: 'list', kind: 'read', exposeToAgent: true }], calls);
-    const [tool] = buildAppExtensionAgentTools(rt);
+    const [tool] = buildAppExtensionAgentTools(rt).tools;
     await tool.execute(undefined, undefined, { scope: scopeFor() });
     expect(calls[0].input).toEqual({});
   });
@@ -348,7 +370,7 @@ describe('agent tool execution', () => {
       },
       { reads: { fetch: async () => nested }, actions: {} },
     );
-    const [tool] = buildAppExtensionAgentTools(rt);
+    const [tool] = buildAppExtensionAgentTools(rt).tools;
     await expect(tool.execute({}, undefined, { scope: scopeFor() })).resolves.toBe(nested);
   });
 
@@ -356,7 +378,7 @@ describe('agent tool execution', () => {
     const rt = new AppExtensionRuntime();
     const calls: SeenCall[] = [];
     registerTestExtension(rt, 'demo.notes', [{ id: 'list', kind: 'read', exposeToAgent: true }], calls);
-    const [tool] = buildAppExtensionAgentTools(rt);
+    const [tool] = buildAppExtensionAgentTools(rt).tools;
     rt.disable('demo.notes');
     await expect(tool.execute({}, undefined, { scope: scopeFor() })).rejects.toSatisfy(
       (err) => err instanceof AppExtensionError && err.code === 'disabled',

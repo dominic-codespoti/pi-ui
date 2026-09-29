@@ -252,13 +252,24 @@ function toSdkTool(
  * regardless of registration order. Pass `createContext` through to let server
  * composition inject the shared validated `AppExtensionExecutionContext`.
  */
+export interface BuiltSdkAppExtensionTools {
+  tools: ToolDefinition[];
+  /** Human-readable per-extension skip notices for session diagnostics. */
+  warnings: string[];
+}
+
 export function buildSdkAppExtensionTools(
   runtime: AppExtensionRuntime,
   options?: BuildSdkAppExtensionToolsOptions,
-): ToolDefinition[] {
-  const descriptors = buildAppExtensionAgentTools(
+): BuiltSdkAppExtensionTools {
+  const { tools: descriptors, skipped } = buildAppExtensionAgentTools(
     runtime,
     options?.createContext !== undefined ? { createContext: options.createContext } : undefined,
   );
-  return descriptors.map((descriptor) => toSdkTool(descriptor) as unknown as ToolDefinition);
+  return {
+    tools: descriptors.map((descriptor) => toSdkTool(descriptor) as unknown as ToolDefinition),
+    warnings: skipped.map(
+      (entry) => `App extension "${entry.extensionId}" agent tools skipped: ${entry.message}`
+    ),
+  };
 }

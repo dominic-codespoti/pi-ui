@@ -221,57 +221,90 @@ async function executeAgentTool(
  * stable regardless of registration order. Throws on colliding or invalid
  * generated names.
  */
+/** One extension's agent tools could not be built (the rest still register). */
+export interface SkippedAppExtensionAgentTools {
+  extensionId: string;
+  message: string;
+}
+
+export interface BuiltAppExtensionAgentTools {
+  tools: AppExtensionAgentToolDescriptor[];
+  skipped: SkippedAppExtensionAgentTools[];
+}
+
+/**
+ * Build agent tool descriptors for every enabled extension exposing operations.
+ * Isolation is per extension: a bad (colliding/unusable) name skips that
+ * extension with a recorded message instead of aborting the whole list, so
+ * one broken package can never take down every other extension's tools.
+ * First registration wins a colliding name; the loser is skipped.
+ */
 export function buildAppExtensionAgentTools(
   runtime: AppExtensionRuntime,
   options?: BuildAppExtensionAgentToolsOptions,
-): AppExtensionAgentToolDescriptor[] {
+): BuiltAppExtensionAgentTools {
   const tools: AppExtensionAgentToolDescriptor[] = [];
+  const skipped: SkippedAppExtensionAgentTools[] = [];
   const seen = new Map<string, { extensionId: string; operationId: string }>();
   for (const summary of runtime.list()) {
     if (!summary.enabled) continue;
     const extensionId = summary.id;
-    for (const op of runtime.operations(extensionId)) {
-      if (op.exposeToAgent !== true) continue;
-      const name = toAgentToolName(extensionId, op.id);
-      const clash = seen.get(name);
-      if (clash) {
-        throw new AppExtensionAgentToolError(
-          'duplicate-name',
-          `agent tool name "${name}" collides: ${clash.extensionId}:${clash.operationId} vs ${extensionId}:${op.id}`,
-        );
+    const before = tools.length;
+    try {
+      for (const op of runtime.operations(extensionId)) {
+        if (op.exposeToAgent !== true) continue;
+        const name = toAgentToolName(extensionId, op.id);
+        const clash = seen.get(name);
+        if (clash) {
+          throw new AppExtensionAgentToolError(
+            'duplicate-name',
+            `agent tool name "${name}" collides: ${clash.extensionId}:${clash.operationId} vs ${extensionId}:${op.id} (rename an operation to fix)`,
+          );
+        }
+        seen.set(name, { extensionId, operationId: op.id });
+        const kind = op.kind;
+        const operationId = op.id;
+        const description = op.description;
+        const scope = op.scope ?? 'app';
+        tools.push({
+          name,
+          label: `${extensionId} ${operationId}`,
+          description,
+          extensionId,
+          operationId,
+          kind,
+          scope,
+          inputSchema: resolveInputSchema(op.inputSchema),
+          execute: (
+            input?: Record<string, unknown>,
+            signalOrSession?: AbortSignal | AppExtensionAgentToolSession,
+            sessionMaybe?: AppExtensionAgentToolSession,
+          ) =>
+            executeAgentTool(
+              runtime,
+              extensionId,
+              operationId,
+              kind,
+              input,
+              signalOrSession,
+              sessionMaybe,
+              options?.createContext,
+            ),
+        });
       }
-      seen.set(name, { extensionId, operationId: op.id });
-      const kind = op.kind;
-      const operationId = op.id;
-      const description = op.description;
-      const scope = op.scope ?? 'app';
-      tools.push({
-        name,
-        label: `${extensionId} ${operationId}`,
-        description,
+    } catch (err) {
+      // Drop this extension's partial tools and its claimed names so later
+      // extensions are unaffected; the failure is recorded, not thrown.
+      for (let i = tools.length - 1; i >= before; i--) tools.splice(i, 1);
+      for (const [name, ref] of seen) {
+        if (ref.extensionId === extensionId) seen.delete(name);
+      }
+      skipped.push({
         extensionId,
-        operationId,
-        kind,
-        scope,
-        inputSchema: resolveInputSchema(op.inputSchema),
-        execute: (
-          input?: Record<string, unknown>,
-          signalOrSession?: AbortSignal | AppExtensionAgentToolSession,
-          sessionMaybe?: AppExtensionAgentToolSession,
-        ) =>
-          executeAgentTool(
-            runtime,
-            extensionId,
-            operationId,
-            kind,
-            input,
-            signalOrSession,
-            sessionMaybe,
-            options?.createContext,
-          ),
+        message: err instanceof Error ? err.message : String(err),
       });
     }
   }
   tools.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-  return tools;
+  return { tools, skipped };
 }
