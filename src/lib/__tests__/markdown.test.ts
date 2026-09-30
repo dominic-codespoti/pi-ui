@@ -82,6 +82,14 @@ describe('renderMarkdown', () => {
     expect(result).toContain('data-fileline="42"');
   });
 
+  it('links a bare path mid-sentence without swallowing the surrounding text', () => {
+    const result = renderMarkdown('Read README.md and src/math.js:3 in parallel');
+    expect(result.match(/class="file-link"/g)).toHaveLength(1);
+    expect(result).toContain('data-filepath="src/math.js"');
+    expect(result).toContain('data-fileline="3"');
+    expect(result.replace(/<[^>]+>/g, '')).toBe('Read README.md and src/math.js:3 in parallel\n');
+  });
+
   it('absolute paths are not rendered as file links', () => {
     const result = renderMarkdown('`/etc/passwd`');
     expect(result).not.toContain('file-link');

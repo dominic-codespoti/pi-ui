@@ -326,16 +326,20 @@ function isFilePath(raw: string): boolean {
 /** Pattern: explicit file paths with at least one directory segment + optional line suffix. */
 const FILE_PATH_RE =
   /(?<![:\w/`])((?:\.{1,2}\/|~\/)?(?:[\w.+()-]+\/)+[\w.+()-]+\.[\w]{1,10})(?::(\d+)(?:-(\d+))?)?(?![:\w/`])/g;
+/** Sticky copy for the tokenizer: marked consumes `raw.length` chars from the START of
+ *  `src`, so a match found later in the string would swallow the preceding text. */
+const FILE_PATH_AT_START_RE = new RegExp(FILE_PATH_RE.source, 'y');
 
 const fileLinkExtension: TokenizerAndRendererExtension = {
   name: 'fileLink',
   level: 'inline',
   start(src) {
-    return src.match(FILE_PATH_RE)?.index;
+    // `match()` with a /g regex returns no index; `search()` does.
+    return src.search(FILE_PATH_RE);
   },
   tokenizer(src) {
-    FILE_PATH_RE.lastIndex = 0;
-    const match = FILE_PATH_RE.exec(src);
+    FILE_PATH_AT_START_RE.lastIndex = 0;
+    const match = FILE_PATH_AT_START_RE.exec(src);
     if (!match) return;
     const raw = match[0];
     const path = match[1];
