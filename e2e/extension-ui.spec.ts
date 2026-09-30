@@ -694,7 +694,10 @@ test.describe('Extension component widgets', () => {
 
     await openProjectsSidebar(page);
     await expect(page.getByText('Active subagents: 2')).toBeVisible({ timeout: 5000 });
-    await page.getByRole('button', { name: /hello world/ }).click();
+    await page
+      .getByRole('button', { name: /hello world/ })
+      .filter({ hasText: 'hello world' })
+      .click();
     await expect(page.getByText('Active subagents: 2')).toHaveCount(0, { timeout: 3000 });
   });
 
@@ -729,7 +732,10 @@ test.describe('Extension component widgets', () => {
 
     await expect(page).toHaveTitle('Previous session title', { timeout: 3000 });
     await openProjectsSidebar(page);
-    await page.getByRole('button', { name: /hello world/ }).click();
+    await page
+      .getByRole('button', { name: /hello world/ })
+      .filter({ hasText: 'hello world' })
+      .click();
     await expect(page).toHaveTitle('Current session', { timeout: 3000 });
   });
 

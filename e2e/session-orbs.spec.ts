@@ -117,7 +117,10 @@ test.describe('Session status orbs', () => {
 
     await openProjectsSidebar(page);
     await expect(page.getByText('hello world')).toBeVisible({ timeout: 3000 });
-    const backgroundRow = page.getByRole('button', { name: /hello world/ });
+    // The row's switch button carries the text; its "More actions" menu trigger is icon-only.
+    const backgroundRow = page
+      .getByRole('button', { name: /hello world/ })
+      .filter({ hasText: 'hello world' });
 
     // s3 running in background → green pulsing orb (broadcast persists until
     // the first click, so this can never miss the transient state).
@@ -130,7 +133,10 @@ test.describe('Session status orbs', () => {
 
     // Leave to s1 → s3 finished while background → "ready to check" orb.
     await openProjectsSidebar(page);
-    await page.getByRole('button', { name: /Bug fix|Fix the login bug/ }).click();
+    await page
+      .getByRole('button', { name: /Bug fix/ })
+      .filter({ hasText: 'Bug fix' })
+      .click();
     await openProjectsSidebar(page);
     await expect(backgroundRow.getByText('Unchecked result', { exact: true })).toHaveCount(1);
     await expect(backgroundRow.getByText('Running in background', { exact: true })).toHaveCount(0);
@@ -143,7 +149,10 @@ test.describe('Session status orbs', () => {
     // session used to flash green "Running in background" forever because its
     // runtime updates were dropped while non-active).
     await openProjectsSidebar(page);
-    await page.getByRole('button', { name: /Bug fix|Fix the login bug/ }).click();
+    await page
+      .getByRole('button', { name: /Bug fix/ })
+      .filter({ hasText: 'Bug fix' })
+      .click();
     await openProjectsSidebar(page);
     await expect(backgroundRow.getByText('Running in background', { exact: true })).toHaveCount(0);
     await expect(backgroundRow.getByText('Unchecked result', { exact: true })).toHaveCount(0);
@@ -191,7 +200,10 @@ test.describe('Session status orbs', () => {
     ).toHaveCount(1);
 
     // Clicking the row "switches" to it; the mock reports the run finished.
-    await page.getByRole('button', { name: /Bug fix/ }).click();
+    await page
+      .getByRole('button', { name: /Bug fix/ })
+      .filter({ hasText: 'Bug fix' })
+      .click();
     await expect(
       page.getByRole('button', { name: /Bug fix/ }).getByText('Streaming', { exact: true })
     ).toHaveCount(0);
@@ -230,7 +242,9 @@ test.describe('Session status orbs', () => {
     await openProjectsSidebar(page);
     await expect(page.getByText('hello world')).toBeVisible({ timeout: 3000 });
 
-    const backgroundRow = page.getByRole('button', { name: /hello world/ });
+    const backgroundRow = page
+      .getByRole('button', { name: /hello world/ })
+      .filter({ hasText: 'hello world' });
     await expect(
       backgroundRow.getByText('Running tool in background', { exact: true })
     ).toHaveCount(1);

@@ -35,6 +35,16 @@ async function openProjectsSidebar(page: Page) {
   await expect(search).toBeVisible({ timeout: 3000 });
 }
 test.describe('Projects sidebar', () => {
+  async function clickRowAction(page: Page, row: ReturnType<Page['locator']>, action: string) {
+    await row.hover();
+    const directAction = row.getByRole('button', { name: action, exact: true });
+    if (await directAction.isVisible()) {
+      await directAction.click();
+      return;
+    }
+    await row.getByRole('button', { name: /^More actions for/ }).click();
+    await page.getByRole('menuitem', { name: action, exact: true }).click();
+  }
   test.beforeEach(async ({ page, login, mockWs }) => {
     await mockWs(page);
     await login(page, 'test-password');
@@ -99,7 +109,10 @@ test.describe('Projects sidebar', () => {
     });
 
     await openProjectsSidebar(page);
-    await page.getByRole('button', { name: /Bug fix/ }).click();
+    await page
+      .getByRole('button', { name: /Bug fix/ })
+      .first()
+      .click();
 
     // The shallow goto must persist the session path to the URL bar…
     await expect(page).toHaveURL(/session=%2Fhome%2Fuser%2Fproject-a%2Fs1\.jsonl/);
@@ -155,7 +168,10 @@ test.describe('Projects sidebar', () => {
     });
 
     await openProjectsSidebar(page);
-    await page.getByRole('button', { name: /Bug fix/ }).click();
+    await page
+      .getByRole('button', { name: /Bug fix/ })
+      .first()
+      .click();
     const s1Url = /session=%2Fhome%2Fuser%2Fproject-a%2Fs1\.jsonl/;
     await expect(page).toHaveURL(s1Url);
 
@@ -237,7 +253,7 @@ test.describe('Projects sidebar', () => {
     await page.reload();
     await expect(page.getByText('Session A only')).toBeVisible({ timeout: 3000 });
     await openProjectsSidebar(page);
-    await page.getByRole('button', { name: 'Add tests' }).click();
+    await page.getByRole('button', { name: 'Add tests' }).first().click();
 
     await expect(page.getByText('Session B only')).toBeVisible({ timeout: 3000 });
     expect(lateSnapshotSent).toBe(true);
@@ -284,7 +300,7 @@ test.describe('Projects sidebar', () => {
 
     await expect(header).toContainText('Bug fix', { timeout: 3000 });
     await openProjectsSidebar(page);
-    await page.getByRole('button', { name: 'Add tests' }).click();
+    await page.getByRole('button', { name: 'Add tests' }).first().click();
 
     await expect(header).not.toContainText('Bug fix', { timeout: 3000 });
   });
@@ -338,16 +354,14 @@ test.describe('Projects sidebar', () => {
     const firstRow = page
       .locator('div.group.rounded-2xl')
       .filter({ has: page.getByText('First pooled', { exact: true }) });
-    await firstRow.hover();
-    await firstRow.getByRole('button', { name: 'Rename session' }).click();
+    await clickRowAction(page, firstRow, 'Rename session');
     await page.getByRole('textbox', { name: 'Session name' }).fill('First renamed');
     await page.getByRole('button', { name: 'Confirm rename' }).click();
 
     const secondRow = page
       .locator('div.group.rounded-2xl')
       .filter({ has: page.getByText('Second pooled', { exact: true }) });
-    await secondRow.hover();
-    await secondRow.getByRole('button', { name: 'Delete session' }).click();
+    await clickRowAction(page, secondRow, 'Delete session');
     await page.getByRole('button', { name: 'Confirm', exact: true }).click();
 
     await expect
@@ -477,9 +491,16 @@ test.describe('Projects sidebar', () => {
     await openProjectsSidebar(page);
     await page.getByRole('button', { name: 'project-a 2' }).hover();
     const newSessionButton = page.getByRole('button', { name: 'New session in project-a' });
-    await newSessionButton.click();
-
-    await expect(newSessionButton).toBeDisabled();
+    const touchActions = page.getByRole('button', { name: 'More actions for project-a' });
+    if (await newSessionButton.isVisible()) {
+      await newSessionButton.click();
+      await expect(newSessionButton).toBeDisabled();
+    } else {
+      await touchActions.click();
+      await page.getByRole('menuitem', { name: 'New session', exact: true }).click();
+      await touchActions.click();
+      await expect(page.getByRole('menuitem', { name: 'New session', exact: true })).toBeDisabled();
+    }
     await expect(page.getByPlaceholder('Opening session…')).toBeVisible();
     expect(newSessionCount).toBe(1);
   });
@@ -524,9 +545,16 @@ test.describe('Projects sidebar', () => {
     await openProjectsSidebar(page);
     await page.getByRole('button', { name: 'project-a 2' }).hover();
     const newSessionButton = page.getByRole('button', { name: 'New session in project-a' });
-    await newSessionButton.click();
-
-    await expect(newSessionButton).toBeDisabled();
+    const touchActions = page.getByRole('button', { name: 'More actions for project-a' });
+    if (await newSessionButton.isVisible()) {
+      await newSessionButton.click();
+      await expect(newSessionButton).toBeDisabled();
+    } else {
+      await touchActions.click();
+      await page.getByRole('menuitem', { name: 'New session', exact: true }).click();
+      await touchActions.click();
+      await expect(page.getByRole('menuitem', { name: 'New session', exact: true })).toBeDisabled();
+    }
     const composer = page.getByLabel('Message to pi');
     await expect(composer).toHaveAttribute('placeholder', 'Opening session…');
     await expect(composer).toBeEnabled();
@@ -579,7 +607,7 @@ test.describe('Projects sidebar', () => {
     await composer.fill('draft before switch');
 
     await openProjectsSidebar(page);
-    const switchButton = page.getByRole('button', { name: 'Add tests' });
+    const switchButton = page.getByRole('button', { name: 'Add tests' }).first();
     await switchButton.evaluate((button) => {
       if (!(button instanceof HTMLElement)) {
         throw new Error('Expected a session switch button');

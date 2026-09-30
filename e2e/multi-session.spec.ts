@@ -83,8 +83,9 @@ test.describe('Multi-session runtime and view routing', () => {
 
     // The visible s1 remains idle while a runtime delta marks non-visible s2 running.
     harness.send(sessionRuntimePayload('s2', { phase: 'running' }));
-    const s1Row = page.getByRole('button', { name: /Bug fix/ });
-    const s2Row = page.getByRole('button', { name: /Add tests/ });
+    // Row switch buttons carry the text; their "More actions" menu triggers are icon-only.
+    const s1Row = page.getByRole('button', { name: /Bug fix/ }).filter({ hasText: 'Bug fix' });
+    const s2Row = page.getByRole('button', { name: /Add tests/ }).filter({ hasText: 'Add tests' });
     await expect(s2Row.getByText('Running in background', { exact: true })).toHaveCount(1);
     await expect(s1Row.getByText('Streaming', { exact: true })).toHaveCount(0);
 
@@ -137,7 +138,7 @@ test.describe('Multi-session runtime and view routing', () => {
     await login(page, 'test-password');
     await openProjectsSidebar(page);
 
-    const s2Row = page.getByRole('button', { name: /Add tests/ });
+    const s2Row = page.getByRole('button', { name: /Add tests/ }).filter({ hasText: 'Add tests' });
     await expect(s2Row).toBeVisible({ timeout: 3000 });
 
     harness.send(sessionRuntimePayload('s2', { phase: 'running' }));
@@ -155,7 +156,11 @@ test.describe('Multi-session runtime and view routing', () => {
       },
     });
     await expect(page.getByText('Renamed background task')).toBeVisible();
-    await expect(page.getByRole('button', { name: /Renamed background task/ })).toHaveCount(1);
+    await expect(
+      page
+        .getByRole('button', { name: /Renamed background task/ })
+        .filter({ hasText: 'Renamed background task' })
+    ).toHaveCount(1);
   });
   test('ignores a stale foreign snapshot after a correlated switch', async ({
     page,
@@ -166,7 +171,7 @@ test.describe('Multi-session runtime and view routing', () => {
     await login(page, 'test-password');
     await openProjectsSidebar(page);
 
-    const s2Row = page.getByRole('button', { name: /Add tests/ });
+    const s2Row = page.getByRole('button', { name: /Add tests/ }).filter({ hasText: 'Add tests' });
     await expect(s2Row).toBeVisible({ timeout: 3000 });
     await s2Row.click();
     const switchMessage = await harness.waitForMessage(

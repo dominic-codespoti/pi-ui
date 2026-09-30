@@ -11,6 +11,8 @@
   import X from '@lucide/svelte/icons/x';
   import Check from '@lucide/svelte/icons/check';
   import TriangleAlert from '@lucide/svelte/icons/triangle-alert';
+  import Ellipsis from '@lucide/svelte/icons/ellipsis';
+  import * as DropdownMenu from '#lib/components/ui/dropdown-menu/index.js';
   import SessionRow from './session-row.svelte';
   import {
     SESSION_PREVIEW_LIMIT,
@@ -162,16 +164,16 @@
         {:else}
           <Folder class="w-4 h-4 shrink-0 text-base-content/45" aria-hidden="true" />
         {/if}
+        <span class="flex-1 min-w-0 truncate text-sm">{group.name}</span>
         {#if group.gitBranch}
           <span
-            class="min-w-0 max-w-[30%] flex shrink items-center gap-1 text-[10px] text-base-content/45"
+            class="min-w-0 max-w-[25%] flex shrink items-center gap-1 text-[10px] text-base-content/45"
             title="Git branch: {group.gitBranch}"
           >
             <GitBranch class="w-3 h-3 shrink-0" aria-hidden="true" />
             <span class="truncate">{group.gitBranch}</span>
           </span>
         {/if}
-        <span class="flex-1 min-w-0 truncate text-sm">{group.name}</span>
         {#if !group.exists}
           <span
             class="shrink-0 flex items-center gap-1 text-[10px] text-warning/70"
@@ -207,7 +209,7 @@
         >
       </button>
       <div
-        class="touch-reveal touch-reveal-lg hidden group-hover/dir:flex group-focus-within/dir:flex items-center gap-0.5 pr-1.5 shrink-0"
+        class="desktop-row-actions hidden group-hover/dir:flex group-focus-within/dir:flex items-center gap-0.5 pr-1.5 shrink-0"
       >
         <button
           onclick={onStartProjectRename}
@@ -243,6 +245,32 @@
           tabindex={open ? 0 : -1}><Plus class="w-3.5 h-3.5" aria-hidden="true" /></button
         >
       </div>
+      <DropdownMenu.Root>
+        <DropdownMenu.Trigger
+          class="touch-row-actions w-10 h-10 shrink-0 items-center justify-center rounded-xl text-base-content/65 hover:bg-base-content/8 focus-visible:outline-2 focus-visible:outline-primary"
+          aria-label="More actions for {group.name}"
+        >
+          <Ellipsis class="w-5 h-5" aria-hidden="true" />
+        </DropdownMenu.Trigger>
+        <DropdownMenu.Content side="bottom" align="end">
+          <DropdownMenu.Item onSelect={onStartProjectRename}
+            ><Pencil aria-hidden="true" />Rename project</DropdownMenu.Item
+          >
+          <DropdownMenu.Item disabled={!group.exists || pendingNewSession} onSelect={onNewSession}
+            ><Plus aria-hidden="true" />New session</DropdownMenu.Item
+          >
+          {#if group.registered && group.sessions.length === 0 && !isActive}
+            <DropdownMenu.Item class="text-error focus:text-error" onSelect={onForgetProject}
+              ><X aria-hidden="true" />Forget project</DropdownMenu.Item
+            >
+          {/if}
+          {#if group.sessions.length > 0 && !isActive}
+            <DropdownMenu.Item class="text-error focus:text-error" onSelect={onDeleteProject}
+              ><Trash aria-hidden="true" />Delete project</DropdownMenu.Item
+            >
+          {/if}
+        </DropdownMenu.Content>
+      </DropdownMenu.Root>
     </div>
   {/if}
 

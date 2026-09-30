@@ -8,6 +8,8 @@
   import Check from '@lucide/svelte/icons/check';
   import X from '@lucide/svelte/icons/x';
   import Tag from '@lucide/svelte/icons/tag';
+  import Ellipsis from '@lucide/svelte/icons/ellipsis';
+  import * as DropdownMenu from '#lib/components/ui/dropdown-menu/index.js';
   import { formatRelativeDate, providerColor } from '#lib/utils.js';
   import type { SessionRow as SessionTreeRow } from '#lib/state/projects-state.svelte.js';
   import type { SessionSummary } from '#lib/ws/protocol.js';
@@ -132,7 +134,7 @@
           />
         </button>
       {:else}
-        <span class="h-10 w-9 shrink-0 sm:h-7 sm:w-7" aria-hidden="true"></span>
+        <span class="h-7 w-7 shrink-0 sm:h-7 sm:w-7" aria-hidden="true"></span>
       {/if}
       <button
         onclick={onSwitch}
@@ -228,7 +230,7 @@
         </p>
       </button>
       <div
-        class="touch-reveal touch-reveal-lg flex flex-col justify-center gap-0.5 pr-1.5 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity"
+        class="desktop-row-actions flex flex-col justify-center gap-0.5 pr-1.5 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 transition-opacity"
       >
         <button
           onclick={() => onStartRename(session)}
@@ -256,6 +258,31 @@
           >
         {/if}
       </div>
+      <DropdownMenu.Root>
+        <DropdownMenu.Trigger
+          class="touch-row-actions w-10 h-10 shrink-0 items-center justify-center rounded-lg text-base-content/65 hover:bg-base-content/8 focus-visible:outline-2 focus-visible:outline-primary"
+          aria-label="More actions for {sessionLabel}"
+        >
+          <Ellipsis class="w-5 h-5" aria-hidden="true" />
+        </DropdownMenu.Trigger>
+        <DropdownMenu.Content side="bottom" align="end">
+          <DropdownMenu.Item onSelect={() => onStartRename(session)}
+            ><Pencil aria-hidden="true" />Rename session</DropdownMenu.Item
+          >
+          {#if isActive && canFork}
+            <DropdownMenu.Item onSelect={onFork}
+              ><GitBranch aria-hidden="true" />Fork session</DropdownMenu.Item
+            >
+          {/if}
+          {#if !isActive}
+            <DropdownMenu.Item
+              class="text-error focus:text-error"
+              onSelect={() => onDelete(session)}
+              ><Trash aria-hidden="true" />Delete session</DropdownMenu.Item
+            >
+          {/if}
+        </DropdownMenu.Content>
+      </DropdownMenu.Root>
     </div>
   {/if}
 </div>
