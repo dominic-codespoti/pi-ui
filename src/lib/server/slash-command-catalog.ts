@@ -1,6 +1,6 @@
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import type { AgentSession } from '@earendil-works/pi-coding-agent';
+import type { AgentSession, InlineExtension } from '@earendil-works/pi-coding-agent';
 
 export type BuiltinSlashCommand = {
   name: string;
@@ -21,6 +21,21 @@ export async function getBuiltinSlashCommands(): Promise<BuiltinSlashCommand[]> 
     await sdkModuleUrl('dist/core/slash-commands.js')
   );
   return BUILTIN_SLASH_COMMANDS.map((command: BuiltinSlashCommand) => ({ ...command }));
+}
+
+let builtInExtensionsPromise: Promise<InlineExtension[]> | null = null;
+
+/**
+ * The SDK's built-in extensions (codemode, tool search, MCP, llama.cpp). The pi
+ * CLI passes these to its resource loader itself; SDK hosts must do the same or
+ * `builtin:<name>` resources, `defaultTools: ["+codemode"]`, `/mcp` and
+ * `tool_search` are silently unavailable. Not re-exported from the package root.
+ */
+export function getBuiltInExtensions(): Promise<InlineExtension[]> {
+  builtInExtensionsPromise ??= sdkModuleUrl('dist/extensions/index.js')
+    .then((url) => import(url))
+    .then((mod: { builtInExtensions: InlineExtension[] }) => mod.builtInExtensions);
+  return builtInExtensionsPromise;
 }
 
 export async function getLatestChangelogEntries(lastSeenVersion?: string) {

@@ -16,6 +16,7 @@ Bun server bridges pi SDK events to browser over WebSocket. Key flow: CLI → se
 - Lazy SDK load (~136 MB) on first WS connect; lazy SvelteKit handler (~30 MB) on first HTTP
 - Background `bindRpcHost` — extensions and tools are bound asynchronously on session initialization, broadcasting updated `tools_list` and `commands_list` without blocking early socket connection or session creation
 - Pi UI bundles a generated `pi-ui-extension-ui` skill teaching agents how extension UI renders; `createSdkSession` passes it through `resourceLoaderOptions.additionalSkillPaths` (`src/lib/server/bundled-resources.ts`). It is generated from `src/lib/extension-ui-capabilities/`, whose examples are verified against the real parser in Vitest; `check:skill` enforces freshness. Changes to extension UI behavior in `server.ts` or `extension-component.svelte` must update the catalog and regenerate the skill.
+- SDK built-in extensions (`codemode`, `tool-search`, `mcp`, `llama.cpp`) are loaded by `createSdkSession` via `resourceLoaderOptions.extensionFactories` (`getBuiltInExtensions()` in `src/lib/server/slash-command-catalog.ts`), matching the pi CLI. Nested `ctx.executeTool()` calls (`parentToolCallId`) render as children of their parent tool card, live and from history (`nestedCalls`).
 - The server retains a resident `Map<sessionId, ManagedSession>` rather than a singleton session runtime. `selectedSessionId` is the server default and each socket has a `focusedSessionId`; switching changes selection without disposing the previous resident. Residency is capped by count (`PI_UI_MAX_RESIDENT_SESSIONS`, default 4) and estimated parsed-history bytes (`PI_UI_MAX_RESIDENT_HISTORY_MB`, default 48 MiB), with both limits env-overridable and bounded. Running sessions, sessions with an active tool or pending extension dialog, and sessions in `awaiting-input` are pinned, while least-recently-active (LRU) unpinned residents are evicted (project outliers are preferred to reduce extension-cache churn). Admission keeps one resident per `.jsonl` path because the SDK has no session-file locking. Residents own per-session services and all resident events are forwarded with their `sessionId`; a separate concurrent-run cap (`PI_UI_MAX_CONCURRENT_RUNS`, default 2) queues work beyond the limit. Non-resident sessions remain disk-backed catalog entries, with idle sidebar status until resident again.
 - Optimistic new-chat stash — when creating a new session, previous messages are stashed and cleared immediately for instant UI feedback, restoring on watchdog timeout or error
 - Extension UI requests block session until response (5 min timeout); terminal input flow bridges browser key events to headless extension TUI handlers with optimistic/awaited key classification
@@ -95,7 +96,7 @@ bun run check:skill      # fail if the committed skill is stale (part of test:ci
 
 # Tests
 bun test src/lib/auth     # Bun-native test runner for auth/rate-limiter (timeout 15s)
-bun run test:unit         # vitest run (jsdom — 50 test files, 614 tests)
+bun run test:unit         # vitest run (jsdom — 51 test files, 631 tests)
 bun run test:unit:watch   # vitest (watch mode)
 bun run test:coverage     # vitest run --coverage (v8 provider)
 bun run test:e2e          # playwright test (chains mock E2E suite + live agent suite)
@@ -280,21 +281,21 @@ bun run test:ci           # check + check:sw + check:server + check:skill + lint
 - **Cold-start resume**: `src/lib/session-snapshot.ts` persists a text-only tail (≤50 msgs, ≤200 KB) of the conversation to localStorage (saved on `agent_end`/`connected`/`session_loaded` + page-hidden); `+page.svelte` hydrates it on boot before the WS connects, so a discarded PWA repaints instantly instead of showing the connecting splash. Live `connected`/`session_loaded` state replaces it wholesale.
 - **Auth library**: `crypto.subtle` (no `jose`, no external JWT library)
 - **Dependencies & DevDeps**:
-  - `@earendil-works/pi-coding-agent` & `@earendil-works/pi-tui` (0.87.1) — pi SDK, ESM-only
-  - `svelte` (^5.57.1), `@sveltejs/kit` (3.0.0-next.27)
-  - `@lucide/svelte` (^1.47.0) — UI icons
+  - `@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui` & `@earendil-works/pi-ai` (0.99.1) — pi SDK, ESM-only
+  - `svelte` (^5.57.1), `@sveltejs/kit` (3.0.0-next.31)
+  - `typescript` stays on `~6.0.3`: `typescript-eslint` (<6.1) and `svelte-check` (^6) don't support TS 7 yet; `@typescript/native` provides TS 7
+  - `@lucide/svelte` (^1.49.0) — UI icons
   - `valibot` (^1.5.0) — schema validation
-  - `msw` (^2.15.0) — API & network mocking for testing
 - **Key env vars**: `PI_PASSWORD` (required), `PORT` (default 3000), `PI_CWD` (optional working dir)
 
 ---
 
 ## Testing & QA
 
-Three layers: **Unit** (Vitest, jsdom — 49 test files, 606 tests), **E2E** (Playwright with mock WebSocket + Live SDK suite), **CI** (GitHub Actions). The Bun-native auth suite still has one pre-existing failure: `password.test.ts` uses `vi.resetModules()`, which Bun's runner does not implement; it passes under Vitest.
+Three layers: **Unit** (Vitest, jsdom — 51 test files, 631 tests), **E2E** (Playwright with mock WebSocket + Live SDK suite), **CI** (GitHub Actions). The Bun-native auth suite still has one pre-existing failure: `password.test.ts` uses `vi.resetModules()`, which Bun's runner does not implement; it passes under Vitest.
 
 ```bash
-bun run test:unit         # vitest run (jsdom — 49 test files, 606 tests)
+bun run test:unit         # vitest run (jsdom — 51 test files, 631 tests)
 bun run test:e2e          # playwright test (chains mock suite + live agent suite)
 bun run test:e2e:fast     # playwright test --project=chromium (mock suite only)
 bun run test:e2e:live     # playwright test -c playwright.live.config.ts (live suite only)

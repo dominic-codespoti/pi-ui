@@ -2,7 +2,7 @@
 
 ## Overview
 
-All communication between client and server happens over a single WebSocket at `/ws`. Messages are JSON-encoded with a `type` field for dispatch.
+All communication between client and server happens over a single WebSocket at /ws. Messages are JSON-encoded with a type field for dispatch. Tool snapshots omit hidden tools and include optional exposure, namespace, and author-provided annotation hints so the UI can distinguish how each visible tool is reached.
 
 ## Message Types
 
@@ -47,7 +47,7 @@ Sent on WS open. Contains the full state for the session selected for this conne
   projectTrust?: ProjectTrustInfo;
   diagnostics?: RuntimeDiagnostic[];
   modelFallbackMessage?: string;
-  tools?: Array<{ name: string; description: string; isBuiltin: boolean; origin?: string }>;
+  tools?: Array<{ name: string; description: string; isBuiltin: boolean; origin?: string; exposure?: 'model-only' | 'codemode' | 'deferred'; namespace?: { name: string; description?: string }; annotations?: { readOnlyHint?: boolean; destructiveHint?: boolean; idempotentHint?: boolean; openWorldHint?: boolean } }>;
   activeToolNames?: string[];
   widgets?: WidgetPayload[];
   extensionUiState?: ExtensionUiStatePayload;
@@ -64,7 +64,7 @@ The authoritative session snapshot carries `availableThinkingLevels`, `scopedMod
 
 `session_tree` returns `tree: TreeNode[]` and may include `branchSummarySkipPrompt`. Each node has `entryId`, `type`, `children`, and optional `role`, `text`, `label`, `isCurrentLeaf`, and `isOnCurrentPath`. `tool_output` may contain `toolDetails: Record<string, unknown>` projected only from recognized built-in tool details; extension details are not exposed. `resources_list` may include `diagnostics: ResourceDiagnosticSummary[]` (`type: 'warning' | 'error' | 'collision'`, `message`, optional `path`), `contextFiles: string[]`, and `themes: ThemeSummary[]` (`name`, optional `scope`, `sourcePath`), alongside skills and prompts.
 
-`footer_data` is `{ sessionId, gitBranch: string | null, availableProviderCount, stats? }`; `stats` contains token totals (`inputTokens`, `outputTokens`, `cacheReadTokens`, `cacheWriteTokens`, `totalTokens`) and `cost`.
+`footer_data` is `{ sessionId, gitBranch: string | null, availableProviderCount, stats?, routedModel? }`; `stats` contains token totals (`inputTokens`, `outputTokens`, `cacheReadTokens`, `cacheWriteTokens`, `totalTokens`) and `cost`. `routedModel` (`{ provider, id, name, thinkingLevel? }`) is present under a virtual model selection and names the physical model of the latest successful response.
 
 Extension UI snapshots may include parsed `headerTree` and `footerTree`, in addition to the legacy text `header` and `footer`.
 
@@ -104,7 +104,7 @@ Broadcast when the visible session changes (new session, switch, or fork) or aft
   /** Optional vestigial compatibility echo; clients do not use it for correlation. */
   requestId?: string;
   contextUsage?: ContextUsage;
-  tools?: Array<{ name: string; description: string; isBuiltin: boolean; origin?: string }>;
+  tools?: Array<{ name: string; description: string; isBuiltin: boolean; origin?: string; exposure?: 'model-only' | 'codemode' | 'deferred'; namespace?: { name: string; description?: string }; annotations?: { readOnlyHint?: boolean; destructiveHint?: boolean; idempotentHint?: boolean; openWorldHint?: boolean } }>;
   activeToolNames?: string[];
   widgets?: WidgetPayload[];
 }
@@ -197,7 +197,7 @@ When `parentSession` is present, clients organize sessions into hierarchical tre
 - `tree_navigated` — `{ sessionId, ok, error?, editorText? }`; result of `navigate_tree`
 - `extension_ui_cancel` — `{ id, sessionId?, reason: 'timeout' | 'aborted' }`; pending extension dialog timed out or was aborted
 - `tool_renderer_update` — `{ sessionId, toolCallId, kind: 'call' | 'result', html: string[] }`; custom renderer state update
-- `footer_data` — `{ sessionId, gitBranch: string | null, availableProviderCount, stats? }`; `stats` has `inputTokens`, `outputTokens`, `cacheReadTokens`, `cacheWriteTokens`, `totalTokens`, and `cost`
+- `footer_data` — `{ sessionId, gitBranch: string | null, availableProviderCount, stats?, routedModel? }`; `stats` has `inputTokens`, `outputTokens`, `cacheReadTokens`, `cacheWriteTokens`, `totalTokens`, and `cost`; `routedModel` is the physical model a virtual model routed the last response to
 - `sdk_settings` — `{ settings, projectOverrides, descriptions }`; `sdk_setting_result` — `{ key, ok, error? }`
 - `session_updated` — `{ session: SessionSummary }`; coalesced catalog delta for one session (emitted on `message_end` turns)
 - `queue_update` — `{ steering: string[], followUp: string[], deferred?: string[], sessionId? }`; SDK queues plus prompts waiting for global concurrency

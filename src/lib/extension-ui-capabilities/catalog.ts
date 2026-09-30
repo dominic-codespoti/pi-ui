@@ -71,7 +71,8 @@ export const UI_METHODS = {
   },
   setWidget: {
     support: { level: 'native', surface: 'widget' },
-    summary: 'Shows text lines or a refreshed component factory above or below the composer.',
+    summary:
+      "Shows text lines or a refreshed component factory above or below the composer; placements other than 'aboveEditor'/'belowEditor' fall back to above the composer.",
     useWhen: 'Use for session-scoped content that should remain visible beside the composer.',
   },
   setFooter: {
@@ -134,7 +135,7 @@ export const UI_METHODS = {
       level: 'degraded',
       surface: 'extension-styling',
       degradation:
-        'Factories receive a stub theme that maps semantic foreground and background colors to Pi UI palette colors.',
+        'Factories receive a stub theme that maps semantic foreground and background colors to Pi UI palette colors; style(), colors, and appearance are supported, and appearance is always "dark".',
     },
     summary: 'Provides the stub theme used by extension UI factories.',
   },

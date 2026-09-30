@@ -56,36 +56,36 @@ These shapes render natively only in Pi UI, so each needs a real `render(width)`
 
 ## Support at a glance
 
-| Method                  | Support  | Surface           | Caveat                                                                                                        |
-| ----------------------- | -------- | ----------------- | ------------------------------------------------------------------------------------------------------------- |
-| select                  | native   | modal-dialog      |                                                                                                               |
-| confirm                 | native   | modal-dialog      |                                                                                                               |
-| input                   | native   | modal-dialog      |                                                                                                               |
-| notify                  | native   | toast             |                                                                                                               |
-| onTerminalInput         | native   | composer          |                                                                                                               |
-| setStatus               | native   | status-bar        |                                                                                                               |
-| setWorkingMessage       | native   | working-indicator |                                                                                                               |
-| setWorkingVisible       | native   | working-indicator |                                                                                                               |
-| setWorkingIndicator     | native   | working-indicator |                                                                                                               |
-| setHiddenThinkingLabel  | native   | thinking-block    |                                                                                                               |
-| setWidget               | native   | widget            |                                                                                                               |
-| setFooter               | native   | footer            |                                                                                                               |
-| setHeader               | native   | header            |                                                                                                               |
-| setTitle                | native   | document-title    |                                                                                                               |
-| custom                  | native   | rich-dialog       |                                                                                                               |
-| pasteToEditor           | native   | composer          |                                                                                                               |
-| setEditorText           | native   | composer          |                                                                                                               |
-| getEditorText           | native   | composer          |                                                                                                               |
-| editor                  | native   | modal-dialog      |                                                                                                               |
-| addAutocompleteProvider | native   | composer          |                                                                                                               |
-| setEditorComponent      | native   | composer          |                                                                                                               |
-| getEditorComponent      | ignored  | —                 | Returns undefined because Pi UI has no custom editor component.                                               |
-| theme                   | degraded | extension-styling | Factories receive a stub theme that maps semantic foreground and background colors to Pi UI palette colors.   |
-| getAllThemes            | native   | theme-catalog     |                                                                                                               |
-| getTheme                | degraded | extension-styling | Returns the stub palette for known Pi UI theme names; browser colors are represented by the active CSS theme. |
-| setTheme                | native   | browser-theme     |                                                                                                               |
-| getToolsExpanded        | native   | tool-output       |                                                                                                               |
-| setToolsExpanded        | native   | tool-output       |                                                                                                               |
+| Method                  | Support  | Surface           | Caveat                                                                                                                                                                                      |
+| ----------------------- | -------- | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| select                  | native   | modal-dialog      |                                                                                                                                                                                             |
+| confirm                 | native   | modal-dialog      |                                                                                                                                                                                             |
+| input                   | native   | modal-dialog      |                                                                                                                                                                                             |
+| notify                  | native   | toast             |                                                                                                                                                                                             |
+| onTerminalInput         | native   | composer          |                                                                                                                                                                                             |
+| setStatus               | native   | status-bar        |                                                                                                                                                                                             |
+| setWorkingMessage       | native   | working-indicator |                                                                                                                                                                                             |
+| setWorkingVisible       | native   | working-indicator |                                                                                                                                                                                             |
+| setWorkingIndicator     | native   | working-indicator |                                                                                                                                                                                             |
+| setHiddenThinkingLabel  | native   | thinking-block    |                                                                                                                                                                                             |
+| setWidget               | native   | widget            |                                                                                                                                                                                             |
+| setFooter               | native   | footer            |                                                                                                                                                                                             |
+| setHeader               | native   | header            |                                                                                                                                                                                             |
+| setTitle                | native   | document-title    |                                                                                                                                                                                             |
+| custom                  | native   | rich-dialog       |                                                                                                                                                                                             |
+| pasteToEditor           | native   | composer          |                                                                                                                                                                                             |
+| setEditorText           | native   | composer          |                                                                                                                                                                                             |
+| getEditorText           | native   | composer          |                                                                                                                                                                                             |
+| editor                  | native   | modal-dialog      |                                                                                                                                                                                             |
+| addAutocompleteProvider | native   | composer          |                                                                                                                                                                                             |
+| setEditorComponent      | native   | composer          |                                                                                                                                                                                             |
+| getEditorComponent      | ignored  | —                 | Returns undefined because Pi UI has no custom editor component.                                                                                                                             |
+| theme                   | degraded | extension-styling | Factories receive a stub theme that maps semantic foreground and background colors to Pi UI palette colors; style(), colors, and appearance are supported, and appearance is always "dark". |
+| getAllThemes            | native   | theme-catalog     |                                                                                                                                                                                             |
+| getTheme                | degraded | extension-styling | Returns the stub palette for known Pi UI theme names; browser colors are represented by the active CSS theme.                                                                               |
+| setTheme                | native   | browser-theme     |                                                                                                                                                                                             |
+| getToolsExpanded        | native   | tool-output       |                                                                                                                                                                                             |
+| setToolsExpanded        | native   | tool-output       |                                                                                                                                                                                             |
 
 ## Where to read more
 

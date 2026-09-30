@@ -1,12 +1,14 @@
 <script lang="ts">
-  import type { FooterStats } from '#lib/ws/protocol.js';
+  import type { FooterStats, RoutedModelInfo } from '#lib/ws/protocol.js';
   import GitBranch from '@lucide/svelte/icons/git-branch';
+  import Route from '@lucide/svelte/icons/route';
   interface Props {
     gitBranch: string | null;
     availableProviderCount: number;
     stats?: FooterStats;
+    routedModel?: RoutedModelInfo;
   }
-  let { gitBranch, availableProviderCount, stats }: Props = $props();
+  let { gitBranch, availableProviderCount, stats, routedModel }: Props = $props();
   const number = (value: number | undefined) => (value ?? 0).toLocaleString();
 </script>
 
@@ -29,6 +31,17 @@
     >
       <span>↑{number(stats.inputTokens)} ↓{number(stats.outputTokens)}</span>
       <span>${(stats.cost ?? 0).toFixed(4)}</span>
+    </span>
+  {/if}
+  {#if routedModel}
+    <span
+      class="inline-flex min-w-0 items-center gap-1"
+      title="Virtual model routed the last response to {routedModel.provider}/{routedModel.id}{routedModel.thinkingLevel
+        ? ` (${routedModel.thinkingLevel})`
+        : ''}"
+    >
+      <Route class="size-3 shrink-0" aria-hidden="true" />
+      <span class="max-w-[12rem] truncate">{routedModel.name}</span>
     </span>
   {/if}
   {#if availableProviderCount > 0}

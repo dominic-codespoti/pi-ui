@@ -251,7 +251,28 @@ function sgrWrap(code: string, text: string): string {
   return `\x1b[${code}m${text}\x1b[0m`;
 }
 
+/** Structural mirror of pi-tui's `Color` (kept type-only-free so this module stays SDK-import-free at runtime). */
+type StubColor =
+  | { readonly kind: 'indexed'; readonly index: number }
+  | { readonly kind: 'rgb'; readonly r: number; readonly g: number; readonly b: number }
+  | { readonly kind: 'oklch'; readonly l: number; readonly c: number; readonly h: number };
+
+/** Mirror of the SDK's `ThemeStyle`: token names or concrete colors plus text attributes. */
+interface StubThemeStyle {
+  fg?: string | StubColor;
+  bg?: string | StubColor;
+  bold?: boolean;
+  dim?: boolean;
+  italic?: boolean;
+  underline?: boolean;
+  inverse?: boolean;
+  strikethrough?: boolean;
+}
+
 interface ThemeFn {
+  readonly appearance: 'dark' | 'light';
+  readonly colors: Readonly<Record<string, StubColor>>;
+  style: (text: string, options: StubThemeStyle) => string;
   fg: (color: string, text: string) => string;
   bg: (color: string, text: string) => string;
   bold: (text: string) => string;
@@ -259,35 +280,88 @@ interface ThemeFn {
   underline: (text: string) => string;
   inverse: (text: string) => string;
   strikethrough: (text: string) => string;
-  [key: string]: unknown;
 }
+
+function hexToColor(hex: string): StubColor {
+  const n = parseInt(hex.slice(1), 16);
+  return { kind: 'rgb', r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 };
+}
+
+/** OKLCH (L 0-1, hue in degrees) -> gamma-encoded sRGB bytes, clamped to gamut. */
+function oklchToRgb(l: number, c: number, h: number): [number, number, number] {
+  const hr = (h * Math.PI) / 180;
+  const a = c * Math.cos(hr);
+  const b = c * Math.sin(hr);
+  const l_ = (l + 0.3963377774 * a + 0.2158037573 * b) ** 3;
+  const m_ = (l - 0.1055613458 * a - 0.0638541728 * b) ** 3;
+  const s_ = (l - 0.0894841775 * a - 1.291485548 * b) ** 3;
+  const linear = [
+    4.0767416621 * l_ - 3.3077115913 * m_ + 0.2309699292 * s_,
+    -1.2684380046 * l_ + 2.6097574011 * m_ - 0.3413193965 * s_,
+    -0.0041960863 * l_ - 0.7034186147 * m_ + 1.707614701 * s_,
+  ];
+  const [r, g, bl] = linear.map((x) => {
+    const v = x <= 0.0031308 ? 12.92 * x : 1.055 * Math.max(x, 0) ** (1 / 2.4) - 0.055;
+    return Math.round(Math.min(1, Math.max(0, v)) * 255);
+  });
+  return [r, g, bl];
+}
+
+/** SGR color parameters for a concrete color; `base` is 38 (fg) or 48 (bg). */
+function colorParams(color: StubColor, base: 38 | 48): string {
+  if (color.kind === 'indexed') return `${base};5;${color.index}`;
+  if (color.kind === 'rgb') return `${base};2;${color.r};${color.g};${color.b}`;
+  return `${base};2;${oklchToRgb(color.l, color.c, color.h).join(';')}`;
+}
+
+const THEME_COLORS: Readonly<Record<string, StubColor>> = Object.freeze(
+  Object.fromEntries(
+    [...Object.entries(FG_PALETTE), ...Object.entries(BG_PALETTE)].map(([token, hex]) => [
+      token,
+      hexToColor(hex),
+    ])
+  )
+);
 
 /**
  * Theme stub passed to extension factories in place of the real pi TUI theme.
  * Emits genuine ANSI truecolor/style SGR codes from `FG_PALETTE`/`BG_PALETTE`
  * so extension widget/dialog/tool-render text built with `theme.fg()`/
- * `theme.bold()` etc. keeps its semantic color once run through `ansiToHtml`
- * downstream, instead of rendering flat and monochrome (the previous no-op
- * behavior of this stub).
+ * `theme.bold()`/`theme.style()` keeps its semantic color once run through
+ * `ansiToHtml` downstream. `colors`/`appearance` describe the web palette,
+ * which is designed for a dark background.
  */
-export const stubTheme: ThemeFn = new Proxy({} as ThemeFn, {
-  get(_target, prop) {
-    if (prop === 'fg') {
-      return (color: string, text: string) =>
-        sgrWrap(`38;2;${hexToRgbParams(FG_PALETTE[color] ?? DEFAULT_FG_HEX)}`, text);
-    }
-    if (prop === 'bg') {
-      return (color: string, text: string) =>
-        sgrWrap(`48;2;${hexToRgbParams(BG_PALETTE[color] ?? DEFAULT_BG_HEX)}`, text);
-    }
-    if (prop === 'bold') return (text: string) => sgrWrap('1', text);
-    if (prop === 'italic') return (text: string) => sgrWrap('3', text);
-    if (prop === 'underline') return (text: string) => sgrWrap('4', text);
-    if (prop === 'inverse') return (text: string) => sgrWrap('7', text);
-    if (prop === 'strikethrough') return (text: string) => sgrWrap('9', text);
-    return undefined;
+export const stubTheme: ThemeFn = {
+  appearance: 'dark',
+  colors: THEME_COLORS,
+  style(text, options) {
+    const codes: string[] = [];
+    if (options.bold) codes.push('1');
+    if (options.dim) codes.push('2');
+    if (options.italic) codes.push('3');
+    if (options.underline) codes.push('4');
+    if (options.inverse) codes.push('7');
+    if (options.strikethrough) codes.push('9');
+    const fg =
+      typeof options.fg === 'string'
+        ? hexToColor(FG_PALETTE[options.fg] ?? DEFAULT_FG_HEX)
+        : options.fg;
+    const bg =
+      typeof options.bg === 'string'
+        ? hexToColor(BG_PALETTE[options.bg] ?? DEFAULT_BG_HEX)
+        : options.bg;
+    if (fg) codes.push(colorParams(fg, 38));
+    if (bg) codes.push(colorParams(bg, 48));
+    return codes.length > 0 ? sgrWrap(codes.join(';'), text) : text;
   },
-});
+  fg: (color, text) => sgrWrap(`38;2;${hexToRgbParams(FG_PALETTE[color] ?? DEFAULT_FG_HEX)}`, text),
+  bg: (color, text) => sgrWrap(`48;2;${hexToRgbParams(BG_PALETTE[color] ?? DEFAULT_BG_HEX)}`, text),
+  bold: (text) => sgrWrap('1', text),
+  italic: (text) => sgrWrap('3', text),
+  underline: (text) => sgrWrap('4', text),
+  inverse: (text) => sgrWrap('7', text),
+  strikethrough: (text) => sgrWrap('9', text),
+};
 
 /** Minimal TUI stub — satisfies `tui` parameter of extension factories. */
 export interface StubComponent {

@@ -1,9 +1,11 @@
 import {
   extractTextContent,
   formatToolInput,
+  nestedCallsFromResult,
   rawMessagesToUI,
   uid,
   type CompactionNoticeDetails,
+  type NestedToolCall,
   type UIMessage,
 } from '#lib/client-messages.js';
 import type { ContextUsage, ModelInfo, ServerMessage } from '#lib/ws/protocol.js';
@@ -22,6 +24,7 @@ export type SessionReducerState = {
   messages: UIMessage[];
   activeStreamMsg: UIMessage | null;
   toolsById: Map<string, UIMessage>;
+  nestedToolStartedAt: Map<string, number>;
   pendingToolCalls: Map<
     number,
     {
@@ -103,6 +106,7 @@ export function createSessionReducerState(
     messages: [],
     activeStreamMsg: null,
     toolsById: new Map(),
+    nestedToolStartedAt: new Map(),
     pendingToolCalls: new Map(),
     contextUsage: null,
     queuedSteering: [],
@@ -145,6 +149,15 @@ function rebuildToolIndex(state: SessionReducerState): void {
 
 function findTool(state: SessionReducerState, toolCallId: string): UIMessage | undefined {
   return state.toolsById.get(toolCallId);
+}
+
+function findTopLevelTool(state: SessionReducerState, toolCallId: string): UIMessage | undefined {
+  return state.messages.find(
+    (message) =>
+      message.role === 'tool' &&
+      (message.toolCallId === toolCallId ||
+        message.nestedCalls?.some((call) => call.id === toolCallId))
+  );
 }
 
 function createTool(
@@ -239,6 +252,7 @@ function applySnapshot(
     state.messages = [];
     state.activeStreamMsg = null;
     state.toolsById = new Map();
+    state.nestedToolStartedAt = new Map();
     state.pendingToolCalls = new Map();
     state.contextUsage = null;
     state.queuedSteering = [];
@@ -504,7 +518,16 @@ function applyEvent(
           ['bashexecution', 'bash_execution', 'bash'].includes(
             endMessage.role.toLowerCase().replace('_', '')
           );
-        if (isBashExecution && converted?.role === 'tool') {
+        if (!isBashExecution && converted?.role === 'tool') {
+          // The live card already has its output from tool_execution_end; the
+          // persisted result only adds the SDK's authoritative nested-call record.
+          const existing = converted.toolCallId ? findTool(state, converted.toolCallId) : undefined;
+          if (existing && converted.nestedCalls?.length) {
+            existing.nestedCalls = converted.nestedCalls;
+            existing.nestedCallsIncomplete = converted.nestedCallsIncomplete;
+            touchedMessageIds.add(existing.id);
+          }
+        } else if (isBashExecution && converted?.role === 'tool') {
           const bash =
             (typeof (endMessage as Record<string, unknown>).id === 'string'
               ? findTool(state, (endMessage as Record<string, unknown>).id as string)
@@ -582,6 +605,23 @@ function applyEvent(
       const toolCallId = frame.toolCallId as string | undefined;
       const details = (frame.args ?? frame.input ?? frame.details) as
         Record<string, unknown> | undefined;
+      const parentId = frame.parentToolCallId as string | undefined;
+      const parent = parentId ? findTopLevelTool(state, parentId) : undefined;
+      if (parent && toolCallId) {
+        const child: NestedToolCall = {
+          id: toolCallId,
+          name: toolName,
+          input: formatToolInput(toolName, details),
+          status: 'running',
+        };
+        parent.nestedCalls = [
+          ...(parent.nestedCalls ?? []).filter((call) => call.id !== toolCallId),
+          child,
+        ];
+        state.nestedToolStartedAt.set(toolCallId, options.now());
+        touchedMessageIds.add(parent.id);
+        return;
+      }
       const tool = createTool(
         state,
         toolName,
@@ -611,6 +651,15 @@ function applyEvent(
       const toolName = (frame.toolName as string | undefined) ?? state.activeToolName ?? 'tool';
       const details = (frame.args ?? frame.input ?? frame.details) as
         Record<string, unknown> | undefined;
+      const parentId = frame.parentToolCallId as string | undefined;
+      const nestedParent = parentId ? findTopLevelTool(state, parentId) : undefined;
+      const nestedChild = nestedParent?.nestedCalls?.find((call) => call.id === toolCallId);
+      if (nestedParent && nestedChild) {
+        const input = formatToolInput(toolName, details);
+        if (input !== undefined) nestedChild.input = input;
+        touchedMessageIds.add(nestedParent.id);
+        return;
+      }
       if (typeof frame.toolName === 'string') state.activeToolName = toolName;
       const tool = toolCallId
         ? createTool(
@@ -649,6 +698,34 @@ function applyEvent(
       const toolName = (frame.toolName as string | undefined) ?? state.activeToolName ?? 'tool';
       const details = (frame.args ?? frame.input ?? frame.details) as
         Record<string, unknown> | undefined;
+      const parentId = frame.parentToolCallId as string | undefined;
+      const nestedParent = parentId ? findTopLevelTool(state, parentId) : undefined;
+      const nestedIndex =
+        nestedParent?.nestedCalls?.findIndex((call) => call.id === toolCallId) ?? -1;
+      if (nestedParent && toolCallId && nestedIndex >= 0) {
+        const nested = [...(nestedParent.nestedCalls ?? [])];
+        const call = nested[nestedIndex]!;
+        const endTime = options.now();
+        const result = frame.result as
+          { content?: { type: string; text?: string }[]; error?: string } | undefined;
+        const isError = Boolean(frame.isError ?? false);
+        const resultText =
+          typeof result?.error === 'string'
+            ? result.error
+            : result?.content
+              ? extractTextContent(result.content)
+              : '';
+        nested[nestedIndex] = {
+          ...call,
+          status: isError ? 'error' : 'ok',
+          durationMs: Math.max(0, endTime - (state.nestedToolStartedAt.get(toolCallId) ?? endTime)),
+          ...(isError && resultText ? { error: resultText.slice(0, 500) } : {}),
+        };
+        nestedParent.nestedCalls = nested;
+        state.nestedToolStartedAt.delete(toolCallId);
+        touchedMessageIds.add(nestedParent.id);
+        return;
+      }
       const tool = toolCallId
         ? createTool(
             state,
@@ -672,8 +749,12 @@ function applyEvent(
             diff?: string;
             exitCode?: number;
             cancelled?: boolean;
+            nestedCalls?: unknown;
           }
         | undefined;
+      const nestedResult = nestedCallsFromResult(result?.nestedCalls);
+      if (nestedResult.calls?.length) tool.nestedCalls = nestedResult.calls;
+      if (nestedResult.incomplete) tool.nestedCallsIncomplete = true;
       if (result?.content) {
         tool.content = extractTextContent(result.content);
         const images = result.content.filter(

@@ -162,6 +162,36 @@ describe('stubTheme', () => {
       '<span style="color:rgb(246,108,109);font-weight:bold">failed</span>'
     );
   });
+
+  it('style() applies token colors and text attributes in one sequence', () => {
+    const styled = stubTheme.style('ok', { fg: 'success', bold: true });
+    expect(stripAnsi(styled)).toBe('ok');
+    expect(ansiToHtml(styled)).toBe(
+      '<span style="color:rgb(79,204,146);font-weight:bold">ok</span>'
+    );
+  });
+
+  it('style() renders concrete indexed and oklch colors from the 0.99 theme API', () => {
+    expect(ansiToHtml(stubTheme.style('x', { fg: { kind: 'indexed', index: 208 } }))).toContain(
+      'color:#ff8700'
+    );
+    expect(ansiToHtml(stubTheme.style('x', { fg: { kind: 'oklch', l: 1, c: 0, h: 0 } }))).toBe(
+      '<span style="color:rgb(255,255,255)">x</span>'
+    );
+  });
+
+  it('style() without options returns the text untouched', () => {
+    expect(stubTheme.style('plain', {})).toBe('plain');
+  });
+
+  it('exposes colors/appearance and survives object spread (getTheme copies it)', () => {
+    expect(stubTheme.appearance).toBe('dark');
+    expect(stubTheme.colors.success).toEqual({ kind: 'rgb', r: 79, g: 204, b: 146 });
+    expect(stubTheme.colors.selectedBg).toEqual({ kind: 'rgb', r: 49, g: 48, b: 57 });
+    const copy = { ...stubTheme, name: 'pi' };
+    expect(stripAnsi(copy.fg('accent', 'a'))).toBe('a');
+    expect(copy.colors).toBe(stubTheme.colors);
+  });
 });
 describe('HeadlessTerminal', () => {
   it('updates size and clamps the virtual viewport', () => {

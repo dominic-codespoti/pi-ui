@@ -71,14 +71,13 @@ test.describe('Live agent', () => {
   test('switching away from and back to a streaming first turn keeps abort targeted correctly', async ({
     page,
   }) => {
-    // Regression test for a bug where switch_session checked the session
-    // .jsonl's existence on disk before checking in-memory residency. The
-    // SDK does not persist a session's file until its first turn completes,
-    // so navigating back to a session while its first reply was still
-    // streaming was rejected with "Session not found" — leaving this
-    // socket's server-side focus stuck on whatever was focused before the
-    // failed switch. Abort/steer omit an explicit sessionId and rely on
-    // that focus, so they landed on the wrong session.
+    // Regression coverage for returning to a streaming first turn. Older SDK
+    // versions did not create the session .jsonl until that turn completed,
+    // so server switching had to resolve resident sessions independently of
+    // file presence. SDK 0.99 creates the file on the first user message,
+    // which can happen while the reply is still streaming. Abort/steer omit
+    // an explicit sessionId and rely on the socket's server-side focus, so
+    // switching back must leave focus on the in-flight session.
     const panel = page.locator('[role="complementary"][aria-label^="projects"]');
     // Sidebar content is lazily mounted and the panel is a fixed off-canvas
     // drawer — use its state attribute, not its transitioning geometry, to

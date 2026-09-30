@@ -13,6 +13,18 @@ export const ToolSummarySchema = v.looseObject({
   description: v.string(),
   isBuiltin: v.boolean(),
   origin: v.optional(v.string()),
+  exposure: v.optional(
+    v.union([v.literal('model-only'), v.literal('codemode'), v.literal('deferred')])
+  ),
+  namespace: v.optional(v.looseObject({ name: v.string(), description: v.optional(v.string()) })),
+  annotations: v.optional(
+    v.looseObject({
+      readOnlyHint: v.optional(v.boolean()),
+      destructiveHint: v.optional(v.boolean()),
+      idempotentHint: v.optional(v.boolean()),
+      openWorldHint: v.optional(v.boolean()),
+    })
+  ),
 });
 
 export const CommandSummarySchema = v.looseObject({
@@ -933,6 +945,14 @@ export const FooterDataSchema = v.looseObject({
       cacheWriteTokens: v.number(),
       totalTokens: v.number(),
       cost: v.number(),
+    })
+  ),
+  routedModel: v.optional(
+    v.looseObject({
+      provider: v.string(),
+      id: v.string(),
+      name: v.string(),
+      thinkingLevel: v.optional(v.string()),
     })
   ),
 });

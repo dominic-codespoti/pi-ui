@@ -37,6 +37,8 @@ export type UIMessage = {
   toolArgsPreview?: string;
   toolCallId?: string;
   toolName?: string;
+  nestedCalls?: NestedToolCall[];
+  nestedCallsIncomplete?: boolean;
   toolDetails?: ToolDetailsView;
   isError?: boolean;
   streaming: boolean;
@@ -77,7 +79,14 @@ export type UIMessage = {
   details?: string;
   createdAt: number;
 };
-
+export type NestedToolCall = {
+  id: string;
+  name: string;
+  input?: string;
+  status: 'running' | 'ok' | 'error' | 'unfinished';
+  durationMs?: number;
+  error?: string;
+};
 export type ToolDetailsView = {
   truncation?: {
     truncated: boolean;
@@ -175,6 +184,14 @@ export function formatToolInput(
   const str = (v: unknown): string | undefined => (typeof v === 'string' ? v : undefined);
   const num = (v: unknown): number | undefined => (typeof v === 'number' ? v : undefined);
 
+  if (toolName === 'codemode') {
+    const code = str(details.code);
+    const firstLine = code
+      ?.split(/\r?\n/)
+      .map((line) => line.trim())
+      .find(Boolean);
+    if (firstLine) return firstLine.length > 80 ? firstLine.slice(0, 79) + '…' : firstLine;
+  }
   if (toolName === 'bash' || toolName === 'execute_bash') {
     const cmd = str(details.command);
     if (cmd) return `$ ${cmd.split('\n')[0].trim()}`;
@@ -220,10 +237,40 @@ export function formatToolInput(
   if (toolName === 'ls') {
     return str(details.path) ?? '.';
   }
+  for (const key of ['query', 'path', 'url', 'command', 'name', 'pattern']) {
+    const value = str(details[key]);
+    if (value && value.length < 80) return value;
+  }
   for (const v of Object.values(details)) {
     if (typeof v === 'string' && v.length < 80) return v;
   }
   return undefined;
+}
+
+export function nestedCallsFromResult(value: unknown): {
+  calls?: NestedToolCall[];
+  incomplete?: boolean;
+} {
+  if (!isRecord(value) || !Array.isArray(value.calls)) return {};
+  const calls = value.calls
+    .slice(0, 256)
+    .filter(isRecord)
+    .map((call, callIndex): NestedToolCall => {
+      const name = typeof call.name === 'string' ? call.name : 'tool';
+      const status =
+        call.status === 'ok' || call.status === 'error' || call.status === 'unfinished'
+          ? call.status
+          : 'unfinished';
+      return {
+        id: typeof call.id === 'string' ? call.id : String(callIndex),
+        name,
+        input: formatToolInput(name, isRecord(call.arguments) ? call.arguments : undefined),
+        status,
+        durationMs: typeof call.durationMs === 'number' ? call.durationMs : undefined,
+        error: typeof call.error === 'string' ? call.error.slice(0, 500) : undefined,
+      };
+    });
+  return { calls, incomplete: value.complete === false };
 }
 
 function msgTimestamp(msg: Record<string, unknown>): number {
@@ -530,9 +577,12 @@ export function agentMsgToUI(
       else if (rawDetails && typeof rawDetails.entryLimitReached === 'number')
         toolDetails.limitReached = 'entry';
 
+      const nested = nestedCallsFromResult(msg.nestedCalls);
       const result: UIMessage = {
         id: stableMsgId(msg, index),
         role: 'tool' as const,
+        ...(nested.calls?.length ? { nestedCalls: nested.calls } : {}),
+        ...(nested.incomplete ? { nestedCallsIncomplete: true } : {}),
         toolName,
         toolCallId,
         toolInput,

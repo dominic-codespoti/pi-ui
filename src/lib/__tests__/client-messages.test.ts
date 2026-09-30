@@ -96,8 +96,16 @@ describe('formatToolInput', () => {
     expect(formatToolInput('bash')).toBeUndefined();
   });
 
-  it('falls back to first short string value', () => {
-    expect(formatToolInput('custom_tool', { name: 'myvalue' })).toBe('myvalue');
+  it('formats the first non-empty codemode code line', () => {
+    expect(
+      formatToolInput('codemode', {
+        code: '  const result = await ctx.executeTool();\nreturn result;',
+      })
+    ).toBe('const result = await ctx.executeTool();');
+  });
+
+  it('falls back to the first short string value for unknown tools', () => {
+    expect(formatToolInput('custom_tool', { opaque: 'myvalue' })).toBe('myvalue');
   });
 });
 
@@ -277,6 +285,66 @@ describe('agentMsgToUI', () => {
       truncation: { truncated: true, truncatedBy: 'lines', totalLines: 18432, outputLines: 2000 },
     });
   });
+  it('maps bounded nested calls from tool result history', () => {
+    const [, tool] = rawMessagesToUI([
+      {
+        role: 'assistant',
+        content: [
+          { type: 'text', text: 'Running tools' },
+          {
+            type: 'toolCall',
+            id: 'parent-call',
+            name: 'codemode',
+            arguments: { code: 'await ctx.executeTool()' },
+          },
+        ],
+      },
+      {
+        role: 'tool_result',
+        toolCallId: 'parent-call',
+        content: [],
+        nestedCalls: {
+          complete: false,
+          calls: [
+            {
+              id: 'child-call',
+              name: 'read',
+              arguments: { path: 'src/file.ts' },
+              status: 'ok',
+              durationMs: 120,
+            },
+            {
+              id: 'failed-call',
+              name: 'bash',
+              arguments: { command: 'bad' },
+              status: 'error',
+              error: 'failed',
+            },
+          ],
+        },
+      },
+    ]);
+    expect(tool?.nestedCalls).toEqual([
+      {
+        id: 'child-call',
+        name: 'read',
+        input: 'file.ts',
+        status: 'ok',
+        durationMs: 120,
+        error: undefined,
+      },
+      {
+        id: 'failed-call',
+        name: 'bash',
+        input: '$ bad',
+        status: 'error',
+        durationMs: undefined,
+        error: 'failed',
+      },
+    ]);
+    expect(tool?.nestedCallsIncomplete).toBe(true);
+  });
+
   it('preserves elided tool output metadata without synthesising content', () => {
     const map = new Map<string, { name: string; input: Record<string, unknown> }>();
     map.set('call-elided', { name: 'bash', input: { command: 'npm test' } });

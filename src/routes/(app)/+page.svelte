@@ -28,6 +28,7 @@
     PackageProgress,
     SessionStats,
     FooterStats,
+    RoutedModelInfo,
     ContextUsage,
     ResourceDiagnosticSummary,
   } from '#lib/ws/protocol.js';
@@ -1329,6 +1330,7 @@
     gitBranch: string | null;
     availableProviderCount: number;
     stats?: FooterStats;
+    routedModel?: RoutedModelInfo;
   } | null>(null);
   let exportFeedback = $state<string | null>(null);
 
@@ -2364,8 +2366,9 @@
         if (sl.uiVersion) uiVersion = sl.uiVersion as string;
         if (sl.sessionMode) sessionMode = sl.sessionMode as string;
         const authoritativePath = loadedPath ?? sessionPath ?? undefined;
+        const closePanelOnLoad = projectsState.sessionOperation.kind === 'switching';
         const settled = projectsState.onSessionLoaded(ownResponse ? requestId : undefined);
-        if (settled) {
+        if (settled && closePanelOnLoad) {
           if (isMobile && showSessionPanel) _skipDrawerHistoryBack = true;
           showSessionPanel = false;
         }
@@ -2484,7 +2487,10 @@
         } else {
           bootResumePath = null;
         }
-        showChatNotice(errMsg as string, 'warning');
+        // A remembered session can legitimately vanish (deleted, or — since
+        // SDK 0.99 — a new chat never written because no message was sent).
+        // The user didn't initiate that resume, so fall back silently.
+        if (!wasIdentityRestore) showChatNotice(errMsg as string, 'warning');
 
         // Restore optimistic new-chat if it failed — don't leave empty chat or draft.
         if (_optimisticPrevMessages) {
@@ -2978,6 +2984,7 @@
             gitBranch: msg.gitBranch as string | null,
             availableProviderCount: (msg.availableProviderCount as number | undefined) ?? 0,
             ...(msg.stats ? { stats: msg.stats as FooterStats } : {}),
+            ...(msg.routedModel ? { routedModel: msg.routedModel as RoutedModelInfo } : {}),
           };
         }
         break;
@@ -4126,6 +4133,11 @@
         return true;
       case 'new_session':
         if (_optimisticPrevInput === null) _optimisticPrevInput = input;
+        // Close on the user's action, not the eventual SDK response: the user
+        // may reopen the sidebar while session creation is still in flight.
+        // Like a confirmed switch, the drawer-marker cleanup must not rewind the URL.
+        if (isMobile && showSessionPanel) _skipDrawerHistoryBack = true;
+        showSessionPanel = false;
         projectsState.newSession(effect.targetCwd);
         return true;
       case 'open_fork_dialog':
@@ -5276,6 +5288,7 @@
               gitBranch={footerData?.gitBranch ?? null}
               availableProviderCount={footerData?.availableProviderCount ?? 0}
               stats={footerData?.stats}
+              routedModel={footerData?.routedModel}
             />
           {/if}
           {#if queuedSteering.length > 0 || queuedFollowUp.length > 0 || queuedDeferred.length > 0}
@@ -6529,9 +6542,13 @@
                     <p class="text-sm text-base-content/45">No extensions loaded.</p>
                   {:else}
                     {#each ['user', 'project', 'temporary'] as scope (scope)}
-                      {@const scoped = extensionsList.filter((e) => e.scope === scope)}
+                      {@const scoped = extensionsList.filter((e) =>
+                        e.path.startsWith('builtin:') ? scope === 'user' : e.scope === scope
+                      )}
                       {#if scoped.length > 0}
-                        {@const bySource = Object.groupBy(scoped, (e) => e.source)}
+                        {@const bySource = Object.groupBy(scoped, (e) =>
+                          e.path.startsWith('builtin:') ? e.path : e.source
+                        )}
                         <div class="mb-5">
                           <p
                             class="text-xs font-semibold text-base-content/50 uppercase tracking-wider mb-2"
@@ -6540,6 +6557,9 @@
                           </p>
                           <div class="space-y-2">
                             {#each Object.entries(bySource).filter((e): e is [string, ExtensionSummary[]] => !!e[1]) as [source, exts] (source)}
+                              {@const builtinName = source.startsWith('builtin:')
+                                ? source.slice(8)
+                                : null}
                               {@const allTools = exts.flatMap((e) => e.tools)}
                               {@const allCommands = exts.flatMap((e) => e.commands)}
                               {@const allFlags = [
@@ -6558,9 +6578,9 @@
                                   <div class="px-4 py-3">
                                     <div class="flex items-center gap-2">
                                       <p class="text-sm font-medium text-base-content/80">
-                                        {source}
+                                        {builtinName ? 'Built-in: ' + builtinName : source}
                                       </p>
-                                      {#if exts.length > 1}
+                                      {#if !builtinName && exts.length > 1}
                                         <span
                                           class="px-1.5 py-0.5 text-[10px] font-mono rounded bg-base-content/10 text-base-content/45"
                                           >{exts.length} files</span
@@ -6569,21 +6589,23 @@
                                       <span
                                         class="px-1.5 py-0.5 text-[10px] font-mono rounded bg-base-content/10 text-base-content/45"
                                       >
-                                        {scope === 'user'
-                                          ? 'User'
-                                          : scope === 'project'
-                                            ? 'Project'
-                                            : 'Temporary'}
+                                        {builtinName
+                                          ? 'Built-in'
+                                          : scope === 'user'
+                                            ? 'User'
+                                            : scope === 'project'
+                                              ? 'Project'
+                                              : 'Temporary'}
                                       </span>
                                     </div>
-                                    {#if exts.length === 1}
+                                    {#if !builtinName && exts.length === 1}
                                       <p
                                         class="mt-0.5 text-xs text-base-content/35 font-mono truncate"
                                         title={exts[0].path}
                                       >
                                         {exts[0].path}
                                       </p>
-                                    {:else}
+                                    {:else if !builtinName}
                                       <p class="mt-0.5 text-xs text-base-content/35">
                                         {exts.map((e) => e.path).join(', ')}
                                       </p>

@@ -26,6 +26,7 @@ import type {
 } from '@earendil-works/pi-coding-agent';
 import { THEMES } from './src/lib/themes.ts';
 import {
+  getBuiltInExtensions,
   getBuiltinSlashCommands,
   getLatestChangelogEntries,
   prepareBugReport,
@@ -152,6 +153,7 @@ import {
   type ExtensionUiStatePayload,
   type TreeNode,
   type SessionPhase,
+  type ToolSummary,
 } from './src/lib/ws/protocol.ts';
 import {
   applyMarkdownTransformersToMessages,
@@ -1730,6 +1732,13 @@ const uiContext: ServerExtensionUIContext = {
       teardownWidget(key, owner);
       return;
     }
+    // Extensions are loaded untyped, so an unknown placement (e.g. 'sidebar')
+    // can reach us; forwarding it fails client validation of the whole
+    // connected snapshot. Fall back to the SDK default placement instead.
+    const placement: WidgetPlacement | undefined =
+      options?.placement === 'aboveEditor' || options?.placement === 'belowEditor'
+        ? options.placement
+        : undefined;
 
     const existing = uiStateFor(owner).widgets.get(key);
     if (existing?.factory) {
@@ -1746,7 +1755,7 @@ const uiContext: ServerExtensionUIContext = {
         widgetType: 'text',
         widgetLines: lines.map((line) => stripAnsi(line)),
         widgetHtmlLines: boundedAnsiToHtmlLines(lines),
-        widgetPlacement: options?.placement,
+        widgetPlacement: placement,
       };
       const ui = uiStateFor(owner);
       ui.widgets.set(key, { payload, failures: 0 });
@@ -1765,7 +1774,7 @@ const uiContext: ServerExtensionUIContext = {
           widgetKey: key,
           widgetType: 'text',
           widgetLines: [],
-          widgetPlacement: options?.placement,
+          widgetPlacement: placement,
         },
         factory,
         failures: 0,
@@ -2322,7 +2331,11 @@ function historyBytesForPath(path: string | null): number {
   try {
     return statSync(path).size * PARSED_HISTORY_MULTIPLIER;
   } catch (err) {
-    log.debug(`[pifrontier] Could not stat resident session history ${path}:`, err);
+    // Since SDK 0.99 a new session's file is only written with its first user
+    // message, so a missing file is the normal state of a fresh session.
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      log.debug(`[pifrontier] Could not stat resident session history ${path}:`, err);
+    }
     return 0;
   }
 }
@@ -2759,7 +2772,10 @@ async function createSdkSession(
     cwd: targetCwd,
     agentDir: sdk.getAgentDir(),
     extensionFlagValues: extensionFlagValuesFor(),
-    resourceLoaderOptions: { additionalSkillPaths: BUNDLED_SKILL_PATHS },
+    resourceLoaderOptions: {
+      additionalSkillPaths: BUNDLED_SKILL_PATHS,
+      extensionFactories: await getBuiltInExtensions(),
+    },
     resourceLoaderReloadOptions: {
       resolveProjectTrust: async () => resolveProjectTrust(targetCwd, settingsManager),
     },
@@ -3797,17 +3813,34 @@ function snapshotModels(sess: AgentSession): ModelInfo[] {
 }
 
 function toolsPayloadFor(sess: AgentSession): {
-  tools: Array<{ name: string; description: string; isBuiltin: boolean; origin?: string }>;
+  tools: ToolSummary[];
   activeToolNames: string[];
   commands: WireExtensionCommand[];
 } {
   return {
-    tools: sess.getAllTools().map((tool) => ({
-      name: tool.name,
-      description: tool.description,
-      isBuiltin: tool.sourceInfo.source === 'builtin',
-      origin: tool.sourceInfo.source,
-    })),
+    // Hidden tools are registered but unreachable (setActiveToolsByName ignores them).
+    tools: sess.getAllTools().flatMap((tool): ToolSummary[] => {
+      const { exposure, namespace, annotations } = tool;
+      if (exposure === 'hidden') return [];
+      return [
+        {
+          name: tool.name,
+          description: tool.description,
+          isBuiltin: tool.sourceInfo.source === 'builtin',
+          origin: tool.sourceInfo.source,
+          ...(exposure && exposure !== 'direct' ? { exposure } : {}),
+          ...(namespace
+            ? {
+                namespace: {
+                  name: namespace.name,
+                  ...(namespace.description ? { description: namespace.description } : {}),
+                },
+              }
+            : {}),
+          ...(annotations ? { annotations } : {}),
+        },
+      ];
+    }),
     activeToolNames: sess.getActiveToolNames(),
     commands: extensionCommandsFor(sess),
   };
@@ -3821,6 +3854,9 @@ function broadcastFooterData(sess: AgentSession | null): void {
   const availableModels = sess.modelRuntime.getAvailableSnapshot();
   provider.setAvailableProviderCount(new Set(availableModels.map((model) => model.provider)).size);
   const stats = sess.getSessionStats();
+  // Under a virtual model selection, show which physical model answered last
+  // (the TUI footer's routed-model readout).
+  const routed = sess.routedModel;
   broadcast({
     type: 'footer_data',
     sessionId: sess.sessionId,
@@ -3834,6 +3870,16 @@ function broadcastFooterData(sess: AgentSession | null): void {
       totalTokens: stats.tokens.total,
       cost: stats.cost,
     },
+    ...(routed
+      ? {
+          routedModel: {
+            provider: routed.model.provider,
+            id: routed.model.id,
+            name: routed.model.name,
+            ...(routed.thinkingLevel ? { thinkingLevel: routed.thinkingLevel } : {}),
+          },
+        }
+      : {}),
   });
 }
 
@@ -4536,7 +4582,11 @@ try {
                       followUp: [...s.getFollowUpMessages()],
                       sessionId: s.sessionId,
                     });
-                    await s.steer(msg.message, images);
+                    // An extension input hook can consume the steer instead of
+                    // queueing it; drop the optimistic chip from the ack above.
+                    if ((await s.steer(msg.message, images)) === 'handled') {
+                      broadcastQueueState(target);
+                    }
                   } else {
                     if (
                       hasQueuedRuns(s.sessionId) ||
@@ -5469,16 +5519,12 @@ try {
                       command,
                       'Reloaded extensions, skills, prompts, and tools.'
                     );
+                    const { tools, activeToolNames } = toolsPayloadFor(session);
                     ws.send(
                       JSON.stringify({
                         type: 'tools_list',
-                        tools: session.getAllTools().map((t) => ({
-                          name: t.name,
-                          description: t.description,
-                          isBuiltin: t.sourceInfo.source === 'builtin',
-                          origin: t.sourceInfo.source,
-                        })),
-                        activeToolNames: session.getActiveToolNames(),
+                        tools,
+                        activeToolNames,
                       })
                     );
                     ws.send(

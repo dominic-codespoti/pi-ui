@@ -422,4 +422,119 @@ describe('session reducer', () => {
       source: 'test',
     });
   });
+  it('attaches nested live tool calls to their top-level parent and updates completion', () => {
+    const state = createSessionReducerState({ sessionId: 'session-1' });
+    apply(
+      state,
+      {
+        type: 'tool_execution_start',
+        toolName: 'codemode',
+        toolCallId: 'parent',
+        args: { code: 'await ctx.executeTool()' },
+      },
+      { now: () => 100 }
+    );
+    apply(
+      state,
+      {
+        type: 'tool_execution_start',
+        toolName: 'read',
+        toolCallId: 'child',
+        parentToolCallId: 'parent',
+        args: { path: 'src/file.ts' },
+      },
+      { now: () => 200 }
+    );
+    expect(state.messages).toHaveLength(1);
+    expect(state.messages[0]?.nestedCalls).toEqual([
+      { id: 'child', name: 'read', input: 'file.ts', status: 'running' },
+    ]);
+
+    apply(
+      state,
+      {
+        type: 'tool_execution_end',
+        toolName: 'read',
+        toolCallId: 'child',
+        parentToolCallId: 'parent',
+        isError: true,
+        result: { content: [{ type: 'text', text: 'read failed' }] },
+      },
+      { now: () => 250 }
+    );
+    expect(state.messages[0]?.nestedCalls?.[0]).toMatchObject({
+      status: 'error',
+      durationMs: 50,
+      error: 'read failed',
+    });
+    expect(state.messages).toHaveLength(1);
+  });
+
+  it('flattens deeper nested calls under their top-level tool card', () => {
+    const state = createSessionReducerState();
+    apply(state, { type: 'tool_execution_start', toolName: 'codemode', toolCallId: 'parent' });
+    apply(state, {
+      type: 'tool_execution_start',
+      toolName: 'codemode',
+      toolCallId: 'child',
+      parentToolCallId: 'parent',
+    });
+    apply(state, {
+      type: 'tool_execution_start',
+      toolName: 'grep',
+      toolCallId: 'grandchild',
+      parentToolCallId: 'child',
+      args: { pattern: 'needle' },
+    });
+    expect(state.messages).toHaveLength(1);
+    expect(state.messages[0]?.nestedCalls?.map((call) => call.id)).toEqual(['child', 'grandchild']);
+  });
+
+  it('falls back to a top-level tool card when a nested parent is unknown', () => {
+    const state = createSessionReducerState();
+    apply(state, {
+      type: 'tool_execution_start',
+      toolName: 'read',
+      toolCallId: 'orphan',
+      parentToolCallId: 'missing',
+      args: { path: 'file.ts' },
+    });
+    expect(state.messages).toHaveLength(1);
+    expect(state.messages[0]).toMatchObject({
+      role: 'tool',
+      toolCallId: 'orphan',
+      toolName: 'read',
+    });
+  });
+
+  it('preserves nested result history when reconciling a live tool card', () => {
+    const state = createSessionReducerState();
+    apply(state, { type: 'tool_execution_start', toolName: 'codemode', toolCallId: 'parent' });
+    apply(state, {
+      type: 'tool_execution_start',
+      toolName: 'read',
+      toolCallId: 'child',
+      parentToolCallId: 'parent',
+      args: { path: 'file.ts' },
+    });
+    apply(state, {
+      type: 'message_end',
+      message: {
+        role: 'tool_result',
+        toolCallId: 'parent',
+        content: [],
+        nestedCalls: {
+          complete: false,
+          calls: [
+            { id: 'child', name: 'read', arguments: { path: 'file.ts' }, status: 'unfinished' },
+          ],
+        },
+      },
+    });
+    expect(state.messages).toHaveLength(1);
+    expect(state.messages[0]?.nestedCalls).toMatchObject([
+      { id: 'child', status: 'unfinished', input: 'file.ts' },
+    ]);
+    expect(state.messages[0]?.nestedCallsIncomplete).toBe(true);
+  });
 });

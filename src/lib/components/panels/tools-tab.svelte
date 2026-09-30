@@ -2,7 +2,20 @@
   import { ScrollArea } from '#lib/components/ui/scroll-area/index.js';
   import ToolRow from './tool-row.svelte';
 
-  type Tool = { name: string; description: string; isBuiltin: boolean; origin?: string };
+  type Tool = {
+    name: string;
+    description: string;
+    isBuiltin: boolean;
+    origin?: string;
+    exposure?: 'model-only' | 'codemode' | 'deferred';
+    namespace?: { name: string; description?: string };
+    annotations?: {
+      readOnlyHint?: boolean;
+      destructiveHint?: boolean;
+      idempotentHint?: boolean;
+      openWorldHint?: boolean;
+    };
+  };
 
   let {
     open,

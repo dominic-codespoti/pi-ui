@@ -25,8 +25,14 @@
   let messageLabelId = $derived(messageElementId('tool-label', msg.id));
   let outputToggleId = $derived(messageElementId('tool-toggle', msg.id));
   let outputPanelId = $derived(messageElementId('tool-output', msg.id));
-
+  let nestedPanelId = $derived(messageElementId('nested-tool-calls', msg.id));
+  let nestedExpanded = $state(false);
   let toolCopiedId: string | null = $state(null);
+
+  function formatNestedDuration(durationMs: number): string {
+    return durationMs < 1000 ? `${Math.round(durationMs)}ms` : `${(durationMs / 1000).toFixed(1)}s`;
+  }
+
   function copyToolOutput(content: string, id: string) {
     navigator.clipboard.writeText(content).catch(() => {
       if (content.length > 50000) downloadToolOutput(content, 'tool-output');
@@ -120,6 +126,76 @@
       {#if msg.images?.length}<span>{msg.images.length}img</span>{/if}
     </span>
   </button>
+  {#if msg.nestedCalls?.length}
+    {@const failedCalls = msg.nestedCalls.filter((call) => call.status === 'error').length}
+    <div class="ml-6 mt-1 min-w-0 border-l border-base-content/10 pl-2">
+      <button
+        type="button"
+        class="flex items-center gap-1 rounded px-1 py-0.5 text-[11px] text-base-content/55 transition-colors hover:bg-base-content/[0.04] hover:text-base-content/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
+        aria-expanded={msg.streaming || nestedExpanded}
+        aria-controls={nestedPanelId}
+        disabled={msg.streaming}
+        onclick={() => (nestedExpanded = !nestedExpanded)}
+      >
+        <ChevronRight
+          class="h-2.5 w-2.5 transition-transform {msg.streaming || nestedExpanded
+            ? 'rotate-90'
+            : ''}"
+        />
+        <span
+          >{msg.nestedCalls.length} tool {msg.nestedCalls.length === 1
+            ? 'call'
+            : 'calls'}{#if failedCalls}
+            · {failedCalls} failed{/if}{#if msg.nestedCallsIncomplete}
+            (list truncated){/if}</span
+        >
+      </button>
+      {#if msg.streaming || nestedExpanded}
+        <div id={nestedPanelId} class="mt-1 space-y-1" role="list" aria-label="Nested tool calls">
+          {#each msg.nestedCalls as call (call.id)}
+            <div class="min-w-0 rounded bg-base-200/30 px-1.5 py-1 text-[11px]" role="listitem">
+              <div class="flex min-w-0 items-center gap-1.5">
+                {#if call.status === 'running'}
+                  <Loader
+                    class="h-3 w-3 shrink-0 animate-spin text-primary/70"
+                    aria-hidden="true"
+                  />
+                {:else if call.status === 'ok'}
+                  <Check class="h-3 w-3 shrink-0 text-success/70" aria-hidden="true" />
+                {:else if call.status === 'error'}
+                  <CircleX class="h-3 w-3 shrink-0 text-destructive/80" aria-hidden="true" />
+                {:else}
+                  <span
+                    class="h-1.5 w-1.5 shrink-0 rounded-full bg-base-content/30"
+                    aria-hidden="true"
+                  ></span>
+                {/if}
+                <span class="sr-only"
+                  >{call.status === 'ok'
+                    ? 'succeeded'
+                    : call.status === 'error'
+                      ? 'failed'
+                      : call.status}:</span
+                >
+                <span class="shrink-0 font-mono text-base-content/75">{call.name}</span>
+                {#if call.input}<span
+                    class="min-w-0 flex-1 truncate text-base-content/45"
+                    title={call.input}>{call.input}</span
+                  >{/if}
+                {#if call.durationMs !== undefined}<span
+                    class="ml-auto shrink-0 tabular-nums text-base-content/40"
+                    >{formatNestedDuration(call.durationMs)}</span
+                  >{/if}
+              </div>
+              {#if call.error}<div class="mt-0.5 break-words pl-4 text-destructive/75">
+                  {call.error}
+                </div>{/if}
+            </div>
+          {/each}
+        </div>
+      {/if}
+    </div>
+  {/if}
   {#if msg.toolDetails?.truncation?.truncated}
     <div class="mt-1 flex flex-wrap items-center gap-1.5 px-2 text-[10px] text-warning/80">
       <span class="rounded bg-warning/10 px-1.5 py-0.5">

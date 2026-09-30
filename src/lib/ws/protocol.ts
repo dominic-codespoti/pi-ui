@@ -13,6 +13,14 @@ export interface ToolSummary {
   description: string;
   isBuiltin: boolean;
   origin?: string;
+  exposure?: 'model-only' | 'codemode' | 'deferred';
+  namespace?: { name: string; description?: string };
+  annotations?: {
+    readOnlyHint?: boolean;
+    destructiveHint?: boolean;
+    idempotentHint?: boolean;
+    openWorldHint?: boolean;
+  };
 }
 
 export interface CommandSummary {
@@ -217,6 +225,14 @@ export interface FooterStats {
   cacheWriteTokens: number;
   totalTokens: number;
   cost: number;
+}
+
+/** Physical model a virtual model routed the latest successful response to (SDK `AgentSession.routedModel`). */
+export interface RoutedModelInfo {
+  provider: string;
+  id: string;
+  name: string;
+  thinkingLevel?: string;
 }
 
 export interface SessionStats {
@@ -471,7 +487,7 @@ export type SessionPhase = 'idle' | 'running' | 'awaiting-input' | 'error';
  *   { type: "available_models_changed", availableModels: ModelInfo[] }
  *   { type: "sessions_error",          message, requestId? }
  *   { type: "fork_points",             entries: Array<{ entryId: string; text: string }> }
- *   { type: "tools_list",              tools: Array<{ name: string; description: string; isBuiltin: boolean; origin?: string }>, activeToolNames: string[] }
+ *   { type: "tools_list",              tools: ToolSummary[], activeToolNames: string[] }
  *   { type: "resources_list",          skills: SkillSummary[], prompts: PromptSummary[] }
  *   { type: "extensions_list",         extensions: ExtensionSummary[], errors: Array<{ path: string; error: string }> }
  *   { type: "commands_list",           commands: Array<{ name: string; description?: string; source: string }> }
@@ -750,6 +766,7 @@ export type ServerCustomEvent =
       gitBranch: string | null;
       availableProviderCount: number;
       stats?: FooterStats;
+      routedModel?: RoutedModelInfo;
     }
   | { type: 'package_progress'; progress: PackageProgress; sessionId?: string }
   | { type: 'package_result'; success: boolean; message: string; sessionId?: string }

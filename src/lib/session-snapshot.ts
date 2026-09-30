@@ -64,6 +64,9 @@ function slim(m: UIMessage): UIMessage {
     lineCount: m.lineCount,
     usage: m.usage,
     thinking: clip(m.thinking),
+    // Without ordered blocks a thinking-only turn renders its reasoning as the
+    // reply body, so the pre-connect paint would differ from the live view.
+    blocks: m.blocks?.map((block) => ({ type: block.type, text: clip(block.text) ?? '' })),
     startMs: m.startMs,
     endMs: m.endMs,
     noticeKind: m.noticeKind,
