@@ -281,8 +281,8 @@ bun run test:ci           # check + check:sw + check:server + check:skill + lint
 - **Cold-start resume**: `src/lib/session-snapshot.ts` persists a text-only tail (≤50 msgs, ≤200 KB) of the conversation to localStorage (saved on `agent_end`/`connected`/`session_loaded` + page-hidden); `+page.svelte` hydrates it on boot before the WS connects, so a discarded PWA repaints instantly instead of showing the connecting splash. Live `connected`/`session_loaded` state replaces it wholesale.
 - **Auth library**: `crypto.subtle` (no `jose`, no external JWT library)
 - **Dependencies & DevDeps**:
-  - `@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui` & `@earendil-works/pi-ai` (0.99.1) — pi SDK, ESM-only
-  - `svelte` (^5.57.1), `@sveltejs/kit` (3.0.0-next.31)
+  - `@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui` & `@earendil-works/pi-ai` (1.0.0) — pi SDK, ESM-only
+  - `svelte` (^5.57.1), `@sveltejs/kit` (3.0.0)
   - `typescript` stays on `~6.0.3`: `typescript-eslint` (<6.1) and `svelte-check` (^6) don't support TS 7 yet; `@typescript/native` provides TS 7
   - `@lucide/svelte` (^1.49.0) — UI icons
   - `valibot` (^1.5.0) — schema validation
