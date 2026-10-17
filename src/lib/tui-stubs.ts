@@ -8,7 +8,7 @@
  */
 
 import type { AgentSession, MarkdownTransformer } from '@earendil-works/pi-coding-agent';
-import type { Terminal } from '@earendil-works/pi-tui';
+import type { ProgramStatus, Terminal } from '@earendil-works/pi-tui';
 import {
   MAX_WIRE_AUX_CHARS,
   MAX_WIRE_AUX_TOTAL_CHARS,
@@ -441,6 +441,10 @@ export class HeadlessTerminal implements Terminal {
   }
   setProgress(active: boolean): void {
     void active;
+  }
+  /** OSC 7501 program status (pi-tui 1.1+) — no terminal to report to. */
+  setProgramStatus(status: ProgramStatus): void {
+    void status;
   }
 }
 
