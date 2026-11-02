@@ -29,7 +29,7 @@ import {
   unlink as nodeUnlink,
   writeFile as nodeWriteFile,
 } from 'node:fs/promises';
-import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
+import { basename, isAbsolute, join, resolve, sep } from 'node:path';
 import type {
   AppExtensionExecResult,
   AppExtensionExecutionContext,

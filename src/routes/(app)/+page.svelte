@@ -3788,6 +3788,7 @@
    * workspace the host returns to chat so the turn stays visible.
    */
   /** Outstanding extension prompt submits, keyed by requestId (see `prompt_result`). */
+  // eslint-disable-next-line svelte/prefer-svelte-reactivity -- response correlation map, never rendered
   const pendingPrompts = new Map<
     string,
     { resolve: () => void; reject: (err: Error) => void; timer: ReturnType<typeof setTimeout> }
@@ -3856,7 +3857,7 @@
         reject(new Error('Chat prompt timed out — the server did not acknowledge it.'));
       }, 15_000);
       pendingPrompts.set(requestId, { resolve, reject, timer });
-      let sent = false;
+      let sent: boolean;
       try {
         sent = send({ type: 'prompt', sessionId, message: text, requestId });
       } catch {
@@ -3890,8 +3891,7 @@
    * confirm, false on cancel/dismiss. Only one confirm at a time.
    */
   const appConfirmStable: AppExtensionHostConfirm = (
-    options: { title?: string; message: string; confirmLabel?: string },
-    _scope: AppExtensionScope
+    options: { title?: string; message: string; confirmLabel?: string }
   ): Promise<boolean> => {
     if (pendingConfirmOnDismiss) {
       return Promise.reject(new Error('A confirmation is already pending.'));
