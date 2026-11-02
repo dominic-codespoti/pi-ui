@@ -227,7 +227,7 @@
                     class="link link-primary break-all"
                     href={link.url}
                     target="_blank"
-                    rel="noopener noreferrer"
+                    rel="noopener noreferrer external"
                   >
                     {link.label ?? link.url}
                   </a>

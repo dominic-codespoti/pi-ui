@@ -865,6 +865,7 @@ class ProjectsState {
         /* non-fatal */
       }
     }
+    // eslint-disable-next-line svelte/no-navigation-without-resolve -- same-page ?session= query rewrite, not route navigation
     replaceState(url, { ...state, piUiOptimisticSession: path }).catch(() => {
       /* best-effort URL sync — never block session switching */
     });
@@ -887,6 +888,7 @@ class ProjectsState {
       } catch {
         /* not in a browser context */
       }
+      // eslint-disable-next-line svelte/no-navigation-without-resolve -- same-page ?session= query rewrite, not route navigation
       replaceState(url, { ...state, piUiOptimisticSession: null }).catch(() => {});
     } catch {
       /* no window (SSR/test env) or replaceState unavailable */
