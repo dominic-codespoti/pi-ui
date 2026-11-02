@@ -95,7 +95,7 @@
     "@types/bun": "^1.4.4",
     "@types/web-push": "^3.6.4",
     "@typescript/native": "npm:typescript@^7.0.2",
-    "@vitest/coverage-v8": "^5.0.5",
+    "@vitest/coverage-v8": "^5.1.0",
     "bits-ui": "^2.20.3",
     "clsx": "^2.1.1",
     "daisyui": "^5.7.50",
@@ -120,7 +120,7 @@
     "typescript": "~6.0.3",
     "typescript-eslint": "^8.72.1",
     "vite": "8.3.5",
-    "vitest": "^5.0.5"
+    "vitest": "^5.1.0"
   },
   "trustedDependencies": [
     "@google/genai",
