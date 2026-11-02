@@ -2,7 +2,7 @@
   import { onMount, onDestroy, tick, untrack } from 'svelte';
   import { THEMES } from '#lib/themes.js';
   import { dev } from '$app/env';
-  import { pushState, replaceState } from '$app/navigation';
+  import { shallowPush, shallowReplace } from '#lib/state/shallow-routing.js';
   import { page } from '$app/state';
   import { resolve } from '$app/paths';
   import { SvelteMap } from 'svelte/reactivity';
@@ -511,13 +511,13 @@
       // Shallow navigation pushes a same-URL history entry carrying the
       // marker; Android back pops it and the listener above swallows the
       // pop by closing the drawer. SvelteKit reapplies page.state on the
-      pushState('', { ...page.state, piUiDrawer: true }).catch(() => {
+      shallowPush('', { ...page.state, piUiDrawer: true }).catch(() => {
         /* marker is best-effort — the drawer still opens without it */
       });
     } else if (!anyOpen && marked) {
       if (_skipDrawerHistoryBack) {
         _skipDrawerHistoryBack = false;
-        replaceState('', { ...page.state, piUiDrawer: undefined }).catch(() => {
+        shallowReplace('', { ...page.state, piUiDrawer: undefined }).catch(() => {
           /* marker cleanup is best-effort */
         });
       } else {
@@ -3632,7 +3632,7 @@
     if (page.state.piUiAppWorkspace === true) return;
     const ref = appExtensionsState.activeViewForSlot('workspace');
     if (!ref) return;
-    pushState('', {
+    shallowPush('', {
       ...page.state,
       piUiAppWorkspace: true,
       piUiAppWorkspaceView: ref,
@@ -3650,8 +3650,8 @@
       piUiDrawer: undefined,
     };
     const navigation = page.state.piUiDrawer === true
-      ? replaceState('', state)
-      : pushState('', state);
+      ? shallowReplace('', state)
+      : shallowPush('', state);
     navigation.catch(() => {});
     appLauncherOpen = true;
     showSessionPanel = false;
@@ -3676,8 +3676,8 @@
     };
     const replaceCurrent = page.state.piUiAppLauncher === true || page.state.piUiDrawer === true;
     const navigation = replaceCurrent
-      ? replaceState('', state)
-      : pushState('', state);
+      ? shallowReplace('', state)
+      : shallowPush('', state);
     _suppressWorkspaceHistorySync = true;
     navigation.catch(() => {}).finally(() => {
       _suppressWorkspaceHistorySync = false;
@@ -3703,7 +3703,7 @@
         piUiAppWorkspaceView: undefined,
         piUiDrawer: isMobile ? true : undefined,
       };
-      replaceState('', state).catch(() => {});
+      shallowReplace('', state).catch(() => {});
       appExtensionsState.setActiveViewForSlot('workspace', null);
     }
     appLauncherOpen = false;
@@ -3731,7 +3731,7 @@
         piUiAppWorkspaceView: undefined,
         piUiDrawer: isMobile ? true : undefined,
       };
-      replaceState('', state).catch(() => {});
+      shallowReplace('', state).catch(() => {});
       appLauncherOpen = false;
       appExtensionsState.setActiveViewForSlot('workspace', null);
     }

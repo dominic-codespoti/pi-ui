@@ -11,8 +11,8 @@
 
 import { untrack } from 'svelte';
 import { SvelteMap, SvelteSet } from 'svelte/reactivity';
-import { replaceState } from '$app/navigation';
 import { page } from '$app/state';
+import { shallowReplace } from './shallow-routing.js';
 import type { ClientMessage, ProjectInfo, SessionSummary } from '#lib/ws/protocol.js';
 
 /** Runtime status for one session, keyed by session id in `ProjectsState.runtime`. */
@@ -865,8 +865,7 @@ class ProjectsState {
         /* non-fatal */
       }
     }
-    // eslint-disable-next-line svelte/no-navigation-without-resolve -- same-page ?session= query rewrite, not route navigation
-    replaceState(url, { ...state, piUiOptimisticSession: path }).catch(() => {
+    shallowReplace(url, { ...state, piUiOptimisticSession: path }).catch(() => {
       /* best-effort URL sync — never block session switching */
     });
     this.startOpTimeout();
@@ -888,8 +887,7 @@ class ProjectsState {
       } catch {
         /* not in a browser context */
       }
-      // eslint-disable-next-line svelte/no-navigation-without-resolve -- same-page ?session= query rewrite, not route navigation
-      replaceState(url, { ...state, piUiOptimisticSession: null }).catch(() => {});
+      shallowReplace(url, { ...state, piUiOptimisticSession: null }).catch(() => {});
     } catch {
       /* no window (SSR/test env) or replaceState unavailable */
     }
