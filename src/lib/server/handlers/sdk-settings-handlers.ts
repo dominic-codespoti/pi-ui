@@ -37,7 +37,7 @@ const settingsDescriptions: Record<string, string> = {
   defaultThinkingLevel: 'Thinking level selected for new sessions.',
   transport: 'Preferred transport when a provider supports multiple transports.',
   'compaction.enabled': 'Enable automatic context compaction.',
-  'compaction.reserveTokens': 'Tokens reserved for the model response during compaction.',
+  'compaction.reserveTokens': 'Free context tokens below which automatic compaction starts.',
   'compaction.keepRecentTokens': 'Recent tokens retained without summarization.',
   'branchSummary.reserveTokens': 'Tokens reserved when summarizing branch history.',
   'branchSummary.skipPrompt': 'Skip the branch-summary prompt and default to no summary.',

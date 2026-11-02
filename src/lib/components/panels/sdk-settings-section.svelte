@@ -52,7 +52,7 @@
         },
         {
           key: 'compaction.reserveTokens',
-          label: 'Reserved response tokens',
+          label: 'Compaction headroom tokens',
           kind: 'number',
           min: 0,
           defaultValue: 16384,
