@@ -488,40 +488,41 @@ test.describe('Extension component widgets', () => {
     await page.routeWebSocket('/ws', (ws) => {
       ws.onMessage(() => {});
       ws.send(JSON.stringify(CONNECTED_S1));
-      setTimeout(() => {
-        ws.send(
-          JSON.stringify({
-            type: 'extension_ui_request',
-            id: 'search-status',
-            method: 'setStatus',
-            statusKey: 'search',
-            statusText: 'DuckDuckGo / Jina',
-            sessionId: 's1',
-          })
-        );
-        ws.send(
-          JSON.stringify({
-            type: 'extension_ui_request',
-            id: 'other-status',
-            method: 'setStatus',
-            statusKey: 'other',
-            statusText: 'Ready',
-            sessionId: 's1',
-          })
-        );
-        ws.send(
-          JSON.stringify({
-            type: 'extension_ui_request',
-            id: 'search-footer',
-            method: 'set_footer',
-            content: 'DuckDuckGo / Jina',
-            sessionId: 's1',
-          })
-        );
-      }, 300);
+      // Frames are ordered: these land after the connected snapshot without
+      // a wall-clock delay (which only ate into the assertion budget).
+      ws.send(
+        JSON.stringify({
+          type: 'extension_ui_request',
+          id: 'search-status',
+          method: 'setStatus',
+          statusKey: 'search',
+          statusText: 'DuckDuckGo / Jina',
+          sessionId: 's1',
+        })
+      );
+      ws.send(
+        JSON.stringify({
+          type: 'extension_ui_request',
+          id: 'other-status',
+          method: 'setStatus',
+          statusKey: 'other',
+          statusText: 'Ready',
+          sessionId: 's1',
+        })
+      );
+      ws.send(
+        JSON.stringify({
+          type: 'extension_ui_request',
+          id: 'search-footer',
+          method: 'set_footer',
+          content: 'DuckDuckGo / Jina',
+          sessionId: 's1',
+        })
+      );
     });
 
-    await expect(page.getByText(/Ready/)).toBeVisible({ timeout: 5000 });
+    // Generous first wait: login + socket + hydration on a loaded host.
+    await expect(page.getByText(/Ready/)).toBeVisible({ timeout: 10_000 });
     await expect(page.getByText(/DuckDuckGo \/ Jina/)).toHaveCount(2);
 
     if ((page.viewportSize()?.width ?? 0) >= 768) {
