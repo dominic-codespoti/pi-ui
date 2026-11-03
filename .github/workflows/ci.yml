@@ -19,6 +19,11 @@ jobs:
         with:
           bun-version: ${{ env.BUN_VERSION }}
 
+      # vitest and Playwright run on Node; undici 8 needs >= 22.19 (.nvmrc).
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: '.nvmrc'
+
       - name: Cache bun install
         uses: actions/cache@v6
         with:
