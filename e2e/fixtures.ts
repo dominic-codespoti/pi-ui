@@ -61,6 +61,16 @@ export const test = base.extend<{
   mockWs: (page: Page, opts?: MockWsOptions) => Promise<MockWsHarness>;
   login: (page: Page, password?: string) => Promise<void>;
 }>({
+  // Opt-in CPU throttling (Chromium/CDP) to reproduce timing flakes seen on
+  // slow or loaded hosts: PI_UI_E2E_CPU_THROTTLE=8 bunx playwright test …
+  page: async ({ page, browserName }, use) => {
+    const rate = Number(process.env.PI_UI_E2E_CPU_THROTTLE ?? '');
+    if (browserName === 'chromium' && Number.isFinite(rate) && rate > 1) {
+      const cdp = await page.context().newCDPSession(page);
+      await cdp.send('Emulation.setCPUThrottlingRate', { rate });
+    }
+    await use(page);
+  },
   mockWs: async ({ browserName }, use) => {
     void browserName;
     const cleanups = new Set<() => void>();

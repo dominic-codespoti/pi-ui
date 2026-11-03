@@ -1,5 +1,5 @@
 import { test, expect, submitPrompt } from './fixtures';
-import type { Page } from '@playwright/test';
+import type { Page, WebSocketRoute } from '@playwright/test';
 import {
   extensionConfirmPayload,
   extensionInputPayload,
@@ -1849,17 +1849,17 @@ test.describe('Extension terminal input', () => {
         sent.push(msg);
         if (msg.type === 'extension_terminal_input' && !closed) {
           const count = sent.filter((m) => m.type === 'extension_terminal_input').length;
-          if (count === 1) {
-            // The first key's verdict never arrives — the socket dies while
-            // the second key is still queued behind it.
-            setTimeout(() => {
-              closed = true;
-              try {
-                ws.close();
-              } catch {
-                /* already closed */
-              }
-            }, 100);
+          if (count === 2) {
+            // Neither verdict ever arrives — the socket dies with the first
+            // key pending and the second queued behind it. Closing on the
+            // second key's arrival (not a timer after the first) keeps both
+            // in flight however slowly the keys are dispatched.
+            closed = true;
+            try {
+              ws.close();
+            } catch {
+              /* already closed */
+            }
           }
         }
       });
@@ -1881,7 +1881,9 @@ test.describe('Extension terminal input', () => {
 
   test('keys are not routed during the reconnect handshake', async ({ page }) => {
     const sent: Record<string, unknown>[] = [];
+    let socket: WebSocketRoute | undefined;
     await page.routeWebSocket('/ws', (ws) => {
+      socket = ws;
       ws.onMessage((data) => {
         const msg = JSON.parse(String(data)) as Record<string, unknown>;
         sent.push(msg);
@@ -1896,18 +1898,11 @@ test.describe('Extension terminal input', () => {
           );
         }
       });
-      // Hold the connected payload so keystrokes land in the handshake
-      // window (socket open, session identity not yet established).
-      setTimeout(() => {
-        ws.send(
-          JSON.stringify({
-            ...CONNECTED_S1,
-            extensionUiState: { terminalInputActive: true },
-          })
-        );
-      }, 300);
+      // Hold the connected payload (sent below) so keystrokes land in the
+      // handshake window: socket open, session identity not yet established.
     });
 
+    await expect.poll(() => socket !== undefined).toBe(true);
     await pressKey(page, 'a');
     await page.waitForTimeout(100);
 
@@ -1916,8 +1911,15 @@ test.describe('Extension terminal input', () => {
     // terminal-input message with the stale session identity).
     expect(sent.some((msg) => msg.type === 'extension_terminal_input')).toBe(false);
 
+    // Complete the handshake. The client requests app extensions in the same
+    // synchronous handler that marks the handshake complete, so that frame is
+    // a deterministic "routing is live" signal (no wall-clock wait).
+    socket!.send(
+      JSON.stringify({ ...CONNECTED_S1, extensionUiState: { terminalInputActive: true } })
+    );
+    await expect.poll(() => sent.some((msg) => msg.type === 'get_app_extensions')).toBe(true);
+
     // Post-handshake: routing resumes normally.
-    await page.waitForTimeout(300);
     await pressKey(page, 'b');
     await expect(page.locator('textarea')).toHaveValue('b');
   });
@@ -2198,6 +2200,7 @@ test.describe('Extension terminal input', () => {
   test('editor mirror resyncs after a same-session reconnect', async ({ page }) => {
     const sent: Record<string, unknown>[] = [];
     let connectionCount = 0;
+    let firstSocket: WebSocketRoute | undefined;
     await page.routeWebSocket('/ws', (ws) => {
       connectionCount++;
       const isFirst = connectionCount === 1;
@@ -2210,16 +2213,7 @@ test.describe('Extension terminal input', () => {
           extensionUiState: { terminalInputActive: true },
         })
       );
-      if (isFirst) {
-        // Force a reconnect to the SAME session shortly after connecting.
-        setTimeout(() => {
-          try {
-            ws.close();
-          } catch {
-            /* already closed */
-          }
-        }, 300);
-      }
+      if (isFirst) firstSocket = ws;
     });
 
     await page.locator('textarea').fill('draft text');
@@ -2228,7 +2222,15 @@ test.describe('Extension terminal input', () => {
         .length;
     await expect.poll(mirrorHits).toBeGreaterThanOrEqual(1);
 
-    // Wait past the forced close and the client's reconnect + handshake.
+    // Force a reconnect to the SAME session only once the first mirror has
+    // landed (a fixed timer could close before it on a slow machine).
+    try {
+      firstSocket?.close();
+    } catch {
+      /* already closed */
+    }
+
+    // Wait for the client's reconnect + handshake.
     await expect.poll(() => connectionCount, { timeout: 10_000 }).toBeGreaterThanOrEqual(2);
 
     // Neither `sessionId` nor `input` changed across the reconnect, so the
