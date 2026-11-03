@@ -26,5 +26,25 @@ describe('usageBreakdownTitle', () => {
     expect(title).toContain('total $0.307000');
     expect(title).not.toContain('Reasoning');
     expect(usageBreakdownTitle(undefined)).toBe('');
+    expect(title).toContain('(estimate)');
+  });
+
+  it('marks provider-billed totals', () => {
+    const usage: NonNullable<UIMessage['usage']> = {
+      input: 1,
+      output: 1,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 2,
+      cost: {
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        total: 0.5,
+        totalFromProvider: true,
+      },
+    };
+    expect(usageBreakdownTitle(usage)).toContain('(billed by provider)');
   });
 });

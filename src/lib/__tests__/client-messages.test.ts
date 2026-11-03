@@ -6,6 +6,7 @@ import {
   agentMsgToUI,
   rawMessagesToUI,
   reconnectDelay,
+  parseMsgUsage,
 } from '../client-messages';
 
 describe('uid', () => {
@@ -563,5 +564,46 @@ describe('rawMessagesToUI', () => {
       { role: 'assistant', content: [{ type: 'text', text: 'hi' }] },
     ]);
     expect(result).toHaveLength(1);
+  });
+});
+
+describe('SDK 1.5 assistant metadata', () => {
+  it('carries model, responseModel and provider-billed cost', () => {
+    const [msg] = rawMessagesToUI([
+      {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'hi' }],
+        model: 'radius/auto',
+        responseModel: 'claude-sonnet-5',
+        usage: {
+          input: 1,
+          output: 2,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 3,
+          cost: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            total: 0.25,
+            totalFromProvider: true,
+          },
+        },
+        stopReason: 'stop',
+        timestamp: 1,
+      },
+    ]);
+    expect(msg.model).toBe('radius/auto');
+    expect(msg.responseModel).toBe('claude-sonnet-5');
+    expect(msg.usage?.cost.totalFromProvider).toBe(true);
+  });
+
+  it('omits totalFromProvider for catalog estimates and rejects usage without totals', () => {
+    expect(
+      parseMsgUsage({ totalTokens: 1, cost: { total: 0.1, totalFromProvider: false } })?.cost
+    ).not.toHaveProperty('totalFromProvider');
+    expect(parseMsgUsage({ input: 3 })).toBeUndefined();
+    expect(parseMsgUsage(null)).toBeUndefined();
   });
 });

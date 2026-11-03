@@ -403,7 +403,18 @@
               ? (msg.usage.totalTokens / 1000).toFixed(1) + 'k'
               : msg.usage.totalTokens}t</span
           >{/if}
-        {#if msg.usage?.cost?.total}<span class="tabular-nums"
+        {#if msg.responseModel && msg.responseModel !== msg.model}<span
+            class="max-w-40 truncate"
+            data-testid="response-model"
+            title={msg.model
+              ? `Requested ${msg.model} · answered by ${msg.responseModel}`
+              : `Answered by ${msg.responseModel}`}>{msg.responseModel}</span
+          >{/if}
+        {#if msg.usage?.cost?.total}<span
+            class="tabular-nums"
+            title={msg.usage.cost.totalFromProvider
+              ? 'Billed cost reported by the provider'
+              : 'Estimated from the model catalog'}
             >{msg.usage.cost.total < 0.0001
               ? '<$0.0001'
               : `$${msg.usage.cost.total.toFixed(4)}`}</span

@@ -166,6 +166,56 @@ test.describe('Chat / prompt streaming', () => {
     await expect(page.getByText('Hi there!')).toBeVisible({ timeout: 3000 });
   });
 
+  test('shows the answering model and billed cost provenance (SDK 1.5)', async ({ page }) => {
+    await page.routeWebSocket('/ws', (ws) => {
+      ws.send(
+        JSON.stringify({
+          type: 'connected',
+          sessionId: 's1',
+          isStreaming: false,
+          thinkingLevel: 'medium',
+          model: null,
+          availableModels: [],
+          messages: [
+            { role: 'user', content: 'Route me', timestamp: Date.now() - 60000 },
+            {
+              role: 'assistant',
+              content: [{ type: 'text', text: 'Routed answer' }],
+              model: 'auto',
+              responseModel: 'sonnet-routed',
+              usage: {
+                input: 5,
+                output: 10,
+                totalTokens: 15,
+                cost: { total: 0.0123, totalFromProvider: true },
+              },
+              stopReason: 'stop',
+              timestamp: Date.now() - 55000,
+            },
+            {
+              role: 'assistant',
+              content: [{ type: 'text', text: 'Plain answer' }],
+              model: 'gpt-4o',
+              responseModel: 'gpt-4o',
+              usage: { input: 5, output: 10, totalTokens: 15, cost: { total: 0.002 } },
+              stopReason: 'stop',
+              timestamp: Date.now() - 50000,
+            },
+          ],
+        })
+      );
+    });
+
+    await page.goto('/');
+    await expect(page.getByText('Routed answer')).toBeVisible({ timeout: 3000 });
+    const label = page.getByTestId('response-model');
+    await expect(label).toHaveCount(1);
+    await expect(label).toHaveText('sonnet-routed');
+    await expect(label).toHaveAttribute('title', 'Requested auto · answered by sonnet-routed');
+    await expect(page.getByTitle('Billed cost reported by the provider')).toHaveText('$0.0123');
+    await expect(page.getByTitle('Estimated from the model catalog')).toHaveText('$0.0020');
+  });
+
   test('dispatches a slash command instead of steering while the agent is streaming', async ({
     page,
   }) => {

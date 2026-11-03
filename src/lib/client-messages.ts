@@ -5,8 +5,54 @@ export type MsgUsage = {
   cacheWrite: number;
   reasoning?: number;
   totalTokens: number;
-  cost: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
+  cost: {
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite: number;
+    total: number;
+    /** SDK 1.5: `total` is the provider-billed cost rather than a catalog estimate. */
+    totalFromProvider?: boolean;
+  };
 };
+
+/** Normalize an SDK `Usage` record; undefined when it carries no token total. */
+export function parseMsgUsage(raw: unknown): MsgUsage | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const u = raw as {
+    input?: number;
+    output?: number;
+    cacheRead?: number;
+    cacheWrite?: number;
+    reasoning?: number;
+    totalTokens?: number;
+    cost?: {
+      input?: number;
+      output?: number;
+      cacheRead?: number;
+      cacheWrite?: number;
+      total?: number;
+      totalFromProvider?: boolean;
+    };
+  };
+  if (u.totalTokens === undefined) return undefined;
+  return {
+    input: u.input ?? 0,
+    output: u.output ?? 0,
+    cacheRead: u.cacheRead ?? 0,
+    cacheWrite: u.cacheWrite ?? 0,
+    ...(u.reasoning !== undefined ? { reasoning: u.reasoning } : {}),
+    totalTokens: u.totalTokens,
+    cost: {
+      input: u.cost?.input ?? 0,
+      output: u.cost?.output ?? 0,
+      cacheRead: u.cost?.cacheRead ?? 0,
+      cacheWrite: u.cost?.cacheWrite ?? 0,
+      total: u.cost?.total ?? 0,
+      ...(u.cost?.totalFromProvider === true ? { totalFromProvider: true } : {}),
+    },
+  };
+}
 
 export type CompactionNoticeDetails = {
   reason?: string;
@@ -47,6 +93,10 @@ export type UIMessage = {
   diff?: string;
   lineCount?: number;
   usage?: MsgUsage;
+  /** Assistant: model requested for this response. */
+  model?: string;
+  /** Assistant (SDK 1.5): concrete model that answered, e.g. behind a virtual model. */
+  responseModel?: string;
   thinking?: string;
   redactedThinking?: boolean;
   blocks?: { type: 'text' | 'thinking'; text: string }[];
@@ -382,41 +432,7 @@ export function agentMsgToUI(
         }
       }
 
-      const rawUsage = msg.usage as
-        | {
-            input?: number;
-            output?: number;
-            cacheRead?: number;
-            cacheWrite?: number;
-            reasoning?: number;
-            totalTokens?: number;
-            cost?: {
-              input?: number;
-              output?: number;
-              cacheRead?: number;
-              cacheWrite?: number;
-              total?: number;
-            };
-          }
-        | undefined;
-      const usage: MsgUsage | undefined =
-        rawUsage?.totalTokens !== undefined
-          ? {
-              input: rawUsage.input ?? 0,
-              output: rawUsage.output ?? 0,
-              cacheRead: rawUsage.cacheRead ?? 0,
-              cacheWrite: rawUsage.cacheWrite ?? 0,
-              ...(rawUsage.reasoning !== undefined ? { reasoning: rawUsage.reasoning } : {}),
-              totalTokens: rawUsage.totalTokens,
-              cost: {
-                input: rawUsage.cost?.input ?? 0,
-                output: rawUsage.cost?.output ?? 0,
-                cacheRead: rawUsage.cost?.cacheRead ?? 0,
-                cacheWrite: rawUsage.cost?.cacheWrite ?? 0,
-                total: rawUsage.cost?.total ?? 0,
-              },
-            }
-          : undefined;
+      const usage = parseMsgUsage(msg.usage);
 
       return text || thinkingText || redactedThinking || images || msg.stopReason
         ? [
@@ -434,6 +450,10 @@ export function agentMsgToUI(
               thinkingExpanded: false,
               streaming: false,
               usage,
+              ...(typeof msg.model === 'string' ? { model: msg.model } : {}),
+              ...(typeof msg.responseModel === 'string'
+                ? { responseModel: msg.responseModel }
+                : {}),
               createdAt: ts,
             },
           ]
@@ -598,40 +618,8 @@ export function agentMsgToUI(
       };
       if (typeof msg.startMs === 'number') result.startMs = msg.startMs;
       if (typeof msg.endMs === 'number') result.endMs = msg.endMs;
-      const rawUsage = msg.usage as
-        | {
-            input?: number;
-            output?: number;
-            cacheRead?: number;
-            cacheWrite?: number;
-            reasoning?: number;
-            totalTokens?: number;
-            cost?: {
-              input?: number;
-              output?: number;
-              cacheRead?: number;
-              cacheWrite?: number;
-              total?: number;
-            };
-          }
-        | undefined;
-      if (rawUsage?.totalTokens !== undefined) {
-        result.usage = {
-          input: rawUsage.input ?? 0,
-          output: rawUsage.output ?? 0,
-          cacheRead: rawUsage.cacheRead ?? 0,
-          cacheWrite: rawUsage.cacheWrite ?? 0,
-          ...(rawUsage.reasoning !== undefined ? { reasoning: rawUsage.reasoning } : {}),
-          totalTokens: rawUsage.totalTokens,
-          cost: {
-            input: rawUsage.cost?.input ?? 0,
-            output: rawUsage.cost?.output ?? 0,
-            cacheRead: rawUsage.cost?.cacheRead ?? 0,
-            cacheWrite: rawUsage.cost?.cacheWrite ?? 0,
-            total: rawUsage.cost?.total ?? 0,
-          },
-        };
-      }
+      const toolUsage = parseMsgUsage(msg.usage);
+      if (toolUsage) result.usage = toolUsage;
       result.toolDetails = toolDetails;
       if (toolDetails.fullOutputPath) result.fullOutputPath = toolDetails.fullOutputPath;
       if (typeof msg.cancelled === 'boolean') result.cancelled = msg.cancelled;

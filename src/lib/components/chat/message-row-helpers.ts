@@ -26,7 +26,8 @@ export function usageBreakdownTitle(usage: UIMessage['usage']): string {
     (usage.reasoning !== undefined ? ` · Reasoning ${tokens(usage.reasoning)}` : '') +
     ` · Total ${tokens(usage.totalTokens)} tokens · Cost: input ${usd(cost.input)}, ` +
     `output ${usd(cost.output)}, cache read ${usd(cost.cacheRead)}, ` +
-    `cache write ${usd(cost.cacheWrite)}, total ${usd(cost.total)}`
+    `cache write ${usd(cost.cacheWrite)}, total ${usd(cost.total)}` +
+    (usage.cost?.totalFromProvider ? ' (billed by provider)' : ' (estimate)')
   );
 }
 
