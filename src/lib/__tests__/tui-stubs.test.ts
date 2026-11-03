@@ -14,6 +14,9 @@ import {
   boundedAnsiToHtmlLines,
   boundTerminalLines,
   renderCustomMessage,
+  renderCustomEntry,
+  renderToolCallHtml,
+  applyMarkdownTransformersToMessages,
   stubKeybindings,
   callFactoryAndParse,
   shouldUseInteractiveCustom,
@@ -933,5 +936,72 @@ describe('parseComponentTree — pi-tui Editor duck-type', () => {
     const result = parseComponentTree(hybrid);
     expect(result.kind).toBe('input');
     if (result.kind === 'input') expect(result.value).toBe('input-value');
+  });
+});
+
+describe('SDK 1.5 render contexts', () => {
+  const sessWith = (runner: Record<string, unknown>, branch: unknown[] = []) =>
+    ({
+      sessionManager: { getEntries: () => [], getBranch: () => branch },
+      extensionRunner: { getMarkdownTransformers: () => [], ...runner },
+    }) as unknown as AgentSession;
+
+  it('injects keyText/keyHint, outputPad and durationMs into tool render contexts', () => {
+    let seen: Record<string, unknown> | undefined;
+    const sess = sessWith({
+      getToolDefinition: () => ({
+        renderCall: (_args: unknown, _theme: unknown, ctx: Record<string, unknown>) => {
+          seen = ctx;
+          const hint = (ctx.keyHint as (k: string, d: string) => string)(
+            'app.tools.expand',
+            'to expand'
+          );
+          return { render: () => [`call ${hint}`] };
+        },
+      }),
+    });
+    const lines = renderToolCallHtml(sess, 'demo', {}, 'tc-keyhint');
+    expect(lines?.join('')).toContain('to expand');
+    expect((seen?.keyText as (k: string) => string)('app.tools.expand')).toBe('');
+    expect(seen?.outputPad).toBe(0);
+    expect('durationMs' in (seen ?? {})).toBe(true);
+  });
+
+  it('passes keybinding hints to message and entry renderers', () => {
+    const useHints = (_m: unknown, options: Record<string, unknown>) => ({
+      render: () => [(options.keyHint as (k: string, d: string) => string)('x', 'hint text')],
+    });
+    const sess = sessWith({ getMessageRenderer: () => useHints, getEntryRenderer: () => useHints });
+    const msg = renderCustomMessage(sess, { role: 'custom', customType: 'demo', content: '' }) as {
+      renderedNoticeHtml?: string[];
+    };
+    expect(msg.renderedNoticeHtml?.join('')).toContain('hint text');
+    const entry = renderCustomEntry(sess, {
+      type: 'custom',
+      customType: 'demo',
+      timestamp: '2026-11-03T00:00:00Z',
+    }) as { renderedNoticeHtml?: string[] } | null;
+    expect(entry?.renderedNoticeHtml?.join('')).toContain('hint text');
+  });
+
+  it('gives markdown transformers the persisted messageId and timestamp', () => {
+    const saved = { role: 'user', content: 'saved' };
+    const unsaved = { role: 'user', content: 'live' };
+    const contexts: Array<Record<string, unknown>> = [];
+    const sess = sessWith(
+      {
+        getMarkdownTransformers: () => [
+          (md: string, ctx: Record<string, unknown>) => {
+            contexts.push(ctx);
+            return md;
+          },
+        ],
+      },
+      [{ type: 'message', id: 'e1', timestamp: '2026-11-03T01:02:03.000Z', message: saved }]
+    );
+    applyMarkdownTransformersToMessages(sess, [saved, unsaved]);
+    expect(contexts[0]).toMatchObject({ messageId: 'e1', timestamp: '2026-11-03T01:02:03.000Z' });
+    expect(contexts[1].messageId).toBeUndefined();
+    expect(contexts[1].timestamp).toBeUndefined();
   });
 });

@@ -596,6 +596,21 @@ export const stubKeybindings = new Proxy({} as Record<string, unknown>, {
   },
 });
 
+/**
+ * SDK 1.5 `KeybindingHints` (`keyText`/`keyHint`) injected into tool, message
+ * and entry render contexts. Same policy as `stubKeybindings`: TUI keybindings
+ * are not bound in the browser, so `keyText` is empty and `keyHint` renders
+ * just the description (styled as the TUI's muted hint text).
+ */
+export const stubKeybindingHints = {
+  keyText: (): string => '',
+  keyHint: (...args: [keybinding: string, description: string]): string =>
+    stubTheme.fg('muted', args[1]),
+};
+
+/** Web rendering: CSS owns padding, so renderers must not add terminal padding columns. */
+const WEB_OUTPUT_PAD = 0;
+
 // ── Parsed component types ────────────────────────────────────────────────────
 
 export interface ParsedSelect {
@@ -1304,6 +1319,9 @@ function buildToolRenderContext(
     expanded,
     showImages: false,
     isError,
+    durationMs: undefined,
+    outputPad: WEB_OUTPUT_PAD,
+    ...stubKeybindingHints,
   };
 }
 
@@ -1413,7 +1431,13 @@ export function renderCustomMessage(sess: AgentSession, msg: unknown): unknown {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- see renderToolCallHtml
     const renderer = sess.extensionRunner.getMessageRenderer(m.customType) as any;
     if (!renderer) return msg;
-    const lines = componentToHtmlLines(renderer(msg, { expanded: true }, stubTheme));
+    const lines = componentToHtmlLines(
+      renderer(
+        msg,
+        { expanded: true, outputPad: WEB_OUTPUT_PAD, ...stubKeybindingHints },
+        stubTheme
+      )
+    );
     if (!lines) return msg;
     return { ...msg, renderedNoticeHtml: lines };
   } catch {
@@ -1440,7 +1464,36 @@ export function renderCustomMessagesForWire(sess: AgentSession, messages: unknow
  * `boundMessagesForWire`. Mirrors what pi's interactive transcript does before
  * rendering markdown; the LLM context is never touched.
  */
-export function applyMarkdownTransformers<T>(sess: AgentSession, msg: T): T {
+/** Persisted session-entry identity for a message (SDK 1.5 `MarkdownTransformContext`). */
+export interface MessageEntryMeta {
+  id: string;
+  timestamp: string;
+}
+
+/**
+ * Map message objects to their persisted session entry, like the SDK's
+ * interactive `renderSessionEntries`: agent-state messages are the same
+ * object references as `entry.message`. Best-effort — anything unmatched
+ * renders with `messageId`/`timestamp` undefined, as live rendering does.
+ */
+export function messageEntryMetaFor(sess: AgentSession): WeakMap<object, MessageEntryMeta> {
+  const meta = new WeakMap<object, MessageEntryMeta>();
+  try {
+    for (const entry of sess.sessionManager.getBranch()) {
+      if (entry.type !== 'message' || !entry.message || typeof entry.message !== 'object') continue;
+      meta.set(entry.message, { id: entry.id, timestamp: entry.timestamp });
+    }
+  } catch {
+    /* sessions without a manager (tests, teardown) just get no metadata */
+  }
+  return meta;
+}
+
+export function applyMarkdownTransformers<T>(
+  sess: AgentSession,
+  msg: T,
+  entryMeta?: MessageEntryMeta
+): T {
   if (!msg || typeof msg !== 'object') return msg;
   if (!('role' in msg) || (msg.role !== 'user' && msg.role !== 'assistant')) return msg;
   const role = msg.role;
@@ -1456,7 +1509,13 @@ export function applyMarkdownTransformers<T>(sess: AgentSession, msg: T): T {
     let out = text;
     for (const transformer of transformers) {
       try {
-        out = transformer(out, { messageType, isStreaming: false, availableWidth: 80 });
+        out = transformer(out, {
+          messageType,
+          isStreaming: false,
+          availableWidth: 80,
+          messageId: entryMeta?.id,
+          timestamp: entryMeta?.timestamp,
+        });
       } catch {
         /* a broken transformer must not take down the wire path */
       }
@@ -1520,8 +1579,20 @@ export function applyMarkdownTransformersToMessages(
   messages: unknown[]
 ): unknown[] {
   let changed = false;
+  // Only build the entry map when a transformer would actually see it.
+  let hasTransformers = false;
+  try {
+    hasTransformers = sess.extensionRunner.getMarkdownTransformers().length > 0;
+  } catch {
+    /* fall through: applyMarkdownTransformers handles the failure per message */
+  }
+  const meta = hasTransformers ? messageEntryMetaFor(sess) : undefined;
   const out = messages.map((msg) => {
-    const next = applyMarkdownTransformers(sess, msg);
+    const next = applyMarkdownTransformers(
+      sess,
+      msg,
+      msg && typeof msg === 'object' ? meta?.get(msg) : undefined
+    );
     if (next !== msg) changed = true;
     return next;
   });
@@ -1547,10 +1618,12 @@ export function renderCustomEntry(sess: AgentSession, entry: unknown): unknown |
     // and we only ever feed it the session manager's untouched entry objects.
     const render = renderer as (
       e: unknown,
-      options: { expanded: boolean },
+      options: { expanded: boolean } & typeof stubKeybindingHints,
       theme: unknown
     ) => unknown;
-    const lines = componentToHtmlLines(render(entry, { expanded: true }, stubTheme));
+    const lines = componentToHtmlLines(
+      render(entry, { expanded: true, ...stubKeybindingHints }, stubTheme)
+    );
     if (!lines || lines.length === 0) return null;
     const data = 'data' in entry ? entry.data : undefined;
     const rawTimestamp = 'timestamp' in entry ? entry.timestamp : undefined;

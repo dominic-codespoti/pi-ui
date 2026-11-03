@@ -132,6 +132,8 @@ import { navigateTree, setEntryLabel } from './src/lib/server/handlers/tree-hand
 import { getSdkSettings, setSdkSetting } from './src/lib/server/handlers/sdk-settings-handlers.ts';
 import {
   ExtensionRuntime,
+  normalizeCustomBlocked,
+  pendingRequestBlocksForInput,
   type AutocompleteProviderFactory,
   type SessionUiState,
   type WidgetFactoryState,
@@ -1448,6 +1450,11 @@ const uiContext: ServerExtensionUIContext = {
       }
     }
 
+    // SDK 1.5 `blocked`: inline components report pi as waiting on the user;
+    // overlays ignore it (same as the TUI).
+    const blocked =
+      options && options.overlay !== true ? normalizeCustomBlocked(options.blocked) : undefined;
+
     const tui = new StubTui();
     const done = (val: unknown) => {
       const pending = ui.pendingDialogs.get(id);
@@ -1505,6 +1512,7 @@ const uiContext: ServerExtensionUIContext = {
               htmlLines,
               interactive: true,
               ...(parsed ? { parsed } : {}),
+              ...(blocked ? { blocked } : {}),
             };
             extensionRuntime.setInteractiveLastRender(id, JSON.stringify(cleanLines), owner);
             return extensionRuntime.createDialogPromise<string | undefined>(
@@ -1576,6 +1584,7 @@ const uiContext: ServerExtensionUIContext = {
         method: 'custom',
         title,
         ...(parsed ? { parsed } : {}),
+        ...(blocked ? { blocked } : {}),
       },
       (r) =>
         'cancelled' in r && r.cancelled
@@ -2375,11 +2384,21 @@ function hasPendingExtensionDialog(sid: string): boolean {
   return (extensionRuntime.stateForSession(sid)?.pendingDialogs.size ?? 0) > 0;
 }
 
+/** A pending dialog that is actually waiting on the user (see `pendingRequestBlocksForInput`). */
+function hasBlockingExtensionDialog(sid: string): boolean {
+  const pending = extensionRuntime.stateForSession(sid)?.pendingDialogs;
+  if (!pending) return false;
+  for (const request of pending.values()) {
+    if (pendingRequestBlocksForInput(request.requestPayload)) return true;
+  }
+  return false;
+}
+
 function sessionPhaseFor(
   sid: string,
   entry: Pick<ManagedSession, 'isRunning' | 'activeToolName' | 'activeToolCalls' | 'lastTurnError'>
 ): SessionPhase {
-  if (hasPendingExtensionDialog(sid)) return 'awaiting-input';
+  if (hasBlockingExtensionDialog(sid)) return 'awaiting-input';
   if (entry.isRunning || entry.activeToolName || entry.activeToolCalls.size > 0) return 'running';
   if (entry.lastTurnError) return 'error';
   return 'idle';

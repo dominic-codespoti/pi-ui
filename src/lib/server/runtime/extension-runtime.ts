@@ -3,8 +3,56 @@ import type { AutocompleteProvider } from '@earendil-works/pi-tui';
 import type { ExtensionUiStatePayload, ServerMessage, WidgetPayload } from '../../ws/protocol.ts';
 
 import { WIDGET_REFRESH_MS, type ParsedComponent, type StubTui } from '../../tui-stubs.ts';
+import {
+  customModalNeedsTextInput,
+  parsedComponentHasAction,
+  parsedComponentHasInput,
+} from '../../extension-modals.ts';
 
 export type RuntimeTimer = number | Timer;
+
+/**
+ * Whether a pending extension request is waiting on the user (drives the
+ * `awaiting-input` phase and sidebar attention). Built-in dialogs (select,
+ * confirm, input, editor) always are. SDK 1.5 treats `ctx.ui.custom()` as
+ * non-blocking — it also hosts loaders — unless the extension passes
+ * `blocked`; components from extensions predating that option still count
+ * when they are interactive or offer an action/text input, so their
+ * questions keep raising attention while passive loaders no longer do.
+ * Every pending request still pins its session against eviction.
+ */
+/** SDK `ProgramStatus` kinds accepted by `ctx.ui.custom(..., { blocked })`. */
+const CUSTOM_BLOCKED_KINDS = new Set(['question', 'permission', 'auth']);
+const MAX_BLOCKED_MESSAGE_CHARS = 500;
+
+/**
+ * Validate an extension-supplied `blocked` option before it goes on the wire:
+ * a known kind plus a bounded string message, or nothing.
+ */
+export function normalizeCustomBlocked(
+  value: unknown
+): { kind: string; message: string } | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const { kind, message } = value as { kind?: unknown; message?: unknown };
+  if (typeof kind !== 'string' || !CUSTOM_BLOCKED_KINDS.has(kind)) return undefined;
+  return {
+    kind,
+    message: typeof message === 'string' ? message.slice(0, MAX_BLOCKED_MESSAGE_CHARS) : '',
+  };
+}
+
+export function pendingRequestBlocksForInput(payload: Record<string, unknown>): boolean {
+  if (payload.method !== 'custom') return true;
+  if (payload.blocked) return true;
+  if (payload.interactive === true) return true;
+  const parsed = payload.parsed as ParsedComponent | undefined;
+  // No parsed tree → the browser shows a free-text reply box (customModalNeedsTextInput).
+  return (
+    parsedComponentHasAction(parsed) ||
+    parsedComponentHasInput(parsed) ||
+    customModalNeedsTextInput(parsed)
+  );
+}
 
 export interface PendingRequest {
   requestPayload: Record<string, unknown>;
