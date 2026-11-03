@@ -1362,13 +1362,23 @@ test.describe('Mobile native feel', () => {
     await page.getByRole('button', { name: /working in project/ }).click();
     const picker = page.locator('[data-project-picker]');
     await expect(picker).toBeVisible();
-    const box = await picker.boundingBox();
     const vh = page.viewportSize()?.height ?? 0;
+    // Docked, not centred: the bottom-sheet panel hosting the picker sits
+    // flush with the viewport bottom once its 240ms slide-in settles. Measure
+    // the panel, not the picker inside it — the panel's content padding and
+    // border keep the picker itself ~9px above the edge by design.
+    const panel = page.locator('[data-sheet-panel]').filter({ has: picker });
+    await expect
+      .poll(async () => {
+        const box = await panel.boundingBox();
+        return box ? Math.round(box.y + box.height) : -1;
+      })
+      .toBeGreaterThanOrEqual(vh - 1);
+    // ...and sits in the lower half regardless of its content height (which
+    // varies with platform font metrics).
+    const box = await picker.boundingBox();
     expect(box).not.toBeNull();
-    // Docked, not centred: the sheet sits in the lower half regardless of its
-    // content height (which varies with platform font metrics).
     expect(box!.y + box!.height / 2).toBeGreaterThan(vh / 2);
-    expect(box!.y + box!.height).toBeGreaterThanOrEqual(vh - 8);
   });
 });
 
