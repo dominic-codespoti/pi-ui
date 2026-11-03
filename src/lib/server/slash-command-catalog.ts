@@ -1,6 +1,7 @@
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { AgentSession, InlineExtension } from '@earendil-works/pi-coding-agent';
+import type { ExtensionChangelogDeps } from './extension-changelog.ts';
 
 export type BuiltinSlashCommand = {
   name: string;
@@ -50,6 +51,21 @@ export async function getLatestChangelogEntries(lastSeenVersion?: string) {
       content: entry.content,
     })
   );
+}
+
+let extensionChangelogDepsPromise: Promise<ExtensionChangelogDeps> | null = null;
+
+/** SDK changelog parser + package-key helper for extension changelogs (not re-exported from the root). */
+export function getExtensionChangelogDeps(): Promise<ExtensionChangelogDeps> {
+  extensionChangelogDepsPromise ??= Promise.all([
+    sdkModuleUrl('dist/utils/changelog.js').then((url) => import(url)),
+    sdkModuleUrl('dist/core/source-info.js').then((url) => import(url)),
+  ]).then(([changelog, sourceInfo]) => ({
+    parseChangelog: changelog.parseChangelog,
+    getNewEntries: changelog.getNewEntries,
+    getSourcePackageKey: sourceInfo.getSourcePackageKey,
+  }));
+  return extensionChangelogDepsPromise;
 }
 
 export async function prepareBugReport(session: AgentSession, hint?: string) {

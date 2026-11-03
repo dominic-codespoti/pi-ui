@@ -26,8 +26,14 @@ import type {
 } from '@earendil-works/pi-coding-agent';
 import { THEMES } from './src/lib/themes.ts';
 import {
+  collectExtensionChangelogUpdates,
+  formatExtensionChangelogNotice,
+  type ExtensionSourceInfo,
+} from './src/lib/server/extension-changelog.ts';
+import {
   getBuiltInExtensions,
   getBuiltinSlashCommands,
+  getExtensionChangelogDeps,
   getLatestChangelogEntries,
   prepareBugReport,
   uploadPreparedBugReport,
@@ -3258,6 +3264,37 @@ async function bindRpcHost(session: AgentSession): Promise<void> {
     },
   });
 }
+let extensionChangelogChecked = false;
+
+/** Show changelog entries for updated extension packages (see extension-changelog.ts). */
+async function announceExtensionChangelogs(sid: string, session: AgentSession): Promise<void> {
+  try {
+    const deps = await getExtensionChangelogDeps();
+    const extensions = session.resourceLoader.getExtensions()
+      .extensions as unknown as ReadonlyArray<{
+      sourceInfo: ExtensionSourceInfo;
+    }>;
+    const updates = collectExtensionChangelogUpdates(extensions, session.settingsManager, deps);
+    const message = formatExtensionChangelogNotice(
+      updates,
+      session.settingsManager.getCollapseChangelog()
+    );
+    if (!message) return;
+    log.info(
+      `[pifrontier] extension updates: ${updates.map((u) => `${u.name}@${u.version}`).join(', ')}`
+    );
+    broadcast({
+      type: 'slash_result',
+      command: 'extension_changelog',
+      message,
+      level: 'info',
+      ...stampOwner(sid),
+    });
+  } catch (err) {
+    log.warn('[pifrontier] extension changelog check failed:', err);
+  }
+}
+
 /** Start extension binding without making session creation wait. */
 function startHostBinding(sid: string, session: AgentSession): Promise<void> {
   const entry = residentStore.get(sid);
@@ -3284,6 +3321,12 @@ function startHostBinding(sid: string, session: AgentSession): Promise<void> {
         diagnostics: entry.diagnostics,
         ...stampOwner(sid),
       });
+      // SDK 1.5 "Extension Updates": the TUI shows them on a fresh launch's
+      // empty session; pi-ui does the same once per server process.
+      if (!extensionChangelogChecked && session.messages.length === 0) {
+        extensionChangelogChecked = true;
+        void announceExtensionChangelogs(sid, session);
+      }
     })
     .catch((err) => {
       if (residentStore.get(sid)?.session === session) entry.bindingPending = false;
