@@ -864,17 +864,30 @@ test.describe('Chat / prompt streaming', () => {
     });
 
     await page.goto('/');
-    await page.fill('textarea', '@a');
-    await page.fill('textarea', '@ab');
-    await page.fill('textarea', '@abc');
+    // Type each burst inside the page, 40ms apart: well within the 200ms
+    // debounce, yet separate input events (without a debounce each would
+    // request). Separate page.fill() calls pay a Playwright round trip per
+    // step, which exceeds the window on a loaded host.
+    const typeBurst = (values: string[]) =>
+      page.evaluate(async (steps) => {
+        const el = document.querySelector('textarea')!;
+        el.focus();
+        for (const [i, value] of steps.entries()) {
+          if (i > 0) await new Promise((resolve) => setTimeout(resolve, 40));
+          el.value = value;
+          el.dispatchEvent(
+            new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value.at(-1) })
+          );
+        }
+      }, values);
+    await expect(page.locator('textarea')).toBeEditable();
+    await typeBurst(['@a', '@ab', '@abc']);
     await expect.poll(() => requests.file.length, { timeout: 3000 }).toBe(1);
     await expect.poll(() => requests.extension.length, { timeout: 3000 }).toBe(1);
     expect(requests.file[0].query).toBe('abc');
     expect(requests.extension[0].query).toBe('abc');
 
-    await page.fill('textarea', '/parent a');
-    await page.fill('textarea', '/parent ab');
-    await page.fill('textarea', '/parent abc');
+    await typeBurst(['/parent a', '/parent ab', '/parent abc']);
     await expect.poll(() => requests.command.length, { timeout: 3000 }).toBe(1);
     expect(requests.command[0].prefix).toBe('abc');
   });
