@@ -124,7 +124,10 @@ import {
 import { AppExtensionHost } from './src/lib/server/app-extensions/host.ts';
 import { buildSdkAppExtensionTools } from './src/lib/server/app-extensions/sdk-tools.ts';
 import { createAppExtensionExecutionContext } from './src/lib/server/app-extensions/context.ts';
-import type { AppExtensionCallContext, AppExtensionExecutionContext } from './src/lib/app-extensions/types.ts';
+import type {
+  AppExtensionCallContext,
+  AppExtensionExecutionContext,
+} from './src/lib/app-extensions/types.ts';
 import { navigateTree, setEntryLabel } from './src/lib/server/handlers/tree-handlers.ts';
 import { getSdkSettings, setSdkSetting } from './src/lib/server/handlers/sdk-settings-handlers.ts';
 import {
@@ -2707,25 +2710,33 @@ function broadcastAppExtensionEvent(
   extensionId: string,
   eventName: string,
   data: unknown,
-  scope: import('./src/lib/app-extensions/types.ts').AppExtensionScope,
+  scope: import('./src/lib/app-extensions/types.ts').AppExtensionScope
 ): void {
   const frame = { type: 'app_extension_event', extensionId, eventName, data, scope } as const;
   try {
     const encoded = JSON.stringify(frame);
     const bytes = Buffer.byteLength(encoded, 'utf8');
     if (bytes > 128 * 1024) {
-      log.warn(`[pifrontier] dropped oversized app extension event ${extensionId}:${eventName} (${bytes} bytes)`);
+      log.warn(
+        `[pifrontier] dropped oversized app extension event ${extensionId}:${eventName} (${bytes} bytes)`
+      );
       return;
     }
     for (const socket of appExtensionEventRecipients(extensionId, eventName, scope)) {
       try {
         socket.send(encoded);
       } catch (err) {
-        log.warn(`[pifrontier] could not deliver app extension event ${extensionId}:${eventName}`, err);
+        log.warn(
+          `[pifrontier] could not deliver app extension event ${extensionId}:${eventName}`,
+          err
+        );
       }
     }
   } catch (err) {
-    log.warn(`[pifrontier] dropped unserializable app extension event ${extensionId}:${eventName}`, err);
+    log.warn(
+      `[pifrontier] dropped unserializable app extension event ${extensionId}:${eventName}`,
+      err
+    );
   }
 }
 
@@ -2737,8 +2748,11 @@ async function createAppExtensionOperationContext(args: {
   signal?: AbortSignal;
 }): Promise<AppExtensionExecutionContext> {
   const [host, sdk] = await Promise.all([ensureAppExtensionHost(), getSDK()]);
-  const declared = host.operations(args.extensionId).find((operation) => operation.id === args.operationId);
-  if (!declared) throw new Error(`unknown app extension operation ${args.extensionId}:${args.operationId}`);
+  const declared = host
+    .operations(args.extensionId)
+    .find((operation) => operation.id === args.operationId);
+  if (!declared)
+    throw new Error(`unknown app extension operation ${args.extensionId}:${args.operationId}`);
   const scopeDeps = { runtime: host, projectCatalog, sessionCatalog };
   const resolved = await resolveAppExtensionScope(declared, args.scope, scopeDeps, args.caller);
   return createAppExtensionExecutionContext({
@@ -2748,7 +2762,9 @@ async function createAppExtensionOperationContext(args: {
     ...(args.signal ? { signal: args.signal } : {}),
     resolveProjectRoot: (projectId) => {
       if (!resolved.scope.projectId || projectId !== resolved.scope.projectId) {
-        throw new Error(`projectId ${JSON.stringify(projectId)} is outside this operation's validated scope`);
+        throw new Error(
+          `projectId ${JSON.stringify(projectId)} is outside this operation's validated scope`
+        );
       }
       return projectId;
     },
@@ -2756,7 +2772,9 @@ async function createAppExtensionOperationContext(args: {
     capabilities: host.capabilities(args.extensionId),
     getSessionMessages: async (sessionId: string) => {
       if (!resolved.scope.sessionId || sessionId !== resolved.scope.sessionId) {
-        throw new Error(`session ${JSON.stringify(sessionId)} is outside this operation's validated scope`);
+        throw new Error(
+          `session ${JSON.stringify(sessionId)} is outside this operation's validated scope`
+        );
       }
       const entry = residentStore.get(sessionId);
       const messages = entry?.session.messages;
@@ -2783,7 +2801,9 @@ async function createAppExtensionOperationContext(args: {
   });
 }
 
-function appExtensionHandlerDependenciesFor(host: AppExtensionHost): AppExtensionHandlerDependencies {
+function appExtensionHandlerDependenciesFor(
+  host: AppExtensionHost
+): AppExtensionHandlerDependencies {
   return {
     runtime: host,
     projectCatalog,
@@ -2791,7 +2811,8 @@ function appExtensionHandlerDependenciesFor(host: AppExtensionHost): AppExtensio
     eventNames: (extensionId) => host.eventNames(extensionId),
     clientUrl: (extensionId) => {
       try {
-        const clientPath = host.clientEntryRelativePath(extensionId)
+        const clientPath = host
+          .clientEntryRelativePath(extensionId)
           .split('/')
           .map((segment) => encodeURIComponent(segment))
           .join('/');
@@ -2968,7 +2989,8 @@ async function createSdkSession(
     },
   });
   const diagnostics: RuntimeDiagnostic[] = [...services.diagnostics];
-  for (const diagnostic of appToolDiagnostics) diagnostics.push({ type: 'warning', message: diagnostic });
+  for (const diagnostic of appToolDiagnostics)
+    diagnostics.push({ type: 'warning', message: diagnostic });
   const enabledModels = settingsManager.getEnabledModels();
   if (enabledModels?.length) {
     try {
@@ -4788,7 +4810,9 @@ try {
                           error: 'Streaming input requires a steer or follow-up mode.',
                         })
                       );
-                      ackPrompt(false, { error: 'Streaming input requires a steer or follow-up mode.' });
+                      ackPrompt(false, {
+                        error: 'Streaming input requires a steer or follow-up mode.',
+                      });
                       return;
                     }
                     ackPrompt(true, { disposition: 'started' });
