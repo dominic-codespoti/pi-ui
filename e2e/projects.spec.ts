@@ -25,14 +25,23 @@ async function openProjectsSidebar(page: Page) {
   };
   if (await isOpen()) return;
   const toggle = page.locator('[aria-label="Toggle session panel"]');
-  // The toggle's listener may not be attached yet during initial hydration —
-  // verify the drawer actually opened and retry if the click no-opped.
+  // The toggle's listener may not be attached yet during initial hydration,
+  // so retry only while the click no-opped — judged by aria-expanded (bound
+  // to the panel state), not by the drawer content: that is lazily mounted
+  // and slides in over 220ms, so on a slow host it can lag the click by
+  // seconds, and a second click would close the drawer or hit the covered
+  // toggle.
   for (let i = 0; i < 5; i++) {
-    if (await isOpen()) break;
+    if ((await toggle.getAttribute('aria-expanded')) === 'true') break;
     await toggle.click();
-    await page.waitForTimeout(250); // drawer slide-in transition (220ms)
+    try {
+      await expect(toggle).toHaveAttribute('aria-expanded', 'true', { timeout: 1000 });
+    } catch {
+      /* click no-opped (pre-hydration) — retry */
+    }
   }
-  await expect(search).toBeVisible({ timeout: 3000 });
+  await expect.poll(isOpen, { timeout: 15_000 }).toBe(true);
+  await expect(search).toBeVisible();
 }
 test.describe('Projects sidebar', () => {
   async function clickRowAction(page: Page, row: ReturnType<Page['locator']>, action: string) {
