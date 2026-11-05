@@ -281,7 +281,7 @@ bun run test:ci           # check + check:sw + check:server + lint + test:unit +
   - `@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui` & `@earendil-works/pi-ai` (1.5.0) — pi SDK, ESM-only
   - `svelte` (^5.57.3), `@sveltejs/kit` (^3.1.1)
   - `typescript` stays on `~6.0.3`: `typescript-eslint` (<6.1) and `svelte-check` (^6) don't support TS 7 yet; `@typescript/native` provides TS 7
-  - `@lucide/svelte` (^1.66.0) — UI icons
+  - `@lucide/svelte` (^1.69.0) — UI icons
   - `valibot` (^1.5.0) — schema validation
 - **Key env vars**: `PI_PASSWORD` (required), `PORT` (default 3000), `PI_CWD` (optional working dir)
 
