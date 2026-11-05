@@ -15,6 +15,9 @@ export default defineConfig({
       // with SvelteKit's origin check; the login server action has its own
       // origin check instead (see hooks.server.ts / login +page.server.ts).
       csrf: { trustedOrigins: ['*'] },
+      // The shared helper registers a build-versioned URL; avoid Kit's
+      // unversioned registration racing it or reviving a stale CDN worker.
+      serviceWorker: { register: false },
       // CSP via SvelteKit's provider (mode 'auto' = nonce-based): SvelteKit adds
       // a nonce to its inline bootstrap script and emits the policy header on
       // SSR responses. Kept out of server.ts's manual header so the two policies

@@ -30,6 +30,39 @@ test.describe('Auth flow', () => {
     await expect(page.locator('#main-content')).toBeFocused();
   });
 
+  test('native login works with JavaScript disabled', async ({ browser, baseURL }) => {
+    const context = await browser.newContext({ baseURL, javaScriptEnabled: false });
+    try {
+      const page = await context.newPage();
+      await page.goto('/login');
+      const submit = page.getByRole('button', { name: 'unlock' });
+      await expect(submit).toBeEnabled();
+      await page.locator('#password').fill('test-password');
+      await submit.click();
+      await expect(page).toHaveURL('/');
+      await expect
+        .poll(async () => (await context.cookies()).some((cookie) => cookie.name === 'pi-session'))
+        .toBe(true);
+    } finally {
+      await context.close();
+    }
+  });
+
+  test('native login works when the app entry script is unavailable', async ({ page }) => {
+    await page.route('**/_app/immutable/entry/**', (route) => route.abort());
+    await page.goto('/login');
+    const submit = page.getByRole('button', { name: 'unlock' });
+    await expect(submit).toBeEnabled();
+    await page.locator('#password').fill('test-password');
+    await submit.click();
+    await expect(page).toHaveURL('/');
+    await expect
+      .poll(async () =>
+        (await page.context().cookies()).some((cookie) => cookie.name === 'pi-session')
+      )
+      .toBe(true);
+  });
+
   test('correct password redirects to app', async ({ page, login }) => {
     await login(page, 'test-password');
     await expect(page).toHaveURL('/');

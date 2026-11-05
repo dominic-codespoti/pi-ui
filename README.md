@@ -171,6 +171,20 @@ sudo systemctl enable pi-ui
 sudo systemctl start pi-ui
 ```
 
+### PWA updates and login recovery
+
+Complete the production build before restarting the service. Replacing `build/`
+under a running server without restarting leaves its in-memory manifest pointing
+at deleted JavaScript chunks and prevents client hydration.
+
+Login uses a native POST form and required-field validation, so sign-in remains
+available even if a stale or failed client asset prevents JavaScript from loading.
+Each build registers a versioned worker URL at the same root scope, bypassing stale
+CDN copies of `/service-worker.js`. Serve that script with `Cache-Control: no-cache`;
+keep long-lived immutable caching for hashed assets only. Worker installation
+revalidates precache requests instead of copying failed HTTP-cache responses.
+Updates do not force-reload open chats or clear credentials, drafts, or session data.
+
 ---
 
 ## Remote access

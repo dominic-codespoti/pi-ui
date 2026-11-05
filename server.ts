@@ -4672,6 +4672,10 @@ try {
       // Merge hardening headers into the SvelteKit response. `new Headers(res.headers)`
       // copies the full list including Set-Cookie (the iterator may omit it).
       const headers = new Headers(res.headers);
+      // Keep the worker revalidatable so edge/browser caches cannot pin an old build.
+      if (url.pathname === '/service-worker.js') {
+        headers.set('Cache-Control', 'no-cache');
+      }
       for (const [name, value] of Object.entries(SECURITY_HEADERS)) {
         if (!headers.has(name)) headers.set(name, value);
       }

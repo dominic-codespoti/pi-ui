@@ -3,7 +3,6 @@
 
   let { form }: { form: ActionData } = $props();
 
-  let password = $state('');
   let loading = $state(false);
 
   $effect(() => {
@@ -54,7 +53,6 @@
             id="password"
             name="password"
             type="password"
-            bind:value={password}
             autocomplete="current-password"
             required
             aria-invalid={form?.error ? 'true' : undefined}
@@ -79,11 +77,11 @@
 
       <button
         type="submit"
-        disabled={loading || !password}
+        disabled={loading}
         class="mt-1 h-10 w-full rounded-xl text-sm font-semibold transition-all duration-200
-          {password && !loading
-          ? 'bg-primary text-primary-content hover:brightness-110 shadow-[0_0_24px_-6px_color-mix(in_oklch,var(--color-primary)_60%,transparent)]'
-          : 'bg-base-content/[0.12] text-base-content/50 cursor-default'}"
+          {loading
+          ? 'bg-base-content/[0.12] text-base-content/50 cursor-default'
+          : 'bg-primary text-primary-content hover:brightness-110 shadow-[0_0_24px_-6px_color-mix(in_oklch,var(--color-primary)_60%,transparent)]'}"
       >
         {loading ? 'unlocking…' : 'unlock'}
       </button>
