@@ -53,6 +53,7 @@
   import { uid, type UIMessage } from '#lib/client-messages.js';
   import { extensionOptionParts } from '#lib/extension-modals.js';
   import { saveSnapshot, loadSnapshot } from '#lib/session-snapshot.js';
+  import { loadDraft, saveDraft } from '#lib/draft-store.js';
   import type { SessionViewUiState } from '#lib/session-view-cache.js';
   import {
     ClientWebSocketController,
@@ -1838,6 +1839,23 @@
   function setComposerInput(value: string): void {
     composerController.setInput(value);
   }
+
+  // Durable drafts: unsent text survives a reload / discarded PWA. The view
+  // cache covers in-app switches; this is only the cold-start backstop, so it
+  // never saves mid-operation (optimistic new-chat clears, switch hand-offs).
+  let _draftSaveTimer: ReturnType<typeof setTimeout> | null = null;
+  function persistDraftNow(): void {
+    if (_draftSaveTimer) clearTimeout(_draftSaveTimer);
+    _draftSaveTimer = null;
+    if (!sessionId || sessionLoading || projectsState.sessionOperation.kind !== 'idle') return;
+    saveDraft(sessionId, input);
+  }
+  $effect(() => {
+    void input;
+    void sessionId;
+    if (_draftSaveTimer) clearTimeout(_draftSaveTimer);
+    _draftSaveTimer = setTimeout(persistDraftNow, 400);
+  });
   $effect(() => {
     composerController.updateContext({
       websocketOpen: wsState === 'open',
@@ -2220,7 +2238,10 @@
         if (sharedDraft !== null) setComposerInput(sharedDraft);
         else if (draftWhileSwitching !== null) setComposerInput(draftWhileSwitching);
       } else {
-        setComposerInput(sharedDraft ?? draftWhileSwitching ?? '');
+        // No cached view (cold start / evicted): fall back to the durable draft.
+        const persisted =
+          typeof payload.sessionId === 'string' ? loadDraft(payload.sessionId) : null;
+        setComposerInput(sharedDraft ?? (draftWhileSwitching || persisted) ?? '');
         expandedUserMsgs = {};
         truncatedUserMsgs = {};
       }
@@ -5143,6 +5164,7 @@
     if (document.hidden) {
       // Last reliable moment to persist before a possible OS freeze/discard.
       saveSnapshot(sessionPath, sessionName, messages);
+      persistDraftNow();
       releaseWakeLock();
       sendSessionFocus(null);
       return;
