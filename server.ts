@@ -152,6 +152,7 @@ import {
   type SessionFileInfo,
 } from './src/lib/server/session-scan.ts';
 import { piAgentDir } from './src/lib/server/agent-dir.ts';
+import { createPhaseTimer } from './src/lib/server/phase-timer.ts';
 import { SessionCatalog } from './src/lib/server/session-catalog.ts';
 import { startSessionWatch } from './src/lib/server/session-watcher.ts';
 import {
@@ -2964,11 +2965,15 @@ async function createSdkSession(
   options?: { model?: AgentSession['model'] }
 ): Promise<CreatedSdkSession> {
   const tCreate = Date.now();
-  const sdk = await getSDK();
+  // Names the stuck phase if construction stalls (it cannot be cancelled).
+  const timer = createPhaseTimer(`[pifrontier] createSdkSession ${reason} (${targetCwd})`, {
+    warn: (message) => log.warn(message),
+  });
+  const sdk = await timer.phase('sdk load', () => getSDK());
   let appCustomTools: ReturnType<typeof buildSdkAppExtensionTools>['tools'] = [];
   const appToolDiagnostics: string[] = [];
   try {
-    const host = await ensureAppExtensionHost();
+    const host = await timer.phase('app extension host', () => ensureAppExtensionHost());
     const built = buildSdkAppExtensionTools(host.innerRuntime, {
       createContext: ({ extensionId, operationId, scope, sessionId, signal }) =>
         createAppExtensionOperationContext({
@@ -2992,38 +2997,43 @@ async function createSdkSession(
   const settingsManager = sdk.SettingsManager.create(targetCwd, sdk.getAgentDir(), {
     projectTrusted: false,
   });
-  const services = await sdk.createAgentSessionServices({
-    cwd: targetCwd,
-    agentDir: sdk.getAgentDir(),
-    extensionFlagValues: extensionFlagValuesFor(),
-    resourceLoaderOptions: {
-      extensionFactories: await getBuiltInExtensions(),
-    },
-    resourceLoaderReloadOptions: {
-      resolveProjectTrust: async () => resolveProjectTrust(targetCwd, settingsManager),
-    },
-  });
-  const result = await sdk.createAgentSessionFromServices({
-    services,
-    sessionManager,
-    customTools: appCustomTools,
-    ...(options?.model !== undefined ? { model: options.model } : {}),
-    sessionStartEvent: {
-      type: 'session_start',
-      reason,
-      ...(previousSessionFile ? { previousSessionFile } : {}),
-    },
-  });
+  const extensionFactories = await timer.phase('built-in extensions', () => getBuiltInExtensions());
+  const services = await timer.phase('services (resources, extensions, packages)', () =>
+    sdk.createAgentSessionServices({
+      cwd: targetCwd,
+      agentDir: sdk.getAgentDir(),
+      extensionFlagValues: extensionFlagValuesFor(),
+      resourceLoaderOptions: {
+        extensionFactories,
+      },
+      resourceLoaderReloadOptions: {
+        resolveProjectTrust: async () => resolveProjectTrust(targetCwd, settingsManager),
+      },
+    })
+  );
+  const result = await timer.phase('session + session_start handlers', () =>
+    sdk.createAgentSessionFromServices({
+      services,
+      sessionManager,
+      customTools: appCustomTools,
+      ...(options?.model !== undefined ? { model: options.model } : {}),
+      sessionStartEvent: {
+        type: 'session_start',
+        reason,
+        ...(previousSessionFile ? { previousSessionFile } : {}),
+      },
+    })
+  );
   const diagnostics: RuntimeDiagnostic[] = [...services.diagnostics];
   for (const diagnostic of appToolDiagnostics)
     diagnostics.push({ type: 'warning', message: diagnostic });
   const enabledModels = settingsManager.getEnabledModels();
   if (enabledModels?.length) {
     try {
-      const { scopedModels: scoped } = await sdk.resolveModelScopeWithDiagnostics(
-        enabledModels,
-        result.session.modelRuntime,
-        { signal: AbortSignal.timeout(15_000) }
+      const { scopedModels: scoped } = await timer.phase('model scope', () =>
+        sdk.resolveModelScopeWithDiagnostics(enabledModels, result.session.modelRuntime, {
+          signal: AbortSignal.timeout(15_000),
+        })
       );
       result.session.setScopedModels(scoped);
     } catch (error) {
@@ -3039,7 +3049,9 @@ async function createSdkSession(
   if (result.modelFallbackMessage) {
     diagnostics.push({ type: 'warning', message: result.modelFallbackMessage });
   }
-  log.info(`[pifrontier] createSdkSession ${reason} done in ${Date.now() - tCreate}ms`);
+  log.info(
+    `[pifrontier] createSdkSession ${reason} done in ${Date.now() - tCreate}ms${timer.slowPhases()}`
+  );
   return {
     session: result.session,
     diagnostics,
