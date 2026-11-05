@@ -215,23 +215,25 @@ When `parentSession` is present, clients organize sessions into hierarchical tre
 - `extension_ui_dismiss` — `{ id, sessionId?: string }`; dismisses an open extension dialog across all tabs
 - `update_status` — Update check results
 - `server_restarting` — Server shutdown initiated
-- `slash_result` — `{ command: string, message: string, level?: 'info' | 'warning' | 'error', sessionId?: string }`; built-in command output
+- `slash_result` — `{ command: string, message: string, level?: 'info' | 'warning' | 'error', sessionId?: string }`; built-in command output. `command: 'extension_changelog'` carries the SDK 1.5 "Extension Updates" notice (once per server process, first empty session)
 - `agent_error` — Error from SDK or server
 
 ##### `session_runtime` fields
 
 Runtime deltas are emitted only when the serialized status changes (with the server's 300 ms per-session debounce); connection initialisation separately sends one snapshot per resident. This is a delta stream for live residents, not a replacement for session inventory messages.
 
-| Field            | Type                                                 | Meaning                                                                                         |
-| ---------------- | ---------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| `sessionId`      | `string`                                             | Session whose runtime status changed                                                            |
-| `phase`          | `'idle' \| 'running' \| 'awaiting-input' \| 'error'` | Canonical lifecycle phase                                                                       |
-| `isRunning`      | `boolean`                                            | Compatibility field; true exactly when `phase` is `running`                                     |
-| `activeToolName` | `string` (optional)                                  | Tool currently executing; omitted when no tool is active                                        |
-| `lastActivity`   | `number`                                             | Unix epoch milliseconds of the latest session activity                                          |
-| `unread`         | `boolean`                                            | True when a turn ended while no socket focused this session; cleared by `session_focus`         |
-| `needsAttention` | `boolean`                                            | True for `awaiting-input` and `error` phases                                                    |
-| `resident`       | `boolean`                                            | True for a live in-memory session; false for a non-resident status such as a deletion tombstone |
+| Field            | Type                                                 | Meaning                                                                                 |
+| ---------------- | ---------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| `sessionId`      | `string`                                             | Session whose runtime status changed                                                    |
+| `phase`          | `'idle' \| 'running' \| 'awaiting-input' \| 'error'` | Canonical lifecycle phase                                                               |
+| `isRunning`      | `boolean`                                            | Compatibility field; true exactly when `phase` is `running`                             |
+| `activeToolName` | `string` (optional)                                  | Tool currently executing; omitted when no tool is active                                |
+| `lastActivity`   | `number`                                             | Unix epoch milliseconds of the latest session activity                                  |
+| `unread`         | `boolean`                                            | True when a turn ended while no socket focused this session; cleared by `session_focus` |
+| `needsAttention` | `boolean`                                            | True for `awaiting-input` and `error` phases                                            |
+
+`awaiting-input` follows SDK 1.5: built-in dialogs (`select`/`confirm`/`input`/`editor`) and `custom()` dialogs that pass `blocked`, are interactive, or need an action/text reply. Passive `custom()` loaders/progress do not raise attention (and count as `running`); every pending dialog still pins its session.
+| `resident` | `boolean` | True for a live in-memory session; false for a non-resident status such as a deletion tombstone |
 
 Non-resident sessions have no live runtime producer; their disk-backed metadata remains the inventory source, and rows without runtime status render idle until the session becomes resident.
 
@@ -345,14 +347,15 @@ Residency is bounded by count (`PI_UI_MAX_RESIDENT_SESSIONS`, default 4) and est
 ## Extension UI & Markdown Flow
 
 1. Server sends `extension_ui_request` with dialog config.
-2. Client renders the dialog (`confirm`, `input`, `select`, `editor`, or `custom`).
+2. Client renders the dialog (`confirm`, `input`, `select`, `editor`, or `custom`). `custom` requests may carry SDK 1.5 `blocked: { kind: 'question' | 'permission' | 'auth', message }` (inline components only; validated and capped server-side).
 3. User interacts → client sends `extension_ui_response` (or `extension_custom_input` for raw terminal key streams).
 4. Server unblocks the session (5 min timeout).
 5. Widgets are replayed from `connected`/`session_loaded`; stale stamped broadcasts buffered across a switch are ignored by the client.
 6. User dismissal sends `dismiss_widget`; the server disposes the factory and broadcasts removal to every tab.
 7. Display-only `CustomEntry` state (`pi.appendEntry`) rendered by `registerEntryRenderer` reaches the client as a synthetic `role:"custom"` message on `message_end` (flagged `fromEntry:true`, HTML pre-rendered server-side); history reloads interleave these notices with messages by timestamp.
 8. When extensions register markdown transformers (`registerMarkdownTransformer`), final user/assistant `message_end` payloads may arrive flagged `contentTransformed:true` — the client replaces its streamed buffer with the transformed text so live and reloaded views stay identical.
-9. Markdown rendering supports inline and display LaTeX math (`$math$`, `$$math$$`, `\(math\)`, `\[math\]`), rendered via `@earendil-works/pi-tui/dist/latex.js` into Unicode formatted markup during streaming and final message display.
+9. Server-side extension rendering mirrors SDK 1.5 contexts: tool/message/entry renderers receive `keyText`/`keyHint` (TUI keys are unbound in the browser, so `keyText` is empty and `keyHint` renders the description), `outputPad: 0`, and tools get `durationMs`; markdown transformers get the persisted `messageId`/`timestamp` for history messages.
+10. Markdown rendering supports inline and display LaTeX math (`$math$`, `$$math$$`, `\(math\)`, `\[math\]`), rendered via `@earendil-works/pi-tui/dist/latex.js` into Unicode formatted markup during streaming and final message display.
 
 ## Terminal Input Roundtrip
 

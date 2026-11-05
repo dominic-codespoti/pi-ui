@@ -93,7 +93,7 @@ bun run format            # prettier --write .
 
 # Tests
 bun test src/lib/auth     # Bun-native test runner for auth/rate-limiter (timeout 15s)
-bun run test:unit         # vitest run (jsdom — 51 test files, 631 tests)
+bun run test:unit         # vitest run (jsdom — 61 test files, 840 tests; Node >= 22.19)
 bun run test:unit:watch   # vitest (watch mode)
 bun run test:coverage     # vitest run --coverage (v8 provider)
 bun run test:e2e          # playwright test (chains mock E2E suite + live agent suite)
@@ -281,7 +281,7 @@ bun run test:ci           # check + check:sw + check:server + lint + test:unit +
   - `@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui` & `@earendil-works/pi-ai` (1.5.0) — pi SDK, ESM-only
   - `svelte` (^5.57.3), `@sveltejs/kit` (^3.1.1)
   - `typescript` stays on `~6.0.3`: `typescript-eslint` (<6.1) and `svelte-check` (^6) don't support TS 7 yet; `@typescript/native` provides TS 7
-  - `@lucide/svelte` (^1.49.0) — UI icons
+  - `@lucide/svelte` (^1.66.0) — UI icons
   - `valibot` (^1.5.0) — schema validation
 - **Key env vars**: `PI_PASSWORD` (required), `PORT` (default 3000), `PI_CWD` (optional working dir)
 
@@ -289,10 +289,10 @@ bun run test:ci           # check + check:sw + check:server + lint + test:unit +
 
 ## Testing & QA
 
-Three layers: **Unit** (Vitest, jsdom — 51 test files, 631 tests), **E2E** (Playwright with mock WebSocket + Live SDK suite), **CI** (GitHub Actions). The Bun-native auth suite still has one pre-existing failure: `password.test.ts` uses `vi.resetModules()`, which Bun's runner does not implement; it passes under Vitest.
+Three layers: **Unit** (Vitest, jsdom — 61 test files, 840 tests; needs Node >= 22.19 on PATH, see `.nvmrc` — `scripts/require-node.ts` fails fast otherwise), **E2E** (Playwright with mock WebSocket + Live SDK suite), **CI** (GitHub Actions). The Bun-native auth suite still has one pre-existing failure: `password.test.ts` uses `vi.resetModules()`, which Bun's runner does not implement; it passes under Vitest.
 
 ```bash
-bun run test:unit         # vitest run (jsdom — 51 test files, 631 tests)
+bun run test:unit         # vitest run (jsdom — 61 test files, 840 tests; Node >= 22.19)
 bun run test:e2e          # playwright test (chains mock suite + live agent suite)
 bun run test:e2e:fast     # playwright test --project=chromium (mock suite only)
 bun run test:e2e:live     # playwright test -c playwright.live.config.ts (live suite only)
