@@ -1246,12 +1246,25 @@ type ToolRendererDefinition = {
   ) => unknown;
 };
 
-type ToolRendererState = {
-  state: Record<string, unknown>;
+type ToolRenderKind = 'call' | 'result';
+
+/** Per-kind renderer slot. The TUI keeps separate call and result components
+ *  (`callRendererComponent` / `resultRendererComponent`): renderers reuse
+ *  `context.lastComponent` as their OWN previous output (the SDK's MCP
+ *  `renderResult` calls `Container#clear()` on it), so handing a result
+ *  renderer the call's `Text` throws. */
+type ToolRendererSlot = {
   lastComponent?: unknown;
   rerender?: () => void;
-  timer?: ReturnType<typeof setTimeout>;
   errorLogged: boolean;
+};
+
+type ToolRendererState = {
+  /** Shared between call and result, like the TUI's `rendererState`. */
+  state: Record<string, unknown>;
+  call: ToolRendererSlot;
+  result: ToolRendererSlot;
+  timer?: ReturnType<typeof setTimeout>;
 };
 
 const toolRendererStates = new Map<string, ToolRendererState>();
@@ -1277,7 +1290,7 @@ export function clearToolRendererState(toolCallId: string): void {
 function toolRendererState(toolCallId: string): ToolRendererState {
   let entry = toolRendererStates.get(toolCallId);
   if (!entry) {
-    entry = { state: {}, errorLogged: false };
+    entry = { state: {}, call: { errorLogged: false }, result: { errorLogged: false } };
     toolRendererStates.set(toolCallId, entry);
     if (toolRendererStates.size > MAX_TOOL_RENDERER_STATES) {
       const oldest = toolRendererStates.keys().next().value;
@@ -1296,21 +1309,21 @@ function buildToolRenderContext(
   isPartial: boolean,
   isError: boolean,
   expanded: boolean,
-  rendererState: ToolRendererState
+  rendererState: ToolRendererState,
+  kind: ToolRenderKind
 ) {
   return {
     args,
     toolCallId,
+    // Like the TUI, invalidation re-renders the whole tool (call and result).
     invalidate: () => {
       clearTimeout(rendererState.timer);
-      rendererState.timer = setTimeout(() => rendererState.rerender?.(), 40);
+      rendererState.timer = setTimeout(() => {
+        rendererState.call.rerender?.();
+        rendererState.result.rerender?.();
+      }, 40);
     },
-    get lastComponent() {
-      return rendererState.lastComponent;
-    },
-    set lastComponent(component: unknown) {
-      rendererState.lastComponent = component;
-    },
+    lastComponent: rendererState[kind].lastComponent,
     state: rendererState.state,
     cwd: process.cwd(),
     executionStarted: true,
@@ -1352,21 +1365,22 @@ export function renderToolCallHtml(
   const renderCall = toolDef?.renderCall;
   if (!renderCall) return undefined;
   const state = toolRendererState(toolCallId);
+  const slot = state.call;
   const render = () => {
     try {
-      const ctx = buildToolRenderContext(args, toolCallId, false, false, expanded, state);
+      const ctx = buildToolRenderContext(args, toolCallId, false, false, expanded, state, 'call');
       const component = renderCall(args, stubTheme, ctx);
-      state.lastComponent = component;
+      slot.lastComponent = component;
       return componentToHtmlLines(component);
     } catch (err) {
-      if (!state.errorLogged) {
-        state.errorLogged = true;
+      if (!slot.errorLogged) {
+        slot.errorLogged = true;
         console.error(`[pi-ui] tool renderer failed for ${toolName}:`, err);
       }
       return ['renderer error'];
     }
   };
-  state.rerender = () => {
+  slot.rerender = () => {
     const html = render();
     if (html) toolRendererUpdateHandler?.(sess.sessionId, toolCallId, 'call', html);
   };
@@ -1387,24 +1401,33 @@ export function renderToolResultHtml(
   const renderResult = toolDef?.renderResult;
   if (!renderResult) return undefined;
   const state = toolRendererState(toolCallId);
+  const slot = state.result;
   const render = () => {
     try {
       const isError = Boolean(
         result && typeof result === 'object' && 'isError' in result && result.isError === true
       );
-      const ctx = buildToolRenderContext(args, toolCallId, isPartial, isError, expanded, state);
+      const ctx = buildToolRenderContext(
+        args,
+        toolCallId,
+        isPartial,
+        isError,
+        expanded,
+        state,
+        'result'
+      );
       const component = renderResult(result, { expanded, isPartial }, stubTheme, ctx);
-      state.lastComponent = component;
+      slot.lastComponent = component;
       return componentToHtmlLines(component);
     } catch (err) {
-      if (!state.errorLogged) {
-        state.errorLogged = true;
+      if (!slot.errorLogged) {
+        slot.errorLogged = true;
         console.error(`[pi-ui] tool renderer failed for ${toolName}:`, err);
       }
       return ['renderer error'];
     }
   };
-  state.rerender = () => {
+  slot.rerender = () => {
     const html = render();
     if (html) toolRendererUpdateHandler?.(sess.sessionId, toolCallId, 'result', html);
   };

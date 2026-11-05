@@ -1,4 +1,6 @@
 import { describe, it, expect } from 'vitest';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import type { AgentSession } from '@earendil-works/pi-coding-agent';
 import {
   stripAnsi,
@@ -16,6 +18,7 @@ import {
   renderCustomMessage,
   renderCustomEntry,
   renderToolCallHtml,
+  renderToolResultHtml,
   applyMarkdownTransformersToMessages,
   stubKeybindings,
   callFactoryAndParse,
@@ -1003,5 +1006,65 @@ describe('SDK 1.5 render contexts', () => {
     expect(contexts[0]).toMatchObject({ messageId: 'e1', timestamp: '2026-11-03T01:02:03.000Z' });
     expect(contexts[1].messageId).toBeUndefined();
     expect(contexts[1].timestamp).toBeUndefined();
+  });
+});
+
+describe('tool renderer call/result component slots', () => {
+  const sessWith = (def: Record<string, unknown>) =>
+    ({
+      sessionId: 's1',
+      sessionManager: { getEntries: () => [], getBranch: () => [] },
+      extensionRunner: { getMarkdownTransformers: () => [], getToolDefinition: () => def },
+    }) as unknown as AgentSession;
+
+  it('never hands the call component to the result renderer', () => {
+    const seen: Record<string, unknown> = {};
+    const callComponent = { render: () => ['call'] };
+    const def = {
+      renderCall: (_a: unknown, _t: unknown, ctx: Record<string, unknown>) => {
+        seen.callLast = ctx.lastComponent;
+        return callComponent;
+      },
+      renderResult: (_r: unknown, _o: unknown, _t: unknown, ctx: Record<string, unknown>) => {
+        seen.resultLast = ctx.lastComponent;
+        return (ctx.lastComponent as object | undefined) ?? { render: () => ['result'] };
+      },
+    };
+    const sess = sessWith(def);
+    renderToolCallHtml(sess, 'demo', {}, 'tc-slots');
+    expect(renderToolResultHtml(sess, 'demo', { content: [] }, {}, 'tc-slots', false)).toEqual(
+      expect.arrayContaining([expect.stringContaining('result')])
+    );
+    expect(seen.resultLast).toBeUndefined();
+    // Each renderer gets back its OWN previous component on re-render.
+    renderToolCallHtml(sess, 'demo', {}, 'tc-slots');
+    expect(seen.callLast).toBe(callComponent);
+    renderToolResultHtml(sess, 'demo', { content: [] }, {}, 'tc-slots', false);
+    expect(seen.resultLast).not.toBe(callComponent);
+    expect(seen.resultLast).toBeDefined();
+  });
+
+  it("renders the SDK's MCP tool result (regression: component.clear is not a function)", async () => {
+    // The SDK's `exports` map hides dist/ internals; load the file directly.
+    const sdkDir = join(
+      process.cwd(),
+      'node_modules',
+      '@earendil-works',
+      'pi-coding-agent',
+      'dist'
+    );
+    const { createMcpToolRenderers } = (await import(
+      pathToFileURL(join(sdkDir, 'extensions', 'mcp', 'tools.js')).href
+    )) as { createMcpToolRenderers: (label: string) => Record<string, unknown> };
+    const sess = sessWith(createMcpToolRenderers('mesh/call'));
+    const call = renderToolCallHtml(sess, 'mcp__mesh__call', { q: 1 }, 'tc-mcp');
+    expect(call?.join('')).toContain('mesh/call');
+    const result = {
+      content: [{ type: 'text', text: 'hello from mcp' }],
+      details: {},
+    };
+    const lines = renderToolResultHtml(sess, 'mcp__mesh__call', result, { q: 1 }, 'tc-mcp', false);
+    expect(lines?.join('')).toContain('hello from mcp');
+    expect(lines?.join('')).not.toContain('renderer error');
   });
 });
