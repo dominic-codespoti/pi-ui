@@ -216,6 +216,8 @@ When `parentSession` is present, clients organize sessions into hierarchical tre
 - `update_status` — Update check results
 - `server_restarting` — Server shutdown initiated
 - `slash_result` — `{ command: string, message: string, level?: 'info' | 'warning' | 'error', sessionId?: string }`; built-in command output. `command: 'extension_changelog'` carries the SDK 1.5 "Extension Updates" notice (once per server process, first empty session)
+- `usage_summary` — `{ summary: UsageSummary, requestId? }`; cross-session tokens/cost for a day window (totals, every day, by model, top projects), answered from the session scanner's cached per-day/per-model buckets
+- `session_search_results` — `{ requestId, query, results: SessionSearchResult[], scannedFiles, totalFiles, truncated, durationMs, error? }`; message-text search hits with highlighted snippets (`matchStart`/`matchLength`)
 - `agent_error` — Error from SDK or server
 
 ##### `session_runtime` fields
@@ -253,23 +255,25 @@ Session-scoped client messages accept an optional target field, `sessionId?: str
 
 #### Session Management
 
-| Type                  | Payload                                                            | Purpose                                                                                                          |
-| --------------------- | ------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------- |
-| `new_session`         | `{ targetCwd?, requestId? }`                                       | Start a new session; an optional legacy `requestId` may be echoed in `session_loaded`/`sessions_error`           |
-| `switch_session`      | `{ path, requestId? }`                                             | Switch to an existing session; an optional legacy `requestId` may be echoed in `session_loaded`/`sessions_error` |
-| `session_focus`       | `{ sessionId: string \| null }`                                    | Set the session visible to this socket and clear its unread flag when non-null                                   |
-| `fork_session`        | `{ sessionId?, entryId }`                                          | Fork a specific resident session at an entry                                                                     |
-| `get_all_sessions`    | —                                                                  | Request all sessions across all project directories (replies with `all_sessions_list`)                           |
-| `get_fork_points`     | `{ sessionId? }`                                                   | Request user messages for forking                                                                                |
-| `set_auto_compaction` | `{ sessionId?, enabled }`                                          | Toggle auto-compaction                                                                                           |
-| `compact`             | `{ sessionId?, customInstructions? }`                              | Manually compact with optional summary instructions                                                              |
-| `remove_queued`       | `{ sessionId?, kind: 'steer' \| 'followUp' \| 'deferred', index }` | Remove an item from an SDK or concurrency-deferred queue                                                         |
-| `navigate_tree`       | `{ sessionId?, entryId, summarize?, customInstructions?, label? }` | Navigate to a branch, optionally summarize and label it                                                          |
-| `set_entry_label`     | `{ sessionId?, entryId, label? }`                                  | Set or clear an entry label                                                                                      |
-| `get_session_tree`    | `{ sessionId? }`                                                   | Request the branch tree with labels and path/leaf state                                                          |
-| `set_auto_retry`      | `{ sessionId?, enabled }`                                          | Toggle auto-retry                                                                                                |
-| `rename_session`      | `{ path, name }`                                                   | Set session display name                                                                                         |
-| `delete_session`      | `{ path }`                                                         | Delete a session file (resident session protected while busy)                                                    |
+| Type                  | Payload                                                            | Purpose                                                                                                                                       |
+| --------------------- | ------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `new_session`         | `{ targetCwd?, requestId? }`                                       | Start a new session; an optional legacy `requestId` may be echoed in `session_loaded`/`sessions_error`                                        |
+| `switch_session`      | `{ path, requestId? }`                                             | Switch to an existing session; an optional legacy `requestId` may be echoed in `session_loaded`/`sessions_error`                              |
+| `session_focus`       | `{ sessionId: string \| null }`                                    | Set the session visible to this socket and clear its unread flag when non-null                                                                |
+| `fork_session`        | `{ sessionId?, entryId }`                                          | Fork a specific resident session at an entry                                                                                                  |
+| `get_all_sessions`    | —                                                                  | Request all sessions across all project directories (replies with `all_sessions_list`)                                                        |
+| `get_fork_points`     | `{ sessionId? }`                                                   | Request user messages for forking                                                                                                             |
+| `set_auto_compaction` | `{ sessionId?, enabled }`                                          | Toggle auto-compaction                                                                                                                        |
+| `compact`             | `{ sessionId?, customInstructions? }`                              | Manually compact with optional summary instructions                                                                                           |
+| `remove_queued`       | `{ sessionId?, kind: 'steer' \| 'followUp' \| 'deferred', index }` | Remove an item from an SDK or concurrency-deferred queue                                                                                      |
+| `navigate_tree`       | `{ sessionId?, entryId, summarize?, customInstructions?, label? }` | Navigate to a branch, optionally summarize and label it                                                                                       |
+| `set_entry_label`     | `{ sessionId?, entryId, label? }`                                  | Set or clear an entry label                                                                                                                   |
+| `get_session_tree`    | `{ sessionId? }`                                                   | Request the branch tree with labels and path/leaf state                                                                                       |
+| `get_usage_summary`   | `{ days?, requestId? }`                                            | Cross-session usage for the last `days` (default 30, 1–366); replies `usage_summary`                                                          |
+| `search_sessions`     | `{ query, requestId }`                                             | Search user/assistant message text (≥2 chars; 30 sessions × 3 snippets, 8 s deadline); a newer query or socket close aborts the previous scan |
+| `set_auto_retry`      | `{ sessionId?, enabled }`                                          | Toggle auto-retry                                                                                                                             |
+| `rename_session`      | `{ path, name }`                                                   | Set session display name                                                                                                                      |
+| `delete_session`      | `{ path }`                                                         | Delete a session file (resident session protected while busy)                                                                                 |
 
 #### Model & Provider
 

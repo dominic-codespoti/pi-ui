@@ -8,16 +8,17 @@
 | Runtime             | Node >= 22.19 (`.nvmrc`: 24) — undici 8 needs it; `scripts/require-node.ts` fails fast on older Node                        |
 | Environment         | jsdom                                                                                                                       |
 | Setup               | `@testing-library/jest-dom/vitest` (auto-imported)                                                                          |
-| Test locations      | `src/**/*.test.ts` (61 test files / 840 tests across `lib/`, `server/`, `state/`, `controllers/`, `components/`, `routes/`) |
+| Test locations      | `src/**/*.test.ts` (66 test files / 864 tests across `lib/`, `server/`, `state/`, `controllers/`, `components/`, `routes/`) |
 | Coverage            | v8 provider, 60% stmts/funcs/lines, 50% branches                                                                            |
 | Coverage exclusions | `src/lib/components/ui/**`, test files, service-worker                                                                      |
 | Mocking             | `vi.mock()` module mocking, `vi.mocked()` typed mocks, `vi.resetModules()` for fresh imports                                |
 
-### Test Files by Area (61 Files / 840 Tests)
+### Test Files by Area (66 Files / 864 Tests)
 
 #### Client Core & Protocol Helpers (`src/lib/__tests__/`, `src/lib/`)
 
 - `src/lib/__tests__/client-messages.test.ts` — uid, extractTextContent, formatToolInput, agentMsgToUI, rawMessagesToUI, reconnectDelay, SDK 1.5 responseModel / provider-billed usage
+- `src/lib/__tests__/draft-store.test.ts` — durable per-session composer drafts: round trip, blank removal, TTL, count/size caps, corrupt storage
 - `src/lib/__tests__/diff-parser.test.ts` — unified diff parser and hunk formatting
 - `src/lib/__tests__/adapter-bun.test.ts` — vendored svelte-adapter-bun distribution files and package exports
 - `src/lib/__tests__/extension-modals.test.ts` — extension modal / confirm / input state transformations
@@ -26,7 +27,7 @@
 - `src/lib/__tests__/session-identity.test.ts` — device-scoped last-session identity persistence and resume priority
 - `src/lib/__tests__/session-snapshot.test.ts` — session snapshot hydration and message projection
 - `src/lib/__tests__/session-view-cache.test.ts` — bounded per-session client view cache: retention cap, LRU eviction order, base64/attachment stripping on save, restore equivalence
-- `src/lib/__tests__/tui-stubs.test.ts` — stripAnsi, StubTui, parseComponentTree, callFactoryAndParse, editor / isEditor stubs, SDK 1.5 render contexts (keyText/keyHint, outputPad, markdown-transform messageId/timestamp)
+- `src/lib/__tests__/tui-stubs.test.ts` — stripAnsi, StubTui, parseComponentTree, callFactoryAndParse, editor / isEditor stubs, SDK 1.5 render contexts (keyText/keyHint, outputPad, markdown-transform messageId/timestamp), separate call/result renderer slots (SDK MCP renderers)
 - `src/lib/__tests__/utils.test.ts` — cn, formatRelativeDate, type helpers
 
 #### App Extensions — client (`src/lib/app-extensions/`, `src/lib/state/__tests__/`)
@@ -44,7 +45,7 @@
 
 #### State Management (`src/lib/state/__tests__/`)
 
-- `src/lib/state/__tests__/projects-state.test.ts` — project/session groups derivation, filtering, runtime indicators, handleMessage
+- `src/lib/state/__tests__/projects-state.test.ts` — project/session groups derivation, filtering, runtime indicators, handleMessage, content-search request correlation
 
 #### Client Controllers (`src/lib/controllers/__tests__/`)
 
@@ -63,18 +64,22 @@
 #### Server & Session Management (`src/lib/server/`, `src/lib/server/__tests__/`)
 
 - `src/lib/server/push-notifications.test.ts` — Web Push VAPID delivery & subscription persistence
+- `src/lib/server/__tests__/agent-dir.test.ts` — `piAgentDir()` honours `PI_CODING_AGENT_DIR` (absolute, `~/`, relative, blank)
 - `src/lib/server/__tests__/compaction-watchdog.test.ts` — auto-compaction trigger thresholds and watchdog lifecycle
 - `src/lib/server/__tests__/extension-changelog.test.ts` — SDK 1.5 extension-package changelogs (real SDK parser), collapsed/full notice formatting
 - `src/lib/server/__tests__/extension-completions.test.ts` — slash-command completions provider from active extensions
+- `src/lib/server/__tests__/phase-timer.test.ts` — stalled-phase warnings stop on completion; slow/failed phases listed
 - `src/lib/server/__tests__/project-catalog.test.ts` — multi-root project scanning and cataloging
 - `src/lib/server/__tests__/project-registry.test.ts` — project CRUD, persistence under `/tmp`
 - `src/lib/server/__tests__/provider-auth.test.ts` — provider API key resolution, OAuth / custom token checks
 - `src/lib/server/__tests__/provider-login-session.test.ts` — requester-scoped provider login prompt bridge
 - `src/lib/server/__tests__/session-catalog.test.ts` — session catalog grouping, sorting, search index
-- `src/lib/server/__tests__/session-scan.test.ts` — JSONL session log scanning, header extraction, metadata parsing
+- `src/lib/server/__tests__/session-content-search.test.ts` — message-text search: case, JSON-escaped queries, caps, abort/deadline, query normalisation
+- `src/lib/server/__tests__/session-scan.test.ts` — JSONL session log scanning, header extraction, metadata parsing, per-day/per-model usage buckets (incremental + persisted cache v3)
 - `src/lib/server/__tests__/session-watcher.test.ts` — inotify / file watcher events on `.pi` session logs
 - `src/lib/server/__tests__/terminal-input.test.ts` — raw terminal mode keystroke and input handling
 - `src/lib/server/__tests__/tool-update-coalescer.test.ts` — coalescing of streamed tool updates
+- `src/lib/server/__tests__/usage-summary.test.ts` — cross-session usage window, day fill, model/project ranking, clamping
 - `src/lib/server/__tests__/ui-settings.test.ts` — durable UI settings and last-session pointer persistence
 - `src/lib/server/__tests__/wire-messages.test.ts` — server wire serialization, protocol framing, message encoding
 - `src/lib/server/__tests__/ws-helpers.test.ts` — path utilities, serialization, semver, formatting
@@ -154,14 +159,15 @@
 - **`loginViaCookie(page)`**: Directly generates a session token signed with `PI_UI_JWT_SECRET` and attaches the auth cookie to the browser context, bypassing the login form submission.
 - **`CONNECTED_PAYLOAD` Factory (`e2e/mocks/payloads.ts`)**: Generates pre-populated connected states, mock session headers, and helper factories (`extensionSetWidgetPayload`, `extensionConfirmPayload`, `extensionInputPayload`, `extensionNotifyPayload`, `textDeltaPayload`, `thinkingDeltaPayload`).
 
-### Test Files (26 Specs)
+### Test Files (28 Specs)
 
-- `auth.spec.ts` — login form redirection, wrong password error banner, valid login, persisted auth cookie
+- `auth.spec.ts` — login form redirection, wrong password error banner, valid login, persisted auth cookie, native sign-in with JavaScript disabled or the app entry chunk unavailable
 - `auth-expiry.spec.ts` — WS close code 4001 session expiry banner and reconnect flows
 - `chat.spec.ts` — composer visibility, prompt WS dispatch, streaming text deltas, thinking deltas, slash commands & subcommands, message resumption, touch selection (11+ tests)
 - `compaction.spec.ts` — auto-compaction banner and in-flight compaction status
 - `connectivity.spec.ts` — connection state indicators, disconnect banners, reconnect backoff with jitter, tooltip hints, offline overlays
 - `extension-ui.spec.ts` — confirm dialogs, input dialogs, notify toast / chat banners, widgets (loaders, progress bars, text), multi-session widget scoping (16+ tests)
+- `draft-persistence.spec.ts` — unsent composer draft restored after reload; sending clears it
 - `file-viewer.spec.ts` — file reference link clicks, modal viewer, WS `read_file` / `file_content` flows
 - `history-pagination.spec.ts` — virtualized message scroll, upward pagination, history chunk requests
 - `horizontal-scroll.spec.ts` — wide markdown tables horizontal panning, wide code block scrolling, page-level overflow containment
@@ -181,6 +187,7 @@
 - `sidebar-order.spec.ts` — chronological and pinned session sorting order
 - `sticky-user-message.spec.ts` — only the current turn's user message sticks at the top of the transcript
 - `tools.spec.ts` — tool list panel, tool toggles, bash stdout streaming, tool error states, diff parser views
+- `usage-and-search.spec.ts` — Settings → Usage request/render and window switch; sidebar message search, highlighted hit, switch on click, stale results dropped
 - `visual-review.spec.ts` — screenshot capture of clean states, widgets, modals, and responsive layout across desktop/mobile
 
 ### Common Test Fixes & Troubleshooting

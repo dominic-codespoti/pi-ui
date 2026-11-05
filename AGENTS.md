@@ -24,9 +24,12 @@ Bun server bridges pi SDK events to browser over WebSocket. Key flow: CLI → se
 - Message editing via `edit_message` — rewinds session via `navigateTree()`, resends. See `pi-sdk-session-manipulation` skill
 - Real-time context usage ring — `contextUsage` (tokens, contextWindow, percent) streamed in `connected`/`session_loaded`/SDK events and displayed in chat header ring indicator
 - History payloads (`connected`/`session_loaded`/`older_messages`) are size-bounded: the last 100 messages (`MAX_INITIAL_MESSAGES`), with an 80 KB per-block cap and 128 KB per-message cap. Oversized tool-result output is elided above `MAX_WIRE_TOOL_OUTPUT_CHARS` (2,000 characters), retaining `outputElided`/`outputBytes` metadata and fetched on demand via `get_tool_output`. `totalBudget` (512 KB) is a hard ceiling covering both message content and rendered extension aux fields; `MAX_WIRE_AUX_TOTAL_CHARS` (256 KB) is a sub-cap inside that total in `src/lib/server/wire-messages.ts`. A failed `connected` send retries without history instead of closing the socket. The requester receives exactly one `session_loaded` per stamped request.
-- Session lists never use SDK `SessionManager.list/listAll` (they load every file fully and build `allMessagesText` — OOM risk at multi-hundred-MB stores). Listing goes through two catalogs in `src/lib/server/`: `session-catalog.ts` (merged session list — `session-scan.ts` streams line-by-line with a per-file (mtime,size) cache persisted to `~/.pi/agent/pi-ui-session-scan.json`; restarts are stat-only, composed with a resident-session overlay so resident session files are never re-read after every message, watched via `session-watcher.ts` with trailing 500 ms debounce, a 5 s max coalescing window, and resident-path `isIgnored` exclusion) and `project-catalog.ts` (merged project list — persisted registry + resident session counts, debounced sync-write persistence). `switch_session` validates with targeted `hasFile` rather than a full `list()`; catalogs are warmed after `Bun.serve`; `projects_list` broadcasts are deduped. Both are singletons with a single `apply()` mutation chokepoint, a `list()` read, and `onChange()` change events
+- Session lists never use SDK `SessionManager.list/listAll` (they load every file fully and build `allMessagesText` — OOM risk at multi-hundred-MB stores). Listing goes through two catalogs in `src/lib/server/`: `session-catalog.ts` (merged session list — `session-scan.ts` streams line-by-line with a per-file (mtime,size) cache persisted to `<agent dir>/pi-ui-session-scan.json` (also folds per-day/per-model usage buckets for `get_usage_summary`); restarts are stat-only, composed with a resident-session overlay so resident session files are never re-read after every message, watched via `session-watcher.ts` with trailing 500 ms debounce, a 5 s max coalescing window, and resident-path `isIgnored` exclusion) and `project-catalog.ts` (merged project list — persisted registry + resident session counts, debounced sync-write persistence). `switch_session` validates with targeted `hasFile` rather than a full `list()`; catalogs are warmed after `Bun.serve`; `projects_list` broadcasts are deduped. Both are singletons with a single `apply()` mutation chokepoint, a `list()` read, and `onChange()` change events
 - Valibot runtime validation — incoming WebSocket server messages are parsed through `parseServerMessage` with loose schemas (`server-message-schema.ts`), separating valid custom/SDK events from malformed frames
 - Markdown & LaTeX rendering — marked parser with LaTeX block/inline extensions (`@earendil-works/pi-tui/dist/latex.js`), wrapped by `memoizedRenderMarkdown` using an FNV-1a hash key with LRU cache bounds (300 entries / 4,000,000 characters)
+- All pi-ui state files (scan cache, project registry, UI settings/`lastSession`, push/VAPID, webhook, JWT secret) live in the SDK agent dir via `piAgentDir()` (`src/lib/server/agent-dir.ts`), which honours `PI_CODING_AGENT_DIR` like `getAgentDir()` — test servers pointed at scratch dirs must never touch `~/.pi/agent`
+- Tool renderers keep separate `call`/`result` `lastComponent` slots (TUI parity); `createSdkSession` logs per-phase timings and warns every 30 s naming a stalled phase (`src/lib/server/phase-timer.ts`)
+- Cross-session usage (Settings → Usage, `usage-section.svelte`) and message-text search (sidebar, `session-content-search.svelte` → `search_sessions`, streamed by `src/lib/server/session-content-search.ts`); composer drafts persist per session in localStorage (`src/lib/draft-store.ts`)
 - Logging via `src/lib/server/logger.ts` — sd-daemon `<N>` priority prefixes under systemd (`JOURNAL_STREAM` set), ISO timestamps otherwise; `uncaughtException`/`unhandledRejection` are logged and contained (process keeps serving)
 
 > **Deep dive:** [`docs/architecture.md`](docs/architecture.md) — full data flow diagram, lifecycle, SDK integration, lazy loading patterns
@@ -93,7 +96,7 @@ bun run format            # prettier --write .
 
 # Tests
 bun test src/lib/auth     # Bun-native test runner for auth/rate-limiter (timeout 15s)
-bun run test:unit         # vitest run (jsdom — 61 test files, 840 tests; Node >= 22.19)
+bun run test:unit         # vitest run (jsdom — 66 test files, 864 tests; Node >= 22.19)
 bun run test:unit:watch   # vitest (watch mode)
 bun run test:coverage     # vitest run --coverage (v8 provider)
 bun run test:e2e          # playwright test (chains mock E2E suite + live agent suite)
@@ -197,6 +200,7 @@ bun run test:ci           # check + check:sw + check:server + lint + test:unit +
 - Tree navigation: `get_session_tree`, `navigate_tree`, `set_entry_label`; compact accepts optional `customInstructions`
 - SDK settings/import: `get_sdk_settings`, `set_sdk_setting`, `import_session`
 - Projects: `get_projects`, `get_all_sessions`, `pin_project`, `rename_project`, `delete_project`
+- Usage & search: `get_usage_summary` → `usage_summary`, `search_sessions` → `session_search_results`
 - Extensions & tools: `get_tools`, `set_active_tools`, `extension_ui_response`, `extension_terminal_input`
 - Filesystem & completions: `read_file`, `write_file`, `dir_complete`, `file_complete`, `get_command_completions`
 - Session recovery: `get_tool_output`, `resync_session`
@@ -289,10 +293,10 @@ bun run test:ci           # check + check:sw + check:server + lint + test:unit +
 
 ## Testing & QA
 
-Three layers: **Unit** (Vitest, jsdom — 61 test files, 840 tests; needs Node >= 22.19 on PATH, see `.nvmrc` — `scripts/require-node.ts` fails fast otherwise), **E2E** (Playwright with mock WebSocket + Live SDK suite), **CI** (GitHub Actions). The Bun-native auth suite still has one pre-existing failure: `password.test.ts` uses `vi.resetModules()`, which Bun's runner does not implement; it passes under Vitest.
+Three layers: **Unit** (Vitest, jsdom — 66 test files, 864 tests; needs Node >= 22.19 on PATH, see `.nvmrc` — `scripts/require-node.ts` fails fast otherwise), **E2E** (Playwright with mock WebSocket + Live SDK suite), **CI** (GitHub Actions). The Bun-native auth suite still has one pre-existing failure: `password.test.ts` uses `vi.resetModules()`, which Bun's runner does not implement; it passes under Vitest.
 
 ```bash
-bun run test:unit         # vitest run (jsdom — 61 test files, 840 tests; Node >= 22.19)
+bun run test:unit         # vitest run (jsdom — 66 test files, 864 tests; Node >= 22.19)
 bun run test:e2e          # playwright test (chains mock suite + live agent suite)
 bun run test:e2e:fast     # playwright test --project=chromium (mock suite only)
 bun run test:e2e:live     # playwright test -c playwright.live.config.ts (live suite only)
