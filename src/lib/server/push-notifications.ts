@@ -11,7 +11,7 @@
  * endpoint and dropped when the push service reports the device gone (404/410).
  */
 import webpush from 'web-push';
-import { homedir } from 'node:os';
+import { piAgentDir } from './agent-dir';
 import { join } from 'node:path';
 import { mkdirSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
 
@@ -26,7 +26,7 @@ const VAPID_SUBJECT = 'mailto:pi@localhost';
 /** Sanity cap — a lost client must not grow the store unboundedly. */
 const MAX_SUBSCRIPTIONS = 100;
 
-let _storeDir = join(homedir(), '.pi', 'agent');
+let _storeDir = piAgentDir();
 let _keys: { publicKey: string; privateKey: string } | null = null;
 let _subs: PushSubscriptionRecord[] | null = null;
 

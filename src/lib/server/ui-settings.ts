@@ -13,10 +13,10 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
-import { homedir } from 'node:os';
+import { piAgentDir } from './agent-dir';
 import { log } from './logger';
 
-let registryDir = join(homedir(), '.pi', 'agent');
+let registryDir = piAgentDir();
 let settingsFile = join(registryDir, 'pi-ui-settings.json');
 
 let cached: Record<string, unknown> | null = null;

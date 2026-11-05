@@ -1,7 +1,7 @@
 export const COOKIE_NAME = 'pi-session';
 
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { piAgentDir } from '../server/agent-dir';
 import { dirname, join } from 'node:path';
 
 const g = globalThis as Record<string, unknown>;
@@ -16,8 +16,7 @@ const g = globalThis as Record<string, unknown>;
 // PI_UI_JWT_SECRET (≥32 chars) in both processes' env — env always wins.
 
 /** Secret file path — overridable so tests never touch the real one. */
-const SECRET_FILE =
-  process.env.PI_UI_JWT_SECRET_FILE ?? join(homedir(), '.pi', 'agent', 'pi-ui-jwt-secret');
+const SECRET_FILE = process.env.PI_UI_JWT_SECRET_FILE ?? join(piAgentDir(), 'pi-ui-jwt-secret');
 
 /** Load the persisted secret, or create it atomically. 'wx' makes the first
  *  writer win so racing processes converge on a single key. */

@@ -9,10 +9,10 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
-import { homedir } from 'node:os';
+import { piAgentDir } from './agent-dir';
 import { log } from './logger';
 
-const WEBHOOK_DIR = join(homedir(), '.pi', 'agent');
+const WEBHOOK_DIR = piAgentDir();
 const WEBHOOK_FILE = join(WEBHOOK_DIR, 'pi-ui-webhook.json');
 
 let cachedUrl: string | null | undefined; // undefined = unloaded, null = no url

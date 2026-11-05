@@ -13,8 +13,8 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { piAgentDir } from './agent-dir';
 import { log } from './logger';
 
 export interface ProjectRecord {
@@ -27,7 +27,7 @@ export interface ProjectRecord {
   lastOpened: number;
 }
 
-const REGISTRY_DIR = join(homedir(), '.pi', 'agent');
+const REGISTRY_DIR = piAgentDir();
 const REGISTRY_FILE = join(REGISTRY_DIR, 'pi-ui-projects.json');
 
 let records: ProjectRecord[] | null = null;

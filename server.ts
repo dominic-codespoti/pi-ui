@@ -151,6 +151,7 @@ import {
   firstTextContent,
   type SessionFileInfo,
 } from './src/lib/server/session-scan.ts';
+import { piAgentDir } from './src/lib/server/agent-dir.ts';
 import { SessionCatalog } from './src/lib/server/session-catalog.ts';
 import { startSessionWatch } from './src/lib/server/session-watcher.ts';
 import {
@@ -7287,7 +7288,7 @@ setToolRendererUpdateHandler((sessionId, toolCallId, kind, html) => {
 });
 // Hydrate session summaries from the previous run — sidebar loads become
 // stat-calls-only; files are fully read at most once per change.
-initSessionScanCache(join(homedir(), '.pi', 'agent', 'pi-ui-session-scan.json'));
+initSessionScanCache(join(piAgentDir(), 'pi-ui-session-scan.json'));
 
 log.info(`[pifrontier] Listening on http://localhost:${PORT}`);
 
