@@ -149,8 +149,15 @@ import {
   flushSessionScanCache,
   initSessionScanCache,
   firstTextContent,
+  cachedSessionUsage,
+  sessionFileInfo,
   type SessionFileInfo,
 } from './src/lib/server/session-scan.ts';
+import { clampUsageDays, summarizeUsage } from './src/lib/server/usage-summary.ts';
+import {
+  normalizeSearchQuery,
+  searchSessionContent,
+} from './src/lib/server/session-content-search.ts';
 import { piAgentDir } from './src/lib/server/agent-dir.ts';
 import { createPhaseTimer } from './src/lib/server/phase-timer.ts';
 import { SessionCatalog } from './src/lib/server/session-catalog.ts';
@@ -2950,6 +2957,9 @@ async function resolveProjectTrust(
   settingsManager.setProjectTrusted(false);
   return false;
 }
+
+/** In-flight content search per socket — a newer query aborts the older scan. */
+const sessionSearchAborts = new WeakMap<object, AbortController>();
 
 interface CreatedSdkSession {
   session: AgentSession;
@@ -6257,6 +6267,83 @@ try {
               break;
             }
 
+            case 'get_usage_summary': {
+              const requestId = typeof msg.requestId === 'string' ? msg.requestId : undefined;
+              try {
+                const sessions = await sessionCatalog.list();
+                // Resident session files are excluded from the watcher; a stat
+                // (plus an incremental parse when they grew) keeps today current.
+                for (let i = 0; i < sessions.length; i += 4) {
+                  await Promise.all(
+                    sessions.slice(i, i + 4).map((s) => sessionFileInfo(s.path).catch(() => null))
+                  );
+                }
+                const listed = new Set(sessions.map((s) => resolve(s.path)));
+                const summary = summarizeUsage(
+                  cachedSessionUsage().filter((f) => listed.has(f.path)),
+                  clampUsageDays(msg.days)
+                );
+                ws.send(JSON.stringify({ type: 'usage_summary', summary, requestId }));
+              } catch (err) {
+                log.error('[pifrontier] get_usage_summary error:', err);
+                ws.send(JSON.stringify({ type: 'agent_error', error: String(err) }));
+              }
+              break;
+            }
+
+            case 'search_sessions': {
+              const requestId = typeof msg.requestId === 'string' ? msg.requestId : '';
+              const query = normalizeSearchQuery(msg.query);
+              // A newer query from this socket supersedes the running scan.
+              sessionSearchAborts.get(ws.data)?.abort();
+              if (!query) {
+                ws.send(
+                  JSON.stringify({
+                    type: 'session_search_results',
+                    requestId,
+                    query: typeof msg.query === 'string' ? msg.query : '',
+                    results: [],
+                    scannedFiles: 0,
+                    totalFiles: 0,
+                    truncated: false,
+                    durationMs: 0,
+                  })
+                );
+                break;
+              }
+              const controller = new AbortController();
+              sessionSearchAborts.set(ws.data, controller);
+              try {
+                const response = await searchSessionContent(await sessionCatalog.list(), query, {
+                  signal: controller.signal,
+                });
+                if (!controller.signal.aborted) {
+                  ws.send(
+                    JSON.stringify({ type: 'session_search_results', requestId, ...response })
+                  );
+                }
+              } catch (err) {
+                log.error('[pifrontier] search_sessions error:', err);
+                ws.send(
+                  JSON.stringify({
+                    type: 'session_search_results',
+                    requestId,
+                    query,
+                    results: [],
+                    scannedFiles: 0,
+                    totalFiles: 0,
+                    truncated: true,
+                    durationMs: 0,
+                    error: err instanceof Error ? err.message : String(err),
+                  })
+                );
+              } finally {
+                if (sessionSearchAborts.get(ws.data) === controller)
+                  sessionSearchAborts.delete(ws.data);
+              }
+              break;
+            }
+
             case 'export_session': {
               const target = targetEntry(ws.data, msg, (data) => ws.send(data));
               if (!target) break;
@@ -7265,6 +7352,7 @@ try {
       close(ws) {
         cancelAppExtensionCallsForSocket(ws);
         cancelProviderLoginsForSocket(ws.data);
+        sessionSearchAborts.get(ws.data)?.abort();
         wsTransport.onClose(ws);
       },
 

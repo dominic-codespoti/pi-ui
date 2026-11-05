@@ -62,6 +62,10 @@ const fileInfoCache = new Map<string, CachedFileInfo>();
 
 // ── Disk persistence ─────────────────────────────────────────────────────────
 
+/** v3 adds per-day/per-model usage buckets to the fold; older caches are
+ *  dropped (one full re-scan) so every file's usage is complete. */
+const SCAN_CACHE_VERSION = 3;
+
 let cacheFilePath: string | null = null;
 let cacheDirty = false;
 
@@ -81,7 +85,7 @@ export function initSessionScanCache(filePath: string): void {
       !parsed ||
       typeof parsed !== 'object' ||
       !('version' in parsed) ||
-      parsed.version !== 2 ||
+      parsed.version !== SCAN_CACHE_VERSION ||
       !('entries' in parsed) ||
       !Array.isArray(parsed.entries)
     )
@@ -160,6 +164,8 @@ function reviveFold(raw: unknown): SessionScanFold | null {
     typeof value.labels !== 'object'
   )
     return null;
+  const usage = reviveUsage(value.usage);
+  if (!usage) return null;
   const lastModel =
     value.lastModel &&
     typeof value.lastModel === 'object' &&
@@ -186,6 +192,7 @@ function reviveFold(raw: unknown): SessionScanFold | null {
     totalTokens: value.totalTokens,
     labels: value.labels as Record<string, string>,
     labelCount: value.labelCount,
+    usage,
   };
 }
 
@@ -235,7 +242,7 @@ async function persistCache(): Promise<void> {
         ]);
         mkdirSync(dirname(filePath), { recursive: true });
         const tmp = `${filePath}.tmp`;
-        await writeFile(tmp, JSON.stringify({ version: 2, entries }));
+        await writeFile(tmp, JSON.stringify({ version: SCAN_CACHE_VERSION, entries }));
         await rename(tmp, filePath);
         // A scan can mutate the cache while the write is awaited. Keep the
         // dirty bit set for that newer generation so the loop persists it too.
@@ -318,6 +325,36 @@ interface SessionScanFold {
   totalTokens: number;
   labels: Record<string, string>;
   labelCount: number;
+  /** Assistant usage by local day (YYYY-MM-DD) then `provider/model`. */
+  usage: SessionUsageBuckets;
+}
+
+/** [cost, totalTokens, inputTokens, outputTokens, assistantMessages] */
+export type UsageCell = [number, number, number, number, number];
+export type SessionUsageBuckets = Record<string, Record<string, UsageCell>>;
+
+function localDay(ms: number): string | undefined {
+  if (!Number.isFinite(ms)) return undefined;
+  const d = new Date(ms);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+function finiteNumber(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+}
+
+function reviveUsage(raw: unknown): SessionUsageBuckets | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const out: SessionUsageBuckets = {};
+  for (const [day, models] of Object.entries(raw as Record<string, unknown>)) {
+    if (!models || typeof models !== 'object') continue;
+    for (const [model, cell] of Object.entries(models as Record<string, unknown>)) {
+      if (!Array.isArray(cell) || cell.length !== 5) continue;
+      (out[day] ??= {})[model] = cell.map(finiteNumber) as UsageCell;
+    }
+  }
+  return out;
 }
 
 function createEmptyFold(): SessionScanFold {
@@ -336,6 +373,7 @@ function createEmptyFold(): SessionScanFold {
     totalTokens: 0,
     labels: {},
     labelCount: 0,
+    usage: {},
   };
 }
 
@@ -405,12 +443,33 @@ function foldSessionLine(fold: SessionScanFold, line: string): void {
   const usage = 'usage' in message ? message.usage : undefined;
   if (!usage || typeof usage !== 'object') return;
   const cost = 'cost' in usage ? usage.cost : undefined;
+  let messageCost = 0;
   if (cost && typeof cost === 'object' && 'total' in cost) {
     const total = cost.total;
-    if (typeof total === 'number' && Number.isFinite(total)) fold.totalCost += total;
+    if (typeof total === 'number' && Number.isFinite(total)) {
+      fold.totalCost += total;
+      messageCost = total;
+    }
   }
+  const usageRecord = usage as Record<string, unknown>;
+  const messageTokens = finiteNumber(usageRecord.totalTokens);
   if ('totalTokens' in usage && typeof usage.totalTokens === 'number')
     fold.totalTokens += usage.totalTokens;
+  // Bucket by the entry's own time (local day) so usage pages can aggregate
+  // across sessions without re-reading files.
+  const entryTime = strField(entry, 'timestamp');
+  const messageTime = (message as Record<string, unknown>).timestamp;
+  const day = localDay(
+    entryTime ? Date.parse(entryTime) : typeof messageTime === 'number' ? messageTime : NaN
+  );
+  if (!day) return;
+  const model = provider && modelId ? `${provider}/${modelId}` : 'unknown';
+  const cell = ((fold.usage[day] ??= {})[model] ??= [0, 0, 0, 0, 0]);
+  cell[0] += messageCost;
+  cell[1] += messageTokens;
+  cell[2] += finiteNumber(usageRecord.input);
+  cell[3] += finiteNumber(usageRecord.output);
+  cell[4] += 1;
 }
 /** Stream `filePath` from `startByte` (default 0) through `fold`, mutating
  *  it in place. Stops as soon as the file is rejected — matching the
@@ -572,7 +631,19 @@ async function tryExtendFold(
       await handle.close();
     }
   }
-  const fold: SessionScanFold = { ...cached.fold, labels: { ...cached.fold.labels } };
+  // Copy every mutable part: a failed extension must leave the cached fold intact.
+  const fold: SessionScanFold = {
+    ...cached.fold,
+    labels: { ...cached.fold.labels },
+    usage: Object.fromEntries(
+      Object.entries(cached.fold.usage).map(([day, models]) => [
+        day,
+        Object.fromEntries(
+          Object.entries(models).map(([model, cell]) => [model, [...cell] as UsageCell])
+        ),
+      ])
+    ),
+  };
   try {
     await foldSessionFileFrom(filePath, fold, cached.size);
   } catch {
@@ -595,6 +666,20 @@ async function tryExtendFold(
  */
 export async function sessionFileInfo(filePath: string): Promise<SessionFileInfo | null> {
   return fileInfo(filePath);
+}
+
+/** Usage buckets for every cached, valid session file (call after a scan). */
+export function cachedSessionUsage(): Array<{
+  path: string;
+  cwd: string;
+  usage: SessionUsageBuckets;
+}> {
+  const out: Array<{ path: string; cwd: string; usage: SessionUsageBuckets }> = [];
+  for (const [path, entry] of fileInfoCache) {
+    if (!entry.info || !entry.fold) continue;
+    out.push({ path, cwd: entry.info.cwd, usage: entry.fold.usage });
+  }
+  return out;
 }
 
 /**

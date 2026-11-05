@@ -746,11 +746,7 @@ export const AppExtensionScopeSchema = v.looseObject({
 export const AppExtensionViewContributionSchema = v.looseObject({
   id: v.string(),
   title: v.string(),
-  slot: v.union([
-    v.literal('sidebar'),
-    v.literal('right-panel'),
-    v.literal('workspace'),
-  ]),
+  slot: v.union([v.literal('sidebar'), v.literal('right-panel'), v.literal('workspace')]),
   icon: v.optional(v.string()),
   order: v.optional(v.number()),
 });
@@ -838,6 +834,61 @@ export const SessionStatsEventSchema = v.looseObject({
   type: v.literal('session_stats'),
   stats: SessionStatsSchema,
   sessionId: v.optional(v.string()),
+});
+
+const UsageTotalsSchema = v.looseObject({
+  cost: v.number(),
+  tokens: v.number(),
+  inputTokens: v.number(),
+  outputTokens: v.number(),
+  messages: v.number(),
+});
+
+export const UsageSummaryEventSchema = v.looseObject({
+  type: v.literal('usage_summary'),
+  requestId: v.optional(v.string()),
+  summary: v.looseObject({
+    days: v.number(),
+    since: v.string(),
+    until: v.string(),
+    totals: UsageTotalsSchema,
+    byDay: v.array(v.looseObject({ day: v.string(), ...UsageTotalsSchema.entries })),
+    byModel: v.array(v.looseObject({ model: v.string(), ...UsageTotalsSchema.entries })),
+    byProject: v.array(v.looseObject({ cwd: v.string(), ...UsageTotalsSchema.entries })),
+    sessionsWithUsage: v.number(),
+  }),
+});
+
+export const SessionSearchResultsSchema = v.looseObject({
+  type: v.literal('session_search_results'),
+  requestId: v.string(),
+  query: v.string(),
+  results: v.array(
+    v.looseObject({
+      path: v.string(),
+      sessionId: v.string(),
+      cwd: v.string(),
+      name: v.optional(v.string()),
+      firstMessage: v.string(),
+      modified: v.number(),
+      matchCount: v.number(),
+      matches: v.array(
+        v.looseObject({
+          role: v.picklist(['user', 'assistant']),
+          snippet: v.string(),
+          matchStart: v.number(),
+          matchLength: v.number(),
+          entryId: v.optional(v.string()),
+          timestamp: v.optional(v.number()),
+        })
+      ),
+    })
+  ),
+  scannedFiles: v.number(),
+  totalFiles: v.number(),
+  truncated: v.boolean(),
+  durationMs: v.number(),
+  error: v.optional(v.string()),
 });
 
 export const UpdateStatusEventSchema = v.looseObject({
@@ -1175,6 +1226,8 @@ export const customEventSchemas = {
   app_extension_reload_result: AppExtensionReloadResultSchema,
   packages_list: PackagesListSchema,
   session_stats: SessionStatsEventSchema,
+  usage_summary: UsageSummaryEventSchema,
+  session_search_results: SessionSearchResultsSchema,
   update_status: UpdateStatusEventSchema,
   session_tree: SessionTreeSchema,
   tree_navigated: TreeNavigatedSchema,

@@ -13,7 +13,12 @@ import { untrack } from 'svelte';
 import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 import { page } from '$app/state';
 import { shallowReplace } from './shallow-routing.js';
-import type { ClientMessage, ProjectInfo, SessionSummary } from '#lib/ws/protocol.js';
+import type {
+  ClientMessage,
+  ProjectInfo,
+  SessionSearchResponse,
+  SessionSummary,
+} from '#lib/ws/protocol.js';
 
 /** Runtime status for one session, keyed by session id in `ProjectsState.runtime`. */
 export interface SessionRuntimeStatus {
@@ -343,6 +348,14 @@ class ProjectsState {
   }
   /** Directory completions for the directory picker inputs. */
   dirCompletions = $state<string[]>([]);
+  /** Server-side search over message text (the filter only matches titles/paths). */
+  contentSearch = $state<{
+    query: string;
+    requestId: string;
+    loading: boolean;
+    response: SessionSearchResponse | null;
+  } | null>(null);
+  private contentSearchSeq = 0;
   /** Watchdog for in-flight new_session/switch_session — see SESSION_OP_TIMEOUT_MS. */
   private opTimeout: ReturnType<typeof setTimeout> | null = null;
   /** Request ids whose responses can no longer change the visible session. */
@@ -673,6 +686,17 @@ class ProjectsState {
       case 'dir_completions':
         this.dirCompletions = (msg.entries as string[]) ?? [];
         return true;
+      case 'session_search_results': {
+        const current = this.contentSearch;
+        // Stale responses (superseded or cleared queries) are dropped.
+        if (!current || msg.requestId !== current.requestId) return true;
+        this.contentSearch = {
+          ...current,
+          loading: false,
+          response: msg as unknown as SessionSearchResponse,
+        };
+        return true;
+      }
       default:
         return false;
     }
@@ -891,6 +915,21 @@ class ProjectsState {
     } catch {
       /* no window (SSR/test env) or replaceState unavailable */
     }
+  }
+
+  /** Search message text across every session; a newer call supersedes the last. */
+  searchContent(query: string): boolean {
+    const trimmed = query.trim();
+    if (trimmed.length < 2) return false;
+    const requestId = `cs-${++this.contentSearchSeq}`;
+    const sent = this.send({ type: 'search_sessions', query: trimmed, requestId });
+    if (sent === false) return false;
+    this.contentSearch = { query: trimmed, requestId, loading: true, response: null };
+    return true;
+  }
+
+  clearContentSearch(): void {
+    this.contentSearch = null;
   }
 
   newSession(targetCwd?: string): void {

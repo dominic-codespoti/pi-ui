@@ -4,10 +4,7 @@
  */
 
 import type { ParsedComponent } from '#lib/tui-stubs.js';
-import type {
-  AppExtensionScope,
-  AppExtensionSummary,
-} from '#lib/app-extensions/types.js';
+import type { AppExtensionScope, AppExtensionSummary } from '#lib/app-extensions/types.js';
 /** Version of the extension-UI wire payloads (ExtensionUiStatePayload et al). Bump on breaking shape changes. */
 export const EXTENSION_UI_SCHEMA_VERSION = 1 as const;
 
@@ -779,6 +776,8 @@ export type ServerCustomEvent =
   | { type: 'package_progress'; progress: PackageProgress; sessionId?: string }
   | { type: 'package_result'; success: boolean; message: string; sessionId?: string }
   | { type: 'session_stats'; stats: SessionStats; sessionId?: string }
+  | { type: 'usage_summary'; summary: UsageSummary; requestId?: string }
+  | ({ type: 'session_search_results'; requestId: string } & SessionSearchResponse)
   | {
       type: 'export_result';
       format: 'html' | 'jsonl';
@@ -972,11 +971,13 @@ export type AppExtensionServerMessage = Extract<
       | 'app_extension_event'
       | 'app_extension_subscription_result'
       | 'app_extension_toggle_result'
-      | 'app_extension_reload_result'
+      | 'app_extension_reload_result';
   }
 >;
 
-export function isAppExtensionServerMessage(message: ServerMessage): message is AppExtensionServerMessage {
+export function isAppExtensionServerMessage(
+  message: ServerMessage
+): message is AppExtensionServerMessage {
   return (
     message.type === 'app_extensions_list' ||
     message.type === 'app_extension_result' ||
@@ -1175,6 +1176,11 @@ export type ClientMessage =
   | { type: 'import_session'; name: string; content: string }
   /** Request aggregate counts, token usage, and cost for the active session. */
   | { type: 'get_session_stats'; sessionId?: string }
+  /** Cross-session usage for the last `days` (default 30, max 366). Replies usage_summary. */
+  | { type: 'get_usage_summary'; days?: number; requestId?: string }
+  /** Full-text search over session message text. Replies session_search_results;
+   *  a newer request from the same socket cancels the previous scan. */
+  | { type: 'search_sessions'; query: string; requestId: string }
   /** Export the active session branch. */
   | { type: 'export_session'; sessionId?: string; format: 'html' | 'jsonl' }
   /** Request the session tree data for visual display. Server replies with session_tree. */
@@ -1262,3 +1268,59 @@ export type ClientMessage =
     }
   /** Remove one app-extension event subscription from this socket. */
   | { type: 'app_extension_unsubscribe'; subscriptionId: string };
+
+// ── Cross-session usage & content search ────────────────────────────────────
+
+export interface UsageTotals {
+  cost: number;
+  tokens: number;
+  inputTokens: number;
+  outputTokens: number;
+  /** Assistant messages that reported usage. */
+  messages: number;
+}
+
+export interface UsageSummary {
+  /** Window length in days, ending today (server local time). */
+  days: number;
+  since: string;
+  until: string;
+  totals: UsageTotals;
+  byDay: Array<{ day: string } & UsageTotals>;
+  byModel: Array<{ model: string } & UsageTotals>;
+  byProject: Array<{ cwd: string } & UsageTotals>;
+  sessionsWithUsage: number;
+}
+
+export interface SessionSearchMatch {
+  role: 'user' | 'assistant';
+  snippet: string;
+  /** Offset of the match inside `snippet`, for highlighting. */
+  matchStart: number;
+  matchLength: number;
+  entryId?: string;
+  timestamp?: number;
+}
+
+export interface SessionSearchResult {
+  path: string;
+  sessionId: string;
+  cwd: string;
+  name?: string;
+  firstMessage: string;
+  modified: number;
+  matches: SessionSearchMatch[];
+  /** Total matching messages in the session (`matches` is capped). */
+  matchCount: number;
+}
+
+export interface SessionSearchResponse {
+  query: string;
+  results: SessionSearchResult[];
+  scannedFiles: number;
+  totalFiles: number;
+  /** True when a limit, the deadline or cancellation cut the scan short. */
+  truncated: boolean;
+  durationMs: number;
+  error?: string;
+}

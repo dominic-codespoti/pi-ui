@@ -14,6 +14,7 @@
   import { ScrollArea } from '#lib/components/ui/scroll-area/index.js';
   import DirectoryPicker from './directory-picker.svelte';
   import ProjectRow from './project-row.svelte';
+  import SessionContentSearch from './session-content-search.svelte';
   import { projectsState, type ProjectGroup } from '#lib/state/projects-state.svelte.js';
   import type { SessionSummary } from '#lib/ws/protocol.js';
   import type {
@@ -290,6 +291,7 @@
 <!-- Project tree -->
 <ScrollArea class="flex-1 min-h-0">
   <div class="px-2.5 pb-2">
+    <SessionContentSearch {open} />
     {#if ps.groups.length === 0}
       <div class="flex flex-col items-center justify-center gap-2 py-12 px-4 text-center">
         <FolderPlus class="w-8 h-8 text-base-content/15" />

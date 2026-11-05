@@ -1147,3 +1147,49 @@ describe('ProjectsState', () => {
     });
   });
 });
+
+describe('projectsState content search', () => {
+  const response = (requestId: string, query: string) => ({
+    type: 'session_search_results',
+    requestId,
+    query,
+    results: [],
+    scannedFiles: 3,
+    totalFiles: 3,
+    truncated: false,
+    durationMs: 5,
+  });
+
+  afterEach(() => {
+    projectsState.clearContentSearch();
+    projectsState.send = () => false;
+  });
+
+  it('sends a trimmed query and applies only the matching response', () => {
+    const sent: Array<Record<string, unknown>> = [];
+    projectsState.send = (msg) => {
+      sent.push(msg as Record<string, unknown>);
+      return true;
+    };
+    expect(projectsState.searchContent(' a ')).toBe(false);
+    expect(projectsState.searchContent('  voynich ')).toBe(true);
+    const first = sent[0]?.requestId as string;
+    expect(sent[0]).toMatchObject({ type: 'search_sessions', query: 'voynich' });
+    expect(projectsState.contentSearch).toMatchObject({ query: 'voynich', loading: true });
+
+    // A newer query supersedes the first; the first's late reply is ignored.
+    projectsState.searchContent('cipher');
+    const second = sent[1]?.requestId as string;
+    expect(projectsState.handleMessage(response(first, 'voynich'))).toBe(true);
+    expect(projectsState.contentSearch).toMatchObject({ query: 'cipher', loading: true });
+    projectsState.handleMessage(response(second, 'cipher'));
+    expect(projectsState.contentSearch).toMatchObject({ query: 'cipher', loading: false });
+    expect(projectsState.contentSearch?.response?.scannedFiles).toBe(3);
+  });
+
+  it('does not enter a loading state while offline', () => {
+    projectsState.send = () => false;
+    expect(projectsState.searchContent('voynich')).toBe(false);
+    expect(projectsState.contentSearch).toBeNull();
+  });
+});

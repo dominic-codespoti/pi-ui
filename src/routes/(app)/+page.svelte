@@ -27,6 +27,7 @@
     PackageUpdateInfo,
     PackageProgress,
     SessionStats,
+    UsageSummary,
     FooterStats,
     RoutedModelInfo,
     ContextUsage,
@@ -104,6 +105,8 @@
   import ChevronRight from '@lucide/svelte/icons/chevron-right';
   import X from '@lucide/svelte/icons/x';
   import Keyboard from '@lucide/svelte/icons/keyboard';
+  import ChartColumn from '@lucide/svelte/icons/chart-column';
+  import UsageSection from '#lib/components/panels/usage-section.svelte';
   import Blocks from '@lucide/svelte/icons/blocks';
   import SlidersHorizontal from '@lucide/svelte/icons/sliders-horizontal';
   import PiIcon from '@lucide/svelte/icons/pi';
@@ -1184,6 +1187,7 @@
     { id: 'shortcuts', label: 'Shortcuts', icon: Keyboard },
     { id: 'extensions', label: 'Extensions', icon: Blocks },
     { id: 'packages', label: 'Packages', icon: PackageOpen },
+    { id: 'usage', label: 'Usage', icon: ChartColumn },
     { id: 'updates', label: 'Updates', icon: RefreshCw },
     { id: 'about', label: 'About', icon: PiIcon },
   ] as const;
@@ -1331,7 +1335,14 @@
   });
 
   function initSettingsSection():
-    'session' | 'notifications' | 'shortcuts' | 'extensions' | 'packages' | 'updates' | 'about' {
+    | 'session'
+    | 'notifications'
+    | 'shortcuts'
+    | 'extensions'
+    | 'packages'
+    | 'usage'
+    | 'updates'
+    | 'about' {
     const v = urlParam('ss', 'session');
     const valid = [
       'session',
@@ -1339,6 +1350,7 @@
       'shortcuts',
       'extensions',
       'packages',
+      'usage',
       'updates',
       'about',
     ] as const;
@@ -1372,6 +1384,10 @@
   let packageProgress = $state<PackageProgress | null>(null);
   let extensionsLoaded = $state(false);
   let sessionStats = $state<SessionStats | null>(null);
+  let usageSummary = $state<UsageSummary | null>(null);
+  let usageLoading = $state(false);
+  let usageDays = $state(30);
+  let usageRequestId = '';
   let footerData = $state<{
     gitBranch: string | null;
     availableProviderCount: number;
@@ -1718,6 +1734,13 @@
   $effect(() => {
     if (showSettingsPanel && settingsSection === 'about' && wsState === 'open') {
       send({ type: 'get_session_stats' });
+    }
+  });
+  $effect(() => {
+    if (showSettingsPanel && settingsSection === 'usage' && wsState === 'open') {
+      usageRequestId = uid();
+      usageLoading = true;
+      send({ type: 'get_usage_summary', days: usageDays, requestId: usageRequestId });
     }
   });
 
@@ -3093,6 +3116,13 @@
           };
         }
         break;
+      case 'usage_summary': {
+        if (msg.requestId !== undefined && msg.requestId !== usageRequestId) break;
+        usageSummary = msg.summary as UsageSummary;
+        usageLoading = false;
+        break;
+      }
+
       case 'session_stats': {
         const stats = msg.stats as SessionStats | undefined;
         if (!stats || stats.sessionId !== sessionId) break;
@@ -3189,7 +3219,8 @@
 
       case 'all_sessions_list':
       case 'session_updated':
-      case 'dir_completions': {
+      case 'dir_completions':
+      case 'session_search_results': {
         projectsState.handleMessage(msg as PiEvent);
         break;
       }
@@ -6730,7 +6761,8 @@
                   PWA push and page notifications{:else if settingsSection === 'shortcuts'}Keyboard
                   shortcuts and touch gestures available in the chat UI{:else if settingsSection === 'extensions'}Loaded
                   extensions and their tools/commands{:else if settingsSection === 'packages'}Manage
-                  SDK extension packages{:else if settingsSection === 'updates'}Check and apply
+                  SDK extension packages{:else if settingsSection === 'usage'}Tokens and cost
+                  across every session{:else if settingsSection === 'updates'}Check and apply
                   pi-ui or SDK updates{:else}Runtime information and server controls{/if}
               </Dialog.Description>
             </header>
@@ -7371,6 +7403,13 @@
                       </p>
                     {/if}
                   </div>
+                {:else if settingsSection === 'usage'}
+                  <UsageSection
+                    summary={usageSummary}
+                    loading={usageLoading}
+                    days={usageDays}
+                    onDaysChange={(next) => (usageDays = next)}
+                  />
                 {:else if settingsSection === 'updates'}
                   <div class="space-y-4">
                     <Card.Root

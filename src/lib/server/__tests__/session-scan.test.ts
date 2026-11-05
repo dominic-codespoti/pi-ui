@@ -16,6 +16,7 @@ import {
   clearSessionScanCache,
   flushSessionScanCache,
   initSessionScanCache,
+  cachedSessionUsage,
 } from '../session-scan';
 
 const ROOT = '/tmp/pi-ui-test-session-scan-' + Date.now();
@@ -368,5 +369,78 @@ describe('session-scan', () => {
     expect((await scanAllSessions(ROOT))[0].labelCount).toBe(1);
     appendLabel('entry-1');
     expect((await scanAllSessions(ROOT))[0].labelCount).toBeUndefined();
+  });
+});
+
+describe('session-scan usage buckets', () => {
+  const assistant = (ts: string, model: string, cost: number, tokens: number) =>
+    JSON.stringify({
+      type: 'message',
+      id: `a-${ts}-${model}`,
+      timestamp: ts,
+      message: {
+        role: 'assistant',
+        provider: 'p',
+        model,
+        content: [{ type: 'text', text: 'ok' }],
+        usage: { input: tokens - 1, output: 1, totalTokens: tokens, cost: { total: cost } },
+      },
+    });
+
+  it('buckets assistant usage by local day and model, incrementally', async () => {
+    const path = join(DIR, 'u.jsonl');
+    writeFileSync(
+      path,
+      [
+        JSON.stringify({
+          type: 'session',
+          version: 3,
+          id: 'u1',
+          timestamp: '2026-03-01T12:00:00.000Z',
+          cwd: CWD,
+        }),
+        assistant('2026-03-01T12:00:00.000Z', 'm1', 0.5, 100),
+        assistant('2026-03-01T12:05:00.000Z', 'm1', 0.25, 50),
+        assistant('2026-03-03T02:00:00.000Z', 'm2', 1, 10),
+      ].join('\n') + '\n'
+    );
+    await scanAllSessions(ROOT);
+    const day = (iso: string) => {
+      const d = new Date(iso);
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    };
+    let usage = cachedSessionUsage().find((f) => f.path === path)?.usage;
+    expect(usage?.[day('2026-03-01T12:00:00.000Z')]?.['p/m1']).toEqual([0.75, 150, 148, 2, 2]);
+    expect(usage?.[day('2026-03-03T02:00:00.000Z')]?.['p/m2']).toEqual([1, 10, 9, 1, 1]);
+
+    appendFileSync(path, assistant('2026-03-03T02:30:00.000Z', 'm2', 2, 20) + '\n');
+    await scanAllSessions(ROOT);
+    usage = cachedSessionUsage().find((f) => f.path === path)?.usage;
+    expect(usage?.[day('2026-03-03T02:00:00.000Z')]?.['p/m2']).toEqual([3, 30, 28, 2, 2]);
+  });
+
+  it('persists buckets across a restart (cache v3)', async () => {
+    const cacheFile = join(ROOT, 'cache.json');
+    initSessionScanCache(cacheFile);
+    const path = join(DIR, 'p.jsonl');
+    writeFileSync(
+      path,
+      [
+        JSON.stringify({
+          type: 'session',
+          version: 3,
+          id: 'p1',
+          timestamp: '2026-03-01T12:00:00.000Z',
+          cwd: CWD,
+        }),
+        assistant('2026-03-01T12:00:00.000Z', 'm1', 0.5, 100),
+      ].join('\n') + '\n'
+    );
+    await scanAllSessions(ROOT);
+    await flushSessionScanCache();
+    expect(JSON.parse(readFileSync(cacheFile, 'utf8')).version).toBe(3);
+    initSessionScanCache(cacheFile);
+    const usage = cachedSessionUsage().find((f) => f.path === path)?.usage;
+    expect(Object.values(usage ?? {})[0]?.['p/m1']).toEqual([0.5, 100, 99, 1, 1]);
   });
 });
