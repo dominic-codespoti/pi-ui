@@ -1,9 +1,10 @@
 ---
 name: pi-ui-app-extensions
 description: Build pi-ui app extensions - installation-wide sidebar, right-panel, and workspace views plus scoped server operations with agent tools. Use when creating or modifying a pi-ui extension package (pi-ui.extension.json, serverEntry, clientEntry), wiring views, operations, events, exposeToAgent tools, chat prompts, composer drafts, confirm dialogs, file viewing, session switching, workspace writes, transcript reads, catalog listing, or manifest capabilities.
-version: 2
-created: "2026-09-27"
-updated: "2026-09-29"
+metadata:
+  version: "2"
+  created: "2026-09-27"
+  updated: "2026-09-29"
 ---
 
 # Pi UI App Extensions
