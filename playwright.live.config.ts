@@ -23,7 +23,7 @@ const appUrl = `http://127.0.0.1:${port}`;
 export default defineConfig({
   globalSetup: './e2e/global-setup.ts',
   testDir: './e2e',
-  testMatch: /live-(agent|widget)\.spec\.ts$/,
+  testMatch: /live-(agent|widget|session-bind)\.spec\.ts$/,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,
   workers: 1,

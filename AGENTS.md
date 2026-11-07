@@ -123,7 +123,7 @@ bun run test:ci           # check + check:sw + check:server + lint + test:unit +
 ## Boundaries and gotchas
 
 - **This checkout is the live custom backend** (`pi-ui.service` → `~/.local/bin/pi-ui-failover.sh` on `:9443`, stable npm fallback). Never stop or restart it from a session it hosts: KillMode=control-group kills every child. Run restarts/deploys as a transient unit (`systemd-run --user --collect --unit=<name> ...`). Local `main` diverges from origin: no pull/rebase without Dom.
-- **Known bug:** sessions created by the `new_session` message are never bound (`setActiveSession(..., hostAlreadyBound=false)`; `startHostBinding` runs only at startup and from the extension `newSession` path). They get no `session_start`, `ctx.hasUI` is false and extension UI dialogs are unavailable. Fix direction: bind in `setActiveSession`, or await binding before the first prompt.
+- **Host binding:** every UI path registers sessions with `hostAlreadyBound=false`; `setActiveSession` starts `startHostBinding` in the background and `invokeRun` awaits it before a turn, so extensions always get `session_start` and a real `ctx.ui` first. Don't remove either (0.21.1 dropped the first; `e2e/live-session-bind.spec.ts` guards it).
 - Adapter: vendored `svelte-adapter-bun` (`adapters/svelte-adapter-bun`), not `@sveltejs/adapter-node` (incompatible with WS). Keep the `vite` entry in package.json `overrides`, or vitest's nested Vite breaks Kit 3's `isRunnableDevEnvironment` check.
 - `typescript` stays on `~6.0.3` until typescript-eslint and svelte-check support TS 7.
 - Unit tests need Node ≥ 22.19 on PATH (`scripts/require-node.ts` fails fast). The Bun-native auth suite has one known failure (`password.test.ts` uses `vi.resetModules()`); it passes under Vitest.

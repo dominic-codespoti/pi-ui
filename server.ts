@@ -2562,6 +2562,9 @@ async function invokeRun(
   const sid = entry.session.sessionId;
   _promptsInFlight.add(sid);
   try {
+    // A turn must not start before the host is bound: extensions get
+    // session_start and their UI context first (no-op once bound).
+    await startHostBinding(sid, entry.session).catch(() => {});
     await entry.session.prompt(message, images ? { images } : undefined);
   } finally {
     _promptsInFlight.delete(sid);
@@ -4335,6 +4338,13 @@ async function setActiveSession(
   }
   const targetId = session.sessionId;
   selectedSessionId = targetId;
+  // Every UI path (new/switch/fork/import/clone) registers with
+  // hostAlreadyBound=false, so bind here in the background, like startup does.
+  // Dropped in the 0.21.1 refactor: since then UI-created sessions never got
+  // session_start, ctx.hasUI or extension commands until an extension command ran.
+  if (!entry.hostBound && !entry.bindingPending) {
+    void startHostBinding(targetId, session).catch(() => {});
+  }
   syncWidgetFactories(targetId);
   if (!entry.forwardingUnsub) {
     const eventForwarder = makeEventForwarder(targetId, session);

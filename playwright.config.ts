@@ -27,7 +27,11 @@ export default defineConfig({
   reporter: process.env.CI ? 'github' : 'list',
   // Live-server specs share one global active session — excluded here, run
   // serially through playwright.live.config.ts (`bun run test:e2e` chains it).
-  testIgnore: ['e2e/live-agent.spec.ts', 'e2e/live-widget.spec.ts'],
+  testIgnore: [
+    'e2e/live-agent.spec.ts',
+    'e2e/live-widget.spec.ts',
+    'e2e/live-session-bind.spec.ts',
+  ],
   use: {
     baseURL: appUrl,
     trace: process.env.CI ? 'on-first-retry' : 'off',
